@@ -1,0 +1,1 @@
+export { AsistenciaPage } from "./AsistenciaPage";

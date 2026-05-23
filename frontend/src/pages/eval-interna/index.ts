@@ -1,0 +1,1 @@
+export { EvalInternaPage } from './EvalInternaPage';

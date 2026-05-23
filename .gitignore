@@ -1,0 +1,36 @@
+﻿# Dependencias
+node_modules/
+frontend/node_modules/
+
+# Build
+dist/
+frontend/dist/
+build/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Base de datos local
+*.db
+*.db-shm
+*.db-wal
+
+# Secretos
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
+
+# Backups
+backups/
+*.backup_*
+backup_educaone_*.json
+INITIAL_CREDENTIALS.txt
+
+# Sistema
+.DS_Store
+Thumbs.db

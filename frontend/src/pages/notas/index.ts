@@ -1,0 +1,1 @@
+export { NotasPage } from './NotasPage';

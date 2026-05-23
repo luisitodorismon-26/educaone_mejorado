@@ -1,0 +1,1 @@
+export { CalificacionesGeneralPage } from './CalificacionesGeneralPage';

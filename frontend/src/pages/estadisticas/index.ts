@@ -1,0 +1,1 @@
+export { EstadisticasPage } from './EstadisticasPage';

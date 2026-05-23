@@ -1,0 +1,1 @@
+export { RegistroEscolarPage } from './RegistroEscolarPage';

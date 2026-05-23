@@ -1,0 +1,1 @@
+export { ComunicacionPage } from "./ComunicacionPage";

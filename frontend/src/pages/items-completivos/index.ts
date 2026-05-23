@@ -1,0 +1,1 @@
+export { ItemsCompletivosPage } from './ItemsCompletivosPage';

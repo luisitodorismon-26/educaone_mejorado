@@ -1,0 +1,1 @@
+export { AsignacionesPage } from "./AsignacionesPage";
