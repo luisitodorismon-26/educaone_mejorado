@@ -2452,6 +2452,21 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
     if 'colegio_id' in data:
         data.pop('colegio_id')
     
+    # Cambio de username: permitido, pero validando que sea único y no vacío.
+    # El username es el identificador de login, así que no puede repetirse.
+    if 'username' in data:
+        nuevo_username = (data['username'] or '').strip()
+        if not nuevo_username:
+            return JSONResponse({'error': 'El nombre de usuario no puede estar vacío'}, status_code=400)
+        # ¿Existe ya OTRO usuario con ese username? (el username es global)
+        existe = db.query(Usuario).filter(
+            Usuario.username == nuevo_username,
+            Usuario.id != usuario.id
+        ).first()
+        if existe:
+            return JSONResponse({'error': f'El nombre de usuario "{nuevo_username}" ya está en uso'}, status_code=400)
+        usuario.username = nuevo_username
+
     # Lista blanca de campos editables (ya no incluye 'role' acá; se setea aparte)
     for campo in ['nombre', 'apellido', 'email', 'telefono', 'cedula', 'tanda_id']:
         if campo in data:

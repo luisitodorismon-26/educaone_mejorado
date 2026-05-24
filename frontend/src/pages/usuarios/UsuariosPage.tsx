@@ -236,7 +236,6 @@ export const UsuariosPage = () => {
             label="Usuario"
             value={form.username}
             onChange={e => setForm({ ...form, username: e.target.value })}
-            disabled={!!editando}
             required
           />
           <div className="grid grid-cols-2 gap-4">
