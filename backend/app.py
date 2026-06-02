@@ -10136,12 +10136,15 @@ async def imprimir_calificaciones(curso_id: int, asignatura_id: int, request: Re
 
 @app.get("/api/registros/validar/{curso_id}")
 async def validar_registro(curso_id: int, request: Request, db: Session = Depends(get_db),
-                           current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+                           current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """
     Valida que los datos del curso estén completos para generar un Registro Escolar.
     Detecta nivel automáticamente (primaria/secundaria) y llama al validador correcto.
     
     Devuelve: {valid: bool, errors: [], warnings: [], info: {...}}
+
+    Permisos: cualquier docente del colegio (la seguridad multitenant
+    impide validar cursos de otros colegios).
     """
     from registro_validator import validar_registro_secundaria, validar_registro_primaria, _normalizar_nivel
     
@@ -10162,10 +10165,13 @@ async def validar_registro(curso_id: int, request: Request, db: Session = Depend
 
 @app.get("/api/registros/preview/{curso_id}")
 async def preview_registro_v2(curso_id: int, request: Request, db: Session = Depends(get_db),
-                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """
     Preview completo del JSON que irá al PDF.
     Usado para debugging y auditoría antes de generar el documento.
+
+    Permisos: cualquier docente del colegio (la seguridad multitenant
+    impide ver cursos de otros colegios).
     """
     from registro_validator import validar_registro_secundaria, _normalizar_nivel, _extraer_grado_numero
     
@@ -10618,18 +10624,25 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
 @app.get("/api/registros/secundaria/{curso_id}/preview-pdf")
 async def preview_pdf_secundaria(curso_id: int, request: Request,
                                   db: Session = Depends(get_db),
-                                  current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+                                  current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """
     Vista previa del PDF de secundaria con marca de agua BORRADOR.
     Genera SIEMPRE, ignorando errores y warnings — para que el director
     pueda ir verificando avance durante el año escolar.
     
     NUNCA usar este PDF para entrega oficial.
+
+    Permisos: dirección/coordinador/profesor del colegio. La seguridad
+    multitenant (filtro por colegio_id) impide ver cursos de otros colegios.
+    Los profesores ven el registro completo del curso (incluidas materias
+    de otros), pero solo pueden MODIFICAR sus propias materias en los
+    endpoints de carga de notas — esto refleja la práctica real del MINERD
+    donde el registro es un documento compartido del curso.
     """
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema
     from registro_borrador import aplicar_marca_borrador
-    
+
     # Validar para incluir info, pero NO bloquear
     validacion = validar_registro_secundaria(db, curso_id, current_user.colegio_id)
     
