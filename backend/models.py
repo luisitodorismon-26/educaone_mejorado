@@ -2094,9 +2094,12 @@ def init_db():
         # Regla: si plan_X = True → forzar usa_X = True (consistencia).
         # Esto NO daña nada porque el código ya ignora usa_X en v2.11.
         try:
-            from sqlalchemy import text as _sql_text
-            for col_id, in db.execute(_sql_text("SELECT id FROM colegios WHERE activo=1")).fetchall():
-                _colegio = db.get(Colegio, col_id)
+            # Usar el ORM (Colegio.activo == True) en vez de SQL crudo.
+            # SQL crudo con "activo=1" funciona en SQLite pero PostgreSQL lo
+            # rechaza (activo es BOOLEAN, no acepta comparar con el entero 1).
+            # El ORM traduce el booleano correctamente para cada motor de BD.
+            for _colegio in db.query(Colegio).filter(Colegio.activo == True).all():
+                col_id = _colegio.id
                 _config = db.query(ConfiguracionColegio).filter_by(colegio_id=col_id).first()
                 if not _colegio or not _config:
                     continue
