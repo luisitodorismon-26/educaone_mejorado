@@ -4169,10 +4169,37 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
         # v2.13.31: capturar valores anteriores para auditoría de detalle fino
         _audit_antes = {c: getattr(calif, c, None) for c in ['p1','p2','p3','p4','rp1','rp2','rp3','rp4']}
     
+    # v2.13.34: VALIDACIÓN DE CIERRE POR PERÍODO (Opción 2 - inteligente)
+    # Al cerrar el Período N, se bloquean los PN de todas las competencias.
+    # Si el profesor intenta modificar un período cerrado, se SALTA ese período
+    # (no se guarda) y se guardan los abiertos. El profesor puede usar
+    # "Solicitar Corrección" para editar un período cerrado con permiso temporal.
+    periodos_cerrados_ignorados = []
+    def _periodo_esta_cerrado(num_periodo):
+        """True si el período está cerrado Y el profesor no tiene permiso temporal."""
+        if not getattr(ano, f'p{num_periodo}_cerrado', False):
+            return False  # abierto → se puede editar
+        # ¿Tiene permiso temporal de corrección?
+        permiso = tenant_filter(db.query(PermisoTemporalCalificacion), PermisoTemporalCalificacion, current_user).filter(
+            PermisoTemporalCalificacion.profesor_id == current_user.id,
+            PermisoTemporalCalificacion.activo == True,
+            PermisoTemporalCalificacion.fecha_fin > now_rd(),
+            (PermisoTemporalCalificacion.periodo == num_periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
+            (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None))
+        ).first()
+        return permiso is None  # cerrado y sin permiso → bloqueado
+
     # Aplicar campos de notas (validar rangos)
     campos_notas = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4']
     for campo in campos_notas:
         if campo in data:
+            # ¿A qué período pertenece este campo? (p1/rp1 → 1, p2/rp2 → 2, etc.)
+            num_periodo = int(campo[-1])
+            # Si el período está cerrado (sin permiso), saltar este campo
+            if _periodo_esta_cerrado(num_periodo):
+                if num_periodo not in periodos_cerrados_ignorados:
+                    periodos_cerrados_ignorados.append(num_periodo)
+                continue  # no modificar un período cerrado
             valor = data[campo]
             if valor is None or valor == '':
                 setattr(calif, campo, None)
@@ -4241,12 +4268,18 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
         logging.getLogger('educaone.audit').warning(f'auditoría nota falló: {_e}')
 
     cache_clear(f'stats:{current_user.colegio_id}')
-    return {
+    respuesta = {
         'message': 'Calificación secundaria guardada',
         'id': calif.id,
         'calificacion': calif.to_dict(),
         'cf_area': cf,
     }
+    # v2.13.34: si se ignoraron períodos cerrados, avisar al profesor
+    if periodos_cerrados_ignorados:
+        periodos_str = ', '.join(f'P{n}' for n in sorted(periodos_cerrados_ignorados))
+        respuesta['message'] = f'Guardado. Nota: {periodos_str} está(n) cerrado(s) y no se modificó(aron). Use Solicitar Corrección si necesita editarlos.'
+        respuesta['periodos_cerrados_ignorados'] = sorted(periodos_cerrados_ignorados)
+    return respuesta
 
 
 @app.post("/api/calificaciones-secundaria/evaluacion-extra")
