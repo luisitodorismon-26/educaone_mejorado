@@ -6,6 +6,7 @@ import { Button, Spinner } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
 import { EstudianteData, Curso, Asignatura } from './secundaria/tipos';
 import { TabNotasRegulares } from './secundaria/TabNotasRegulares';
+import { TabNotasPorPeriodo } from './secundaria/TabNotasPorPeriodo';
 import { TabEvaluacionesExtra } from './secundaria/TabEvaluacionesExtra';
 import { TabAsistencia } from './secundaria/TabAsistencia';
 import { TabBoletin } from './secundaria/TabBoletin';
@@ -33,6 +34,8 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
   const [estudiantes, setEstudiantes] = useState<EstudianteData[]>([]);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<TabId>('notas');
+  // Modo de carga de notas: 'competencia' (por competencia) o 'periodo' (por período)
+  const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('competencia');
 
   useEffect(() => {
     if (cursoId && asignaturaId) cargar();
@@ -120,13 +123,48 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
 
       <div>
         {tab === 'notas' && (
-          <TabNotasRegulares
-            estudiantes={estudiantes}
-            asignaturaId={asignaturaId}
-            puedeEditar={puedeEditar}
-            onReload={cargar}
-            onAbrirFicha={abrirFicha}
-          />
+          <div className="space-y-4">
+            {/* Selector de modo de carga: Por Competencia / Por Período */}
+            <div className="flex gap-2 bg-gray-100 p-1 rounded-lg w-fit">
+              <button
+                onClick={() => setModoNotas('competencia')}
+                className={`px-4 py-2 rounded-md text-sm font-medium transition ${
+                  modoNotas === 'competencia'
+                    ? 'bg-white text-blue-700 shadow-sm'
+                    : 'text-gray-600 hover:text-gray-800'
+                }`}
+              >
+                Por Competencia
+              </button>
+              <button
+                onClick={() => setModoNotas('periodo')}
+                className={`px-4 py-2 rounded-md text-sm font-medium transition ${
+                  modoNotas === 'periodo'
+                    ? 'bg-white text-blue-700 shadow-sm'
+                    : 'text-gray-600 hover:text-gray-800'
+                }`}
+              >
+                Por Período
+              </button>
+            </div>
+
+            {modoNotas === 'competencia' ? (
+              <TabNotasRegulares
+                estudiantes={estudiantes}
+                asignaturaId={asignaturaId}
+                puedeEditar={puedeEditar}
+                onReload={cargar}
+                onAbrirFicha={abrirFicha}
+              />
+            ) : (
+              <TabNotasPorPeriodo
+                estudiantes={estudiantes}
+                asignaturaId={asignaturaId}
+                puedeEditar={puedeEditar}
+                onReload={cargar}
+              />
+            )}
+          </div>
         )}
         {tab === 'extra' && (
           <TabEvaluacionesExtra
