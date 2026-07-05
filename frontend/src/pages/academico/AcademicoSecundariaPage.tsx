@@ -160,6 +160,7 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
                 puedeEditar={puedeEditar}
                 onReload={cargar}
                 onAbrirFicha={abrirFicha}
+                periodosCerrados={periodosCerrados}
               />
             ) : (
               <TabNotasPorPeriodo

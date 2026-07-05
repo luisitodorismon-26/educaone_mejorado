@@ -21,11 +21,12 @@ interface Props {
   puedeEditar: boolean;
   onReload: () => Promise<void>;
   onAbrirFicha?: (estudianteId: number) => void;
+  periodosCerrados?: Record<string, boolean>;
 }
 
 type EditadasState = Record<string, Partial<Record<CampoEditable, number | null>>>;
 
-export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, onAbrirFicha }) => {
+export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, onAbrirFicha, periodosCerrados = {} }) => {
   const [competenciaActiva, setCompetenciaActiva] = useState<number>(1);
   const [editadas, setEditadas] = useState<EditadasState>({});
   const [saving, setSaving] = useState(false);
@@ -122,7 +123,11 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
     const val = getValor(est, compNum, campo);
     const esRetirado = !!est.estudiante.retirado;
     const cellKey = `${est.estudiante.id}-${compNum}-${campo}`;
-    
+
+    // v2.13.35: ¿el período de este campo está cerrado? (p1/rp1 → 1, p2/rp2 → 2, etc.)
+    const numPeriodo = campo.replace(/[^0-9]/g, '');
+    const periodoCerrado = !!periodosCerrados[`p${numPeriodo}`];
+
     // v2.13.1: RP solo se puede editar si P del mismo período < 70 (regla MINERD oficial)
     // Calculamos el P correspondiente para saber si habilitar el RP.
     let rpDeshabilitado = false;
@@ -133,8 +138,9 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
       // RP queda deshabilitado si: P no existe O P >= 70
       rpDeshabilitado = pVal === null || pVal >= 70;
     }
-    
-    if (!puedeEditar || esRetirado) {
+
+    // Si no puede editar, está retirado, o el período está cerrado → solo lectura
+    if (!puedeEditar || esRetirado || periodoCerrado) {
       return (
         <span className={`inline-block w-16 text-center text-sm ${
           esRetirado ? (val !== null ? 'text-gray-500' : 'text-gray-300') :
@@ -242,13 +248,13 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
                 <tr className="bg-gray-50">
                   <th className="px-2 py-2 text-left font-medium text-gray-600">No.</th>
                   <th className="px-2 py-2 text-left font-medium text-gray-600 min-w-[180px]">Estudiante</th>
-                  <th className="px-2 py-2 text-center font-medium text-gray-600">P1</th>
+                  <th className="px-2 py-2 text-center font-medium text-gray-600">P1 {periodosCerrados['p1'] && '🔒'}</th>
                   <th className="px-2 py-2 text-center font-medium text-amber-600 bg-amber-50">RP1</th>
-                  <th className="px-2 py-2 text-center font-medium text-gray-600">P2</th>
+                  <th className="px-2 py-2 text-center font-medium text-gray-600">P2 {periodosCerrados['p2'] && '🔒'}</th>
                   <th className="px-2 py-2 text-center font-medium text-amber-600 bg-amber-50">RP2</th>
-                  <th className="px-2 py-2 text-center font-medium text-gray-600">P3</th>
+                  <th className="px-2 py-2 text-center font-medium text-gray-600">P3 {periodosCerrados['p3'] && '🔒'}</th>
                   <th className="px-2 py-2 text-center font-medium text-amber-600 bg-amber-50">RP3</th>
-                  <th className="px-2 py-2 text-center font-medium text-gray-600">P4</th>
+                  <th className="px-2 py-2 text-center font-medium text-gray-600">P4 {periodosCerrados['p4'] && '🔒'}</th>
                   <th className="px-2 py-2 text-center font-medium text-amber-600 bg-amber-50">RP4</th>
                   <th className="px-3 py-2 text-center font-bold text-blue-700 bg-blue-100">Prom C{competenciaActiva}</th>
                 </tr>
