@@ -19,16 +19,20 @@ interface Props {
   asignaturaId: number;
   puedeEditar: boolean;
   onReload: () => Promise<void>;
+  periodosCerrados?: Record<string, boolean>;
 }
 
 // clave: "estudianteId-competenciaNumero" → { p?: valor, rp?: valor }
 type EditadasState = Record<string, { p?: number | null; rp?: number | null }>;
 
-export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload }) => {
+export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, periodosCerrados = {} }) => {
   const [periodoActivo, setPeriodoActivo] = useState<number>(1);
   const [editadas, setEditadas] = useState<EditadasState>({});
   const [saving, setSaving] = useState(false);
   const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error' | 'warning'; texto: string } | null>(null);
+
+  // ¿El período activo está cerrado? → bloquea las casillas
+  const periodoActivoCerrado = !!periodosCerrados[`p${periodoActivo}`];
 
   // Nombre del campo P/RP para el período activo (ej. periodo 1 → 'p1' / 'rp1')
   const campoP = `p${periodoActivo}` as const;
@@ -122,7 +126,8 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
   const renderCelda = (est: EstudianteData, compNum: number, tipo: 'p' | 'rp') => {
     const valor = getValor(est, compNum, tipo);
     const esRetirado = !!est.estudiante.retirado;
-    if (!puedeEditar || esRetirado) {
+    // Si no puede editar, está retirado, o el período está cerrado → solo lectura
+    if (!puedeEditar || esRetirado || periodoActivoCerrado) {
       return <span className={getNotaClass(valor)}>{valor ?? '—'}</span>;
     }
     return (
@@ -156,19 +161,22 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       <div className="bg-white rounded-xl shadow-sm border p-4">
         <label className="block text-sm font-medium text-gray-700 mb-2">Período a calificar</label>
         <div className="flex gap-2">
-          {[1, 2, 3, 4].map(n => (
-            <button
-              key={n}
-              onClick={() => setPeriodoActivo(n)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
-                periodoActivo === n
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-              }`}
-            >
-              Período {n}
-            </button>
-          ))}
+          {[1, 2, 3, 4].map(n => {
+            const cerrado = !!periodosCerrados[`p${n}`];
+            return (
+              <button
+                key={n}
+                onClick={() => setPeriodoActivo(n)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
+                  periodoActivo === n
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                }`}
+              >
+                Período {n} {cerrado && '🔒'}
+              </button>
+            );
+          })}
         </div>
         {!puedeEditar && (
           <p className="text-xs text-gray-500 mt-2">Vista solo lectura. Únicamente los profesores asignados pueden calificar.</p>
@@ -183,12 +191,21 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
         </div>
       ) : (
         <div className="bg-white rounded-xl shadow-sm border p-4">
-          <div className="mb-3 px-3 py-2 bg-blue-50 border-l-4 border-blue-500 rounded">
-            <p className="font-bold text-blue-900 text-sm">Período {periodoActivo}</p>
-            <p className="text-xs text-blue-700">
-              Llená el P{periodoActivo} de las 4 competencias. RP = recuperación (solo si P &lt; 70).
-            </p>
-          </div>
+          {periodoActivoCerrado ? (
+            <div className="mb-3 px-3 py-2 bg-red-50 border-l-4 border-red-500 rounded">
+              <p className="font-bold text-red-900 text-sm">🔒 Período {periodoActivo} cerrado</p>
+              <p className="text-xs text-red-700">
+                Este período está cerrado y no se puede editar. Use "Solicitar Corrección" si necesita cambiar una nota.
+              </p>
+            </div>
+          ) : (
+            <div className="mb-3 px-3 py-2 bg-blue-50 border-l-4 border-blue-500 rounded">
+              <p className="font-bold text-blue-900 text-sm">Período {periodoActivo}</p>
+              <p className="text-xs text-blue-700">
+                Llená el P{periodoActivo} de las 4 competencias. RP = recuperación (solo si P &lt; 70).
+              </p>
+            </div>
+          )}
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
               <thead>

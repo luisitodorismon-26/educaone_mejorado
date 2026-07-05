@@ -3778,6 +3778,14 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
         'asignatura_id': asignatura_id,
         'ano_escolar': ano.nombre,
         'calificaciones': resultado,
+        # v2.13.35: estado de cierre de períodos (para bloquear casillas en el frontend)
+        'periodos_cerrados': {
+            'p1': bool(ano.p1_cerrado),
+            'p2': bool(ano.p2_cerrado),
+            'p3': bool(ano.p3_cerrado),
+            'p4': bool(ano.p4_cerrado),
+        },
+        'periodo_activo': ano.periodo_activo,
     }
 
 

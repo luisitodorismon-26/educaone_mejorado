@@ -36,6 +36,8 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
   const [tab, setTab] = useState<TabId>('notas');
   // Modo de carga de notas: 'competencia' (por competencia) o 'periodo' (por período)
   const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('competencia');
+  // Estado de cierre de períodos (para bloquear casillas de períodos cerrados)
+  const [periodosCerrados, setPeriodosCerrados] = useState<Record<string, boolean>>({ p1: false, p2: false, p3: false, p4: false });
 
   useEffect(() => {
     if (cursoId && asignaturaId) cargar();
@@ -47,6 +49,9 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
     try {
       const res = await api.get(`/calificaciones-secundaria/curso/${cursoId}/asignatura/${asignaturaId}`);
       setEstudiantes(res.data.calificaciones || []);
+      if (res.data.periodos_cerrados) {
+        setPeriodosCerrados(res.data.periodos_cerrados);
+      }
     } catch (err: any) {
       console.error('Error cargando calificaciones', err);
     } finally {
@@ -162,6 +167,7 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
                 asignaturaId={asignaturaId}
                 puedeEditar={puedeEditar}
                 onReload={cargar}
+                periodosCerrados={periodosCerrados}
               />
             )}
           </div>
