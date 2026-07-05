@@ -46,9 +46,12 @@ from __future__ import annotations
 
 import io
 import os
+import base64
+import re
 from typing import Any
 
 from reportlab.lib.colors import Color
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from pypdf import PdfReader, PdfWriter
 
@@ -451,8 +454,74 @@ def _get_plantilla_path(curso) -> str:
 # Dibujado de cada página
 # ─────────────────────────────────────────────────────────────────────
 
+# Posición del escudo del MINERD y textos del ministerio en la portada.
+# Los colegios privados sustituyen TODO esto (escudo + "Viceministro..." +
+# "Dirección General...") por su propio sello.
+ESCUDO_CX = 754.6   # centro X (pts)
+# Área del recuadro blanco que tapa el escudo Y los textos del ministerio:
+TAPA_CY = 533.9     # centro Y del área a tapar (desde abajo)
+TAPA_W = 200.0      # ancho del recuadro blanco (cubre los textos anchos)
+TAPA_H = 112.0      # alto del recuadro (desde arriba del escudo hasta debajo de los textos)
+# Tamaño al que se dibuja el logo del colegio (centrado, sin estirar):
+LOGO_MAX_W = 105.0  # ancho máximo del logo (pts)
+LOGO_MAX_H = 95.0   # alto máximo del logo (pts)
+LOGO_CY = 540.0     # centro Y donde se dibuja el logo (un poco más arriba que el centro de la tapa)
+
+
+def _dibujar_logo_colegio(c: canvas.Canvas, config) -> bool:
+    """Dibuja el logo del colegio (privado) sobre el escudo del MINERD.
+
+    Los colegios privados usan su propio sello en lugar del escudo del Ministerio.
+    Tapa el escudo oficial con un recuadro blanco y dibuja el logo del colegio
+    centrado en la misma posición. Devuelve True si dibujó el logo.
+
+    El logo se guarda como Base64 en config.logo (puede venir como
+    'data:image/png;base64,XXXX' o solo 'XXXX').
+    """
+    logo_raw = getattr(config, 'logo', None) if config else None
+    if not logo_raw:
+        return False  # sin logo → se deja el escudo del MINERD
+
+    try:
+        # Extraer los datos base64 (quitar el prefijo 'data:image/...;base64,')
+        if isinstance(logo_raw, str) and 'base64,' in logo_raw:
+            logo_b64 = logo_raw.split('base64,', 1)[1]
+        else:
+            logo_b64 = logo_raw
+        # Limpiar espacios/saltos de línea que pueda tener el base64
+        logo_b64 = re.sub(r'\s+', '', logo_b64)
+        logo_bytes = base64.b64decode(logo_b64)
+        img = ImageReader(io.BytesIO(logo_bytes))
+
+        # 1) Tapar el escudo del MINERD Y los textos del ministerio con blanco
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(ESCUDO_CX - TAPA_W / 2, TAPA_CY - TAPA_H / 2,
+               TAPA_W, TAPA_H, fill=1, stroke=0)
+
+        # 2) Dibujar el logo del colegio centrado, manteniendo proporción
+        iw, ih = img.getSize()
+        if iw and ih:
+            ratio = min(LOGO_MAX_W / iw, LOGO_MAX_H / ih)
+            draw_w = iw * ratio
+            draw_h = ih * ratio
+        else:
+            draw_w, draw_h = LOGO_MAX_W, LOGO_MAX_H
+        draw_x = ESCUDO_CX - draw_w / 2
+        draw_y = LOGO_CY - draw_h / 2
+        c.drawImage(img, draw_x, draw_y, width=draw_w, height=draw_h,
+                    mask='auto', preserveAspectRatio=True)
+        return True
+    except Exception:
+        # Si el logo falla (base64 inválido, formato raro), no romper el boletín:
+        # simplemente se deja el escudo del MINERD.
+        return False
+
+
 def _dibujar_portada(c: canvas.Canvas, estudiante, curso, config, ano_escolar, observaciones: str = '', docente_nombre: str = '') -> None:
     """Página 1: portada con datos del estudiante (lado derecho) y observaciones (izquierda)."""
+    # Si el colegio tiene logo propio, sustituye el escudo del MINERD
+    _dibujar_logo_colegio(c, config)
+
     c.setFillColor(COLOR_DATOS)
     c.setFont("Helvetica", 11)
     
