@@ -1073,10 +1073,11 @@ class EvaluacionExtraSecundaria(Base):
         return round(0.3 * self.cf_original + 0.7 * self.ceex, 0)
     
     def calcular_especial_final(self):
-        """C.F. + C.E. — suma simple sin ponderación."""
+        """C.F. (redondeado) + C.E. — suma simple sin ponderación.
+        La tabla oficial MINERD usa el CF redondeado en la Especial (64+10=74)."""
         if self.cf_original is None or self.ce is None:
             return None
-        return self.cf_original + self.ce
+        return round(self.cf_original, 0) + self.ce
     
     def calcular_condicion_final(self):
         """Cascada oficial MINERD para determinar condición final.
@@ -1087,8 +1088,10 @@ class EvaluacionExtraSecundaria(Base):
         if self.cf_original is None:
             return (None, None)
         
-        if self.cf_original >= 70:
-            return ('aprobado_normal', self.cf_original)
+        # El corte de 70 y la nota mostrada usan el CF redondeado (boletín oficial)
+        cf_redondeado = round(self.cf_original, 0)
+        if cf_redondeado >= 70:
+            return ('aprobado_normal', cf_redondeado)
         
         # Si entra acá es porque CF < 70, evalúa completiva
         cf_comp = self.calcular_completiva_final()

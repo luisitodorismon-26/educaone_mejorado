@@ -3633,7 +3633,7 @@ def _es_curso_secundaria(db, curso_id: int) -> bool:
     return grado and (grado.nivel or '').lower() == 'secundaria'
 
 
-def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: int):
+def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: int, con_exacto: bool = False):
     """Calcular CF del área de secundaria según MINERD oficial.
     
     Fórmula MINERD: CF = AVG(PC1, PC2, PC3, PC4) redondeado a entero.
@@ -3658,8 +3658,10 @@ def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: 
             return (None, None)  # falta alguna competencia en ese período
         pcs.append(pc)
     
-    # CF = promedio de los 4 PC, redondeado a entero (boletín MINERD)
-    cf = round(sum(pcs) / 4, 0)
+    # CF = promedio de los 4 PC. El oficial usa el valor SIN redondear para
+    # los porcentajes de completiva/extraordinaria, y el redondeado para mostrar.
+    cf_exacto = sum(pcs) / 4
+    cf = round(cf_exacto, 0)
     
     # Literal MINERD
     if cf >= 90: literal = 'A'
@@ -3667,6 +3669,8 @@ def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: 
     elif cf >= 70: literal = 'C'
     else: literal = 'F'
     
+    if con_exacto:
+        return (cf, literal, cf_exacto)
     return (cf, literal)
 
 
@@ -4245,7 +4249,7 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
     
     # Si las 4 competencias están completas, actualizar/crear EvaluacionExtraSecundaria con el CF
     db.flush()
-    cf, _ = _calcular_cf_secundaria(db, estudiante_id, asignatura_id, ano.id)
+    cf, _, cf_exacto = _calcular_cf_secundaria(db, estudiante_id, asignatura_id, ano.id, con_exacto=True)
     if cf is not None:
         # Buscar o crear evaluación extra (siempre se crea para tener el CF cacheado)
         ev = db.query(EvaluacionExtraSecundaria).filter_by(
@@ -4257,7 +4261,9 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
                 ano_escolar_id=ano.id, colegio_id=current_user.colegio_id
             )
             db.add(ev)
-        ev.cf_original = cf
+        # Se guarda el CF SIN redondear: la tabla oficial MINERD calcula
+        # 50%CF y 30%CF sobre el valor exacto (ej. 63.5 → 31.8 / 19.1).
+        ev.cf_original = cf_exacto
         ev.recalcular_todo()
     
     db.commit()
@@ -4351,8 +4357,8 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
             'error': 'No hay CF calculado para este estudiante en esta asignatura. Primero deben estar las 4 competencias completas.'
         }, status_code=400)
     
-    # No tiene sentido cargar completiva si aprobó normal
-    if ev.cf_original >= 70:
+    # No tiene sentido cargar completiva si aprobó normal (corte con CF redondeado)
+    if round(ev.cf_original, 0) >= 70:
         return JSONResponse({
             'error': f'El estudiante aprobó el año normal (CF={ev.cf_original}). No necesita {tipo}.'
         }, status_code=400)
@@ -4415,9 +4421,9 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
         ano_escolar_id=ano.id
     )
     
-    # Solo los que tienen CF reprobado (< 70)
+    # Solo los que tienen CF reprobado (< 70 tras redondeo: 69.5 redondea a 70)
     q = q.filter(EvaluacionExtraSecundaria.cf_original != None)
-    q = q.filter(EvaluacionExtraSecundaria.cf_original < 70)
+    q = q.filter(EvaluacionExtraSecundaria.cf_original < 69.5)
     
     if asignatura_id:
         try:
