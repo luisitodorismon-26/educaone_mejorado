@@ -7346,280 +7346,81 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
 
 @app.get("/api/boletines/curso/{curso_id}/pdf")
 async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
-    """Generar boletines de todo un curso en un solo PDF.
-    
-    v2.13.7: incluye notas de AMBOS modelos (Calificacion legacy +
-    CalificacionSecundaria nuevo MINERD). Si una asignatura tiene datos en
-    ambos modelos, prevalece el legacy (asume migración manual).
+    """Boletines para PADRES de todo un curso en un solo PDF (v2.13.36).
+
+    Genera el boletin de padres detallado (por competencia y periodo) de
+    cada estudiante del curso, combinados en un unico PDF.
     """
-    from boletin_minerd import generar_boletin_minerd
-    from reportlab.lib.pagesizes import letter, landscape
-    from reportlab.pdfgen import canvas as pdf_canvas
-    
+    from boletin_padres import generar_boletin_padres
+    from pypdf import PdfReader, PdfWriter
+
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso_id, activo=True).order_by(Estudiante.apellido, Estudiante.nombre).all()
-    
-    if not estudiantes:
-        return JSONResponse({'error': 'No hay estudiantes en este curso'}, status_code=404)
-    
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    
-    from boletin_minerd import dibujar_portada, dibujar_calificaciones, normalizar_asignatura, get_situacion_asignatura, get_situacion_final
-    
-    buffer = io.BytesIO()
-    c = pdf_canvas.Canvas(buffer)
-    
-    for idx, est in enumerate(estudiantes):
-        # ─── Modelo LEGACY ───
-        calificaciones_legacy = tenant_filter(
-            db.query(Calificacion), Calificacion, current_user
-        ).filter_by(estudiante_id=est.id).all()
-        asig_ids_legacy = {c.asignatura_id for c in calificaciones_legacy}
-        
-        # Preparar datos calificaciones (legacy)
-        cal_data_list = []
-        for cal in calificaciones_legacy:
-            data = {'asignatura': cal.asignatura.nombre if cal.asignatura else 'N/A'}
-            for periodo in range(1, 5):
-                for parcial in range(1, 5):
-                    key = f'p{periodo}_p{parcial}'
-                    data[key] = getattr(cal, key, None)
-                data[f'pc{periodo}'] = getattr(cal, f'pc{periodo}', None)
-                data[f'rp{periodo}'] = getattr(cal, f'rp{periodo}', None)
-            data['cf'] = cal.cf
-            cal_data_list.append(data)
-        
-        # ─── Modelo NUEVO: CalificacionSecundaria ───
+    if not ano:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+
+    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
+        curso_id=curso_id, activo=True
+    ).order_by(Estudiante.apellido, Estudiante.nombre).all()
+
+    if not estudiantes:
+        return JSONResponse({'error': 'El curso no tiene estudiantes activos.'}, status_code=400)
+
+    # Asignaturas del curso (una sola vez para todos)
+    asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso_id).all()
+    asig_ids = []
+    for a in asignaciones:
+        if a.asignatura_id not in asig_ids:
+            asig_ids.append(a.asignatura_id)
+
+    writer = PdfWriter()
+    generados = 0
+    for estudiante in estudiantes:
+        califs_est = []
         if ano:
-            califs_sec = tenant_filter(
-                db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-            ).filter_by(estudiante_id=est.id, ano_escolar_id=ano.id).all()
-            
-            # Agrupar por asignatura
-            from collections import defaultdict as _dd
-            por_asig = _dd(list)
-            for cs in califs_sec:
-                por_asig[cs.asignatura_id].append(cs)
-            
-            for aid, comps in por_asig.items():
-                if aid in asig_ids_legacy:
-                    continue  # legacy prevalece
-                asig_obj = db.get(Asignatura, aid)
-                data = {'asignatura': asig_obj.nombre if asig_obj else 'N/A'}
-                
-                # Los parciales p1_p1..p4_p4 NO existen en modelo nuevo (son competencias)
-                # Quedan en None — el PDF los mostrará vacíos. Solo pc1..pc4 son significativos.
-                for periodo in range(1, 5):
-                    for parcial in range(1, 5):
-                        data[f'p{periodo}_p{parcial}'] = None
-                
-                # PCs por período (AVG de las competencias)
-                for periodo in range(1, 5):
-                    vals = []
-                    rps_periodo = []
-                    for comp in comps:
-                        v = comp.valor_periodo(periodo) if hasattr(comp, 'valor_periodo') else None
-                        if v is not None:
-                            vals.append(v)
-                        rp_val = getattr(comp, f'rp{periodo}', None)
-                        if rp_val is not None:
-                            rps_periodo.append(rp_val)
-                    data[f'pc{periodo}'] = round(sum(vals) / len(vals), 1) if vals else None
-                    data[f'rp{periodo}'] = min(rps_periodo) if rps_periodo else None
-                
-                # CF = AVG(PC1..PC4)
-                pcs_validos = [data[f'pc{p}'] for p in range(1, 5) if data[f'pc{p}'] is not None]
-                data['cf'] = int(round(sum(pcs_validos) / len(pcs_validos))) if pcs_validos else None
-                
-                cal_data_list.append(data)
-        
-        # Asistencia
-        asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(estudiante_id=est.id).all()
-        asist_data = {}
-        total_p = sum(1 for a in asistencias if a.estado == 'presente')
-        total_a = sum(1 for a in asistencias if a.estado in ('ausente', 'ausente_justificado'))
-        for p in range(1, 5):
-            asist_data[f'periodo_{p}'] = {'presentes': total_p // 4, 'ausentes': total_a // 4}
-        
-        # Página 1: Portada
-        c.setPageSize(letter)
-        dibujar_portada(c, config, est, ano, curso)
-        c.showPage()
-        
-        # Página 2: Calificaciones
-        c.setPageSize(landscape(letter))
-        dibujar_calificaciones(c, est, curso, cal_data_list, asist_data)
-        c.showPage()
-    
-    c.save()
-    buffer.seek(0)
-    
-    nombre_curso = curso.nombre.replace(' ', '_') if curso else 'Curso'
-    filename = f"Boletines_MINERD_{nombre_curso}.pdf"
-    return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+            califs_est = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter_by(
+                estudiante_id=estudiante.id, ano_escolar_id=ano.id
+            ).all()
+        # asignaturas de este estudiante (curso + las que tengan notas)
+        est_asig_ids = list(asig_ids)
+        for cal in califs_est:
+            if cal.asignatura_id not in est_asig_ids:
+                est_asig_ids.append(cal.asignatura_id)
+        if not est_asig_ids:
+            continue
+        asignaturas_data = []
+        for aid in est_asig_ids:
+            asig_obj = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(id=aid).first()
+            if not asig_obj:
+                continue
+            competencias = {}
+            for cal in califs_est:
+                if cal.asignatura_id == aid and cal.competencia_numero in (1, 2, 3, 4):
+                    competencias[cal.competencia_numero] = cal
+            asignaturas_data.append({'nombre': asig_obj.nombre, 'competencias': competencias})
+        asignaturas_data.sort(key=lambda a: a['nombre'])
+        try:
+            buf = generar_boletin_padres(
+                estudiante=estudiante, curso=curso, asignaturas_data=asignaturas_data,
+                config=config, ano_nombre=ano.nombre if ano else '',
+            )
+            reader = PdfReader(buf)
+            for page in reader.pages:
+                writer.add_page(page)
+            generados += 1
+        except Exception as e:
+            logger.error(f"Error boletin padres curso, estudiante {estudiante.id}: {e}")
+            continue
 
+    if generados == 0:
+        return JSONResponse({'error': 'No se pudo generar ningun boletin (sin calificaciones).'}, status_code=400)
 
-# ============== BOLETÍN MINERD SECUNDARIA PIXEL-EXACTO (v2.13) ==============
-# Endpoints nuevos que usan CalificacionSecundaria + EvaluacionExtraSecundaria
-# y overlayean sobre plantilla PDF oficial MINERD (1008×612 pts).
-# NO sustituyen los endpoints viejos /api/boletines/estudiante/{id}/pdf
-# que siguen funcionando con el modelo legacy Calificacion.
-
-def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano):
-    """Helper que arma el dict calificaciones_por_asig esperado por
-    generar_boletin_secundaria_minerd, leyendo de la BD las
-    CalificacionSecundaria y EvaluacionExtraSecundaria del estudiante.
-    """
-    # Todas las asignaturas que cursa (vía AsignacionCurso o similar)
-    # En este sistema, las asignaturas asociadas al curso vienen de Asignatura
-    # filtradas por colegio_id. Tomamos solo asignaturas de secundaria.
-    asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).all()
-    
-    califs_estudiante = tenant_filter(
-        db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-    ).filter_by(estudiante_id=estudiante.id, ano_escolar_id=ano.id).all()
-    
-    # Indexar califs por (asig_id, comp_num)
-    califs_idx = {}
-    for c in califs_estudiante:
-        califs_idx.setdefault(c.asignatura_id, {})[c.competencia_numero] = c
-    
-    extras_estudiante = tenant_filter(
-        db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria, current_user
-    ).filter_by(estudiante_id=estudiante.id, ano_escolar_id=ano.id).all()
-    extras_idx = {e.asignatura_id: e for e in extras_estudiante}
-    
-    resultado = {}
-    for asig in asignaturas:
-        comps_dict = califs_idx.get(asig.id, {})
-        if not comps_dict:
-            continue  # estudiante no tiene notas en esta asignatura
-        
-        comps_list = [comps_dict[n] for n in sorted(comps_dict.keys())]
-        
-        # PC1-PC4
-        pcs = {}
-        if len(comps_list) == 4:
-            for p in range(1, 5):
-                pcs[f'pc{p}'] = CalificacionSecundaria.calcular_pc_periodo(comps_list, p)
-        else:
-            pcs = {f'pc{p}': None for p in range(1, 5)}
-        
-        # CF
-        cf, literal = _calcular_cf_secundaria(db, estudiante.id, asig.id, ano.id)
-        
-        resultado[asig.id] = {
-            'asignatura_nombre': asig.nombre,
-            'competencias': comps_list,
-            'pc_por_periodo': pcs,
-            'cf': cf,
-            'literal': literal,
-            'evaluacion_extra': extras_idx.get(asig.id),
-        }
-    
-    return resultado
-
-
-def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
-    """Helper que arma el dict asistencias_por_periodo desde la BD.
-    
-    Los períodos (P1-P4) están definidos en AnoEscolar como p1_inicio/p1_fin, etc.
-    
-    v2.13.3: si AnoEscolar no tiene los rangos p1_inicio/p1_fin configurados,
-    o si una asistencia cae FUERA de todos los rangos, ya NO se descarta
-    silenciosamente. En cambio, se hace fallback inteligente:
-      1. Si AnoEscolar tiene fecha_inicio y fecha_fin, dividir en 4 trimestres iguales
-      2. Si una fecha cae fuera de todo rango pero está dentro del año, mapearla
-         al período más cercano (no perderla)
-      3. Si no hay año escolar válido, usar el año calendario actual dividido en 4
-    """
-    asistencias = tenant_filter(
-        db.query(Asistencia), Asistencia, current_user
-    ).filter_by(estudiante_id=estudiante_id).all()
-    
-    # Construir rangos de períodos con fallback
-    rangos = []
-    if ano:
-        for p in range(1, 5):
-            ini = getattr(ano, f'p{p}_inicio', None)
-            fin = getattr(ano, f'p{p}_fin', None)
-            if ini and fin:
-                rangos.append((p, ini, fin))
-    
-    # Fallback 1: si no hay períodos configurados, dividir el rango del año en 4
-    if not rangos and ano:
-        fi = getattr(ano, 'fecha_inicio', None)
-        ff = getattr(ano, 'fecha_fin', None)
-        if fi and ff:
-            from datetime import timedelta as _td
-            total_dias = (ff - fi).days
-            if total_dias > 0:
-                paso = total_dias // 4
-                for p in range(1, 5):
-                    ini_p = fi + _td(days=paso * (p - 1))
-                    fin_p = ff if p == 4 else fi + _td(days=paso * p - 1)
-                    rangos.append((p, ini_p, fin_p))
-    
-    # Fallback 2: si todavía no hay rangos, usar año calendario actual
-    if not rangos:
-        from datetime import date as _date
-        hoy = today_rd()
-        year = hoy.year
-        rangos = [
-            (1, _date(year, 1, 1), _date(year, 3, 31)),
-            (2, _date(year, 4, 1), _date(year, 6, 30)),
-            (3, _date(year, 7, 1), _date(year, 9, 30)),
-            (4, _date(year, 10, 1), _date(year, 12, 31)),
-        ]
-    
-    def periodo_de_fecha(fecha):
-        # Match exacto
-        for p, ini, fin in rangos:
-            if ini <= fecha <= fin:
-                return p
-        # Fallback: período más cercano por proximidad al inicio/fin
-        # (en lugar de descartar la asistencia, la mapeamos al más cercano)
-        mejor_p = None
-        mejor_dist = None
-        for p, ini, fin in rangos:
-            d_ini = abs((fecha - ini).days)
-            d_fin = abs((fecha - fin).days)
-            dist = min(d_ini, d_fin)
-            if mejor_dist is None or dist < mejor_dist:
-                mejor_dist = dist
-                mejor_p = p
-        return mejor_p
-    
-    conteo = {1: {'a': 0, 'au': 0}, 2: {'a': 0, 'au': 0},
-              3: {'a': 0, 'au': 0}, 4: {'a': 0, 'au': 0}}
-    total_a = 0
-    total_au = 0
-    for a in asistencias:
-        p = periodo_de_fecha(a.fecha) if a.fecha else None
-        if p:
-            if a.estado == 'presente':
-                conteo[p]['a'] += 1
-                total_a += 1
-            elif a.estado in ('ausente', 'ausente_justificado'):
-                conteo[p]['au'] += 1
-                total_au += 1
-    
-    total = total_a + total_au
-    
-    resultado = {}
-    for p in range(1, 5):
-        d = conteo[p]
-        sub_total = d['a'] + d['au']
-        resultado[f'p{p}'] = {
-            'asistencia': d['a'],
-            'ausencia': d['au'],
-            # v2.13.3: % POR PERÍODO (no anual). Antes confundía: el campo decía 'anual'
-            # pero realmente era del período. El frontend renombra al mostrar.
-            'pct_asistencia_anual': round((d['a'] / sub_total * 100), 0) if sub_total > 0 else None,
-            'pct_ausencia_anual': round((d['au'] / sub_total * 100), 0) if sub_total > 0 else None,
-        }
-    return resultado
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    filename = f"Boletines_Padres_{curso.nombre.replace(' ', '_')}.pdf"
+    return StreamingResponse(out, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
 @app.get("/api/boletines/estudiante/{id}/pdf-minerd-v2")

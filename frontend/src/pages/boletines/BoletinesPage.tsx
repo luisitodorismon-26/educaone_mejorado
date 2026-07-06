@@ -189,29 +189,54 @@ export const BoletinesPage = () => {
           </div>
         </div>
         {cursoId && (
-          <div className="mt-3 pt-3 border-t flex justify-end">
-            <Button 
-              variant="secondary"
-              icon={<Download size={16} />}
-              onClick={async () => {
-                try {
-                  const response = await api.get(`/boletines/curso/${cursoId}/pdf`, { responseType: 'blob' });
-                  const url = window.URL.createObjectURL(new Blob([response.data]));
-                  const link = document.createElement('a');
-                  link.href = url;
-                  const cursoNombre = cursos.find(c => c.id === cursoId)?.nombre_completo || 'Curso';
-                  link.setAttribute('download', `Boletines_MINERD_${cursoNombre.replace(/ /g, '_')}.pdf`);
-                  document.body.appendChild(link);
-                  link.click();
-                  link.remove();
-                } catch (err) {
-                  console.error('Error:', err);
-                  alert('Error al generar boletines del curso');
-                }
-              }}
-            >
-              📄 Descargar Boletines del Curso (PDF MINERD)
-            </Button>
+          <div className="mt-3 pt-3 border-t">
+            <p className="text-sm text-gray-600 mb-2">Descargar todos los boletines del curso:</p>
+            <div className="flex flex-wrap gap-2 justify-end">
+              <Button
+                variant="secondary"
+                icon={<Download size={16} />}
+                onClick={async () => {
+                  try {
+                    const response = await api.get(`/boletines/curso/${cursoId}/pdf`, { responseType: 'blob' });
+                    const url = window.URL.createObjectURL(new Blob([response.data]));
+                    const link = document.createElement('a');
+                    link.href = url;
+                    const cursoNombre = cursos.find(c => c.id === cursoId)?.nombre_completo || 'Curso';
+                    link.setAttribute('download', `Boletines_Padres_${cursoNombre.replace(/ /g, '_')}.pdf`);
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                  } catch (err) {
+                    console.error('Error:', err);
+                    alert('Error al generar boletines para padres del curso');
+                  }
+                }}
+              >
+                📥 Boletines para Padres (Curso)
+              </Button>
+              <Button
+                variant="secondary"
+                icon={<Download size={16} />}
+                onClick={async () => {
+                  try {
+                    const response = await api.get(`/boletines/curso/${cursoId}/pdf-minerd-v2`, { responseType: 'blob' });
+                    const url = window.URL.createObjectURL(new Blob([response.data]));
+                    const link = document.createElement('a');
+                    link.href = url;
+                    const cursoNombre = cursos.find(c => c.id === cursoId)?.nombre_completo || 'Curso';
+                    link.setAttribute('download', `Boletines_MINERD_${cursoNombre.replace(/ /g, '_')}.pdf`);
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                  } catch (err) {
+                    console.error('Error:', err);
+                    alert('Error al generar boletines MINERD del curso');
+                  }
+                }}
+              >
+                📄 Boletines MINERD Oficial (Curso)
+              </Button>
+            </div>
           </div>
         )}
       </div>
@@ -220,10 +245,50 @@ export const BoletinesPage = () => {
         <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
           <div className="p-4 bg-gray-50 border-b flex justify-end gap-2 print:hidden">
             <Button onClick={() => window.print()} variant="secondary" icon={<Printer size={18} />}>Imprimir</Button>
-            <Button 
+            <Button
               onClick={async () => {
                 try {
                   const response = await api.get(`/boletines/estudiante/${estudianteId}/pdf`, {
+                    responseType: 'blob'
+                  });
+                  if (response.data.type === 'application/json' || response.data.size < 500) {
+                    const texto = await response.data.text();
+                    try {
+                      const json = JSON.parse(texto);
+                      throw new Error(json.error || json.detail || 'Error en respuesta');
+                    } catch (e: any) {
+                      throw new Error(e?.message || 'El servidor no devolvió un PDF válido');
+                    }
+                  }
+                  const url = window.URL.createObjectURL(new Blob([response.data]));
+                  const link = document.createElement('a');
+                  link.href = url;
+                  link.setAttribute('download', `Reporte_Padres_${boletin.estudiante.nombre.replace(/ /g, '_')}.pdf`);
+                  document.body.appendChild(link);
+                  link.click();
+                  link.remove();
+                } catch (err: any) {
+                  let mensajeError = err?.message || 'Error al descargar el PDF';
+                  if (err?.response?.data instanceof Blob) {
+                    try {
+                      const texto = await err.response.data.text();
+                      const json = JSON.parse(texto);
+                      mensajeError = json.error || json.detail || texto;
+                    } catch { /* no era JSON */ }
+                  }
+                  console.error('Error descargando PDF:', mensajeError);
+                  alert(mensajeError);
+                }
+              }}
+              variant="primary"
+              icon={<Download size={18} />}
+            >
+              📥 Boletín para Padres
+            </Button>
+            <Button 
+              onClick={async () => {
+                try {
+                  const response = await api.get(`/boletines/estudiante/${estudianteId}/pdf-minerd-v2`, {
                     responseType: 'blob'
                   });
                   // v2.13.9: validar que sí es PDF antes de descargar
@@ -239,7 +304,7 @@ export const BoletinesPage = () => {
                   const url = window.URL.createObjectURL(new Blob([response.data]));
                   const link = document.createElement('a');
                   link.href = url;
-                  link.setAttribute('download', `Boletin_${boletin.estudiante.nombre.replace(/ /g, '_')}.pdf`);
+                  link.setAttribute('download', `Boletin_MINERD_${boletin.estudiante.nombre.replace(/ /g, '_')}.pdf`);
                   document.body.appendChild(link);
                   link.click();
                   link.remove();
@@ -257,10 +322,10 @@ export const BoletinesPage = () => {
                   alert(mensajeError);
                 }
               }} 
-              variant="primary" 
+              variant="secondary" 
               icon={<Download size={18} />}
             >
-              📥 Descargar PDF
+              📄 Boletín MINERD Oficial
             </Button>
             <Button 
               onClick={() => {
