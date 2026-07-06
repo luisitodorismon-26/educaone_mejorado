@@ -759,10 +759,12 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             nota_final = cf
         
         if nota_final is not None:
+            # La tabla oficial MINERD muestra la NOTA FINAL en la columna A o R
+            # (ej: A=76, A=74, R=69), no una marca.
             if nota_final >= 70:
-                c.drawCentredString(RIGHT_X['A'], y_row - 3, '1')
+                c.drawCentredString(RIGHT_X['A'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
             else:
-                c.drawCentredString(RIGHT_X['R'], y_row - 3, '1')
+                c.drawCentredString(RIGHT_X['R'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
     
     # Resumen de asistencia
     if asistencias_por_periodo:

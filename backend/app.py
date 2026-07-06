@@ -4363,22 +4363,53 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
             'error': f'El estudiante aprobó el año normal (CF={ev.cf_original}). No necesita {tipo}.'
         }, status_code=400)
     
-    # Cascada: solo permitir la fase pendiente
+    # Cascada: permitir la fase pendiente O corregir la ÚLTIMA fase ya cargada
+    # (ej: si se cargó un CE equivocado, poder corregirlo sin quedar bloqueado).
     fase = ev.fase_pendiente()
+    es_correccion = False
     if fase != tipo:
-        if fase is None:
+        # ¿Es corrección de la última fase cargada?
+        ultima_fase = None
+        if ev.ce is not None:
+            ultima_fase = 'especial'
+        elif ev.ceex is not None:
+            ultima_fase = 'extraordinaria'
+        elif ev.cec is not None:
+            ultima_fase = 'completiva'
+        if tipo == ultima_fase:
+            es_correccion = True
+        elif fase is None:
             return JSONResponse({
                 'error': f'Este estudiante no tiene fase {tipo} pendiente. Condición final: {ev.condicion_final}'
             }, status_code=400)
-        return JSONResponse({
-            'error': f'Este estudiante tiene fase {fase} pendiente. No puede saltar a {tipo}.'
-        }, status_code=400)
+        else:
+            return JSONResponse({
+                'error': f'Este estudiante tiene fase {fase} pendiente. No puede saltar a {tipo}.'
+            }, status_code=400)
     
-    # Asignar nota según el tipo
+    # Validación específica de la ESPECIAL: el C.E. es un valor COMPLEMENTARIO
+    # (puntos que se SUMAN al CF, ej: 5, 10), no una nota de examen 0-100.
+    # La suma CF + CE no puede pasar de 100.
+    if tipo == 'especial':
+        cf_red = round(ev.cf_original, 0)
+        max_ce = 100 - cf_red
+        if nota_f > max_ce:
+            return JSONResponse({
+                'error': f'C.E. inválido: es un valor COMPLEMENTARIO que se suma al CF ({int(cf_red)}). '
+                         f'Máximo permitido: {int(max_ce)} puntos (para que la nota final no pase de 100). '
+                         f'Ejemplo oficial MINERD: CF=64 + CE=10 → 74.'
+            }, status_code=400)
+    
+    # Asignar nota según el tipo (si es corrección, limpiar las fases posteriores)
     if tipo == 'completiva':
         ev.cec = nota_f
+        if es_correccion:
+            ev.ceex = None
+            ev.ce = None
     elif tipo == 'extraordinaria':
         ev.ceex = nota_f
+        if es_correccion:
+            ev.ce = None
     elif tipo == 'especial':
         ev.ce = nota_f
     

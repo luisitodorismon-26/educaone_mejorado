@@ -334,20 +334,30 @@ export const EvaluacionesExtraPage = () => {
                 </span>
               </div>
               <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
-                  <thead className="bg-gray-50">
-                    <tr>
-                      <th className="px-3 py-2 text-left font-medium text-gray-600 min-w-[180px]">Estudiante</th>
-                      <th className="px-3 py-2 text-left font-medium text-gray-600">Asignatura</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">CF</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">Fase</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">C.E.C.</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">Comp.</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">C.E.EX</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">Extra.</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">C.E.</th>
-                      <th className="px-3 py-2 text-center font-medium text-gray-600">Esp.</th>
-                      {puedeEditar && <th className="px-3 py-2 text-center font-medium text-gray-600 min-w-[180px]">Cargar nota</th>}
+                <table className="min-w-full text-sm border-collapse">
+                  <thead>
+                    <tr className="text-xs">
+                      <th rowSpan={2} className="px-2 py-1 text-left bg-gray-50 border font-medium text-gray-600 min-w-[160px]">Estudiante</th>
+                      <th rowSpan={2} className="px-2 py-1 text-left bg-gray-50 border font-medium text-gray-600">Asignatura</th>
+                      <th rowSpan={2} className="px-2 py-1 text-center bg-gray-100 border font-bold">C.F.</th>
+                      <th rowSpan={2} className="px-2 py-1 text-center bg-gray-50 border font-medium text-gray-600">Fase</th>
+                      <th colSpan={4} className="px-2 py-1 text-center bg-amber-50 text-amber-800 border font-bold">CALIF. COMPLETIVA</th>
+                      <th colSpan={4} className="px-2 py-1 text-center bg-orange-50 text-orange-800 border font-bold">CALIF. EXTRAORDINARIA</th>
+                      <th colSpan={3} className="px-2 py-1 text-center bg-red-50 text-red-800 border font-bold">EVAL. ESPECIAL</th>
+                      {puedeEditar && <th rowSpan={2} className="px-2 py-1 text-center bg-gray-50 border font-medium text-gray-600 min-w-[160px]">Cargar nota</th>}
+                    </tr>
+                    <tr className="text-[11px] text-gray-600">
+                      <th className="px-1 py-1 text-center bg-amber-50 border">50% C.F.</th>
+                      <th className="px-1 py-1 text-center bg-amber-50 border">C.E.C.</th>
+                      <th className="px-1 py-1 text-center bg-amber-50 border">50% C.E.C.</th>
+                      <th className="px-1 py-1 text-center bg-amber-100 border font-bold">C.C.F.</th>
+                      <th className="px-1 py-1 text-center bg-orange-50 border">30% C.F.</th>
+                      <th className="px-1 py-1 text-center bg-orange-50 border">C.E.EX</th>
+                      <th className="px-1 py-1 text-center bg-orange-50 border">70% C.E.EX</th>
+                      <th className="px-1 py-1 text-center bg-orange-100 border font-bold">C.EX.F.</th>
+                      <th className="px-1 py-1 text-center bg-red-50 border">C.F.</th>
+                      <th className="px-1 py-1 text-center bg-red-50 border">C.E.</th>
+                      <th className="px-1 py-1 text-center bg-red-100 border font-bold">Final</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -355,14 +365,18 @@ export const EvaluacionesExtraPage = () => {
                       const k = keyFila(p);
                       const fase = p.fase_pendiente;
                       const faseInfo = FASE_LABEL[fase];
+                      const cf = p.cf_original;
+                      const pct = (v: number | null | undefined, f: number) =>
+                        v == null ? '—' : (Math.round(v * f * 10) / 10).toFixed(1).replace(/\.0$/, '');
+                      const cfRed = cf != null ? Math.round(cf) : null;
                       return (
                         <tr key={k} className="border-b hover:bg-gray-50">
-                          <td className="px-3 py-2 font-medium text-gray-800">{p.estudiante_nombre}</td>
-                          <td className="px-3 py-2 text-gray-700">{p.asignatura_nombre || '—'}</td>
-                          <td className="px-3 py-2 text-center font-bold text-red-600">
-                            {p.cf_original?.toFixed(0) ?? '—'}
+                          <td className="px-2 py-1 border font-medium text-gray-800">{p.estudiante_nombre}</td>
+                          <td className="px-2 py-1 border text-gray-700">{p.asignatura_nombre || '—'}</td>
+                          <td className="px-2 py-1 border text-center font-bold text-red-600">
+                            {cf != null ? Math.round(cf) : '—'}
                           </td>
-                          <td className="px-3 py-2 text-center">
+                          <td className="px-2 py-1 border text-center">
                             <span
                               className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium border ${faseInfo.color}`}
                               title={faseInfo.descripcion}
@@ -370,21 +384,30 @@ export const EvaluacionesExtraPage = () => {
                               {faseInfo.label}
                             </span>
                           </td>
-                          <td className="px-3 py-2 text-center text-gray-700">{p.cec?.toFixed(0) ?? '—'}</td>
-                          <td className="px-3 py-2 text-center font-semibold text-gray-700">{p.completiva_final?.toFixed(0) ?? '—'}</td>
-                          <td className="px-3 py-2 text-center text-gray-700">{p.ceex?.toFixed(0) ?? '—'}</td>
-                          <td className="px-3 py-2 text-center font-semibold text-gray-700">{p.extraordinaria_final?.toFixed(0) ?? '—'}</td>
-                          <td className="px-3 py-2 text-center text-gray-700">{p.ce?.toFixed(0) ?? '—'}</td>
-                          <td className="px-3 py-2 text-center font-semibold text-gray-700">{p.especial_final?.toFixed(0) ?? '—'}</td>
+                          {/* COMPLETIVA: 50%CF | CEC | 50%CEC | CCF */}
+                          <td className="px-1 py-1 border text-center bg-amber-50/40">{pct(cf, 0.5)}</td>
+                          <td className="px-1 py-1 border text-center">{p.cec?.toFixed(0) ?? '—'}</td>
+                          <td className="px-1 py-1 border text-center bg-amber-50/40">{pct(p.cec, 0.5)}</td>
+                          <td className="px-1 py-1 border text-center bg-amber-100/50 font-bold">{p.completiva_final?.toFixed(0) ?? '—'}</td>
+                          {/* EXTRAORDINARIA: 30%CF | CEEX | 70%CEEX | CEXF */}
+                          <td className="px-1 py-1 border text-center bg-orange-50/40">{p.completiva_final != null ? pct(cf, 0.3) : '—'}</td>
+                          <td className="px-1 py-1 border text-center">{p.ceex?.toFixed(0) ?? '—'}</td>
+                          <td className="px-1 py-1 border text-center bg-orange-50/40">{pct(p.ceex, 0.7)}</td>
+                          <td className="px-1 py-1 border text-center bg-orange-100/50 font-bold">{p.extraordinaria_final?.toFixed(0) ?? '—'}</td>
+                          {/* ESPECIAL: CF + CE = Final */}
+                          <td className="px-1 py-1 border text-center bg-red-50/40">{p.extraordinaria_final != null && cfRed != null ? cfRed : '—'}</td>
+                          <td className="px-1 py-1 border text-center">{p.ce?.toFixed(0) ?? '—'}</td>
+                          <td className="px-1 py-1 border text-center bg-red-100/50 font-bold">{p.especial_final?.toFixed(0) ?? '—'}</td>
                           {puedeEditar && (
-                            <td className="px-3 py-2">
+                            <td className="px-2 py-1 border">
                               <div className="flex gap-1 items-center justify-center">
                                 <input
                                   type="number"
                                   min={0}
                                   max={100}
                                   step={0.01}
-                                  placeholder={`Nota ${fase}`}
+                                  placeholder={fase === 'especial' && cfRed != null ? `máx ${100 - cfRed}` : `Nota ${fase}`}
+                                  title={fase === 'especial' ? 'C.E. complementario: puntos que se SUMAN al C.F.' : undefined}
                                   value={drafts[k] || ''}
                                   onChange={e => setDrafts(prev => ({ ...prev, [k]: e.target.value }))}
                                   className="w-20 px-2 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400"
