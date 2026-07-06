@@ -7268,132 +7268,79 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
 
 @app.get("/api/boletines/estudiante/{id}/pdf")
 async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
-    """Generar boletín en PDF formato MINERD para un estudiante.
-    
-    v2.13.7: lee AMBOS modelos. Para CalificacionSecundaria (modelo nuevo)
-    crea un adapter que expone la estructura plana esperada por
-    `generar_boletin_minerd()` (que fue escrito para el modelo legacy).
+    """Boletin para PADRES - reporte detallado de calificaciones (v2.13.36).
+
+    Documento formal con el detalle completo por competencia y periodo.
+    Sirve para comunicacion con padres y como constancia de traslado.
+    Muestra TODAS las asignaturas del curso. El PC de cada competencia
+    aparece solo si sus 4 periodos estan completos.
     """
-    from boletin_minerd import generar_boletin_minerd
-    
+    from boletin_padres import generar_boletin_padres
+
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
     curso = estudiante.curso
-    
-    # v2.13.7: construir la lista de "calificaciones" desde AMBOS modelos
-    calificaciones_legacy = tenant_filter(
-        db.query(Calificacion), Calificacion, current_user
-    ).filter_by(estudiante_id=id).all()
-    
-    # IDs de asignaturas en modelo legacy
-    asig_ids_legacy = {c.asignatura_id for c in calificaciones_legacy}
-    
-    # Adapter para CalificacionSecundaria
-    class _CalificacionAdapter:
-        """Expone la misma interface que Calificacion (modelo legacy) pero
-        calcula pc1..pc4 y cf a partir de las 4 competencias del modelo nuevo.
-        """
-        __slots__ = ('estudiante_id', 'asignatura_id', 'asignatura',
-                     'pc1', 'pc2', 'pc3', 'pc4',
-                     'rp1', 'rp2', 'rp3', 'rp4',
-                     'cf', 'literal',
-                     # Compatibilidad con código legacy que pueda mirar campos parciales:
-                     'p1_p1', 'p1_p2', 'p1_p3', 'p1_p4',
-                     'p2_p1', 'p2_p2', 'p2_p3', 'p2_p4',
-                     'p3_p1', 'p3_p2', 'p3_p3', 'p3_p4',
-                     'p4_p1', 'p4_p2', 'p4_p3', 'p4_p4')
-        
-        def __init__(self, **kw):
-            for slot in self.__slots__:
-                setattr(self, slot, kw.get(slot))
-        
-        def get_literal(self):
-            n = self.cf
-            if n is None: return ''
-            if n >= 90: return 'A'
-            if n >= 80: return 'B'
-            if n >= 70: return 'C'
-            return 'F'
-    
-    califs_adapter = []
+    if not curso:
+        return JSONResponse({'error': 'El estudiante no tiene curso asignado.'}, status_code=400)
+
+    # TODAS las asignaturas del curso (via asignaciones de profesores del curso)
+    asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso.id).all()
+    asig_ids = []
+    for a in asignaciones:
+        if a.asignatura_id not in asig_ids:
+            asig_ids.append(a.asignatura_id)
+
+    # Calificaciones del estudiante en secundaria
+    califs_est = []
     if ano:
-        califs_sec = tenant_filter(
-            db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-        ).filter_by(estudiante_id=id, ano_escolar_id=ano.id).all()
-        
-        # Agrupar por asignatura
-        from collections import defaultdict as _dd
-        por_asig = _dd(list)
-        for c in califs_sec:
-            por_asig[c.asignatura_id].append(c)
-        
-        for aid, comps in por_asig.items():
-            if aid in asig_ids_legacy:
-                # Si también existe en modelo legacy, el legacy prevalece
-                # (es probable que ya esté actualizado a mano)
-                continue
-            
-            asig_obj = db.get(Asignatura, aid)
-            
-            # PCs y RPs por período
-            pcs = {}  # pc1..pc4
-            rps = {}  # rp1..rp4 (la más baja por período)
-            for p in range(1, 5):
-                vals = []
-                rps_periodo = []
-                for c in comps:
-                    v = c.valor_periodo(p) if hasattr(c, 'valor_periodo') else None
-                    if v is not None:
-                        vals.append(v)
-                    rp_val = getattr(c, f'rp{p}', None)
-                    if rp_val is not None:
-                        rps_periodo.append(rp_val)
-                pcs[f'pc{p}'] = round(sum(vals) / len(vals), 1) if vals else None
-                rps[f'rp{p}'] = min(rps_periodo) if rps_periodo else None
-            
-            # CF anual = AVG(PC1..PC4) entero
-            pcs_validos = [v for v in pcs.values() if v is not None]
-            cf = int(round(sum(pcs_validos) / len(pcs_validos))) if pcs_validos else None
-            
-            adapter = _CalificacionAdapter(
-                estudiante_id=id, asignatura_id=aid, asignatura=asig_obj,
-                **pcs, **rps, cf=cf, literal=None
-            )
-            califs_adapter.append(adapter)
-    
-    # Combinar: legacy + adaptados de secundaria nueva
-    calificaciones = list(calificaciones_legacy) + califs_adapter
-    
-    # v2.13.9: validar que haya algo que mostrar
-    if not calificaciones:
+        califs_est = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter_by(
+            estudiante_id=id, ano_escolar_id=ano.id
+        ).all()
+    # Agregar asignaturas que tengan notas aunque no esten en asignaciones
+    for cal in califs_est:
+        if cal.asignatura_id not in asig_ids:
+            asig_ids.append(cal.asignatura_id)
+
+    if not asig_ids:
         return JSONResponse({
-            'error': f'{estudiante.nombre_completo} no tiene calificaciones cargadas. Cargá notas antes de generar el boletín.'
+            'error': f'{estudiante.nombre_completo} no tiene asignaturas ni calificaciones en su curso.'
         }, status_code=400)
-    
-    # Asistencia del estudiante
-    asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(estudiante_id=id).all()
-    
-    # Observaciones (si se pasan como parámetro)
-    observaciones = request.query_params.get('observaciones', '')
-    
+
+    # Construir datos por asignatura: {nombre, competencias: {1..4: comp_obj}}
+    asignaturas_data = []
+    for aid in asig_ids:
+        asig_obj = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(id=aid).first()
+        if not asig_obj:
+            continue
+        competencias = {}
+        for cal in califs_est:
+            if cal.asignatura_id == aid and cal.competencia_numero in (1, 2, 3, 4):
+                competencias[cal.competencia_numero] = cal
+        asignaturas_data.append({
+            'nombre': asig_obj.nombre,
+            'competencias': competencias,
+        })
+
+    asignaturas_data.sort(key=lambda a: a['nombre'])
+
     try:
-        buffer = generar_boletin_minerd(
+        buffer = generar_boletin_padres(
             estudiante=estudiante,
             curso=curso,
-            calificaciones=calificaciones,
-            asistencias=asistencias,
+            asignaturas_data=asignaturas_data,
             config=config,
-            ano_escolar=ano,
-            observaciones=observaciones
+            ano_nombre=ano.nombre if ano else '',
         )
     except Exception as e:
-        logger.error(f"Error generando boletín legacy para estudiante {id}: {e}", exc_info=True)
+        logger.error(f"Error generando boletin de padres para estudiante {id}: {e}", exc_info=True)
         return JSONResponse({
             'error': f'Error generando PDF: {type(e).__name__}: {str(e)[:150]}'
         }, status_code=500)
-    
-    filename = f"Boletin_MINERD_{estudiante.nombre_completo.replace(' ', '_')}.pdf"
+
+    filename = f"Reporte_Calificaciones_{estudiante.nombre_completo.replace(' ', '_')}.pdf"
     return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
