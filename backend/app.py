@@ -4423,7 +4423,6 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
         grupos = {}
         for cal in califs_ano:
             grupos.setdefault((cal.estudiante_id, cal.asignatura_id), {})[cal.competencia_numero] = cal
-        cambios = False
         for (est_id, asig_id), comps in grupos.items():
             if len([c for c in comps if c in (1, 2, 3, 4)]) < 4:
                 continue
@@ -4450,10 +4449,8 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
                 cambios = True
             if ev.cf_original != cf_exacto:
                 ev.cf_original = cf_exacto
-                cambios = True
             ev.recalcular_todo()
-        if cambios:
-            db.commit()
+        db.commit()
     except Exception as e:
         db.rollback()
         logger.error(f"Backfill evaluaciones extra falló: {e}")
@@ -7506,22 +7503,26 @@ def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano
         
         comps_list = [comps_dict[n] for n in sorted(comps_dict.keys())]
         
-        # PC1-PC4
+        # PC1-PC4 — v2.13.37: POR COMPETENCIA (oficial MINERD).
+        # PC1 = promedio de los 4 períodos de la Competencia 1, etc.
+        # (Antes se calculaba por período/columna — cruzado respecto al registro oficial.)
         pcs = {}
         if len(comps_list) == 4:
-            for p in range(1, 5):
-                pcs[f'pc{p}'] = CalificacionSecundaria.calcular_pc_periodo(comps_list, p)
+            for n in range(1, 5):
+                comp = comps_dict.get(n)
+                pcs[f'pc{n}'] = comp.calcular_promedio_competencia() if comp else None
         else:
             pcs = {f'pc{p}': None for p in range(1, 5)}
         
-        # CF
-        cf, literal = _calcular_cf_secundaria(db, estudiante.id, asig.id, ano.id)
+        # CF (redondeado para mostrar) + CF exacto (para los porcentajes 50%/30%)
+        cf, literal, cf_exacto = _calcular_cf_secundaria(db, estudiante.id, asig.id, ano.id, con_exacto=True)
         
         resultado[asig.id] = {
             'asignatura_nombre': asig.nombre,
             'competencias': comps_list,
             'pc_por_periodo': pcs,
             'cf': cf,
+            'cf_exacto': cf_exacto,
             'literal': literal,
             'evaluacion_extra': extras_idx.get(asig.id),
         }

@@ -714,24 +714,29 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             cexf = getattr(ev, 'extraordinaria_final', None)
             ce = getattr(ev, 'ce', None)
             esp_final = getattr(ev, 'especial_final', None)
+            # CF exacto (sin redondear) para los porcentajes, como la tabla oficial
+            # MINERD (ej: CF 63.5 → 50%=31.8, 30%=19.1). Fallback al CF redondeado.
+            cf_pct = asig_data.get('cf_exacto')
+            if cf_pct is None:
+                cf_pct = cf
             
             if cec is not None or ccf is not None:
-                if cf is not None:
-                    c.drawCentredString(RIGHT_X['p_cf_50'], y_row - 3, _fmt_nota(cf, ints_only=True))
+                if cf_pct is not None:
+                    c.drawCentredString(RIGHT_X['p_cf_50'], y_row - 3, _fmt_nota(round(cf_pct * 0.5, 1)))
                 if cec is not None:
                     c.drawCentredString(RIGHT_X['cec'], y_row - 3, _fmt_nota(cec, ints_only=True))
-                    c.drawCentredString(RIGHT_X['p_cec_50'], y_row - 3, _fmt_nota(cec, ints_only=True))
+                    c.drawCentredString(RIGHT_X['p_cec_50'], y_row - 3, _fmt_nota(round(cec * 0.5, 1)))
                 if ccf is not None:
                     c.setFont("Helvetica-Bold", 8)
                     c.drawCentredString(RIGHT_X['ccf'], y_row - 3, _fmt_nota(ccf, ints_only=True))
                     c.setFont("Helvetica", 8)
             
             if ceex is not None or cexf is not None:
-                if cf is not None:
-                    c.drawCentredString(RIGHT_X['p_cf_30'], y_row - 3, _fmt_nota(cf, ints_only=True))
+                if cf_pct is not None:
+                    c.drawCentredString(RIGHT_X['p_cf_30'], y_row - 3, _fmt_nota(round(cf_pct * 0.3, 1)))
                 if ceex is not None:
                     c.drawCentredString(RIGHT_X['ceex'], y_row - 3, _fmt_nota(ceex, ints_only=True))
-                    c.drawCentredString(RIGHT_X['p_ceex_70'], y_row - 3, _fmt_nota(ceex, ints_only=True))
+                    c.drawCentredString(RIGHT_X['p_ceex_70'], y_row - 3, _fmt_nota(round(ceex * 0.7, 1)))
                 if cexf is not None:
                     c.setFont("Helvetica-Bold", 8)
                     c.drawCentredString(RIGHT_X['cexf'], y_row - 3, _fmt_nota(cexf, ints_only=True))
