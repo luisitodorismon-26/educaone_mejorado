@@ -7423,6 +7423,163 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
     return StreamingResponse(out, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
+def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano):
+    """Helper que arma el dict calificaciones_por_asig esperado por
+    generar_boletin_secundaria_minerd, leyendo de la BD las
+    CalificacionSecundaria y EvaluacionExtraSecundaria del estudiante.
+    """
+    # Todas las asignaturas que cursa (vía AsignacionCurso o similar)
+    # En este sistema, las asignaturas asociadas al curso vienen de Asignatura
+    # filtradas por colegio_id. Tomamos solo asignaturas de secundaria.
+    asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).all()
+    
+    califs_estudiante = tenant_filter(
+        db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
+    ).filter_by(estudiante_id=estudiante.id, ano_escolar_id=ano.id).all()
+    
+    # Indexar califs por (asig_id, comp_num)
+    califs_idx = {}
+    for c in califs_estudiante:
+        califs_idx.setdefault(c.asignatura_id, {})[c.competencia_numero] = c
+    
+    extras_estudiante = tenant_filter(
+        db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria, current_user
+    ).filter_by(estudiante_id=estudiante.id, ano_escolar_id=ano.id).all()
+    extras_idx = {e.asignatura_id: e for e in extras_estudiante}
+    
+    resultado = {}
+    for asig in asignaturas:
+        comps_dict = califs_idx.get(asig.id, {})
+        if not comps_dict:
+            continue  # estudiante no tiene notas en esta asignatura
+        
+        comps_list = [comps_dict[n] for n in sorted(comps_dict.keys())]
+        
+        # PC1-PC4
+        pcs = {}
+        if len(comps_list) == 4:
+            for p in range(1, 5):
+                pcs[f'pc{p}'] = CalificacionSecundaria.calcular_pc_periodo(comps_list, p)
+        else:
+            pcs = {f'pc{p}': None for p in range(1, 5)}
+        
+        # CF
+        cf, literal = _calcular_cf_secundaria(db, estudiante.id, asig.id, ano.id)
+        
+        resultado[asig.id] = {
+            'asignatura_nombre': asig.nombre,
+            'competencias': comps_list,
+            'pc_por_periodo': pcs,
+            'cf': cf,
+            'literal': literal,
+            'evaluacion_extra': extras_idx.get(asig.id),
+        }
+    
+    return resultado
+
+
+def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
+    """Helper que arma el dict asistencias_por_periodo desde la BD.
+    
+    Los períodos (P1-P4) están definidos en AnoEscolar como p1_inicio/p1_fin, etc.
+    
+    v2.13.3: si AnoEscolar no tiene los rangos p1_inicio/p1_fin configurados,
+    o si una asistencia cae FUERA de todos los rangos, ya NO se descarta
+    silenciosamente. En cambio, se hace fallback inteligente:
+      1. Si AnoEscolar tiene fecha_inicio y fecha_fin, dividir en 4 trimestres iguales
+      2. Si una fecha cae fuera de todo rango pero está dentro del año, mapearla
+         al período más cercano (no perderla)
+      3. Si no hay año escolar válido, usar el año calendario actual dividido en 4
+    """
+    asistencias = tenant_filter(
+        db.query(Asistencia), Asistencia, current_user
+    ).filter_by(estudiante_id=estudiante_id).all()
+    
+    # Construir rangos de períodos con fallback
+    rangos = []
+    if ano:
+        for p in range(1, 5):
+            ini = getattr(ano, f'p{p}_inicio', None)
+            fin = getattr(ano, f'p{p}_fin', None)
+            if ini and fin:
+                rangos.append((p, ini, fin))
+    
+    # Fallback 1: si no hay períodos configurados, dividir el rango del año en 4
+    if not rangos and ano:
+        fi = getattr(ano, 'fecha_inicio', None)
+        ff = getattr(ano, 'fecha_fin', None)
+        if fi and ff:
+            from datetime import timedelta as _td
+            total_dias = (ff - fi).days
+            if total_dias > 0:
+                paso = total_dias // 4
+                for p in range(1, 5):
+                    ini_p = fi + _td(days=paso * (p - 1))
+                    fin_p = ff if p == 4 else fi + _td(days=paso * p - 1)
+                    rangos.append((p, ini_p, fin_p))
+    
+    # Fallback 2: si todavía no hay rangos, usar año calendario actual
+    if not rangos:
+        from datetime import date as _date
+        hoy = today_rd()
+        year = hoy.year
+        rangos = [
+            (1, _date(year, 1, 1), _date(year, 3, 31)),
+            (2, _date(year, 4, 1), _date(year, 6, 30)),
+            (3, _date(year, 7, 1), _date(year, 9, 30)),
+            (4, _date(year, 10, 1), _date(year, 12, 31)),
+        ]
+    
+    def periodo_de_fecha(fecha):
+        # Match exacto
+        for p, ini, fin in rangos:
+            if ini <= fecha <= fin:
+                return p
+        # Fallback: período más cercano por proximidad al inicio/fin
+        # (en lugar de descartar la asistencia, la mapeamos al más cercano)
+        mejor_p = None
+        mejor_dist = None
+        for p, ini, fin in rangos:
+            d_ini = abs((fecha - ini).days)
+            d_fin = abs((fecha - fin).days)
+            dist = min(d_ini, d_fin)
+            if mejor_dist is None or dist < mejor_dist:
+                mejor_dist = dist
+                mejor_p = p
+        return mejor_p
+    
+    conteo = {1: {'a': 0, 'au': 0}, 2: {'a': 0, 'au': 0},
+              3: {'a': 0, 'au': 0}, 4: {'a': 0, 'au': 0}}
+    total_a = 0
+    total_au = 0
+    for a in asistencias:
+        p = periodo_de_fecha(a.fecha) if a.fecha else None
+        if p:
+            if a.estado == 'presente':
+                conteo[p]['a'] += 1
+                total_a += 1
+            elif a.estado in ('ausente', 'ausente_justificado'):
+                conteo[p]['au'] += 1
+                total_au += 1
+    
+    total = total_a + total_au
+    
+    resultado = {}
+    for p in range(1, 5):
+        d = conteo[p]
+        sub_total = d['a'] + d['au']
+        resultado[f'p{p}'] = {
+            'asistencia': d['a'],
+            'ausencia': d['au'],
+            # v2.13.3: % POR PERÍODO (no anual). Antes confundía: el campo decía 'anual'
+            # pero realmente era del período. El frontend renombra al mostrar.
+            'pct_asistencia_anual': round((d['a'] / sub_total * 100), 0) if sub_total > 0 else None,
+            'pct_ausencia_anual': round((d['au'] / sub_total * 100), 0) if sub_total > 0 else None,
+        }
+    return resultado
+
+
+
 @app.get("/api/boletines/estudiante/{id}/pdf-minerd-v2")
 async def generar_boletin_minerd_v2(
     id: int,
