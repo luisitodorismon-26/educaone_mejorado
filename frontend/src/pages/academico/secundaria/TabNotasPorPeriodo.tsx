@@ -130,6 +130,22 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
     if (!puedeEditar || esRetirado || periodoActivoCerrado) {
       return <span className={getNotaClass(valor)}>{valor ?? '—'}</span>;
     }
+    // Regla MINERD: RP solo se habilita si el P del mismo período existe y es < 70
+    if (tipo === 'rp') {
+      const pVal = getValor(est, compNum, 'p');
+      const rpDeshabilitado = pVal === null || pVal >= 70;
+      if (rpDeshabilitado) {
+        return (
+          <input
+            type="number"
+            value={valor ?? ''}
+            disabled
+            title="RP solo aplica si el estudiante reprobó P (< 70)"
+            className="w-14 px-1 py-1 text-center border rounded text-sm bg-gray-100 text-gray-400 cursor-not-allowed"
+          />
+        );
+      }
+    }
     return (
       <input
         type="number"

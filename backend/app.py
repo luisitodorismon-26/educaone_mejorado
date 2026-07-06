@@ -3648,14 +3648,14 @@ def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: 
         estudiante_id=estudiante_id, asignatura_id=asignatura_id, ano_escolar_id=ano_id
     ).all()
     if len(competencias) < 4:
-        return (None, None)
+        return (None, None, None) if con_exacto else (None, None)
     
     # PC por período = promedio de las 4 competencias en ese período
     pcs = []
     for p in range(1, 5):
         pc = CalificacionSecundaria.calcular_pc_periodo(competencias, p)
         if pc is None:
-            return (None, None)  # falta alguna competencia en ese período
+            return (None, None, None) if con_exacto else (None, None)  # falta alguna competencia en ese período
         pcs.append(pc)
     
     # CF = promedio de los 4 PC. El oficial usa el valor SIN redondear para
@@ -4412,6 +4412,51 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
         return {'pendientes': []}
+    
+    # v2.13.37: BACKFILL automático — estudiantes con las 4 competencias completas
+    # y CF < 70 pasan a completivo automáticamente aunque sus notas se hayan
+    # cargado antes (sin necesidad de re-guardar nota por nota).
+    try:
+        califs_ano = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter_by(
+            ano_escolar_id=ano.id
+        ).all()
+        grupos = {}
+        for cal in califs_ano:
+            grupos.setdefault((cal.estudiante_id, cal.asignatura_id), {})[cal.competencia_numero] = cal
+        cambios = False
+        for (est_id, asig_id), comps in grupos.items():
+            if len([c for c in comps if c in (1, 2, 3, 4)]) < 4:
+                continue
+            proms = []
+            completo = True
+            for n in (1, 2, 3, 4):
+                pr = comps[n].calcular_promedio_competencia()
+                if pr is None:
+                    completo = False
+                    break
+                proms.append(pr)
+            if not completo:
+                continue
+            cf_exacto = sum(proms) / 4
+            ev = db.query(EvaluacionExtraSecundaria).filter_by(
+                estudiante_id=est_id, asignatura_id=asig_id, ano_escolar_id=ano.id
+            ).first()
+            if not ev:
+                ev = EvaluacionExtraSecundaria(
+                    estudiante_id=est_id, asignatura_id=asig_id,
+                    ano_escolar_id=ano.id, colegio_id=current_user.colegio_id
+                )
+                db.add(ev)
+                cambios = True
+            if ev.cf_original != cf_exacto:
+                ev.cf_original = cf_exacto
+                cambios = True
+            ev.recalcular_todo()
+        if cambios:
+            db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Backfill evaluaciones extra falló: {e}")
     
     curso_id = request.query_params.get('curso_id')
     asignatura_id = request.query_params.get('asignatura_id')
