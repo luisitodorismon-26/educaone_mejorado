@@ -113,8 +113,8 @@ export const CalificacionesGeneralPage = () => {
     if (!cursoId) return;
     try {
       await descargarBlob(
-        `/calificaciones-secundaria/reporte-padres/curso/${cursoId}/pdf?competencia=${competenciaPadres}&modo=${modoPadres}&estudiante_id=${estId}`,
-        `Reporte_Competencia${competenciaPadres}_${modoPadres === 'pc' ? 'PC' : 'UltimoP'}_${nombre.replace(/\s+/g, '_')}.pdf`
+        `/calificaciones-secundaria/reporte-padres/curso/${cursoId}/pdf?periodo=${periodo}&estudiante_id=${estId}`,
+        `Reporte_Periodo${periodo}_${nombre.replace(/\s+/g, '_')}.pdf`
       );
     } catch (e: any) { setError(e.message || 'Error al generar reporte individual'); }
   };
@@ -255,7 +255,7 @@ export const CalificacionesGeneralPage = () => {
                       <td className="p-2 text-center bg-blue-50"><span className={`text-sm font-bold ${getColorNota(est.promedio)}`}>{est.promedio !== null ? est.promedio.toFixed(1) : '-'}</span></td>
                     )}
                     <td className="p-2 text-center">
-                      <button onClick={() => descargarReportePadresIndividual(est.estudiante_id, est.nombre)} title={`Reporte de Competencia ${competenciaPadres} de este estudiante`} className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 hover:underline">
+                      <button onClick={() => descargarReportePadresIndividual(est.estudiante_id, est.nombre)} title={`Reporte del Período ${periodo} de este estudiante`} className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 hover:underline">
                         <User size={12} /> PDF
                       </button>
                     </td>
