@@ -101,10 +101,11 @@ export const FichaEstudianteAsignatura: React.FC = () => {
       const asig = (asigRes.data || []).find((a: AsignaturaInfo) => a.id === asigIdNum);
       setAsignaturaInfo(asig);
 
-      // 3. Curso
+      // 3. Curso — v2.13.38: GET /cursos/{id} no existe; usamos la lista y filtramos
       if (est.curso_id) {
-        const cursoRes = await api.get(`/cursos/${est.curso_id}`);
-        setCursoInfo(cursoRes.data);
+        const cursosRes = await api.get('/cursos');
+        const cursoEncontrado = (cursosRes.data || []).find((c: any) => c.id === est.curso_id);
+        setCursoInfo(cursoEncontrado || null);
 
         // 4. Calificaciones del estudiante en esa materia
         const calRes = await api.get(`/calificaciones-secundaria/curso/${est.curso_id}/asignatura/${asigIdNum}`);

@@ -16,6 +16,22 @@ interface Estudiante {
   matricula: string;
 }
 
+interface CompetenciaDetalle {
+  numero: number;
+  p1: number | null; p2: number | null; p3: number | null; p4: number | null;
+  pc: number | null;
+}
+
+interface EvExtraResumen {
+  cf_original: number | null;
+  cec: number | null; completiva_final: number | null;
+  ceex: number | null; extraordinaria_final: number | null;
+  ce: number | null; especial_final: number | null;
+  fase_pendiente: string | null;
+  nota_final: number | null;
+  condicion_final: string | null;
+}
+
 interface CalificacionBoletin {
   asignatura: string;
   asignatura_id: number;
@@ -29,6 +45,10 @@ interface CalificacionBoletin {
   rp4: number | null;
   cf: number | null;
   literal: string | null;
+  competencias_detalle?: CompetenciaDetalle[];
+  nota_final?: number | null;
+  condicion_final?: string | null;
+  evaluacion_extra?: EvExtraResumen | null;
 }
 
 interface Boletin {
@@ -208,7 +228,7 @@ export const BoletinesPage = () => {
                     link.remove();
                   } catch (err) {
                     console.error('Error:', err);
-                    alert('Error al generar boletines para padres del curso');
+                    setError('Error al generar boletines para padres del curso');
                   }
                 }}
               >
@@ -230,7 +250,7 @@ export const BoletinesPage = () => {
                     link.remove();
                   } catch (err) {
                     console.error('Error:', err);
-                    alert('Error al generar boletines MINERD del curso');
+                    setError('Error al generar boletines MINERD del curso');
                   }
                 }}
               >
@@ -277,7 +297,7 @@ export const BoletinesPage = () => {
                     } catch { /* no era JSON */ }
                   }
                   console.error('Error descargando PDF:', mensajeError);
-                  alert(mensajeError);
+                  setError(mensajeError);
                 }
               }}
               variant="primary"
@@ -319,7 +339,7 @@ export const BoletinesPage = () => {
                     } catch { /* no era JSON */ }
                   }
                   console.error('Error descargando PDF:', mensajeError);
-                  alert(mensajeError);
+                  setError(mensajeError);
                 }
               }} 
               variant="secondary" 
@@ -362,52 +382,95 @@ export const BoletinesPage = () => {
               <div><p className="text-xs text-blue-600">Grado</p><p className="font-semibold">{boletin.estudiante.grado}</p></div>
             </div>
 
-            {/* Tabla MINERD */}
+            {/* Tabla detallada — igual al Boletín para Padres (v2.13.38) */}
             <div className="overflow-x-auto">
               <table className="w-full text-xs border-collapse">
                 <thead>
                   <tr className="bg-blue-900 text-white">
                     <th className="border border-blue-800 p-1.5 text-left" rowSpan={2}>Áreas Curriculares</th>
-                    <th className="border border-blue-800 p-1 text-center" colSpan={4}>PC por Período</th>
+                    <th className="border border-blue-800 p-1 text-center" colSpan={4}>Competencia 1</th>
+                    <th className="border border-blue-800 p-1 text-center" colSpan={4}>Competencia 2</th>
+                    <th className="border border-blue-800 p-1 text-center" colSpan={4}>Competencia 3</th>
+                    <th className="border border-blue-800 p-1 text-center" colSpan={4}>Competencia 4</th>
+                    <th className="border border-blue-800 p-1 text-center bg-amber-600" rowSpan={2}>PC<br/>(1·2·3·4)</th>
                     <th className="border border-blue-800 p-1 text-center bg-yellow-700" rowSpan={2}>CF</th>
-                    <th className="border border-blue-800 p-1 text-center bg-orange-700" colSpan={2}>Completiva</th>
-                    <th className="border border-blue-800 p-1 text-center bg-green-800" colSpan={2}>Situación</th>
+                    <th className="border border-blue-800 p-1 text-center bg-green-800" rowSpan={2}>Situación</th>
                   </tr>
                   <tr className="bg-blue-800 text-white text-[10px]">
-                    <th className="border border-blue-700 p-1">PC1</th>
-                    <th className="border border-blue-700 p-1">PC2</th>
-                    <th className="border border-blue-700 p-1">PC3</th>
-                    <th className="border border-blue-700 p-1">PC4</th>
-                    <th className="border border-blue-700 p-1 bg-orange-600">RP</th>
-                    <th className="border border-blue-700 p-1 bg-orange-600">CCF</th>
-                    <th className="border border-blue-700 p-1 bg-green-700">A</th>
-                    <th className="border border-blue-700 p-1 bg-red-700">R</th>
+                    {[1, 2, 3, 4].map(c => (
+                      ['P1', 'P2', 'P3', 'P4'].map(p => (
+                        <th key={`${c}-${p}`} className="border border-blue-700 p-1">{p}</th>
+                      ))
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
                   {boletin.asignaturas.map((asig, idx) => {
-                    const aprobada = asig.cf !== null && asig.cf >= 70;
-                    const reprobada = asig.cf !== null && asig.cf < 70;
-                    const tieneRP = asig.rp1 || asig.rp2 || asig.rp3 || asig.rp4;
-                    const rpMayor = Math.max(asig.rp1 || 0, asig.rp2 || 0, asig.rp3 || 0, asig.rp4 || 0) || null;
+                    const ev = asig.evaluacion_extra;
+                    const notaFinal = asig.nota_final ?? asig.cf;
+                    const comps = asig.competencias_detalle || [];
+                    const compPorNum = (n: number) => comps.find(c => c.numero === n);
+                    const situacion = () => {
+                      if (asig.cf === null) return <span className="text-gray-400">—</span>;
+                      if (asig.cf >= 70) return <span className="font-bold text-green-700">A ({asig.cf.toFixed(0)})</span>;
+                      if (ev?.fase_pendiente) return <span className="text-amber-700 font-medium uppercase text-[10px]">{ev.fase_pendiente} pend.</span>;
+                      if (notaFinal != null && notaFinal >= 70) return <span className="font-bold text-green-700">A ({Math.round(notaFinal)})</span>;
+                      return <span className="font-bold text-red-600">R ({notaFinal != null ? Math.round(notaFinal) : '—'})</span>;
+                    };
                     return (
                       <tr key={asig.asignatura_id || idx} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                         <td className="border border-gray-300 p-1.5 font-medium bg-blue-50">{asig.asignatura}</td>
-                        <td className={`border border-gray-300 p-1 text-center ${getNotaClass(asig.pc1)}`}>{asig.pc1?.toFixed(0) ?? ''}</td>
-                        <td className={`border border-gray-300 p-1 text-center ${getNotaClass(asig.pc2)}`}>{asig.pc2?.toFixed(0) ?? ''}</td>
-                        <td className={`border border-gray-300 p-1 text-center ${getNotaClass(asig.pc3)}`}>{asig.pc3?.toFixed(0) ?? ''}</td>
-                        <td className={`border border-gray-300 p-1 text-center ${getNotaClass(asig.pc4)}`}>{asig.pc4?.toFixed(0) ?? ''}</td>
+                        {[1, 2, 3, 4].map(n => {
+                          const comp = compPorNum(n);
+                          return (['p1', 'p2', 'p3', 'p4'] as const).map(pk => {
+                            const v = comp ? comp[pk] : null;
+                            return (
+                              <td key={`${n}-${pk}`} className={`border border-gray-300 p-1 text-center ${v == null ? 'text-gray-300' : getNotaClass(v)}`}>
+                                {v != null ? Math.round(v) : '—'}
+                              </td>
+                            );
+                          });
+                        })}
+                        <td className="border border-gray-300 p-1 text-center bg-amber-50 font-bold text-[10px] whitespace-nowrap">
+                          {comps.length === 4 ? comps.map(c => c.pc != null ? c.pc.toFixed(1).replace(/\.0$/, '') : '—').join('·') : '—'}
+                        </td>
                         <td className={`border border-gray-300 p-1 text-center font-bold bg-yellow-50 ${getNotaClass(asig.cf)}`}>{asig.cf?.toFixed(0) ?? ''}</td>
-                        <td className="border border-gray-300 p-1 text-center text-orange-600 bg-orange-50">{tieneRP ? rpMayor?.toFixed(0) : ''}</td>
-                        <td className="border border-gray-300 p-1 text-center text-orange-600 bg-orange-50">{tieneRP && asig.cf ? Math.round((asig.cf * 0.5 + (rpMayor || 0) * 0.5)) : ''}</td>
-                        <td className="border border-gray-300 p-1 text-center bg-green-50 font-bold text-green-700">{aprobada ? '✓' : ''}</td>
-                        <td className="border border-gray-300 p-1 text-center bg-red-50 font-bold text-red-600">{reprobada ? '✗' : ''}</td>
+                        <td className="border border-gray-300 p-1 text-center bg-green-50 whitespace-nowrap">{situacion()}</td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
             </div>
+
+            {/* Desglose de evaluaciones extra (si las hay) — mismo lenguaje que la pantalla de carga */}
+            {boletin.asignaturas.some(a => a.evaluacion_extra) && (
+              <div className="mt-3 bg-amber-50 border border-amber-200 rounded-lg p-3">
+                <p className="text-xs font-bold text-amber-800 mb-2">Evaluaciones extra (desglose oficial):</p>
+                {boletin.asignaturas.filter(a => a.evaluacion_extra).map(a => {
+                  const ev = a.evaluacion_extra!;
+                  const cf = ev.cf_original ?? a.cf ?? 0;
+                  const partes: string[] = [];
+                  if (ev.cec != null) partes.push(`Completiva: 50%CF ${(cf * 0.5).toFixed(1)} + 50%CEC ${(ev.cec * 0.5).toFixed(1)} → ${ev.completiva_final != null ? Math.round(ev.completiva_final) : '—'}`);
+                  if (ev.ceex != null) partes.push(`Extraordinaria: 30%CF ${(cf * 0.3).toFixed(1)} + 70%CEEX ${(ev.ceex * 0.7).toFixed(1)} → ${ev.extraordinaria_final != null ? Math.round(ev.extraordinaria_final) : '—'}`);
+                  if (ev.ce != null) partes.push(`Especial: ${Math.round(cf)} + ${Math.round(ev.ce)} → ${ev.especial_final != null ? Math.round(ev.especial_final) : '—'}`);
+                  const resuelto = !ev.fase_pendiente && ev.nota_final != null;
+                  return (
+                    <p key={a.asignatura_id} className="text-[11px] text-gray-700 mb-1">
+                      <strong>{a.asignatura}:</strong> {partes.join('  |  ')}
+                      {resuelto && (
+                        <span className={`ml-2 px-2 py-0.5 rounded-full text-[10px] font-medium ${ev.nota_final! >= 70 ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                          {(ev.condicion_final || '').replace(/_/g, ' ')} ({Math.round(ev.nota_final!)})
+                        </span>
+                      )}
+                      {ev.fase_pendiente && (
+                        <span className="ml-2 px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-100 text-amber-800 uppercase">{ev.fase_pendiente} pendiente</span>
+                      )}
+                    </p>
+                  );
+                })}
+              </div>
+            )}
 
             {/* Resumen */}
             <div className="mt-4 grid grid-cols-3 gap-3">
@@ -419,20 +482,33 @@ export const BoletinesPage = () => {
                 <p className="text-xs text-emerald-600 uppercase">Asistencia</p>
                 <p className="text-xl font-bold text-emerald-600">{boletin.asistencia.porcentaje.toFixed(0)}%</p>
               </div>
-              <div className={`rounded-lg p-3 text-center border ${boletin.promedio_general >= 70 ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
-                <p className="text-xs uppercase">Situación</p>
-                <p className={`text-lg font-bold ${boletin.promedio_general >= 70 ? 'text-green-600' : 'text-red-600'}`}>
-                  {boletin.promedio_general >= 70 ? '✓ APROBADO' : '✗ REPROBADO'}
-                </p>
-              </div>
+              {(() => {
+                // v2.13.38: la situación general respeta la cascada de evaluaciones extra
+                const conNotas = boletin.asignaturas.filter(a => a.cf !== null);
+                const hayPendiente = conNotas.some(a => a.evaluacion_extra?.fase_pendiente);
+                const todasResueltas = conNotas.length > 0 && conNotas.every(a => (a.nota_final ?? a.cf ?? 0) >= 70);
+                const hayReprobada = conNotas.some(a => !a.evaluacion_extra?.fase_pendiente && (a.nota_final ?? a.cf ?? 0) < 70);
+                let texto = '— SIN NOTAS'; let clase = 'bg-gray-50 border-gray-200 text-gray-500';
+                if (conNotas.length > 0) {
+                  if (hayPendiente) { texto = '⏳ EVALUACIONES EXTRA EN CURSO'; clase = 'bg-amber-50 border-amber-200 text-amber-700'; }
+                  else if (todasResueltas) { texto = '✓ APROBADO'; clase = 'bg-green-50 border-green-200 text-green-600'; }
+                  else if (hayReprobada) { texto = '✗ REPROBADO'; clase = 'bg-red-50 border-red-200 text-red-600'; }
+                }
+                return (
+                  <div className={`rounded-lg p-3 text-center border ${clase}`}>
+                    <p className="text-xs uppercase">Situación</p>
+                    <p className="text-sm font-bold">{texto}</p>
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Leyenda */}
             <div className="mt-3 text-[10px] text-gray-500 border-t pt-2 grid grid-cols-2 gap-1">
-              <p><strong>PC</strong> = Promedio Grupo Competencias Específicas</p>
+              <p><strong>PC</strong> = Promedio de cada Competencia (sus 4 períodos)</p>
               <p><strong>CF</strong> = Calificación Final del Área</p>
-              <p><strong>RP</strong> = Recuperación Pedagógica</p>
-              <p><strong>CCF</strong> = Calificación Completiva Final</p>
+              <p><strong>A/R</strong> = Aprobado/Reprobado con la nota final (cascada incluida)</p>
+              <p><strong>P</strong> = nota del período (se usa el mayor entre P y RP)</p>
               <p><strong>A</strong> = Aprobado (≥70) | <strong>R</strong> = Reprobado (&lt;70)</p>
               <p><strong>Literales:</strong> A(90+) B(80-89) C(70-79) F(&lt;70)</p>
             </div>

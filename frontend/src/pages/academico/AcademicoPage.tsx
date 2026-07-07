@@ -606,7 +606,7 @@ export const AcademicoPage = () => {
                     const u = URL.createObjectURL(blob);
                     window.open(u, '_blank');
                   })
-                  .catch(() => alert('No se pudo generar el PDF'));
+                  .catch(() => setMensaje({ tipo: 'error', texto: 'No se pudo generar el PDF' }));
               }}
               icon={<span>🖨️</span>}
             >

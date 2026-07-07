@@ -3858,12 +3858,17 @@ async def get_competencias_periodo_curso(curso_id: int, periodo: int,
             # PC del período = promedio de las competencias con valor
             vals = [cv['valor'] for cv in comp_valores if cv['valor'] is not None]
             pc = round(sum(vals) / len(vals), 1) if vals else None
+            # v2.13.39: ÚLTIMO P del período = el de la competencia más alta con
+            # valor. Es la nota que el colegio PROYECTA/entrega a los padres al
+            # final de cada período (práctica MINERD confirmada por el colegio).
+            ultimo_p = vals[-1] if vals else None
             
             asignaturas_data.append({
                 'asignatura_id': asig_id,
                 'asignatura': asig_nombres.get(asig_id, f'Asig {asig_id}'),
                 'competencias': comp_valores,
                 'pc': pc,
+                'ultimo_p': ultimo_p,
                 'completo': len(vals) == 4,
             })
         
@@ -7291,6 +7296,17 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
                 if n >= 70: return 'C'
                 return 'F'
             
+            # v2.13.38: detalle por COMPETENCIA (oficial) para la vista previa —
+            # cada competencia con sus P1-P4 efectivos (max P,RP) y su PC.
+            competencias_detalle = []
+            for c in sorted(comps, key=lambda x: x.competencia_numero or 0):
+                competencias_detalle.append({
+                    'numero': c.competencia_numero,
+                    'p1': c.valor_periodo(1), 'p2': c.valor_periodo(2),
+                    'p3': c.valor_periodo(3), 'p4': c.valor_periodo(4),
+                    'pc': c.calcular_promedio_competencia(),
+                })
+            
             asignaturas_por_id[aid] = {
                 'asignatura': asig_nombre,
                 'asignatura_id': aid,
@@ -7300,9 +7316,19 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
                 'pc4': pcs['pc4'], 'rp4': rps_minimas['rp4'],
                 'cf': cf,
                 'literal': _literal(cf),
+                'competencias_detalle': competencias_detalle,
                 # Bonus para el frontend: si hay evaluación extra resuelta, exponer nota_final
                 'nota_final': ev_extra.nota_final if ev_extra else cf,
                 'condicion_final': ev_extra.condicion_final if ev_extra else None,
+                'evaluacion_extra': ({
+                    'cf_original': ev_extra.cf_original,
+                    'cec': ev_extra.cec, 'completiva_final': ev_extra.completiva_final,
+                    'ceex': ev_extra.ceex, 'extraordinaria_final': ev_extra.extraordinaria_final,
+                    'ce': ev_extra.ce, 'especial_final': ev_extra.especial_final,
+                    'fase_pendiente': ev_extra.fase_pendiente(),
+                    'nota_final': ev_extra.nota_final,
+                    'condicion_final': ev_extra.condicion_final,
+                } if ev_extra else None),
             }
     
     # ─── 2. Calificacion (modelo legacy) ───
@@ -9571,8 +9597,13 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
             comps = sec_por_est_asig_pdf.get((est.id, asig.id), [])
             pc = None
             if comps:
-                vals = [c.valor_periodo(periodo) for c in comps if hasattr(c, 'valor_periodo') and c.valor_periodo(periodo) is not None]
-                pc = round(sum(vals) / len(vals), 1) if vals else None
+                # v2.13.39: la nota del período que se ENTREGA es el ÚLTIMO P
+                # (el de la competencia más alta con valor), no el promedio.
+                con_valor = sorted(
+                    [c for c in comps if hasattr(c, 'valor_periodo') and c.valor_periodo(periodo) is not None],
+                    key=lambda c: c.competencia_numero or 0
+                )
+                pc = con_valor[-1].valor_periodo(periodo) if con_valor else None
             
             # Fallback LEGACY
             if pc is None:

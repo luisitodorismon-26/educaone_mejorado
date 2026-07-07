@@ -18,7 +18,7 @@ interface ReporteData {
 interface CompetenciaValor { competencia: number; valor: number | null; }
 interface AsigCompetencias {
   asignatura_id: number; asignatura: string;
-  competencias: CompetenciaValor[]; pc: number | null; completo: boolean;
+  competencias: CompetenciaValor[]; pc: number | null; ultimo_p: number | null; completo: boolean;
 }
 interface EstCompetencias {
   estudiante_id: number; no_lista: number; nombre: string;
@@ -316,7 +316,7 @@ export const CalificacionesGeneralPage = () => {
                     <th className="text-center p-2 font-medium text-gray-600 whitespace-nowrap">Comp. 2</th>
                     <th className="text-center p-2 font-medium text-gray-600 whitespace-nowrap">Comp. 3</th>
                     <th className="text-center p-2 font-medium text-gray-600 whitespace-nowrap">Comp. 4</th>
-                    <th className="text-center p-2 font-bold text-gray-700 whitespace-nowrap bg-indigo-50">PC{compData.periodo}</th>
+                    <th className="text-center p-2 font-bold text-gray-700 whitespace-nowrap bg-indigo-50">Nota P{compData.periodo}<span className="block text-[9px] font-normal text-gray-500">(último P)</span></th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
@@ -333,8 +333,9 @@ export const CalificacionesGeneralPage = () => {
                           </td>
                         ))}
                         <td className="p-2 text-center bg-indigo-50">
-                          <span className={`text-sm font-bold ${getColorNota(asig.pc)}`}>{asig.pc !== null ? asig.pc.toFixed(1) : '-'}</span>
-                          {!asig.completo && asig.pc !== null && <span className="block text-[9px] text-amber-500">parcial</span>}
+                          <span className={`text-sm font-bold ${getColorNota(asig.ultimo_p)}`}>{asig.ultimo_p !== null ? Math.round(asig.ultimo_p) : '-'}</span>
+                          {asig.pc !== null && <span className="block text-[9px] text-gray-500">prom {asig.pc.toFixed(1)}</span>}
+                          {!asig.completo && asig.ultimo_p !== null && <span className="block text-[9px] text-amber-500">parcial</span>}
                         </td>
                       </tr>
                     );
@@ -343,7 +344,7 @@ export const CalificacionesGeneralPage = () => {
               </table>
             </div>
             <div className="p-3 bg-gray-50 border-t text-xs text-gray-500">
-              <strong>PC{compData.periodo}</strong> = promedio de las 4 competencias en el periodo {compData.periodo}.
+              <strong>Nota P{compData.periodo}</strong> = último P registrado del periodo (competencia más alta con valor) — la nota que se entrega a los padres. <em>prom</em> = promedio de las 4 competencias, como referencia.
               "parcial" indica que aun no estan las 4 competencias cargadas (el PC mostrado es provisional).
             </div>
           </div>
