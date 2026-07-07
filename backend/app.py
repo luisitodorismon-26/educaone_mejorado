@@ -3893,17 +3893,13 @@ async def get_competencias_periodo_curso(curso_id: int, periodo: int,
 async def reporte_padres_curso_pdf(curso_id: int, request: Request,
                                     db: Session = Depends(get_db),
                                     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
-    """v2.13.17 — Reporte de Calificaciones de UNA competencia (curso o individual).
+    """v2.13.40 — Reporte del PERÍODO para padres (curso o individual).
     
-    El reporte es de la competencia que se está trabajando (1, 2, 3 o 4).
-    Por asignatura muestra UNA nota de esa competencia según el MODO:
-    
-      modo='pc' (default): PC de la competencia = promedio de sus 4 períodos
-        (p1+p2+p3+p4)/4 usando los períodos cargados.
-      
-      modo='ultimo_p': el p4 (cuarto período) de la competencia. Se usa para
-        reportar antes del cierre y dar tiempo de recuperación a quien esté
-        por debajo de 70.
+    Al final de cada período el colegio entrega la nota de ese período.
+    Por asignatura se reporta EL ÚLTIMO P del período: el valor del período N
+    en la competencia más alta que lo tenga cargado (práctica del colegio).
+    Sin promedio general. Parámetros: periodo=1-4 (default: período activo),
+    estudiante_id opcional.
     
     NOTA: al padre NO se le indica si la nota es PC o último P. El PDF solo
     dice "Reporte de Calificaciones / Competencia N". El modo es interno.
@@ -3929,15 +3925,12 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
     
-    modo = request.query_params.get('modo', 'pc')
-    if modo not in ('pc', 'ultimo_p'):
-        modo = 'pc'
     try:
-        competencia = int(request.query_params.get('competencia', 1))
+        periodo_rep = int(request.query_params.get('periodo', 0))
     except (ValueError, TypeError):
-        competencia = 1
-    if not (1 <= competencia <= 4):
-        competencia = 1
+        periodo_rep = 0
+    if not (1 <= periodo_rep <= 4):
+        periodo_rep = ano.periodo_activo or 1
     
     estudiante_id = request.query_params.get('estudiante_id')
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
@@ -3980,22 +3973,19 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
             logger.warning(f"No se pudo decodificar el logo del colegio: {e}")
             logo_img = None
     
-    # Valor de la asignatura para la COMPETENCIA elegida, según el modo.
-    # comps = dict {competencia_numero: CalificacionSecundaria} de esa asignatura
-    def _nota_competencia_asignatura(comps):
-        c_obj = comps.get(competencia) if comps else None
-        if c_obj is None:
+    def _nota_periodo_asignatura(comps):
+        """Último P del período: valor del período en la competencia más alta con valor."""
+        if not comps:
             return None
-        if modo == 'ultimo_p':
-            # Último P = p4 (cuarto período) de esta competencia
-            return c_obj.valor_periodo(4)
-        else:
-            # PC de la competencia = promedio de sus 4 períodos (p1+p2+p3+p4)/4
-            vals = [c_obj.valor_periodo(p) for p in range(1, 5) if c_obj.valor_periodo(p) is not None]
-            return round(sum(vals) / len(vals), 1) if vals else None
+        for num in (4, 3, 2, 1):
+            c_obj = comps.get(num)
+            if c_obj is not None:
+                v = c_obj.valor_periodo(periodo_rep)
+                if v is not None:
+                    return v
+        return None
     
-    # Título: el padre NO ve si es PC o último P. Solo "Competencia N".
-    titulo_competencia = f"Competencia {competencia}"
+    titulo_competencia = f"Período {periodo_rep}"
     
     buffer = io.BytesIO()
     c = pdf_canvas.Canvas(buffer, pagesize=letter)
@@ -4048,7 +4038,7 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
         count = 0
         for asig_id in asig_ids:
             comps = idx.get((est.id, asig_id), {})
-            nota = _nota_competencia_asignatura(comps)
+            nota = _nota_periodo_asignatura(comps)
             
             def _lit(n):
                 if n is None: return '-'
@@ -4077,15 +4067,7 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
                 c.showPage()
                 y = height - 2*cm
         
-        # Promedio general
-        y -= 0.3*cm
-        promedio = round(suma/count, 1) if count > 0 else None
-        c.setFont("Helvetica-Bold", 11)
-        if promedio is not None:
-            color = rl_colors.HexColor('#16a34a') if promedio >= 70 else rl_colors.HexColor('#dc2626')
-            c.setFillColor(color)
-            c.drawString(2.3*cm, y, f"Promedio general: {promedio}")
-            c.setFillColor(rl_colors.black)
+        # (Sin promedio general: el reporte del período entrega notas por asignatura)
         y -= 1.5*cm
         
         # Firma
@@ -4102,8 +4084,7 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
     buffer.seek(0)
     
     tipo = 'individual' if estudiante_id else 'curso'
-    modo_str = 'PC' if modo == 'pc' else 'UltimoP'
-    filename = f"Reporte_Calificaciones_Competencia{competencia}_{modo_str}_{tipo}_{(curso.nombre or 'curso').replace(' ', '_')}.pdf"
+    filename = f"Reporte_Periodo{periodo_rep}_{tipo}_{(curso.nombre or 'curso').replace(' ', '_')}.pdf"
     return StreamingResponse(buffer, media_type='application/pdf',
                              headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 

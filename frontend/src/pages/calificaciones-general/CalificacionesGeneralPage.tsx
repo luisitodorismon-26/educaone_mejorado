@@ -47,8 +47,6 @@ export const CalificacionesGeneralPage = () => {
   const [ordenarPor, setOrdenarPor] = useState<string>('no_lista');
   const [ordenDesc, setOrdenDesc] = useState(false);
 
-  const [modoPadres, setModoPadres] = useState<'pc' | 'ultimo_p'>('pc');
-  const [competenciaPadres, setCompetenciaPadres] = useState<number>(1);
   const [descargandoPadres, setDescargandoPadres] = useState(false);
 
   useEffect(() => { cargarCursos(); }, []);
@@ -104,8 +102,8 @@ export const CalificacionesGeneralPage = () => {
     setDescargandoPadres(true); setError('');
     try {
       await descargarBlob(
-        `/calificaciones-secundaria/reporte-padres/curso/${cursoId}/pdf?competencia=${competenciaPadres}&modo=${modoPadres}`,
-        `Reporte_Competencia${competenciaPadres}_${modoPadres === 'pc' ? 'PC' : 'UltimoP'}_Curso_${nombreCurso()}.pdf`
+        `/calificaciones-secundaria/reporte-padres/curso/${cursoId}/pdf?periodo=${periodo}`,
+        `Reporte_Periodo${periodo}_Curso_${nombreCurso()}.pdf`
       );
     } catch (e: any) { setError(e.message || 'Error al generar reporte'); }
     finally { setDescargandoPadres(false); }
@@ -195,27 +193,9 @@ export const CalificacionesGeneralPage = () => {
                 <p className="text-[9px] text-gray-400 mt-0.5">Todas las asignaturas del periodo</p>
               </div>
               <div className="border-l border-gray-200 pl-6">
-                <p className="text-[11px] font-medium text-gray-600 mb-1.5">Reporte por competencia (para entregar)</p>
-                <div className="flex items-end gap-2">
-                  <div>
-                    <label className="block text-[10px] text-gray-400 mb-1">Competencia</label>
-                    <select value={competenciaPadres} onChange={e => setCompetenciaPadres(Number(e.target.value))} className="px-2 py-1.5 border rounded-lg text-xs">
-                      <option value={1}>Competencia 1</option>
-                      <option value={2}>Competencia 2</option>
-                      <option value={3}>Competencia 3</option>
-                      <option value={4}>Competencia 4</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] text-gray-400 mb-1">Nota a usar</label>
-                    <select value={modoPadres} onChange={e => setModoPadres(e.target.value as 'pc' | 'ultimo_p')} className="px-2 py-1.5 border rounded-lg text-xs">
-                      <option value="pc">PC (promedio de los 4 P)</option>
-                      <option value="ultimo_p">Último P (P4)</option>
-                    </select>
-                  </div>
-                  <Button onClick={descargarReportePadresCurso} variant="primary" loading={descargandoPadres} icon={<Users size={16} />} className="text-xs">Reporte (curso)</Button>
-                </div>
-                <p className="text-[9px] text-gray-400 mt-0.5">El PDF dice solo "Competencia N" — el padre no ve si es PC o P4</p>
+                <p className="text-[11px] font-medium text-gray-600 mb-1.5">Reporte del Período para padres</p>
+                <Button onClick={descargarReportePadresCurso} variant="primary" loading={descargandoPadres} icon={<Users size={16} />} className="text-xs">Reporte del Período {periodo} (curso)</Button>
+                <p className="text-[9px] text-gray-400 mt-0.5">Un reporte por estudiante con la nota del período (último P registrado) por asignatura</p>
               </div>
             </div>
           </div>
