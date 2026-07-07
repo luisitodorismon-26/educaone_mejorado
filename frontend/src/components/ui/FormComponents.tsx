@@ -46,7 +46,7 @@ interface SelectProps extends React.SelectHTMLAttributes<HTMLSelectElement> {
 }
 
 export const Select = forwardRef<HTMLSelectElement, SelectProps>(
-  ({ label, error, options, placeholder, className = '', ...props }, ref) => {
+  ({ label, error, options = [], placeholder, className = '', ...props }, ref) => {
     const hasGroups = options.some(o => o.group);
     const grouped = hasGroups ? options.reduce((acc, opt) => {
       const g = opt.group || '';

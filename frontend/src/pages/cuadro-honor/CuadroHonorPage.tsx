@@ -137,10 +137,14 @@ export const CuadroHonorPage: React.FC = () => {
       <div className="bg-white rounded-xl shadow-sm border p-4 flex items-end gap-3 flex-wrap">
         <div className="min-w-[220px]">
           <label className="block text-xs text-gray-500 mb-1">Curso</label>
-          <Select value={cursoId} onChange={e => setCursoId(e.target.value)}>
-            <option value="">Todo el colegio</option>
-            {cursos.map(c => <option key={c.id} value={c.id}>{c.nombre_completo || c.nombre}</option>)}
-          </Select>
+          <Select
+            value={cursoId}
+            onChange={e => setCursoId(e.target.value)}
+            options={[
+              { value: '', label: 'Todo el colegio' },
+              ...cursos.map(c => ({ value: String(c.id), label: c.nombre_completo || c.nombre })),
+            ]}
+          />
         </div>
         <Button onClick={cargar} variant="primary" loading={loading} icon={<Search size={16} />}>Ver</Button>
       </div>
