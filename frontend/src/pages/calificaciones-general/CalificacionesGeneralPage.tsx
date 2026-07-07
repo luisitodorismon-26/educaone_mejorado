@@ -171,7 +171,7 @@ export const CalificacionesGeneralPage = () => {
       <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 w-fit">
         <button onClick={() => { setVista('pc'); setData(null); setCompData(null); }}
           className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${vista === 'pc' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
-          <List size={16} /> Vista PC (resumen)
+          <List size={16} /> Vista Promedios (resumen)
         </button>
         <button onClick={() => { setVista('competencias'); setData(null); setCompData(null); }}
           className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${vista === 'competencias' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
@@ -243,7 +243,7 @@ export const CalificacionesGeneralPage = () => {
         <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
           <div className="p-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white">
             <h2 className="text-lg font-bold">{data.curso} - Periodo {data.periodo}</h2>
-            <p className="text-blue-100 text-sm">{data.estudiantes.length} estudiantes - {data.asignaturas_nombres.length} {data.asignaturas_nombres.length === 1 ? 'asignatura' : 'asignaturas'} - cada celda = PC del periodo (promedio de las 4 competencias)</p>
+            <p className="text-blue-100 text-sm">{data.estudiantes.length} estudiantes - {data.asignaturas_nombres.length} {data.asignaturas_nombres.length === 1 ? 'asignatura' : 'asignaturas'} - cada celda = promedio del periodo (promedio de las 4 competencias en ese periodo)</p>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -355,7 +355,7 @@ export const CalificacionesGeneralPage = () => {
           <h3 className="font-semibold text-blue-800 mb-2">Sobre esta vista</h3>
           <p className="text-blue-700 text-sm mb-2">Selecciona un curso y periodo, luego "Ver Notas".</p>
           <ul className="text-blue-700 text-sm list-disc list-inside space-y-1">
-            <li><strong>Vista PC (resumen):</strong> el PC de cada asignatura por periodo (promedio de sus competencias) + promedio general. Aca descargas el reporte de calificaciones, individual o de todo el curso.</li>
+            <li><strong>Vista Promedios (resumen):</strong> el promedio de cada asignatura en el periodo elegido (promedio de sus 4 competencias) + promedio general. Aca descargas el reporte de calificaciones, individual o de todo el curso.</li>
             <li><strong>Vista por Competencia:</strong> eliges una asignatura y ves como se forma el PC - el valor de cada una de las 4 competencias en el periodo.</li>
             <li><strong>Reporte por competencia:</strong> eleg\u00ed la <strong>Competencia</strong> que se trabaja (1-4) y la nota a usar: "PC" (promedio de los 4 P de esa competencia) o "\u00daltimo P" (el P4). Sirve para reportar antes del cierre y dar tiempo de recuperaci\u00f3n. El PDF dice solo "Competencia N" \u2014 el padre no ve si es PC o P4. Sale con el logo del colegio.</li>
           </ul>

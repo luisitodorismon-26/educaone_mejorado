@@ -168,13 +168,27 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
                           <span className="px-2 py-1 rounded-full text-xs bg-gray-200 text-gray-600">Retirado</span>
                         ) : !tieneCF ? (
                           <span className="px-2 py-1 rounded-full text-xs bg-gray-100 text-gray-500">Sin notas</span>
-                        ) : (
-                          <span className={`px-2 py-1 rounded-full text-xs font-medium ${
-                            aprobado ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
-                          }`}>
-                            {aprobado ? 'Aprobado' : 'Pendiente'}
-                          </span>
-                        )}
+                        ) : (() => {
+                          // v2.13.38: el estado refleja la cascada de evaluaciones extra.
+                          const ev: any = (est as any).evaluacion_extra;
+                          if (aprobado) {
+                            return <span className="px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800">Aprobado</span>;
+                          }
+                          if (ev?.fase_pendiente) {
+                            return <span className="px-2 py-1 rounded-full text-xs font-medium bg-amber-100 text-amber-800 uppercase whitespace-nowrap">{ev.fase_pendiente} pendiente</span>;
+                          }
+                          if (ev && ev.nota_final != null) {
+                            const aproboExtra = ev.nota_final >= 70;
+                            return (
+                              <span className={`px-2 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                                aproboExtra ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                              }`}>
+                                {(ev.condicion_final || (aproboExtra ? 'aprobado' : 'reprobado')).replace(/_/g, ' ')} ({Math.round(ev.nota_final)})
+                              </span>
+                            );
+                          }
+                          return <span className="px-2 py-1 rounded-full text-xs font-medium bg-red-100 text-red-800">Pendiente</span>;
+                        })()}
                       </td>
                       <td className="px-3 py-2 text-center">
                         <Button
