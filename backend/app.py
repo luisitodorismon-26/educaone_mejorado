@@ -4459,6 +4459,12 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
         grupos = {}
         for cal in califs_ano:
             grupos.setdefault((cal.estudiante_id, cal.asignatura_id), {})[cal.competencia_numero] = cal
+        # v2.13.39: precargar TODAS las fichas del año en una consulta
+        # (antes: una consulta por grupo → lento en colegios grandes)
+        evs_existentes = {
+            (e.estudiante_id, e.asignatura_id): e
+            for e in tenant_filter(db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria, current_user).filter_by(ano_escolar_id=ano.id).all()
+        }
         for (est_id, asig_id), comps in grupos.items():
             if len([c for c in comps if c in (1, 2, 3, 4)]) < 4:
                 continue
@@ -4473,15 +4479,14 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
             if not completo:
                 continue
             cf_exacto = sum(proms) / 4
-            ev = db.query(EvaluacionExtraSecundaria).filter_by(
-                estudiante_id=est_id, asignatura_id=asig_id, ano_escolar_id=ano.id
-            ).first()
+            ev = evs_existentes.get((est_id, asig_id))
             if not ev:
                 ev = EvaluacionExtraSecundaria(
                     estudiante_id=est_id, asignatura_id=asig_id,
                     ano_escolar_id=ano.id, colegio_id=current_user.colegio_id
                 )
                 db.add(ev)
+                evs_existentes[(est_id, asig_id)] = ev
                 cambios = True
             if ev.cf_original != cf_exacto:
                 ev.cf_original = cf_exacto
