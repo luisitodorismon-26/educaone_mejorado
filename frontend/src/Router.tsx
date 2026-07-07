@@ -24,6 +24,7 @@ import { WhatsAppPage } from './pages/whatsapp';
 import { CierreAnoPage } from './pages/cierre-ano';
 import { RegistroEscolarPage } from './pages/registro-escolar';
 import { CalificacionesGeneralPage } from './pages/calificaciones-general';
+import { CuadroHonorPage } from './pages/cuadro-honor';
 import { EvaluacionesPage } from './pages/evaluaciones';
 import { NotasPage } from './pages/notas';
 import { EvalInternaPage } from './pages/eval-interna';
@@ -138,6 +139,10 @@ export const AppRouter = () => {
         
         <Route path="/calificaciones-general" element={
           <ProtectedRoute roles={['direccion', 'coordinador']}><MainLayout><CalificacionesGeneralPage /></MainLayout></ProtectedRoute>
+        } />
+        
+        <Route path="/cuadro-honor" element={
+          <ProtectedRoute roles={['direccion', 'coordinador', 'secretaria']}><MainLayout><CuadroHonorPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/estadisticas" element={

@@ -24,7 +24,8 @@ import {
   ClipboardCheck,
   StickyNote,
   Building2,
-  AlertTriangle
+  AlertTriangle,
+  Award
 } from 'lucide-react';
 
 interface NavItem {
@@ -148,6 +149,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     // ─── ACADÉMICO ───
     { path: '/academico', label: 'Calificaciones', icon: BookOpen, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/calificaciones-general', label: 'Notas por Período', icon: BarChart3, roles: ['direccion', 'coordinador'], section: 'Académico' },
+    { path: '/cuadro-honor', label: 'Cuadro de Honor', icon: Award, roles: ['direccion', 'coordinador', 'secretaria'], section: 'Académico' },
     { path: '/evaluaciones-extra', label: 'Evaluaciones Extra', icon: AlertTriangle, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/items-completivos', label: 'Detalle de evaluaciones (Registro)', icon: ClipboardCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/asistencia', label: 'Asistencia', icon: CalendarCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },

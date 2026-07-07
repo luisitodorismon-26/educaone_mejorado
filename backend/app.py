@@ -9752,6 +9752,206 @@ async def get_resumen_calificaciones_curso(curso_id, request: Request, db: Sessi
 
 # ============== ESTADÍSTICAS REALES ==============
 
+# ═════════════════════════════════════════════════════════════════
+# CUADRO DE HONOR — v2.13.41
+# Reconocimientos anuales: promedio de los CF de todas las asignaturas.
+# Niveles: Excelencia (95+) y Honor (90+).
+# ═════════════════════════════════════════════════════════════════
+
+def _calcular_cuadro_honor(db, current_user, curso_id=None, umbral=90.0):
+    """Lista de estudiantes con promedio anual (promedio de CF) >= umbral.
+    CF por asignatura = promedio de las 4 competencias (solo asignaturas
+    con las 4 completas). Promedio anual = promedio de esos CF redondeados.
+    """
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    if not ano:
+        return None, []
+    
+    q_est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True)
+    if curso_id:
+        q_est = q_est.filter(Estudiante.curso_id == int(curso_id))
+    estudiantes = q_est.all()
+    est_por_id = {e.id: e for e in estudiantes}
+    if not estudiantes:
+        return ano, []
+    
+    califs = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter(
+        CalificacionSecundaria.ano_escolar_id == ano.id,
+        CalificacionSecundaria.estudiante_id.in_(list(est_por_id.keys())),
+    ).all()
+    grupos = {}
+    for c in califs:
+        grupos.setdefault((c.estudiante_id, c.asignatura_id), {})[c.competencia_numero] = c
+    
+    # Nota por (estudiante, asignatura):
+    #  - CF oficial si las 4 competencias están completas.
+    #  - PROYECCIÓN si no: promedio de todas las notas cargadas hasta ahora.
+    cfs_por_est = {}
+    completas_por_est = {}
+    for (est_id, asig_id), comps in grupos.items():
+        proms = []
+        for n in (1, 2, 3, 4):
+            c = comps.get(n)
+            pr = c.calcular_promedio_competencia() if c else None
+            if pr is None:
+                proms = None
+                break
+            proms.append(pr)
+        if proms:
+            # CF oficial (redondeado como en el boletín)
+            nota_asig = round(sum(proms) / 4, 0)
+            completa = True
+        else:
+            # Proyección: promedio de los períodos cargados (max P,RP)
+            vals = []
+            for c in comps.values():
+                for p in (1, 2, 3, 4):
+                    v = c.valor_periodo(p) if hasattr(c, 'valor_periodo') else None
+                    if v is not None:
+                        vals.append(v)
+            if not vals:
+                continue
+            nota_asig = sum(vals) / len(vals)
+            completa = False
+        cfs_por_est.setdefault(est_id, []).append(nota_asig)
+        completas_por_est.setdefault(est_id, []).append(completa)
+    
+    resultado = []
+    for est_id, cfs in cfs_por_est.items():
+        promedio = round(sum(cfs) / len(cfs), 1)
+        if promedio >= umbral:
+            est = est_por_id[est_id]
+            nivel = 'excelencia' if promedio >= 95 else 'honor'
+            resultado.append({
+                'estudiante_id': est_id,
+                'nombre': est.nombre_completo,
+                'curso': est.curso.nombre_completo if est.curso else '',
+                'promedio': promedio,
+                'nivel': nivel,
+                'asignaturas_con_cf': len(cfs),
+                'oficial': all(completas_por_est.get(est_id, [False])),
+            })
+    resultado.sort(key=lambda r: (-r['promedio'], r['nombre']))
+    for i, r in enumerate(resultado, start=1):
+        r['posicion'] = i
+    return ano, resultado
+
+
+@app.get("/api/estadisticas/cuadro-honor")
+async def get_cuadro_honor(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria', 'profesor'))):
+    """Cuadro de Honor anual: estudiantes con promedio de CF >= 90 (Honor) / 95 (Excelencia)."""
+    curso_id = request.query_params.get('curso_id')
+    try:
+        umbral = float(request.query_params.get('umbral', 90))
+    except (ValueError, TypeError):
+        umbral = 90.0
+    ano, lista = _calcular_cuadro_honor(db, current_user, curso_id=curso_id, umbral=umbral)
+    if ano is None:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+    # Modo global: OFICIAL solo si todos los del cuadro tienen CF completos
+    modo = 'oficial' if (lista and all(r.get('oficial') for r in lista)) else 'proyeccion'
+    return {
+        'ano_escolar': ano.nombre,
+        'umbral': umbral,
+        'modo': modo,
+        'total': len(lista),
+        'excelencia': len([r for r in lista if r['nivel'] == 'excelencia']),
+        'honor': len([r for r in lista if r['nivel'] == 'honor']),
+        'estudiantes': lista,
+    }
+
+
+@app.get("/api/estadisticas/cuadro-honor/pdf")
+async def get_cuadro_honor_pdf(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
+    """PDF del Cuadro de Honor para el acto de reconocimiento (con logo)."""
+    from reportlab.pdfgen import canvas as pdf_canvas
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import cm
+    from reportlab.lib import colors as rl_colors
+    from boletin_padres import _dibujar_logo
+    
+    curso_id = request.query_params.get('curso_id')
+    ano, lista = _calcular_cuadro_honor(db, current_user, curso_id=curso_id, umbral=90.0)
+    if ano is None:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+    
+    buffer = io.BytesIO()
+    c = pdf_canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    y = height - 2*cm
+    
+    _dibujar_logo(c, config, 2*cm, y + 0.8*cm, 2.2*cm, 2.2*cm)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawCentredString(width/2, y, (config.nombre if config else 'Centro Educativo'))
+    y -= 0.8*cm
+    c.setFont("Helvetica-Bold", 14)
+    c.setFillColor(rl_colors.HexColor('#b8860b'))
+    c.drawCentredString(width/2, y, "CUADRO DE HONOR")
+    c.setFillColor(rl_colors.black)
+    y -= 0.55*cm
+    modo_oficial = bool(lista) and all(r.get('oficial') for r in lista)
+    c.setFont("Helvetica", 10)
+    if modo_oficial:
+        c.drawCentredString(width/2, y, f"Año escolar {ano.nombre} — Promedio general de Calificaciones Finales (OFICIAL)")
+    else:
+        c.setFillColor(rl_colors.HexColor('#b45309'))
+        c.setFont("Helvetica-Bold", 10)
+        c.drawCentredString(width/2, y, f"Año escolar {ano.nombre} — PROYECCIÓN EN CURSO (con las notas cargadas hasta hoy)")
+        c.setFillColor(rl_colors.black)
+    y -= 1.1*cm
+    
+    if not lista:
+        c.setFont("Helvetica", 11)
+        c.drawCentredString(width/2, y, "Aún no hay estudiantes con promedio de 90 o más (requiere CF completos).")
+    else:
+        # Encabezado de tabla
+        c.setFillColor(rl_colors.HexColor('#1e4d8b'))
+        c.rect(1.5*cm, y - 0.15*cm, width - 3*cm, 0.65*cm, fill=1, stroke=0)
+        c.setFillColor(rl_colors.white)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(1.8*cm, y, "Pos.")
+        c.drawString(3*cm, y, "Estudiante")
+        c.drawString(11*cm, y, "Curso")
+        c.drawString(15.2*cm, y, "Promedio")
+        c.drawString(17.6*cm, y, "Nivel")
+        c.setFillColor(rl_colors.black)
+        y -= 0.75*cm
+        c.setFont("Helvetica", 10)
+        for r in lista:
+            if y < 3*cm:
+                c.showPage()
+                y = height - 2*cm
+                c.setFont("Helvetica", 10)
+            es_exc = r['nivel'] == 'excelencia'
+            c.drawString(1.9*cm, y, str(r['posicion']))
+            c.drawString(3*cm, y, r['nombre'][:42])
+            c.drawString(11*cm, y, (r['curso'] or '')[:20])
+            c.setFillColor(rl_colors.HexColor('#b8860b') if es_exc else rl_colors.HexColor('#16a34a'))
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(15.5*cm, y, str(r['promedio']))
+            c.drawString(17.6*cm, y, 'EXCELENCIA' if es_exc else 'HONOR')
+            c.setFillColor(rl_colors.black)
+            c.setFont("Helvetica", 10)
+            y -= 0.55*cm
+    
+    y -= 1.3*cm
+    if y < 3.5*cm:
+        c.showPage()
+        y = height - 4*cm
+    c.setFont("Helvetica", 9)
+    c.line(width/2 - 3.5*cm, y, width/2 + 3.5*cm, y)
+    c.drawCentredString(width/2, y - 0.4*cm, "Firma del Director/a")
+    
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return StreamingResponse(buffer, media_type='application/pdf',
+                             headers={'Content-Disposition': 'attachment; filename="Cuadro_de_Honor.pdf"'})
+
+
 @app.get("/api/estadisticas/cursos")
 async def get_estadisticas_cursos(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Estadísticas por curso - optimizado con bulk queries. Filtro opcional por nivel."""
