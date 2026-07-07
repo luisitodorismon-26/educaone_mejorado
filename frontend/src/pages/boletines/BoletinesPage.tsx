@@ -144,7 +144,12 @@ export const BoletinesPage = () => {
     setError(null);
     try {
       const res = await api.get(`/boletines/estudiante/${estudianteId}`);
-      setBoletin(res.data);
+      if (res.data?.error) {
+        setError(res.data.error);
+      } else {
+        // Blindaje: garantizar que asignaturas siempre sea un array
+        setBoletin({ ...res.data, asignaturas: Array.isArray(res.data?.asignaturas) ? res.data.asignaturas : [] });
+      }
     } catch (err) {
       console.error('Error cargando boletín:', err);
       setError('Error al cargar el boletín');
@@ -405,7 +410,7 @@ export const BoletinesPage = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {boletin.asignaturas.map((asig, idx) => {
+                  {(boletin.asignaturas || []).map((asig, idx) => {
                     const ev = asig.evaluacion_extra;
                     const notaFinal = asig.nota_final ?? asig.cf;
                     const comps = asig.competencias_detalle || [];
@@ -444,10 +449,10 @@ export const BoletinesPage = () => {
             </div>
 
             {/* Desglose de evaluaciones extra (si las hay) — mismo lenguaje que la pantalla de carga */}
-            {boletin.asignaturas.some(a => a.evaluacion_extra) && (
+            {(boletin.asignaturas || []).some(a => a.evaluacion_extra) && (
               <div className="mt-3 bg-amber-50 border border-amber-200 rounded-lg p-3">
                 <p className="text-xs font-bold text-amber-800 mb-2">Evaluaciones extra (desglose oficial):</p>
-                {boletin.asignaturas.filter(a => a.evaluacion_extra).map(a => {
+                {(boletin.asignaturas || []).filter(a => a.evaluacion_extra).map(a => {
                   const ev = a.evaluacion_extra!;
                   const cf = ev.cf_original ?? a.cf ?? 0;
                   const partes: string[] = [];
@@ -484,7 +489,7 @@ export const BoletinesPage = () => {
               </div>
               {(() => {
                 // v2.13.38: la situación general respeta la cascada de evaluaciones extra
-                const conNotas = boletin.asignaturas.filter(a => a.cf !== null);
+                const conNotas = (boletin.asignaturas || []).filter(a => a.cf !== null);
                 const hayPendiente = conNotas.some(a => a.evaluacion_extra?.fase_pendiente);
                 const todasResueltas = conNotas.length > 0 && conNotas.every(a => (a.nota_final ?? a.cf ?? 0) >= 70);
                 const hayReprobada = conNotas.some(a => !a.evaluacion_extra?.fase_pendiente && (a.nota_final ?? a.cf ?? 0) < 70);
