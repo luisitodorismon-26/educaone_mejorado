@@ -232,6 +232,57 @@ CONDICION_FINAL_Y_PRIMERO = 472
 # Helpers internos
 # ─────────────────────────────────────────────────────────────────────
 
+# ─── Calibración de FILA EXTRA (materias del colegio, ej. Música) ───
+# Extraída de la plantilla oficial con pdfplumber (v2.13.43):
+# las 36 líneas verticales reales de la tabla, el borde inferior real,
+# la franja verde de ÁREAS CURRICULARES y las celdas con fondo verde.
+EXTRA_ROW_VERTICALES = [36.4, 63.0, 160.2, 185.5, 210.8, 236.1, 261.4, 286.7,
+                        312.0, 337.3, 362.6, 387.9, 413.2, 438.5, 463.8, 489.1,
+                        514.4, 539.7, 565.0, 589.0, 613.0, 637.0, 661.0, 685.0,
+                        709.0, 733.0, 757.1, 781.1, 805.1, 829.1, 853.1, 877.1,
+                        905.8, 934.6, 962.8, 991.1]
+TABLA_FIN_Y_PRIMERO = 375.1   # borde inferior real de la tabla (primer ciclo)
+EXTRA_ROW_ALTO = 25.0
+FRANJA_VERDE_X = (36.4, 63.0)
+FRANJA_VERDE_COLOR = (0.834, 0.895, 0.684)
+CELDAS_VERDES_X = [(661.0, 685.0), (757.1, 781.1), (853.1, 877.1), (905.8, 934.6)]
+CELDA_VERDE_COLOR = (0.919, 0.948, 0.847)
+
+
+def _dibujar_fila_extra(c, indice: int) -> float:
+    """Extiende la tabla oficial con una fila calibrada idéntica a las impresas.
+    
+    Dibuja fondos (franja verde + celdas verdes), la cuadrícula con las
+    verticales REALES de la plantilla, y devuelve el y_top del centro de la
+    fila para que el llamador dibuje nombre y notas. Reutilizable para
+    cualquier materia extra futura del colegio.
+    """
+    y_sup_top = TABLA_FIN_Y_PRIMERO + indice * EXTRA_ROW_ALTO
+    y_inf_top = y_sup_top + EXTRA_ROW_ALTO
+    y_sup, y_inf = _y(y_sup_top), _y(y_inf_top)
+    x_izq, x_der = EXTRA_ROW_VERTICALES[0], EXTRA_ROW_VERTICALES[-1]
+    
+    # Fondos primero
+    c.setFillColorRGB(*FRANJA_VERDE_COLOR)
+    c.rect(FRANJA_VERDE_X[0], y_inf, FRANJA_VERDE_X[1] - FRANJA_VERDE_X[0],
+           y_sup - y_inf, fill=1, stroke=0)
+    c.setFillColorRGB(*CELDA_VERDE_COLOR)
+    for cx0, cx1 in CELDAS_VERDES_X:
+        c.rect(cx0, y_inf, cx1 - cx0, y_sup - y_inf, fill=1, stroke=0)
+    c.setFillColorRGB(0, 0, 0)
+    
+    # Cuadrícula con las líneas reales
+    c.setLineWidth(0.5)
+    c.setStrokeColorRGB(0.2, 0.2, 0.2)
+    c.line(x_izq, y_sup, x_der, y_sup)
+    c.line(x_izq, y_inf, x_der, y_inf)
+    for vx in EXTRA_ROW_VERTICALES:
+        c.line(vx, y_sup, vx, y_inf)
+    c.setStrokeColorRGB(0, 0, 0)
+    
+    return y_sup_top + EXTRA_ROW_ALTO / 2  # centro de la fila (y_top)
+
+
 def _y(y_top: float) -> float:
     """Convierte y_top (desde arriba) a coordenadas ReportLab (desde abajo)."""
     return PAGE_H - y_top
@@ -663,6 +714,7 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
     # Tabla de notas
     c.setFont("Helvetica", 8)
     
+    extras_usadas = 0  # v2.13.42: contador de materias extra del colegio
     for asig_id, asig_data in calificaciones_por_asig.items():
         nombre_asig = _normalizar_nombre_asignatura(asig_data.get('asignatura_nombre', ''))
         
@@ -673,8 +725,32 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             # Solo segundo ciclo tiene SALIDA OPTATIVA
             y_row = _y(row_y_map['SALIDA OPTATIVA 1'])
         else:
-            # Asignatura no reconocida o intento de Salida Optativa en primer ciclo
-            continue
+            # v2.13.42: asignatura EXTRA del colegio (ej. Música) — no existe en
+            # la plantilla oficial MINERD. Se le dibuja su propia casilla:
+            #  - Segundo ciclo: usa las filas SALIDA OPTATIVA (nombre en blanco).
+            #  - Primer ciclo: fila dibujada debajo de Formación Integral.
+            # Máximo 2 extras por boletín (límite físico de la hoja).
+            if 'SALIDA OPTATIVA 1' in row_y_map:
+                candidatas = ['SALIDA OPTATIVA 1', 'SALIDA OPTATIVA 2']
+                if extras_usadas >= len(candidatas):
+                    continue
+                y_top_extra = row_y_map[candidatas[extras_usadas]]
+                dibujar_linea = False
+            else:
+                # Primer ciclo: solo cabe 1 fila extra a tamaño completo antes
+                # del bloque impreso "RESUMEN DE ASISTENCIA" de la plantilla.
+                if extras_usadas >= 1:
+                    continue
+                # v2.13.43: fila calibrada — extiende la tabla con las líneas
+                # y fondos REALES extraídos de la plantilla oficial.
+                y_top_extra = _dibujar_fila_extra(c, extras_usadas)
+                dibujar_linea = True
+            extras_usadas += 1
+            y_row = _y(y_top_extra)
+            # Nombre de la materia: misma tipografía que las áreas oficiales
+            c.setFont("Helvetica-Bold", 7.5)
+            c.drawString(67, y_row - 3, str(asig_data.get('asignatura_nombre', ''))[:26])
+            c.setFont("Helvetica", 8)
         
         competencias = asig_data.get('competencias', [])
         if not competencias:
