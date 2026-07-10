@@ -832,15 +832,22 @@ class CalificacionPrimaria(Base):
             return p
         return None
     
-    def calcular_final(self):
-        """Final de la competencia: promedio de los 4 períodos"""
+    def calcular_final(self, minimo_periodos=1):
+        """Final de la competencia = promedio de los períodos EVALUADOS.
+
+        Regla oficial MINERD primaria (Registro, pág. 85): "En caso de que un
+        estudiante tenga indicado (NE) en algún período, la calificación final
+        de la competencia se obtiene del promedio de los períodos evaluados."
+        Un período NE = valor None (no cargado). Se promedian los que sí tienen
+        valor. Requiere al menos `minimo_periodos` evaluado(s).
+        """
         valores = []
         for p in range(1, 5):
             v = self.valor_periodo(p)
             if v is not None:
                 valores.append(v)
-        if len(valores) == 4:
-            return round(sum(valores) / 4, 2)
+        if len(valores) >= minimo_periodos and valores:
+            return round(sum(valores) / len(valores), 2)
         return None
     
     def get_literal(self, nota=None):
