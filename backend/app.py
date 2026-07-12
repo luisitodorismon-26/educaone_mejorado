@@ -7675,6 +7675,174 @@ def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
 
 
 
+# ═════════════════════════════════════════════════════════════════
+# BOLETÍN DE PRIMARIA — "Informe de Aprendizaje" (v2.13.46)
+# CARRIL SEPARADO de secundaria: modelo CalificacionPrimaria,
+# motor calculo_primaria (corte 65), plantilla oficial del Nivel Primario.
+# ═════════════════════════════════════════════════════════════════
+
+def _construir_areas_primaria(db, estudiante_id, current_user, ano):
+    """Arma el dict areas_data que consume boletin_primaria.
+
+    {nombre_area: {'competencias': {1:obj, 2:obj, 3:obj}, 'cf_area': int,
+                   'recuperacion_final': int|None, 'recuperacion_especial': int|None}}
+    """
+    from calculo_primaria import cf_area as calc_cf_area
+
+    califs = tenant_filter(
+        db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
+    ).filter(
+        CalificacionPrimaria.estudiante_id == estudiante_id,
+        CalificacionPrimaria.ano_escolar_id == ano.id,
+    ).all()
+
+    if not califs:
+        return {}
+
+    asig_ids = {c.asignatura_id for c in califs}
+    asigs = {
+        a.id: a.nombre
+        for a in tenant_filter(db.query(Asignatura), Asignatura, current_user)
+        .filter(Asignatura.id.in_(asig_ids)).all()
+    }
+
+    por_asig = {}
+    for c in califs:
+        por_asig.setdefault(c.asignatura_id, {})[c.competencia_numero] = c
+
+    resultado = {}
+    for asig_id, comps in por_asig.items():
+        nombre = asigs.get(asig_id)
+        if not nombre:
+            continue
+        _, cf_red = calc_cf_area(list(comps.values()))
+        resultado[nombre] = {
+            'competencias': comps,
+            'cf_area': cf_red,
+            # Las recuperaciones de área se cargarán cuando exista su pantalla.
+            'recuperacion_final': None,
+            'recuperacion_especial': None,
+        }
+    return resultado
+
+
+def _generar_pdf_primaria(db, estudiante, current_user, ano, config):
+    """Genera el buffer del Informe de Aprendizaje de un estudiante de primaria."""
+    from boletin_primaria import generar_boletin_primaria
+
+    curso = estudiante.curso
+    grado = db.get(Grado, curso.grado_id) if curso and curso.grado_id else None
+    grado_nombre = grado.nombre if grado else ''
+
+    areas = _construir_areas_primaria(db, estudiante.id, current_user, ano)
+    asistencias = _construir_asistencias_boletin(db, estudiante.id, current_user, ano)
+
+    # Docente encargado del grado (primer profesor asignado al curso)
+    docente_nombre = ''
+    asignacion = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id).first() if curso else None
+    if asignacion:
+        prof = db.get(Usuario, asignacion.profesor_id)
+        if prof:
+            docente_nombre = f"{prof.nombre} {prof.apellido}".strip()
+
+    return generar_boletin_primaria(
+        estudiante=estudiante,
+        curso=curso,
+        grado_nombre=grado_nombre,
+        areas_data=areas,
+        config=config,
+        ano_escolar=ano,
+        docente_nombre=docente_nombre,
+        asistencias_por_periodo=asistencias,
+    )
+
+
+@app.get("/api/boletines-primaria/estudiante/{id}/pdf")
+async def boletin_primaria_estudiante_pdf(
+    id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
+):
+    """Informe de Aprendizaje (primaria) de UN estudiante, sobre plantilla oficial."""
+    estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    curso = estudiante.curso
+    if not curso:
+        return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
+    if _es_curso_secundaria(db, curso.id):
+        return JSONResponse(
+            {'error': 'Este boletín es solo para primaria. Para secundaria usá el Boletín MINERD.'},
+            status_code=400)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+
+    try:
+        buf = _generar_pdf_primaria(db, estudiante, current_user, ano, config)
+    except FileNotFoundError:
+        return JSONResponse({'error': 'No se encontró la plantilla oficial de ese grado.'}, status_code=500)
+
+    nombre_archivo = f"Informe_Aprendizaje_{(estudiante.nombre_completo or 'estudiante').replace(' ', '_')}.pdf"
+    return StreamingResponse(buf, media_type='application/pdf',
+                             headers={'Content-Disposition': f'attachment; filename="{nombre_archivo}"'})
+
+
+@app.get("/api/boletines-primaria/curso/{curso_id}/pdf")
+async def boletin_primaria_curso_pdf(
+    curso_id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
+):
+    """Informe de Aprendizaje de TODO el curso (un PDF con todos los estudiantes)."""
+    from pypdf import PdfWriter, PdfReader
+
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    if _es_curso_secundaria(db, curso.id):
+        return JSONResponse({'error': 'Este boletín es solo para primaria.'}, status_code=400)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
+        curso_id=curso_id, activo=True
+    ).order_by(Estudiante.no_lista, Estudiante.apellido).all()
+
+    if not estudiantes:
+        return JSONResponse({'error': 'El curso no tiene estudiantes activos'}, status_code=404)
+
+    writer = PdfWriter()
+    generados = 0
+    for est in estudiantes:
+        try:
+            buf = _generar_pdf_primaria(db, est, current_user, ano, config)
+            for page in PdfReader(buf).pages:
+                writer.add_page(page)
+            generados += 1
+        except Exception as e:
+            logger.error(f"Boletín primaria falló para estudiante {est.id}: {e}")
+            continue
+
+    if generados == 0:
+        return JSONResponse({'error': 'No se pudo generar ningún boletín'}, status_code=500)
+
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+    nombre_archivo = f"Informes_Aprendizaje_{(curso.nombre or 'curso').replace(' ', '_')}.pdf"
+    return StreamingResponse(out, media_type='application/pdf',
+                             headers={'Content-Disposition': f'attachment; filename="{nombre_archivo}"'})
+
+
 @app.get("/api/boletines/estudiante/{id}/pdf-minerd-v2")
 async def generar_boletin_minerd_v2(
     id: int,
