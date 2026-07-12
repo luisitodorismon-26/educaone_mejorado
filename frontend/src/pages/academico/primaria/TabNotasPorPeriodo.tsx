@@ -4,7 +4,7 @@ import { Save } from 'lucide-react';
 import { Button, Alert } from '../../../components/ui';
 import {
   EstudiantePrimData, CampoEditable,
-  NOMBRES_COMPETENCIAS_PRIM,
+  NOMBRES_COMPETENCIAS_PRIM, UMBRAL_RP_PRIMARIA, rpHabilitado,
 } from './tipos';
 
 // ════════════════════════════════════════════════════════════════════
@@ -128,7 +128,10 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
             {activos.map(est => (
               <tr key={est.estudiante.id} className="border-b hover:bg-gray-50">
                 <td className="px-3 py-1.5 font-medium text-gray-800 sticky left-0 bg-white">{est.estudiante.nombre_completo}</td>
-                {comps.map(n => (
+                {comps.map(n => {
+                  const pVal = getValor(est, n, campoP) !== '' ? Number(getValor(est, n, campoP)) : null;
+                  const rpOn = rpHabilitado(pVal);
+                  return (
                   <Fragment key={n}>
                     <td className="px-1 py-1 text-center border-l">
                       <input
@@ -142,15 +145,17 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                     <td className="px-1 py-1 text-center">
                       <input
                         type="number" min={0} max={100}
-                        value={getValor(est, n, campoRP)}
+                        value={rpOn ? getValor(est, n, campoRP) : ''}
                         onChange={e => handleChange(est.estudiante.id, n, campoRP, e.target.value)}
-                        disabled={!puedeEditar}
-                        placeholder="RP"
-                        className="w-12 px-1 py-1 text-center border rounded text-xs bg-amber-50/40 focus:ring-1 focus:ring-amber-400 disabled:bg-gray-50"
+                        disabled={!puedeEditar || !rpOn}
+                        placeholder={rpOn ? 'RP' : '—'}
+                        title={rpOn ? `Recuperación del P${periodo}` : `RP se habilita solo si P${periodo} < ${UMBRAL_RP_PRIMARIA}`}
+                        className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                       />
                     </td>
                   </Fragment>
-                ))}
+                  );
+                })}
               </tr>
             ))}
           </tbody>

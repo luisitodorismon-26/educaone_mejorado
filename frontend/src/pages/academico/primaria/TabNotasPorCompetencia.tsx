@@ -5,7 +5,7 @@ import { Button, Alert } from '../../../components/ui';
 import {
   EstudiantePrimData, CampoEditable, CAMPOS_PERIODOS,
   NOMBRES_COMPETENCIAS_PRIM, MINIMO_APROBATORIO_PRIMARIA,
-  finalCompetencia,
+  UMBRAL_RP_PRIMARIA, rpHabilitado, finalCompetencia,
 } from './tipos';
 
 // ════════════════════════════════════════════════════════════════════
@@ -140,7 +140,10 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
               return (
                 <tr key={est.estudiante.id} className="border-b hover:bg-gray-50">
                   <td className="px-3 py-1.5 font-medium text-gray-800 sticky left-0 bg-white">{est.estudiante.nombre_completo}</td>
-                  {CAMPOS_PERIODOS.map(cp => (
+                  {CAMPOS_PERIODOS.map(cp => {
+                    const pVal = getValor(est, cp.p) !== '' ? Number(getValor(est, cp.p)) : null;
+                    const rpOn = rpHabilitado(pVal);
+                    return (
                     <Fragment key={cp.periodo}>
                       <td className="px-1 py-1 text-center">
                         <input
@@ -154,15 +157,17 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                       <td className="px-1 py-1 text-center">
                         <input
                           type="number" min={0} max={100}
-                          value={getValor(est, cp.rp)}
+                          value={rpOn ? getValor(est, cp.rp) : ''}
                           onChange={e => handleChange(est.estudiante.id, cp.rp, e.target.value)}
-                          disabled={!puedeEditar}
-                          placeholder="RP"
-                          className="w-12 px-1 py-1 text-center border rounded text-xs bg-amber-50/40 focus:ring-1 focus:ring-amber-400 disabled:bg-gray-50"
+                          disabled={!puedeEditar || !rpOn}
+                          placeholder={rpOn ? 'RP' : '—'}
+                          title={rpOn ? `Recuperación del P${cp.periodo}` : `RP se habilita solo si P${cp.periodo} < ${UMBRAL_RP_PRIMARIA}`}
+                          className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                         />
                       </td>
                     </Fragment>
-                  ))}
+                    );
+                  })}
                   <td className={`px-3 py-1.5 text-center font-bold ${fin == null ? 'text-gray-300' : aprobado ? 'text-green-600' : 'text-red-600'}`}>
                     {fin != null ? Math.round(fin) : '—'}
                   </td>

@@ -54,6 +54,18 @@ export const CAMPOS_PERIODOS: Array<{ periodo: number; p: CampoEditable; rp: Cam
 // Corte de aprobación en primaria (oficial MINERD)
 export const MINIMO_APROBATORIO_PRIMARIA = 65;
 
+// Umbral para habilitar la recuperación (RP) de un período.
+// Por defecto = mínimo aprobatorio (65). Si el colegio usa un umbral más
+// exigente (ej. 70), cambiar SOLO este valor.
+export const UMBRAL_RP_PRIMARIA = 65;
+
+// ¿Debe habilitarse la casilla RP de un período?
+// Solo si el P existe y está por debajo del umbral (el estudiante no aprobó
+// ese período y necesita recuperar). Si ya aprobó, no hay nada que recuperar.
+export function rpHabilitado(pValor: number | null): boolean {
+  return pValor != null && pValor < UMBRAL_RP_PRIMARIA;
+}
+
 // Nombres oficiales de las competencias fundamentales (primaria)
 export const NOMBRES_COMPETENCIAS_PRIM: Record<number, string> = {
   1: 'Comunicativa',
