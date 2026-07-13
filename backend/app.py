@@ -10425,6 +10425,19 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
     periodo = int(request.query_params.get('periodo', 0) or 0)
     asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(activo=True).all()
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+
+    # v2.13.51: corte de aprobación por estudiante según el NIVEL de su curso
+    # (primaria 65 / secundaria 70). Se calcula una sola vez para todo el endpoint.
+    from services.stats_service import umbral_de
+    _umbral_nivel_estudiante = {
+        eid: umbral_de(niv)
+        for eid, niv in tenant_filter(
+            db.query(Estudiante.id, Grado.nivel), Estudiante, current_user
+        ).join(Curso, Estudiante.curso_id == Curso.id)
+         .join(Grado, Curso.grado_id == Grado.id)
+         .filter(Estudiante.activo == True).all()
+    }
+
     resultado = []
     
     for asig in asignaturas:
@@ -10503,7 +10516,12 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
             continue
         
         promedio = sum(notas) / len(notas)
-        aprobados = sum(1 for n in notas if n >= 70)
+        # v2.13.51: cada estudiante se evalúa con el corte de SU nivel
+        # (primaria 65 / secundaria 70). Antes se usaba 70 para todos.
+        aprobados = sum(
+            1 for eid, n in notas_por_est.items()
+            if n >= _umbral_nivel_estudiante.get(eid, 70)
+        )
         reprobados = len(notas) - aprobados
         
         resultado.append({

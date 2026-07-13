@@ -649,26 +649,49 @@ def get_stats_cursos(db: Session, user, periodo: int = 0, nivel: str = None) -> 
                             notas_por_est.setdefault(eid, []).append(promedio_actual)
 
     # PRIMARIA — tabla CalificacionPrimaria (una fila por competencia)
+    # v2.13.51: robusto — si `final_competencia` no está guardado, se calcula
+    # desde los períodos (valor del período = max(P, RP); regla NE = se saltan
+    # los períodos sin evaluar). Antes se ignoraban esas filas y el curso
+    # aparecía con 0 aprobados / 0 reprobados.
     if est_primaria_ids:
         try:
-            from models import CalificacionPrimaria
             rows = db.query(
                 CalificacionPrimaria.estudiante_id,
                 CalificacionPrimaria.asignatura_id,
-                CalificacionPrimaria.final_competencia
+                CalificacionPrimaria.final_competencia,
+                CalificacionPrimaria.p1, CalificacionPrimaria.rp1,
+                CalificacionPrimaria.p2, CalificacionPrimaria.rp2,
+                CalificacionPrimaria.p3, CalificacionPrimaria.rp3,
+                CalificacionPrimaria.p4, CalificacionPrimaria.rp4,
             ).filter(
-                CalificacionPrimaria.estudiante_id.in_(est_primaria_ids),
-                CalificacionPrimaria.final_competencia != None
+                CalificacionPrimaria.estudiante_id.in_(est_primaria_ids)
             ).all()
-            # Agrupar por estudiante+asignatura para calcular CF del área
+
+            def _valor_periodo(p, rp):
+                if p is not None and rp is not None:
+                    return max(p, rp)
+                return rp if rp is not None else p
+
             cf_por_area: Dict[tuple, List[float]] = {}
-            for eid, aid, fc in rows:
-                cf_por_area.setdefault((eid, aid), []).append(fc)
-            # CF del área = promedio de las competencias; el promedio del estudiante = promedio de CFs
-            for (eid, aid), vals in cf_por_area.items():
+            for (eid, aid, fc, p1, rp1, p2, rp2, p3, rp3, p4, rp4) in rows:
+                pares = [(p1, rp1), (p2, rp2), (p3, rp3), (p4, rp4)]
+                if periodo and periodo > 0:
+                    # Filtro por período: solo ese período de la competencia
+                    v = _valor_periodo(*pares[periodo - 1])
+                    final = v
+                else:
+                    if fc is not None:
+                        final = fc
+                    else:
+                        vals = [v for v in (_valor_periodo(p, rp) for p, rp in pares) if v is not None]
+                        final = (sum(vals) / len(vals)) if vals else None
+                if final is not None:
+                    cf_por_area.setdefault((eid, aid), []).append(final)
+
+            # CF del área = promedio de sus competencias
+            for (eid, _aid), vals in cf_por_area.items():
                 if vals:
-                    cf_area = sum(vals) / len(vals)
-                    notas_por_est.setdefault(eid, []).append(cf_area)
+                    notas_por_est.setdefault(eid, []).append(sum(vals) / len(vals))
         except Exception as e:
             logger.warning(f"Error cargando stats primaria: {e}")
 
@@ -888,6 +911,13 @@ def generar_tarjetas_pdf(db: Session, user, curso_id: int, periodo: int, simple:
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_CENTER, TA_LEFT
+
+    # v2.13.51: el corte de aprobación depende del NIVEL del curso
+    # (primaria 65 / secundaria 70). Antes se usaba 70 para todos, marcando
+    # como "Reprobado" a un estudiante de primaria con 67 (que aprobó).
+    _fila_nivel = db.query(Grado.nivel).join(Curso, Curso.grado_id == Grado.id).filter(
+        Curso.id == curso_id).first()
+    CORTE = umbral_de(_fila_nivel[0] if _fila_nivel else None)
     import io
 
     curso = db.get(Curso, curso_id)
@@ -971,17 +1001,17 @@ def generar_tarjetas_pdf(db: Session, user, curso_id: int, periodo: int, simple:
                     # Elegir nota base según opción
                     nota_base = p4 if usar_p4 else pc
                     # Si reprobó y tiene recuperación, usar RP
-                    nfinal = rp if (nota_base is not None and nota_base < 70 and rp is not None) else nota_base
+                    nfinal = rp if (nota_base is not None and nota_base < CORTE and rp is not None) else nota_base
                     lit = c.get_literal(nfinal) if nfinal else '-'
-                    est_str = 'Aprobado' if nfinal and nfinal >= 70 else 'Reprobado' if nfinal else '-'
+                    est_str = 'Aprobado' if nfinal and nfinal >= CORTE else 'Reprobado' if nfinal else '-'
                     if nfinal is not None: nf_list.append(nfinal)
                     row = [asig.nombre, _fv(nfinal), lit, est_str]
                 else:
                     row = [asig.nombre, '-', '-', '-']
                 tdata.append(row)
             prom = round(sum(nf_list) / len(nf_list), 1) if nf_list else 0
-            pl = 'A' if prom >= 90 else 'B' if prom >= 80 else 'C' if prom >= 70 else 'F'
-            tdata.append(['PROMEDIO GENERAL', str(prom), pl, 'Aprobado' if prom >= 70 else 'Reprobado'])
+            pl = 'A' if prom >= 90 else 'B' if prom >= 80 else 'C' if prom >= CORTE else 'F'
+            tdata.append(['PROMEDIO GENERAL', str(prom), pl, 'Aprobado' if prom >= CORTE else 'Reprobado'])
             cw = [3*inch, 1*inch, 0.8*inch, 1.2*inch]
             nota_col = 1
         else:
@@ -998,9 +1028,9 @@ def generar_tarjetas_pdf(db: Session, user, curso_id: int, periodo: int, simple:
                     p4 = getattr(c, f'p{periodo}_p4', None)
                     pc = getattr(c, pc_key, None)
                     rp = getattr(c, rp_key, None)
-                    nfinal = rp if (pc is not None and pc < 70 and rp is not None) else pc
+                    nfinal = rp if (pc is not None and pc < CORTE and rp is not None) else pc
                     lit = c.get_literal(nfinal) if nfinal else '-'
-                    est_str = 'Aprobado' if nfinal and nfinal >= 70 else 'Reprobado' if nfinal else '-'
+                    est_str = 'Aprobado' if nfinal and nfinal >= CORTE else 'Reprobado' if nfinal else '-'
                     if nfinal is not None: nf_list.append(nfinal)
                     # P4 column shows as "Promedio" — display p4 value or pc as the promedio
                     promedio_val = p4 if p4 is not None else pc
@@ -1009,8 +1039,8 @@ def generar_tarjetas_pdf(db: Session, user, curso_id: int, periodo: int, simple:
                     row = [asig.nombre[:22]] + ['-'] * 8
                 tdata.append(row)
             prom = round(sum(nf_list) / len(nf_list), 1) if nf_list else 0
-            pl = 'A' if prom >= 90 else 'B' if prom >= 80 else 'C' if prom >= 70 else 'F'
-            tdata.append(['PROMEDIO', '', '', '', '', str(prom), '', pl, 'Aprobado' if prom >= 70 else 'Reprobado'])
+            pl = 'A' if prom >= 90 else 'B' if prom >= 80 else 'C' if prom >= CORTE else 'F'
+            tdata.append(['PROMEDIO', '', '', '', '', str(prom), '', pl, 'Aprobado' if prom >= CORTE else 'Reprobado'])
             cw = [1.5*inch, 0.5*inch, 0.5*inch, 0.5*inch, 0.5*inch, 0.45*inch, 0.45*inch, 0.4*inch, 0.7*inch]
             nota_col = 5
         t = Table(tdata, colWidths=cw, repeatRows=1)
@@ -1031,7 +1061,7 @@ def generar_tarjetas_pdf(db: Session, user, curso_id: int, periodo: int, simple:
         for ri in range(1, len(tdata)):
             for ci in ([nota_col] if simple else [5, 6]):
                 try:
-                    if tdata[ri][ci] != '-' and float(tdata[ri][ci]) < 70:
+                    if tdata[ri][ci] != '-' and float(tdata[ri][ci]) < CORTE:
                         sc.append(('TEXTCOLOR', (ci, ri), (ci, ri), colors.red))
                         sc.append(('FONTNAME', (ci, ri), (ci, ri), 'Helvetica-Bold'))
                 except (ValueError, IndexError):
