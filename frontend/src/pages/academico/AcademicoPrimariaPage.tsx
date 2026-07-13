@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
-import { BookOpen, Backpack } from 'lucide-react';
-import { Button, Spinner } from '../../components/ui';
+import { BookOpen, Backpack, Download } from 'lucide-react';
+import { Button, Spinner, Alert } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
 import { EstudiantePrimData, Curso, Asignatura } from './primaria/tipos';
 import { TabNotasPorCompetencia } from './primaria/TabNotasPorCompetencia';
@@ -28,6 +28,37 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
   const [numCompetencias, setNumCompetencias] = useState(3);
   const [loading, setLoading] = useState(false);
   const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('competencia');
+  const [descargando, setDescargando] = useState(false);
+  const [mensaje, setMensaje] = useState<string | null>(null);
+
+  // Informes de Aprendizaje (boletín oficial de primaria) de todo el curso
+  const descargarBoletines = async () => {
+    setDescargando(true);
+    setMensaje(null);
+    try {
+      const res = await api.get(`/boletines-primaria/curso/${cursoId}/pdf`, { responseType: 'blob' });
+      if (res.data.type === 'application/json' || res.data.size < 300) {
+        const texto = await res.data.text();
+        try {
+          const j = JSON.parse(texto);
+          setMensaje(j.error || 'No se pudo generar el PDF');
+          return;
+        } catch { /* no era JSON */ }
+      }
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `Informes_Aprendizaje_${(curso?.nombre_completo || 'curso').replace(/ /g, '_')}.pdf`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setMensaje(e?.response?.data?.error || 'Error al descargar los Informes de Aprendizaje');
+    } finally {
+      setDescargando(false);
+    }
+  };
 
   useEffect(() => {
     if (cursoId && asignaturaId) cargar();
@@ -65,8 +96,21 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
             <span className="text-gray-400"> · Nivel primario · {numCompetencias} competencias · aprueba con 65</span>
           </p>
         </div>
-        <Button variant="secondary" onClick={onVolver}>Volver</Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            icon={<Download size={16} />}
+            loading={descargando}
+            onClick={descargarBoletines}
+            title="Informes de Aprendizaje de todo el curso"
+          >
+            Informes de Aprendizaje
+          </Button>
+          <Button variant="secondary" onClick={onVolver}>Volver</Button>
+        </div>
       </div>
+
+      {mensaje && <Alert variant="error" onClose={() => setMensaje(null)}>{mensaje}</Alert>}
 
       {/* Selector de modo de carga: Por Competencia / Por Período */}
       <div className="flex gap-2 bg-gray-100 p-1 rounded-lg w-fit">
