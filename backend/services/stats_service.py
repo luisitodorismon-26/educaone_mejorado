@@ -23,6 +23,20 @@ from services.cache_service import cache_get, cache_set, make_cache_key
 logger = logging.getLogger("educaone.stats")
 
 
+# ═════════════════════════════════════════════════════════════════
+# v2.13.49: cada nivel tiene su propio corte de aprobación (oficial MINERD).
+# Primaria aprueba con 65; secundaria con 70. Usar el corte equivocado hace
+# que un estudiante de primaria con 67 (aprobado) se cuente como reprobado.
+# ═════════════════════════════════════════════════════════════════
+UMBRAL_APROBACION = {'primaria': 65, 'secundaria': 70}
+UMBRAL_DEFAULT = 70
+
+
+def umbral_de(nivel: str | None) -> int:
+    """Corte de aprobación según el nivel del curso."""
+    return UMBRAL_APROBACION.get((nivel or '').lower(), UMBRAL_DEFAULT)
+
+
 def get_graficos(db: Session, user) -> dict:
     """
     Dashboard gráficos — calcula con Python puro para máxima compatibilidad.
@@ -268,7 +282,21 @@ def get_graficos(db: Session, user) -> dict:
     total_est = tenant_filter(db.query(func.count(Estudiante.id)), Estudiante, user).filter(Estudiante.activo == True).scalar() or 0
     
     con_notas = len(estudiante_notas)
-    aprobados = sum(1 for notas in estudiante_notas.values() if min(notas) >= 70)
+    # v2.13.49: el corte de aprobación depende del NIVEL de cada estudiante
+    # (primaria 65, secundaria 70). Antes se usaba 70 para todos, contando como
+    # reprobado a un estudiante de primaria con 67 (que en realidad aprobó).
+    nivel_por_est = {}
+    if estudiante_notas:
+        filas_nivel = db.query(Estudiante.id, Grado.nivel).join(
+            Curso, Estudiante.curso_id == Curso.id
+        ).join(Grado, Curso.grado_id == Grado.id).filter(
+            Estudiante.id.in_(list(estudiante_notas.keys()))
+        ).all()
+        nivel_por_est = {eid: niv for eid, niv in filas_nivel}
+    aprobados = sum(
+        1 for eid, notas in estudiante_notas.items()
+        if min(notas) >= umbral_de(nivel_por_est.get(eid))
+    )
     reprobados = con_notas - aprobados
     en_proceso = total_est - con_notas
 
@@ -375,13 +403,15 @@ def get_graficos(db: Session, user) -> dict:
             est_promedios.append({
                 'nombre': f'{est.nombre} {est.apellido}',
                 'curso': curso_nombre,
-                'promedio': prom
+                'promedio': prom,
+                'corte': umbral_de(nivel_por_est.get(est_id)),
             })
         
         est_promedios.sort(key=lambda x: x['promedio'], reverse=True)
         ranking_mejor = est_promedios[:5]
+        # "En peligro" = por debajo del corte DE SU NIVEL
         ranking_peligro = sorted(
-            [e for e in est_promedios if e['promedio'] < 70],
+            [e for e in est_promedios if e['promedio'] < e['corte']],
             key=lambda x: x['promedio']
         )[:10]
 
@@ -650,11 +680,13 @@ def get_stats_cursos(db: Session, user, periodo: int = 0, nivel: str = None) -> 
             continue
         proms = []
         apr = rep = 0
+        # v2.13.49: el corte depende del NIVEL de este curso (65 primaria / 70 secundaria)
+        corte = umbral_de(c.nivel)
         for eid in eids:
             ns = notas_por_est.get(eid, [])
             if ns:
                 proms.append(sum(ns) / len(ns))
-                if all(x >= 70 for x in ns):
+                if all(x >= corte for x in ns):
                     apr += 1
                 else:
                     rep += 1

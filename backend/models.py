@@ -894,6 +894,104 @@ class CalificacionPrimaria(Base):
 # Las evaluaciones extra (completiva/extra/especial) NO van acá — están en
 # EvaluacionExtraSecundaria porque son a nivel materia, no a nivel competencia.
 
+class RecuperacionPrimaria(Base):
+    """Recuperación de un ÁREA en primaria (v2.13.50) — CARRIL SEPARADO.
+
+    Reglas oficiales (Registro Nivel Primario, MINERD):
+      - Si la CF del área < 65 → Recuperación Final.
+      - Es COMPLEMENTARIA: los puntos se SUMAN a la CF del área.
+        Máximo = 100 - CF (para no pasar de 100). Aprueba con >= 65.
+      - Si tras la recuperación final sigue < 65:
+          * 4 o más áreas → repite el grado.
+          * 1 a 3 áreas   → repitente condicional → Recuperación Especial
+            (primeros 15 días del año siguiente).
+      - La Recuperación Especial también es complementaria sobre la CF.
+    """
+    __tablename__ = 'recuperaciones_primaria'
+    __table_args__ = (
+        UniqueConstraint('estudiante_id', 'asignatura_id', 'ano_escolar_id',
+                         name='uq_recuperacion_primaria'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'), nullable=False, index=True)
+    asignatura_id = Column(Integer, ForeignKey('asignaturas.id'), nullable=False, index=True)
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'))
+
+    cf_area = Column(Float)                  # CF del área (redondeada) al momento
+    puntos_final = Column(Float)             # puntos complementarios de la rec. final
+    recuperacion_final = Column(Float)       # cf_area + puntos_final
+    puntos_especial = Column(Float)          # puntos de la rec. especial
+    recuperacion_especial = Column(Float)    # cf_area + puntos_especial
+    nota_final = Column(Float)               # nota definitiva del área
+    condicion_final = Column(String(40))     # aprobado_recuperacion | reprobado | ...
+
+    estudiante = relationship('Estudiante')
+    asignatura = relationship('Asignatura')
+
+    MINIMO = 65
+
+    def maximo_puntos(self):
+        """Máximo de puntos complementarios permitidos (para no pasar de 100)."""
+        if self.cf_area is None:
+            return None
+        return 100 - round(self.cf_area)
+
+    def fase_pendiente(self):
+        """Qué fase falta cargar: 'final', 'especial' o None (resuelto)."""
+        if self.cf_area is None or self.cf_area >= self.MINIMO:
+            return None
+        if self.puntos_final is None:
+            return 'final'
+        if self.recuperacion_final is not None and self.recuperacion_final >= self.MINIMO:
+            return None
+        if self.puntos_especial is None:
+            return 'especial'
+        return None
+
+    def recalcular(self):
+        """Recalcula la cascada de primaria (suma complementaria, corte 65)."""
+        if self.cf_area is None:
+            self.nota_final = None
+            self.condicion_final = None
+            return
+
+        base = round(self.cf_area)
+
+        if base >= self.MINIMO:
+            self.nota_final = base
+            self.condicion_final = 'aprobado'
+            return
+
+        # Recuperación final
+        if self.puntos_final is not None:
+            self.recuperacion_final = base + self.puntos_final
+            if self.recuperacion_final >= self.MINIMO:
+                self.nota_final = self.recuperacion_final
+                self.condicion_final = 'aprobado_recuperacion'
+                return
+        else:
+            self.recuperacion_final = None
+            self.nota_final = base
+            self.condicion_final = 'recuperacion_pendiente'
+            return
+
+        # Recuperación especial
+        if self.puntos_especial is not None:
+            self.recuperacion_especial = base + self.puntos_especial
+            if self.recuperacion_especial >= self.MINIMO:
+                self.nota_final = self.recuperacion_especial
+                self.condicion_final = 'aprobado_especial'
+            else:
+                self.nota_final = self.recuperacion_especial
+                self.condicion_final = 'reprobado'
+        else:
+            self.recuperacion_especial = None
+            self.nota_final = self.recuperacion_final
+            self.condicion_final = 'especial_pendiente'
+
+
 class CalificacionSecundaria(Base):
     """Calificaciones secundaria v2.12 con estructura oficial MINERD por competencia."""
     __tablename__ = 'calificaciones_secundaria'

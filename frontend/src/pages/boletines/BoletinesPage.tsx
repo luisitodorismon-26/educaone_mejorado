@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, Fragment } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { FileText, Download, Printer, Search, Users, GraduationCap, Calendar } from 'lucide-react';
@@ -53,6 +53,35 @@ interface CalificacionBoletin {
   nota_final?: number | null;
   condicion_final?: string | null;
   evaluacion_extra?: EvExtraResumen | null;
+}
+
+// ─── Vista previa de PRIMARIA (3 competencias, corte 65) ───
+interface CompetenciaPrim {
+  numero: number;
+  p1: number | null; rp1: number | null;
+  p2: number | null; rp2: number | null;
+  p3: number | null; rp3: number | null;
+  p4: number | null; rp4: number | null;
+  final: number | null;
+}
+
+interface AreaPrimaria {
+  asignatura_id: number;
+  asignatura: string;
+  competencias: CompetenciaPrim[];
+  cf_area: number | null;
+  estado: string;
+  nota_final: number | null;
+}
+
+interface BoletinPrimaria {
+  nivel: 'primaria';
+  minimo_aprobatorio: number;
+  estudiante: { id: number; nombre: string; matricula: string; curso: string; no_lista: number | null };
+  areas: AreaPrimaria[];
+  promedio_general: number;
+  asistencia: { presentes: number; total: number; porcentaje: number };
+  condicion_final: { condicion: string; detalle: string } | null;
 }
 
 interface Boletin {
@@ -117,6 +146,7 @@ export const BoletinesPage = () => {
   };
   const [estudianteId, setEstudianteId] = useState<number | null>(null);
   const [boletin, setBoletin] = useState<Boletin | null>(null);
+  const [boletinPrim, setBoletinPrim] = useState<BoletinPrimaria | null>(null);
   const [colegio, setColegio] = useState<Colegio | null>(null);
   const [periodo, setPeriodo] = useState<number>(0);
   const [loading, setLoading] = useState(true);
@@ -175,17 +205,28 @@ export const BoletinesPage = () => {
     if (!estudianteId) return;
     setLoadingBoletin(true);
     setError(null);
+    setBoletin(null);
+    setBoletinPrim(null);
     try {
-      const res = await api.get(`/boletines/estudiante/${estudianteId}`);
-      if (res.data?.error) {
-        setError(res.data.error);
+      // v2.13.49: cada nivel tiene su propio boletín (primaria ≠ secundaria)
+      if (esPrimaria) {
+        const res = await api.get(`/boletines-primaria/estudiante/${estudianteId}`);
+        if (res.data?.error) {
+          setError(res.data.error);
+        } else {
+          setBoletinPrim({ ...res.data, areas: Array.isArray(res.data?.areas) ? res.data.areas : [] });
+        }
       } else {
-        // Blindaje: garantizar que asignaturas siempre sea un array
-        setBoletin({ ...res.data, asignaturas: Array.isArray(res.data?.asignaturas) ? res.data.asignaturas : [] });
+        const res = await api.get(`/boletines/estudiante/${estudianteId}`);
+        if (res.data?.error) {
+          setError(res.data.error);
+        } else {
+          setBoletin({ ...res.data, asignaturas: Array.isArray(res.data?.asignaturas) ? res.data.asignaturas : [] });
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error cargando boletín:', err);
-      setError('Error al cargar el boletín');
+      setError(err?.response?.data?.error || 'Error al cargar el boletín');
     } finally {
       setLoadingBoletin(false);
     }
@@ -259,11 +300,11 @@ export const BoletinesPage = () => {
                   icon={<Download size={16} />}
                   onClick={() => descargarPDF(
                     `/boletines-primaria/curso/${cursoId}/pdf`,
-                    `Informes_Aprendizaje_${(cursoActual?.nombre_completo || 'Curso').replace(/ /g, '_')}.pdf`,
-                    'Error al generar los Informes de Aprendizaje del curso'
+                    `Boletines_${(cursoActual?.nombre_completo || 'Curso').replace(/ /g, '_')}.pdf`,
+                    'Error al generar los boletines del curso'
                   )}
                 >
-                  🎒 Informes de Aprendizaje (Curso)
+                  🎒 Boletines del Curso (Primaria)
                 </Button>
               ) : (
                 <>
@@ -296,48 +337,185 @@ export const BoletinesPage = () => {
         )}
       </div>
 
+      {/* ═══ VISTA PREVIA — PRIMARIA (3 competencias, corte 65) ═══ */}
+      {boletinPrim && (
+        <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
+          <div className="p-4 bg-gray-50 border-b flex justify-end gap-2 print:hidden">
+            <Button onClick={() => window.print()} variant="secondary" icon={<Printer size={18} />}>Imprimir</Button>
+            <Button
+              variant="primary"
+              icon={<Download size={16} />}
+              onClick={() => descargarPDF(
+                `/boletines-primaria/estudiante/${estudianteId}/pdf`,
+                `Boletin_${(boletinPrim.estudiante.nombre || 'estudiante').replace(/ /g, '_')}.pdf`,
+                'Error al generar el boletín de primaria'
+              )}
+            >
+              🎒 Boletín (Informe de Aprendizaje)
+            </Button>
+          </div>
+
+          <div className="p-6 print:p-4">
+            <div className="text-center mb-4">
+              <p className="text-xs text-gray-500">Dirección General de Educación Primaria</p>
+              <h1 className="text-lg font-bold text-blue-800 mt-2">
+                BOLETÍN — INFORME DE APRENDIZAJE
+                <span className="ml-2 align-middle inline-flex items-center gap-1 bg-blue-100 text-blue-700 text-[10px] font-semibold px-2 py-0.5 rounded-full">
+                  🎒 PRIMARIA
+                </span>
+              </h1>
+              <p className="text-sm text-gray-600 font-medium">{colegio?.nombre || 'Centro Educativo'}</p>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4 p-3 bg-blue-50 rounded-lg border border-blue-200 text-sm">
+              <div><p className="text-xs text-blue-600">Estudiante</p><p className="font-semibold">{boletinPrim.estudiante.nombre}</p></div>
+              <div><p className="text-xs text-blue-600">ID (SIGERD)</p><p className="font-semibold">{boletinPrim.estudiante.matricula || 'N/A'}</p></div>
+              <div><p className="text-xs text-blue-600">Curso</p><p className="font-semibold">{boletinPrim.estudiante.curso}</p></div>
+              <div><p className="text-xs text-blue-600">No. de orden</p><p className="font-semibold">{boletinPrim.estudiante.no_lista ?? '—'}</p></div>
+            </div>
+
+            {/* Tabla: 3 competencias × (P1-P4 con RP) + CF competencia + CF área */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs border-collapse">
+                <thead>
+                  <tr className="bg-blue-900 text-white">
+                    <th className="border border-blue-800 p-1.5 text-left" rowSpan={2}>Áreas Curriculares</th>
+                    {[1, 2, 3].map(n => (
+                      <th key={n} className="border border-blue-800 p-1 text-center" colSpan={5}>
+                        C{n} · {['Comunicativa', 'Pensamiento Lógico', 'Ética y Ciudadana'][n - 1]}
+                      </th>
+                    ))}
+                    <th className="border border-blue-800 p-1 text-center bg-yellow-700" rowSpan={2}>C.F.<br />del área</th>
+                    <th className="border border-blue-800 p-1 text-center bg-green-800" rowSpan={2}>Situación</th>
+                  </tr>
+                  <tr className="bg-blue-800 text-white text-[10px]">
+                    {[1, 2, 3].map(n => (
+                      <Fragment key={n}>
+                        <th className="border border-blue-700 p-1">P1</th>
+                        <th className="border border-blue-700 p-1">P2</th>
+                        <th className="border border-blue-700 p-1">P3</th>
+                        <th className="border border-blue-700 p-1">P4</th>
+                        <th className="border border-blue-700 p-1 bg-amber-600">CF</th>
+                      </Fragment>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {(boletinPrim.areas || []).map((area, idx) => {
+                    const min = boletinPrim.minimo_aprobatorio;
+                    const compPorNum = (n: number) => area.competencias.find(c => c.numero === n);
+                    const valorPeriodo = (c: CompetenciaPrim | undefined, p: number): number | null => {
+                      if (!c) return null;
+                      const pv = (c as any)[`p${p}`] as number | null;
+                      const rv = (c as any)[`rp${p}`] as number | null;
+                      if (pv != null && rv != null) return Math.max(pv, rv);
+                      return rv ?? pv;
+                    };
+                    const situacion = () => {
+                      if (area.cf_area === null) return <span className="text-gray-400">—</span>;
+                      if (area.estado === 'aprobado') return <span className="font-bold text-green-700">A ({area.cf_area})</span>;
+                      if (area.estado === 'recuperacion_pendiente') return <span className="text-amber-700 font-medium text-[10px]">RECUPERACIÓN</span>;
+                      if (area.estado === 'aprobado_recuperacion') return <span className="font-bold text-green-700">A ({area.nota_final})</span>;
+                      return <span className="font-bold text-red-600">R ({area.nota_final ?? area.cf_area})</span>;
+                    };
+                    return (
+                      <tr key={area.asignatura_id || idx} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                        <td className="border border-gray-300 p-1.5 font-medium bg-blue-50">{area.asignatura}</td>
+                        {[1, 2, 3].map(n => {
+                          const comp = compPorNum(n);
+                          return (
+                            <Fragment key={n}>
+                              {[1, 2, 3, 4].map(p => {
+                                const v = valorPeriodo(comp, p);
+                                return (
+                                  <td key={p} className={`border border-gray-300 p-1 text-center ${v == null ? 'text-gray-300' : v >= min ? 'text-gray-800' : 'text-red-600'}`}>
+                                    {v != null ? Math.round(v) : '—'}
+                                  </td>
+                                );
+                              })}
+                              <td className="border border-gray-300 p-1 text-center bg-amber-50 font-bold">
+                                {comp?.final != null ? Math.round(comp.final) : '—'}
+                              </td>
+                            </Fragment>
+                          );
+                        })}
+                        <td className={`border border-gray-300 p-1 text-center font-bold bg-yellow-50 ${area.cf_area == null ? 'text-gray-300' : area.cf_area >= min ? 'text-green-700' : 'text-red-600'}`}>
+                          {area.cf_area ?? '—'}
+                        </td>
+                        <td className="border border-gray-300 p-1 text-center bg-green-50 whitespace-nowrap">{situacion()}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <p className="text-[11px] text-gray-500 mt-2">
+              Cada período muestra el mayor entre P y su recuperación (RP). CF de competencia = promedio de los períodos evaluados.
+              CF del área = promedio de las {boletinPrim.areas[0]?.competencias.length || 3} competencias. <strong>Aprueba con {boletinPrim.minimo_aprobatorio}</strong>.
+            </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4">
+              <div className="bg-blue-50 rounded-lg p-3 text-center border border-blue-200">
+                <p className="text-xs uppercase text-blue-600">Promedio General</p>
+                <p className="text-xl font-bold text-blue-700">{boletinPrim.promedio_general || '—'}</p>
+              </div>
+              <div className="bg-green-50 rounded-lg p-3 text-center border border-green-200">
+                <p className="text-xs uppercase text-green-700">Asistencia</p>
+                <p className="text-xl font-bold text-green-600">{boletinPrim.asistencia.porcentaje}%</p>
+              </div>
+              {(() => {
+                const cond = boletinPrim.condicion_final;
+                const c = cond?.condicion || '';
+                const clase = c === 'promovido' ? 'bg-green-50 border-green-200 text-green-700'
+                  : c === 'repite' ? 'bg-red-50 border-red-200 text-red-700'
+                  : c === 'repitente_condicional' ? 'bg-orange-50 border-orange-200 text-orange-700'
+                  : c === 'en_proceso' ? 'bg-amber-50 border-amber-200 text-amber-700'
+                  : 'bg-gray-50 border-gray-200 text-gray-500';
+                const texto = c === 'promovido' ? '✓ PROMOVIDO/A'
+                  : c === 'repite' ? '✗ REPITE EL GRADO'
+                  : c === 'repitente_condicional' ? '⚠ REPITENTE CONDICIONAL'
+                  : c === 'en_proceso' ? '⏳ RECUPERACIÓN EN CURSO'
+                  : '— SIN NOTAS';
+                return (
+                  <div className={`rounded-lg p-3 text-center border ${clase}`}>
+                    <p className="text-xs uppercase">Condición Final</p>
+                    <p className="text-sm font-bold">{texto}</p>
+                    {cond?.detalle && <p className="text-[10px] mt-0.5 opacity-80">{cond.detalle}</p>}
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
       {boletin && (
         <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
           <div className="p-4 bg-gray-50 border-b flex justify-end gap-2 print:hidden">
             <Button onClick={() => window.print()} variant="secondary" icon={<Printer size={18} />}>Imprimir</Button>
-            {esPrimaria ? (
               <Button
-                variant="primary"
+                variant="secondary"
                 icon={<Download size={16} />}
                 onClick={() => descargarPDF(
-                  `/boletines-primaria/estudiante/${estudianteId}/pdf`,
-                  `Informe_Aprendizaje_${(boletin.estudiante.nombre || 'estudiante').replace(/ /g, '_')}.pdf`,
-                  'Error al generar el Informe de Aprendizaje'
+                  `/boletines/estudiante/${estudianteId}/pdf`,
+                  `Boletin_${(boletin.estudiante.nombre || 'estudiante').replace(/ /g, '_')}.pdf`,
+                  'Error al generar el boletín para padres'
                 )}
               >
-                🎒 Informe de Aprendizaje
+                📥 Boletín para Padres
               </Button>
-            ) : (
-              <>
-                <Button
-                  variant="secondary"
-                  icon={<Download size={16} />}
-                  onClick={() => descargarPDF(
-                    `/boletines/estudiante/${estudianteId}/pdf`,
-                    `Boletin_${(boletin.estudiante.nombre || 'estudiante').replace(/ /g, '_')}.pdf`,
-                    'Error al generar el boletín para padres'
-                  )}
-                >
-                  📥 Boletín para Padres
-                </Button>
-                <Button
-                  variant="secondary"
-                  icon={<Download size={16} />}
-                  onClick={() => descargarPDF(
-                    `/boletines/estudiante/${estudianteId}/pdf-minerd-v2`,
-                    `Boletin_MINERD_${(boletin.estudiante.nombre || 'estudiante').replace(/ /g, '_')}.pdf`,
-                    'Error al generar el boletín MINERD'
-                  )}
-                >
-                  📄 Boletín MINERD Oficial
-                </Button>
-              </>
-            )}
+              <Button
+                variant="secondary"
+                icon={<Download size={16} />}
+                onClick={() => descargarPDF(
+                  `/boletines/estudiante/${estudianteId}/pdf-minerd-v2`,
+                  `Boletin_MINERD_${(boletin.estudiante.nombre || 'estudiante').replace(/ /g, '_')}.pdf`,
+                  'Error al generar el boletín MINERD'
+                )}
+              >
+                📄 Boletín MINERD Oficial
+              </Button>
             <Button 
               onClick={() => {
                 const est = estudiantes.find(e => e.id === estudianteId);

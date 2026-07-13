@@ -51,7 +51,7 @@ from models import (
     NotaPersonal, EvaluacionProfesor, ConfigEvalInterna, EvalInternaEstudiante,
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
     HistorialComunicacionPadres, IndicadorLogro, ItemCompletivo, Notificacion,
-    AreaCurricular, CalificacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria, init_db
+    AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -7757,6 +7757,289 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config):
         docente_nombre=docente_nombre,
         asistencias_por_periodo=asistencias,
     )
+
+
+# ═════════════════════════════════════════════════════════════════
+# RECUPERACIONES DE PRIMARIA (v2.13.50) — CARRIL SEPARADO
+# Corte 65. Suma complementaria. Final → (si sigue <65) Especial.
+# ═════════════════════════════════════════════════════════════════
+
+def _sincronizar_recuperaciones_primaria(db, current_user, ano):
+    """Crea/actualiza las fichas de recuperación de las áreas con CF < 65."""
+    from calculo_primaria import cf_area as calc_cf_area, MINIMO_APROBATORIO_PRIMARIA
+
+    califs = tenant_filter(
+        db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
+    ).filter(CalificacionPrimaria.ano_escolar_id == ano.id).all()
+    if not califs:
+        return
+
+    grupos = {}
+    for c in califs:
+        grupos.setdefault((c.estudiante_id, c.asignatura_id), []).append(c)
+
+    existentes = {
+        (r.estudiante_id, r.asignatura_id): r
+        for r in tenant_filter(db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user)
+        .filter_by(ano_escolar_id=ano.id).all()
+    }
+
+    try:
+        for (est_id, asig_id), comps in grupos.items():
+            _, cf_red = calc_cf_area(comps)
+            if cf_red is None:
+                continue
+            ficha = existentes.get((est_id, asig_id))
+            if cf_red >= MINIMO_APROBATORIO_PRIMARIA:
+                continue  # aprobó: no necesita recuperación
+            if not ficha:
+                ficha = RecuperacionPrimaria(
+                    colegio_id=current_user.colegio_id,
+                    estudiante_id=est_id, asignatura_id=asig_id,
+                    ano_escolar_id=ano.id,
+                )
+                db.add(ficha)
+                existentes[(est_id, asig_id)] = ficha
+            ficha.cf_area = cf_red
+            ficha.recalcular()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Sincronización de recuperaciones primaria falló: {e}")
+
+
+@app.get("/api/recuperaciones-primaria/pendientes")
+async def get_recuperaciones_primaria_pendientes(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria', 'profesor'))
+):
+    """Áreas de primaria con CF < 65 que requieren recuperación."""
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
+
+    _sincronizar_recuperaciones_primaria(db, current_user, ano)
+
+    curso_id = request.query_params.get('curso_id')
+    q = tenant_filter(db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user).filter_by(
+        ano_escolar_id=ano.id)
+    fichas = q.all()
+    if not fichas:
+        return {'pendientes': [], 'resueltas': [], 'minimo': 65}
+
+    est_ids = {f.estudiante_id for f in fichas}
+    ests = {
+        e.id: e for e in tenant_filter(db.query(Estudiante), Estudiante, current_user)
+        .filter(Estudiante.id.in_(est_ids)).all()
+    }
+    asigs = {
+        a.id: a.nombre for a in tenant_filter(db.query(Asignatura), Asignatura, current_user)
+        .filter(Asignatura.id.in_({f.asignatura_id for f in fichas})).all()
+    }
+
+    pendientes, resueltas = [], []
+    for f in fichas:
+        est = ests.get(f.estudiante_id)
+        if not est or (curso_id and str(est.curso_id) != str(curso_id)):
+            continue
+        item = {
+            'estudiante_id': f.estudiante_id,
+            'estudiante_nombre': est.nombre_completo,
+            'curso': est.curso.nombre_completo if est.curso else '',
+            'asignatura_id': f.asignatura_id,
+            'asignatura_nombre': asigs.get(f.asignatura_id, ''),
+            'cf_area': f.cf_area,
+            'maximo_puntos': f.maximo_puntos(),
+            'puntos_final': f.puntos_final,
+            'recuperacion_final': f.recuperacion_final,
+            'puntos_especial': f.puntos_especial,
+            'recuperacion_especial': f.recuperacion_especial,
+            'nota_final': f.nota_final,
+            'condicion_final': f.condicion_final,
+            'fase_pendiente': f.fase_pendiente(),
+        }
+        (pendientes if f.fase_pendiente() else resueltas).append(item)
+
+    pendientes.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
+    resueltas.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
+    return {'pendientes': pendientes, 'resueltas': resueltas, 'minimo': 65}
+
+
+@app.post("/api/recuperaciones-primaria")
+async def guardar_recuperacion_primaria(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('profesor'))
+):
+    """Carga los puntos de una recuperación de primaria (solo el profesor)."""
+    data = await request.json()
+    est_id = data.get('estudiante_id')
+    asig_id = data.get('asignatura_id')
+    tipo = data.get('tipo')          # 'final' | 'especial'
+    puntos = data.get('puntos')
+
+    if not all([est_id, asig_id, tipo]) or puntos is None:
+        return JSONResponse({'error': 'Faltan datos (estudiante, asignatura, tipo, puntos)'}, status_code=400)
+    if tipo not in ('final', 'especial'):
+        return JSONResponse({'error': "El tipo debe ser 'final' o 'especial'"}, status_code=400)
+
+    try:
+        puntos_f = float(puntos)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'Los puntos deben ser un número'}, status_code=400)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
+
+    ficha = tenant_filter(db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user).filter_by(
+        estudiante_id=est_id, asignatura_id=asig_id, ano_escolar_id=ano.id).first()
+    if not ficha:
+        return JSONResponse(
+            {'error': 'Esta área no tiene recuperación pendiente (su CF es 65 o más).'},
+            status_code=400)
+
+    # La recuperación es COMPLEMENTARIA: los puntos se suman a la CF del área.
+    maximo = ficha.maximo_puntos()
+    if puntos_f < 0 or (maximo is not None and puntos_f > maximo):
+        return JSONResponse({
+            'error': (f'Puntos inválidos: la recuperación es COMPLEMENTARIA y se SUMA a la CF '
+                      f'del área ({int(ficha.cf_area)}). Máximo permitido: {int(maximo)} puntos '
+                      f'(para que la nota no pase de 100). Se aprueba con 65.')
+        }, status_code=400)
+
+    fase = ficha.fase_pendiente()
+    # Permitir corregir la última fase cargada
+    if tipo == 'final':
+        if fase not in ('final', None) and ficha.puntos_final is None:
+            return JSONResponse({'error': f'Este área tiene la fase {fase} pendiente.'}, status_code=400)
+        ficha.puntos_final = puntos_f
+        ficha.puntos_especial = None  # corregir la final limpia la especial
+    else:  # especial
+        if ficha.puntos_final is None:
+            return JSONResponse(
+                {'error': 'No se puede cargar la recuperación especial sin la recuperación final.'},
+                status_code=400)
+        if ficha.recuperacion_final is not None and ficha.recuperacion_final >= 65:
+            return JSONResponse(
+                {'error': 'Esta área ya aprobó en la recuperación final.'}, status_code=400)
+        ficha.puntos_especial = puntos_f
+
+    ficha.recalcular()
+    db.commit()
+
+    return {
+        'message': f'Recuperación {tipo} registrada',
+        'nota_final': ficha.nota_final,
+        'condicion_final': ficha.condicion_final,
+        'aprobado': (ficha.nota_final or 0) >= 65,
+    }
+
+
+@app.get("/api/boletines-primaria/estudiante/{id}")
+async def boletin_primaria_estudiante_json(
+    id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user)
+):
+    """Vista previa del boletín de PRIMARIA (3 competencias, corte 65).
+
+    Carril separado del JSON de secundaria: devuelve por área las 3
+    competencias con P1-P4/RP1-RP4, su CF, la CF del área y la situación.
+    """
+    from calculo_primaria import (cf_area as calc_cf_area, situacion_area,
+                                  condicion_final_estudiante,
+                                  MINIMO_APROBATORIO_PRIMARIA)
+
+    estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    curso = estudiante.curso
+    if not curso:
+        return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
+    if _es_curso_secundaria(db, curso.id):
+        return JSONResponse({'error': 'Este estudiante es de secundaria.'}, status_code=400)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+
+    califs = tenant_filter(
+        db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
+    ).filter(
+        CalificacionPrimaria.estudiante_id == id,
+        CalificacionPrimaria.ano_escolar_id == ano.id,
+    ).all()
+
+    asig_ids = {c.asignatura_id for c in califs}
+    asigs = {
+        a.id: a.nombre
+        for a in tenant_filter(db.query(Asignatura), Asignatura, current_user)
+        .filter(Asignatura.id.in_(asig_ids)).all()
+    } if asig_ids else {}
+
+    por_asig = {}
+    for c in califs:
+        por_asig.setdefault(c.asignatura_id, {})[c.competencia_numero] = c
+
+    areas, situaciones = [], []
+    for asig_id, comps in sorted(por_asig.items()):
+        nombre = asigs.get(asig_id)
+        if not nombre:
+            continue
+        _, cf_red = calc_cf_area(list(comps.values()))
+        sit = situacion_area(cf_red)
+        situaciones.append(sit)
+
+        detalle = []
+        for num in sorted(comps.keys()):
+            c = comps[num]
+            detalle.append({
+                'numero': num,
+                'p1': c.p1, 'rp1': c.rp1,
+                'p2': c.p2, 'rp2': c.rp2,
+                'p3': c.p3, 'rp3': c.rp3,
+                'p4': c.p4, 'rp4': c.rp4,
+                'final': c.calcular_final(),
+            })
+
+        areas.append({
+            'asignatura_id': asig_id,
+            'asignatura': nombre,
+            'competencias': detalle,
+            'cf_area': cf_red,
+            'estado': sit['estado'],
+            'nota_final': sit['nota_final'],
+        })
+
+    condicion = condicion_final_estudiante(situaciones) if situaciones else None
+    asistencia = _construir_asistencias_boletin(db, id, current_user, ano)
+    total_pres = sum((a or {}).get('presentes', 0) for a in (asistencia or {}).values())
+    total_aus = sum((a or {}).get('ausentes', 0) for a in (asistencia or {}).values())
+    total_dias = total_pres + total_aus
+
+    cfs = [a['cf_area'] for a in areas if a['cf_area'] is not None]
+
+    return {
+        'nivel': 'primaria',
+        'minimo_aprobatorio': MINIMO_APROBATORIO_PRIMARIA,
+        'estudiante': {
+            'id': estudiante.id,
+            'nombre': estudiante.nombre_completo,
+            'matricula': estudiante.matricula or '',
+            'curso': curso.nombre_completo if curso else '',
+            'no_lista': estudiante.no_lista,
+        },
+        'areas': areas,
+        'promedio_general': round(sum(cfs) / len(cfs), 1) if cfs else 0,
+        'asistencia': {
+            'presentes': total_pres,
+            'total': total_dias,
+            'porcentaje': round(total_pres / total_dias * 100) if total_dias else 0,
+        },
+        'condicion_final': condicion,
+    }
 
 
 @app.get("/api/boletines-primaria/estudiante/{id}/pdf")

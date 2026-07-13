@@ -1,0 +1,1 @@
+export { RecuperacionesPrimariaPage } from './RecuperacionesPrimariaPage';
