@@ -75,6 +75,19 @@ CF_AREA_X = 736.7      # Calificación final del área
 REC_FINAL_X = 760.1    # Calificación recuperación final
 REC_ESPECIAL_X = 783.5 # Calificación recuperación especial
 
+# ─── 1ro y 2do (SIN RP): columnas más anchas, posiciones distintas ───
+# Extraídas de la plantilla oficial: 3 competencias × 4 períodos (sin RP),
+# columnas finales sin "recuperación especial".
+COMP_X_SIN_RP = {
+    1: {'p1': 211.9, 'p2': 249.1, 'p3': 286.4, 'p4': 323.5},
+    2: {'p1': 361.2, 'p2': 398.3, 'p3': 435.7, 'p4': 472.8},
+    3: {'p1': 510.5, 'p2': 547.6, 'p3': 584.9, 'p4': 622.1},
+}
+CF_COMP_X_SIN_RP = {1: 656.5, 2: 686.9, 3: 717.4}
+CF_AREA_X_SIN_RP = 748.4
+REC_FINAL_X_SIN_RP = 779.0
+# (1ro y 2do no tienen columna de recuperación especial)
+
 # Filas de áreas (centro vertical de cada fila; 8 filas × 27pt)
 FILA_ALTO = 27.0
 FILAS_Y = {
@@ -353,6 +366,15 @@ def _dibujar_tabla(c: canvas.Canvas, areas_data, grado_nombre, asistencias_por_p
     tiene_rp = _grado_tiene_rp(grado_nombre)
     filas = FILAS_Y if _grado_tiene_ingles(grado_nombre) else FILAS_Y_SIN_INGLES
 
+    # v2.13.52: 1ro y 2do (sin RP) tienen columnas más anchas y en otras
+    # posiciones. Se elige el juego de coordenadas correcto según el grado.
+    if tiene_rp:
+        comp_x, cf_comp_x = COMP_X, CF_COMP_X
+        cf_area_x, rec_final_x, rec_especial_x = CF_AREA_X, REC_FINAL_X, REC_ESPECIAL_X
+    else:
+        comp_x, cf_comp_x = COMP_X_SIN_RP, CF_COMP_X_SIN_RP
+        cf_area_x, rec_final_x, rec_especial_x = CF_AREA_X_SIN_RP, REC_FINAL_X_SIN_RP, None
+
     c.setFont("Helvetica", 7.5)
     c.setFillColorRGB(0, 0, 0)
 
@@ -367,7 +389,7 @@ def _dibujar_tabla(c: canvas.Canvas, areas_data, grado_nombre, asistencias_por_p
             comp = comps.get(num)
             if comp is None:
                 continue
-            cols = COMP_X[num]
+            cols = comp_x[num]
             for per in (1, 2, 3, 4):
                 # Período
                 p_val = getattr(comp, f'p{per}', None)
@@ -388,25 +410,25 @@ def _dibujar_tabla(c: canvas.Canvas, areas_data, grado_nombre, asistencias_por_p
                     final_comp = None
             if final_comp is not None:
                 c.setFont("Helvetica-Bold", 7.5)
-                c.drawCentredString(CF_COMP_X[num], y_row, _fmt(final_comp))
+                c.drawCentredString(cf_comp_x[num], y_row, _fmt(final_comp))
                 c.setFont("Helvetica", 7.5)
 
         # Calificación final del área
         cf_area = data.get('cf_area')
         if cf_area is not None:
             c.setFont("Helvetica-Bold", 8)
-            c.drawCentredString(CF_AREA_X, y_row, _fmt(cf_area))
+            c.drawCentredString(cf_area_x, y_row, _fmt(cf_area))
             c.setFont("Helvetica", 7.5)
 
         # Recuperación final
         rec_f = data.get('recuperacion_final')
         if rec_f is not None:
-            c.drawCentredString(REC_FINAL_X, y_row, _fmt(rec_f))
+            c.drawCentredString(rec_final_x, y_row, _fmt(rec_f))
 
         # Recuperación especial (no existe en 1ro/2do)
         rec_e = data.get('recuperacion_especial')
-        if rec_e is not None and tiene_rp:
-            c.drawCentredString(REC_ESPECIAL_X, y_row, _fmt(rec_e))
+        if rec_e is not None and rec_especial_x is not None:
+            c.drawCentredString(rec_especial_x, y_row, _fmt(rec_e))
 
     # Resumen de asistencia por período
     if asistencias_por_periodo:
