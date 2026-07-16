@@ -1301,6 +1301,36 @@ class Asistencia(Base):
     curso = relationship('Curso', backref='asistencias')
     asignatura = relationship('Asignatura', backref='asistencias')
 
+
+class AlertaAtendida(Base):
+    """v2.14: registro de alertas del dashboard atendidas por dirección.
+
+    Cada alerta "atendible" (hoy: inasistencia semanal de un estudiante) se
+    identifica con una `clave` única del caso, ej:
+        'inasistencia_semana:{estudiante_id}:{año}-W{semana}'
+    Al atenderla, dirección puede dejar una nota de seguimiento ("se llamó a
+    la madre, vuelve el lunes"). El GET /dashboard/alertas excluye las claves
+    ya atendidas. Si el caso se repite otra semana, la clave cambia y la
+    alerta reaparece (no se entierra un problema recurrente).
+
+    Tabla ADITIVA: no modifica ninguna tabla existente. create_all() la crea
+    automáticamente al arrancar.
+    """
+    __tablename__ = 'alertas_atendidas'
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
+    tipo = Column(String(50), nullable=False, index=True)      # ej: 'inasistencia_semana'
+    clave = Column(String(120), nullable=False, index=True)    # identidad única del caso
+    nota = Column(String(300))                                 # seguimiento opcional
+    atendida_por = Column(Integer, ForeignKey('usuarios.id'))
+    fecha = Column(DateTime, default=_now_dr)
+
+    usuario = relationship('Usuario', foreign_keys=[atendida_por])
+
+    __table_args__ = (
+        Index('ix_alerta_atendida_colegio_clave', 'colegio_id', 'clave'),
+    )
+
 # ============== REPORTES Y PSICOLOGÍA ==============
 
 class ReporteConducta(Base):

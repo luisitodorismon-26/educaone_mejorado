@@ -368,6 +368,67 @@ def get_graficos(db: Session, user) -> dict:
     hoy_total = total_est  # total de activos = denominador
     hoy_porcentaje = round(hoy_pr / hoy_total * 100, 1) if hoy_total > 0 else 0
 
+    # 3c. v2.14: Asistencia HOY desglosada POR CURSO.
+    # Cada curso es diferente — el snapshot global mezcla cursos que pasaron
+    # lista con cursos que no, y el "% de asistencia" resultante no es
+    # accionable. Aquí cada curso reporta sus propios números, y los cursos
+    # sin NINGUNA marca hoy se señalan con registrado=False (el frontend los
+    # pinta como "Sin registrar" en vez de inflar un 'No reg.' global).
+    q_cursos = db.query(Curso).filter(Curso.activo == True)
+    if cid:
+        q_cursos = q_cursos.filter(Curso.colegio_id == cid)
+    cursos_activos = q_cursos.all()
+
+    q_est_curso = db.query(Estudiante.id, Estudiante.curso_id).filter(Estudiante.activo == True)
+    if cid:
+        q_est_curso = q_est_curso.filter(Estudiante.colegio_id == cid)
+    est_curso_map: Dict[int, int] = {}
+    matricula_curso: Dict[int, int] = defaultdict(int)
+    for est_id, curso_id_row in q_est_curso.all():
+        if curso_id_row:
+            est_curso_map[est_id] = curso_id_row
+            matricula_curso[curso_id_row] += 1
+
+    # Estado del día por curso, reusando dias_est (ya agrupado est+día del mes)
+    curso_hoy: Dict[int, Dict[str, int]] = defaultdict(lambda: {'presentes': 0, 'ausentes': 0, 'tardanzas': 0, 'excusas': 0, 'marcados': 0})
+    for (est_id, fecha), estados in dias_est.items():
+        if fecha != hoy:
+            continue
+        c_id = est_curso_map.get(est_id)
+        if not c_id:
+            continue
+        d = curso_hoy[c_id]
+        d['marcados'] += 1
+        if 'presente' in estados:
+            d['presentes'] += 1
+        elif 'tardanza' in estados:
+            d['tardanzas'] += 1
+        elif 'excusa' in estados:
+            d['excusas'] += 1
+        else:
+            d['ausentes'] += 1
+
+    asistencia_hoy_por_curso = []
+    for c in cursos_activos:
+        total_curso = matricula_curso.get(c.id, 0)
+        if total_curso == 0:
+            continue  # cursos sin matrícula no aportan al panel
+        d = curso_hoy.get(c.id, {'presentes': 0, 'ausentes': 0, 'tardanzas': 0, 'excusas': 0, 'marcados': 0})
+        registrado = d['marcados'] > 0
+        asistencia_hoy_por_curso.append({
+            'curso_id': c.id,
+            'curso': c.nombre_completo,
+            'total': total_curso,
+            'presentes': d['presentes'],
+            'ausentes': d['ausentes'],
+            'tardanzas': d['tardanzas'],
+            'excusas': d['excusas'],
+            'sin_marca': max(0, total_curso - d['marcados']),
+            'registrado': registrado,
+            'porcentaje': round(d['presentes'] / total_curso * 100, 1) if registrado else 0,
+        })
+    asistencia_hoy_por_curso.sort(key=lambda x: x['curso'])
+
     # 4. Asistencia por materia — esto SÍ cuenta por materia (es el detalle)
     q_mat = (
         db.query(Asignatura.nombre, Asistencia.estado, func.count(Asistencia.id))
@@ -446,6 +507,9 @@ def get_graficos(db: Session, user) -> dict:
             'total_estudiantes': total_est,
             'porcentaje_asistencia': hoy_porcentaje,
         },
+        # v2.14: desglose por curso (cada curso reporta sus propios números;
+        # los cursos sin marca hoy vienen con registrado=False)
+        'asistencia_hoy_por_curso': asistencia_hoy_por_curso,
         'asistencia_por_materia': [
             {
                 'asignatura': n, 'presentes': d['presentes'], 'ausentes': d['ausentes'],

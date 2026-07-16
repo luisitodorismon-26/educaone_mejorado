@@ -51,7 +51,8 @@ from models import (
     NotaPersonal, EvaluacionProfesor, ConfigEvalInterna, EvalInternaEstudiante,
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
     HistorialComunicacionPadres, IndicadorLogro, ItemCompletivo, Notificacion,
-    AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria, init_db
+    AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
+    AlertaAtendida, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -4882,86 +4883,118 @@ async def get_dashboard_alertas(db: Session = Depends(get_db), current_user: Usu
     alertas = []
     
     # ─────────────────────────────────────────────────────────────────
-    # ALERTA: estudiantes con 3+ ausencias consecutivas (solo direccion/coordinador)
-    # Detecta estudiantes que tienen al menos 3 días LECTIVOS seguidos marcados
-    # como ausentes. Una ausencia "del día" es: el estudiante no tiene NINGUNA
-    # marca de presente o tardanza ese día, pero sí tiene marca de ausente
-    # (en al menos una asignatura).
+    # ALERTA v2.14: inasistencia semanal (solo direccion/coordinador)
+    # Un estudiante con N+ días de ausencia en la SEMANA EN CURSO (lunes→hoy)
+    # genera UNA alerta individual "atendible": dirección puede marcarla como
+    # atendida (con nota de seguimiento) y desaparece. La clave incluye la
+    # semana ISO, así que si el patrón se repite otra semana, reaparece.
+    # Umbral configurable: ConfiguracionColegio.dias_ausencia_alerta (default 3).
+    # Ausencia "del día" = tiene marca de ausente y NINGUNA de presente/tardanza.
     # ─────────────────────────────────────────────────────────────────
     if current_user.role in ('direccion', 'coordinador') and current_user.colegio_id:
         from datetime import timedelta as _td
+        from collections import defaultdict as _dd
         hoy = today_rd()
-        # Mirar los últimos 14 días (cubre 2 semanas)
-        desde = hoy - _td(days=14)
-        
-        # Traer todas las asistencias del período por estudiante por día
+        lunes = hoy - _td(days=hoy.weekday())  # lunes de la semana en curso
+
+        _cfg = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+        umbral_semana = (_cfg.dias_ausencia_alerta if _cfg and _cfg.dias_ausencia_alerta else 3)
+
         rows = (
             tenant_filter(db.query(Asistencia), Asistencia, current_user)
-            .filter(Asistencia.fecha >= desde, Asistencia.fecha <= hoy)
+            .filter(Asistencia.fecha >= lunes, Asistencia.fecha <= hoy)
             .all()
         )
         # Agrupar por (estudiante, fecha) → estados de ese día
-        from collections import defaultdict as _dd
         dias_est = _dd(set)
         for a in rows:
             dias_est[(a.estudiante_id, a.fecha)].add(a.estado)
-        
-        # Para cada estudiante, determinar el estado del día (presente/ausente/tardanza/sin_marca)
-        # y buscar racha de 3+ ausencias consecutivas
-        est_dias = _dd(dict)
+
+        # Contar días de ausencia real por estudiante en la semana
+        ausencias_semana = _dd(int)
         for (est_id, fecha), estados in dias_est.items():
-            if 'presente' in estados:
-                est_dias[est_id][fecha] = 'P'
-            elif 'tardanza' in estados:
-                est_dias[est_id][fecha] = 'T'
-            elif 'ausente' in estados:
-                est_dias[est_id][fecha] = 'A'
-            else:
-                est_dias[est_id][fecha] = '?'
-        
-        # Para cada estudiante, ordenar fechas y buscar 3+ ausencias seguidas
-        # (consecutivas en días con marca, ignorando días sin registro)
-        estudiantes_con_racha = []
-        for est_id, dias_dict in est_dias.items():
-            fechas_ordenadas = sorted(dias_dict.keys())
-            # Construir secuencia ignorando días sin marca: solo consideramos
-            # días donde HAY estado (P/T/A). Una racha de 3 A consecutivas en
-            # esa secuencia → alerta.
-            secuencia = [(f, dias_dict[f]) for f in fechas_ordenadas if dias_dict[f] in ('P','T','A')]
-            racha = 0
-            max_racha = 0
-            for _, estado in secuencia:
-                if estado == 'A':
-                    racha += 1
-                    if racha > max_racha:
-                        max_racha = racha
-                else:
-                    racha = 0
-            if max_racha >= 3:
-                estudiantes_con_racha.append((est_id, max_racha))
-        
-        if estudiantes_con_racha:
-            # Traer nombres
-            est_ids = [e[0] for e in estudiantes_con_racha]
+            if 'presente' in estados or 'tardanza' in estados:
+                continue
+            if 'ausente' in estados:
+                ausencias_semana[est_id] += 1
+
+        afectados = {eid: n for eid, n in ausencias_semana.items() if n >= umbral_semana}
+        if afectados:
+            iso = hoy.isocalendar()
+            semana_tag = f"{iso[0]}-W{iso[1]:02d}"
+            # Claves ya atendidas esta semana → se excluyen
+            claves_atendidas = set(
+                r.clave for r in tenant_filter(db.query(AlertaAtendida), AlertaAtendida, current_user)
+                .filter_by(tipo='inasistencia_semana')
+                .filter(AlertaAtendida.clave.like(f'%:{semana_tag}'))
+                .all()
+            )
             ests = (tenant_filter(db.query(Estudiante), Estudiante, current_user)
-                    .filter(Estudiante.id.in_(est_ids), Estudiante.activo == True).all())
-            est_dict = {e.id: e for e in ests}
-            
-            count = len(estudiantes_con_racha)
-            ejemplos = []
-            for est_id, racha in sorted(estudiantes_con_racha, key=lambda x: -x[1])[:3]:
-                est = est_dict.get(est_id)
-                if est:
-                    ejemplos.append(f"{est.nombre_completo} ({racha} días)")
-            
-            alertas.append({
-                'tipo': 'inasistencia',
-                'prioridad': 'alta',
-                'mensaje': f'{count} estudiante(s) con 3+ ausencias consecutivas: {", ".join(ejemplos)}' + ('...' if count > 3 else ''),
-                'count': count,
-                'link': '/asistencia'
-            })
-    
+                    .filter(Estudiante.id.in_(list(afectados.keys())), Estudiante.activo == True).all())
+
+            MAX_ALERTAS_INASISTENCIA = 15  # tope para no inundar el dashboard
+            emitidas = 0
+            restantes = 0
+            for est in sorted(ests, key=lambda e: -afectados.get(e.id, 0)):
+                clave = f"inasistencia_semana:{est.id}:{semana_tag}"
+                if clave in claves_atendidas:
+                    continue
+                if emitidas >= MAX_ALERTAS_INASISTENCIA:
+                    restantes += 1
+                    continue
+                curso_nombre = est.curso.nombre_completo if est.curso else ''
+                alertas.append({
+                    'tipo': 'inasistencia_semana',
+                    'prioridad': 'alta',
+                    'mensaje': f"{est.nombre_completo} ({curso_nombre}): {afectados[est.id]} ausencias esta semana",
+                    'count': afectados[est.id],
+                    'link': '/asistencia',
+                    'clave': clave,
+                    'atendible': True,
+                })
+                emitidas += 1
+            if restantes > 0:
+                alertas.append({
+                    'tipo': 'inasistencia_semana',
+                    'prioridad': 'alta',
+                    'mensaje': f'... y {restantes} estudiante(s) más con {umbral_semana}+ ausencias esta semana',
+                    'count': restantes,
+                    'link': '/asistencia',
+                })
+
+        # ─────────────────────────────────────────────────────────────
+        # ALERTA v2.14: cursos sin pasar lista hoy (después de las 10:00,
+        # solo días de semana). Se auto-resuelve al registrar asistencia.
+        # ─────────────────────────────────────────────────────────────
+        HORA_LIMITE_ASISTENCIA = 10
+        if hoy.weekday() < 5 and now_rd().hour >= HORA_LIMITE_ASISTENCIA:
+            cursos_activos = (tenant_filter(db.query(Curso), Curso, current_user)
+                              .filter_by(activo=True).all())
+            rows_e = (db.query(Estudiante.curso_id, func.count(Estudiante.id))
+                      .filter(Estudiante.activo == True,
+                              Estudiante.colegio_id == current_user.colegio_id)
+                      .group_by(Estudiante.curso_id).all())
+            est_por_curso = {r[0]: r[1] for r in rows_e}
+            cursos_con_marca = set(
+                r[0] for r in db.query(Asistencia.curso_id)
+                .filter(Asistencia.fecha == hoy,
+                        Asistencia.colegio_id == current_user.colegio_id)
+                .distinct().all()
+            )
+            sin_registrar = [c for c in cursos_activos
+                             if est_por_curso.get(c.id, 0) > 0 and c.id not in cursos_con_marca]
+            if sin_registrar:
+                nombres = ', '.join(c.nombre_completo for c in sin_registrar[:4])
+                if len(sin_registrar) > 4:
+                    nombres += '...'
+                alertas.append({
+                    'tipo': 'asistencia_sin_registrar',
+                    'prioridad': 'media',
+                    'mensaje': f'{len(sin_registrar)} curso(s) sin pasar lista hoy: {nombres}',
+                    'count': len(sin_registrar),
+                    'link': '/asistencia',
+                })
+
     # Comunicados no leídos
     query = tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True)
     if current_user.role == 'profesor':
@@ -5343,6 +5376,43 @@ async def get_dashboard_alertas(db: Session = Depends(get_db), current_user: Usu
                             })
     
     return alertas
+
+
+@app.post("/api/dashboard/alertas/atender")
+async def atender_alerta(
+    datos: dict,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user)
+):
+    """v2.14: marca una alerta 'atendible' como atendida (con nota opcional).
+
+    Body: { "clave": "inasistencia_semana:123:2026-W29", "tipo": "inasistencia_semana", "nota": "..." }
+    Solo dirección/coordinación. Idempotente: si ya estaba atendida, responde ok.
+    Solo INSERTA en alertas_atendidas — no toca ningún dato existente.
+    """
+    if current_user.role not in ('direccion', 'coordinador'):
+        raise HTTPException(status_code=403, detail="Solo dirección puede atender alertas")
+
+    clave = (datos.get('clave') or '').strip()
+    if not clave or len(clave) > 120:
+        raise HTTPException(status_code=400, detail="Clave de alerta inválida")
+
+    existe = (tenant_filter(db.query(AlertaAtendida), AlertaAtendida, current_user)
+              .filter_by(clave=clave).first())
+    if existe:
+        return {'ok': True, 'ya_atendida': True}
+
+    reg = AlertaAtendida(
+        colegio_id=current_user.colegio_id,
+        tipo=(datos.get('tipo') or clave.split(':')[0])[:50],
+        clave=clave,
+        nota=(datos.get('nota') or '').strip()[:300] or None,
+        atendida_por=current_user.id,
+    )
+    db.add(reg)
+    db.commit()
+    return {'ok': True}
+
 
 @app.get("/api/dashboard/actividad-reciente")
 async def get_actividad_reciente(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):

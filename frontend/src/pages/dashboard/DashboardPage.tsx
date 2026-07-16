@@ -34,8 +34,18 @@ interface GraficoData {
     porcentaje_asistencia: number;
   };
   asistencia_por_materia?: Array<{ asignatura: string; presentes: number; ausentes: number; tardanzas: number; excusas: number; total: number; porcentaje: number }>;
+  // v2.14: desglose de asistencia de HOY por curso (registrado=false ⇒ "Sin registrar")
+  asistencia_hoy_por_curso?: Array<{
+    curso_id: number; curso: string; total: number;
+    presentes: number; ausentes: number; tardanzas: number; excusas: number;
+    sin_marca: number; registrado: boolean; porcentaje: number;
+  }>;
+  ranking_mejor?: Array<{ nombre: string; curso: string; promedio: number; corte?: number }>;
+  ranking_peligro?: Array<{ nombre: string; curso: string; promedio: number; corte?: number }>;
+  periodo_activo?: number;
 }
-interface Alerta { tipo: string; prioridad: string; mensaje: string; count?: number; link?: string; }
+// v2.14: clave+atendible ⇒ la alerta puede marcarse como atendida (con nota) y desaparece
+interface Alerta { tipo: string; prioridad: string; mensaje: string; count?: number; link?: string; clave?: string; atendible?: boolean; }
 
 // Labels amigables para los tipos de alerta. Si el tipo no está aquí,
 // se usa el fallback `tipo.replace('_', ' ')` (que es lo que había antes).
@@ -48,6 +58,9 @@ const ALERTA_LABELS: Record<string, string> = {
   'evaluacion_extra_pendiente': 'Evaluación extra',
   'cierre_periodo_secundaria': 'Cierre de período',
   'profesores_atrasados_secundaria': 'Profesores atrasados',
+  // Alertas v2.14
+  'inasistencia_semana': 'Inasistencia semanal',
+  'asistencia_sin_registrar': 'Asistencia sin registrar',
 };
 interface HorarioHoy { id: number; hora_inicio: string; hora_fin: string; asignatura: string; curso: string; curso_id: number; aula: string; }
 interface Comunicado { id: number; titulo: string; contenido: string; autor: string; fecha: string; imagen?: string; }
@@ -90,6 +103,10 @@ export const DashboardPage = () => {
   const [graficos, setGraficos] = useState<GraficoData | null>(null);
   const [alertas, setAlertas] = useState<Alerta[]>([]);
   const [alertasOcultas, setAlertasOcultas] = useState<number[]>([]);
+  // v2.14: atención de alertas (inasistencia): clave en proceso, nota y claves ya atendidas en esta sesión
+  const [atendiendoClave, setAtendiendoClave] = useState<string | null>(null);
+  const [notaAtencion, setNotaAtencion] = useState('');
+  const [alertasAtendidas, setAlertasAtendidas] = useState<string[]>([]);
   const [comunicados, setComunicados] = useState<Comunicado[]>([]);
   const [dashProfesor, setDashProfesor] = useState<DashboardProfesor | null>(null);
   const [dashDireccion, setDashDireccion] = useState<DashboardDireccion | null>(null);
@@ -157,6 +174,80 @@ export const DashboardPage = () => {
   };
 
   if (loading) return (<div className="flex items-center justify-center h-64"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div></div>);
+
+  // v2.14: marcar una alerta atendible como atendida (con nota de seguimiento).
+  // Solo inserta en alertas_atendidas en el backend; la alerta desaparece del
+  // dashboard y del badge del sidebar. Si el caso se repite otra semana, reaparece.
+  const atenderAlerta = async (alerta: Alerta) => {
+    if (!alerta.clave) return;
+    try {
+      await api.post('/dashboard/alertas/atender', { clave: alerta.clave, tipo: alerta.tipo, nota: notaAtencion });
+      setAlertasAtendidas(prev => [...prev, alerta.clave!]);
+      setAtendiendoClave(null);
+      setNotaAtencion('');
+    } catch (e) { console.error('Error atendiendo alerta:', e); }
+  };
+
+  const alertasVisibles = alertas.filter((a, i) =>
+    !alertasOcultas.includes(i) && !(a.clave && alertasAtendidas.includes(a.clave))
+  );
+
+  // v2.14: sección de Alertas reutilizable. Para dirección/coordinación se
+  // renderiza ARRIBA (justo después de las stats); para los demás roles queda
+  // en su posición de siempre, al final.
+  const seccionAlertas = alertasVisibles.length > 0 ? (
+    <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
+      <div className="p-4 border-b bg-gray-50 flex items-center justify-between">
+        <h2 className="font-bold text-gray-800 flex items-center gap-2"><Bell className="text-amber-500" /> Alertas</h2>
+        <div className="flex items-center gap-2">
+          <span className="bg-red-500 text-white text-xs px-2 py-0.5 rounded-full">{alertasVisibles.length}</span>
+          <button onClick={() => setAlertasOcultas(alertas.map((_, i) => i))} className="text-xs text-gray-400 hover:text-gray-600">Ocultar todas</button>
+        </div>
+      </div>
+      <div className="divide-y">
+        {alertasVisibles.map((alerta) => (
+          <div key={alerta.clave || `${alerta.tipo}-${alertas.indexOf(alerta)}`} className="hover:bg-gray-50">
+            <div className="p-4 flex items-start gap-3">
+              <Link to={(alerta as any).link || '#'} className="flex items-start gap-3 flex-1 min-w-0">
+                <span className={`w-3 h-3 mt-1.5 rounded-full flex-shrink-0 ${alerta.prioridad === 'alta' ? 'bg-red-500 animate-pulse' : alerta.prioridad === 'media' ? 'bg-amber-500' : 'bg-blue-500'}`}></span>
+                <div className="flex-1 min-w-0"><p className="text-sm font-medium text-gray-800 truncate">{alerta.mensaje}</p><p className="text-xs text-gray-400 mt-1 capitalize">{ALERTA_LABELS[alerta.tipo] || alerta.tipo.replace('_', ' ')}</p></div>
+                {alerta.count && alerta.count > 0 && <span className={`px-2 py-1 text-xs rounded-full font-bold flex-shrink-0 ${alerta.prioridad === 'alta' ? 'bg-red-100 text-red-600' : 'bg-gray-100 text-gray-600'}`}>{alerta.count}</span>}
+              </Link>
+              {alerta.atendible && alerta.clave && (esDireccion || esCoordinador) && (
+                <button
+                  onClick={() => { setAtendiendoClave(atendiendoClave === alerta.clave ? null : alerta.clave!); setNotaAtencion(''); }}
+                  className="flex-shrink-0 px-2.5 py-1 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100"
+                  title="Marcar como atendida (con nota de seguimiento)"
+                >
+                  ✓ Atender
+                </button>
+              )}
+              <button onClick={() => setAlertasOcultas([...alertasOcultas, alertas.indexOf(alerta)])} className="text-gray-300 hover:text-gray-500 flex-shrink-0 p-1" title="Ocultar">
+                <X size={14} />
+              </button>
+            </div>
+            {alerta.atendible && alerta.clave === atendiendoClave && (
+              <div className="px-4 pb-4 -mt-1 flex flex-col sm:flex-row gap-2">
+                <input
+                  type="text"
+                  value={notaAtencion}
+                  onChange={e => setNotaAtencion(e.target.value)}
+                  placeholder="Nota de seguimiento (opcional): ej. se llamó a la madre..."
+                  maxLength={300}
+                  className="flex-1 px-3 py-1.5 border border-gray-200 rounded-lg text-xs focus:ring-2 focus:ring-emerald-400 focus:outline-none"
+                  autoFocus
+                />
+                <div className="flex gap-2 flex-shrink-0">
+                  <button onClick={() => atenderAlerta(alerta)} className="px-3 py-1.5 bg-emerald-600 text-white text-xs font-medium rounded-lg hover:bg-emerald-700">Confirmar</button>
+                  <button onClick={() => { setAtendiendoClave(null); setNotaAtencion(''); }} className="px-3 py-1.5 text-xs text-gray-500 hover:text-gray-700">Cancelar</button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  ) : null;
 
   const getRoleLabel = () => {
     const labels: Record<string, string> = { profesor: 'Panel de Control — Profesor', direccion: 'Panel de Control — Dirección', coordinador: 'Panel de Control — Coordinación', psicologia: 'Panel de Control — Psicología', secretaria: 'Panel de Control — Secretaría' };
@@ -227,6 +318,11 @@ export const DashboardPage = () => {
           <StatCard icon={<Star size={24} />} title="Atendidos (Mes)" value={stats?.casos_atendidos_mes || 0} color="emerald" />
         </div>
       )}
+
+      {/* ALERTAS (v2.14): para dirección/coordinación van ARRIBA, justo
+          después de las stats — es la sección más valiosa del panel y estaba
+          enterrada al fondo (había que scrollear dos pantallas para verla). */}
+      {(esDireccion || esCoordinador) && seccionAlertas}
 
       {/* GUÍA INICIAL */}
       {(esDireccion || esCoordinador) && stats && stats.estudiantes === 0 && stats.profesores === 0 && (
@@ -563,80 +659,125 @@ export const DashboardPage = () => {
               </div>
             </div>
 
-            {/* Fila 2: Asistencia + Ranking */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-              {/* Asistencia: HOY (snapshot del día) + acumulado del mes */}
-              <div className="bg-white rounded-xl shadow-sm border p-4">
-                <div className="flex items-baseline justify-between mb-3">
-                  <h2 className="font-bold text-gray-800 text-sm">Asistencia hoy</h2>
-                  {graficos.asistencia_hoy?.fecha && (
-                    <span className="text-[10px] text-gray-400">
-                      {new Date(graficos.asistencia_hoy.fecha + 'T00:00:00').toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })}
+            {/* Fila 2 (v2.14): Asistencia hoy POR CURSO. Cada curso reporta
+                sus propios números; los cursos sin pasar lista se marcan en
+                ámbar ("Sin registrar") en vez de inflar un "No reg." global
+                que distorsionaba el porcentaje del día. */}
+            <div className="bg-white rounded-xl shadow-sm border p-4">
+              <div className="flex items-baseline justify-between mb-3">
+                <h2 className="font-bold text-gray-800 text-sm">Asistencia hoy</h2>
+                {graficos.asistencia_hoy?.fecha && (
+                  <span className="text-[10px] text-gray-400">
+                    {new Date(graficos.asistencia_hoy.fecha + 'T00:00:00').toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })}
+                  </span>
+                )}
+              </div>
+
+              {graficos.asistencia_hoy_por_curso && graficos.asistencia_hoy_por_curso.length > 0 ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="text-[10px] text-gray-400 uppercase tracking-wide">
+                        <th className="text-left font-semibold pb-2">Curso</th>
+                        <th className="text-center font-semibold pb-2">Pres.</th>
+                        <th className="text-center font-semibold pb-2">Aus.</th>
+                        <th className="text-center font-semibold pb-2">Tard.</th>
+                        <th className="text-center font-semibold pb-2 hidden md:table-cell">Exc.</th>
+                        <th className="text-right font-semibold pb-2">Asistencia</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {graficos.asistencia_hoy_por_curso.map((c) => (
+                        <tr key={c.curso_id} className="border-t border-gray-100">
+                          <td className="py-2 pr-2 text-xs font-medium text-gray-800">{c.curso}</td>
+                          {c.registrado ? (
+                            <>
+                              <td className="py-2 text-center text-xs font-bold text-emerald-600">{c.presentes}</td>
+                              <td className={`py-2 text-center text-xs font-bold ${c.ausentes > 0 ? 'text-red-500' : 'text-gray-300'}`}>{c.ausentes}</td>
+                              <td className={`py-2 text-center text-xs font-bold ${c.tardanzas > 0 ? 'text-amber-500' : 'text-gray-300'}`}>{c.tardanzas}</td>
+                              <td className="py-2 text-center text-xs text-gray-400 hidden md:table-cell">{c.excusas}</td>
+                              <td className="py-2 text-right">
+                                <div className="flex items-center justify-end gap-2">
+                                  <div className="w-16 h-1.5 bg-gray-100 rounded-full overflow-hidden hidden sm:block">
+                                    <div
+                                      className={`h-full rounded-full ${c.porcentaje >= 90 ? 'bg-emerald-500' : c.porcentaje >= 75 ? 'bg-blue-500' : 'bg-red-400'}`}
+                                      style={{ width: `${Math.min(100, c.porcentaje)}%` }}
+                                    ></div>
+                                  </div>
+                                  <span className="text-xs font-bold text-gray-700 w-11 text-right">{c.porcentaje}%</span>
+                                </div>
+                              </td>
+                            </>
+                          ) : (
+                            <td colSpan={5} className="py-2 text-right">
+                              <Link to="/asistencia" className="inline-block px-2.5 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-md text-[11px] font-medium hover:bg-amber-100" title="Este curso no ha pasado lista hoy">
+                                Sin registrar
+                              </Link>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : graficos.asistencia_hoy && graficos.asistencia_hoy.total_estudiantes > 0 ? (
+                /* Fallback (compatibilidad): backend sin desglose por curso aún */
+                <>
+                  <div className="grid grid-cols-4 gap-2 text-center mb-3">
+                    <div>
+                      <p className="text-lg font-bold text-emerald-600">{graficos.asistencia_hoy.presentes}</p>
+                      <p className="text-[10px] text-gray-400">Presentes</p>
+                    </div>
+                    <div>
+                      <p className="text-lg font-bold text-red-500">{graficos.asistencia_hoy.ausentes}</p>
+                      <p className="text-[10px] text-gray-400">Ausentes</p>
+                    </div>
+                    <div>
+                      <p className="text-lg font-bold text-amber-500">{graficos.asistencia_hoy.excusas ?? 0}</p>
+                      <p className="text-[10px] text-gray-400">Excusas</p>
+                    </div>
+                    <div>
+                      <p className="text-lg font-bold text-gray-400">{graficos.asistencia_hoy.no_registrados}</p>
+                      <p className="text-[10px] text-gray-400">No reg.</p>
+                    </div>
+                  </div>
+                  <div className="text-center pb-2 border-b border-gray-100">
+                    <p className="text-2xl font-bold text-blue-600">{graficos.asistencia_hoy.porcentaje_asistencia}%</p>
+                    <p className="text-[10px] text-gray-400">Asistencia hoy ({graficos.asistencia_hoy.presentes} de {graficos.asistencia_hoy.total_estudiantes})</p>
+                  </div>
+                </>
+              ) : (
+                <div className="text-center py-3 text-gray-400 text-sm">Sin registros de asistencia hoy</div>
+              )}
+
+              {/* Acumulado del mes (debajo, igual que siempre) */}
+              <div className="pt-3 mt-3 border-t border-gray-100">
+                <h3 className="font-semibold text-gray-700 text-xs mb-2">
+                  Asistencia del mes
+                  {graficos.asistencia_resumen?.periodo_inicio && graficos.asistencia_resumen?.periodo_fin && (
+                    <span className="text-[10px] text-gray-400 font-normal ml-1">
+                      ({new Date(graficos.asistencia_resumen.periodo_inicio + 'T00:00:00').toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })}
+                      {' al '}
+                      {new Date(graficos.asistencia_resumen.periodo_fin + 'T00:00:00').toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })})
                     </span>
                   )}
-                </div>
-                {graficos.asistencia_hoy && graficos.asistencia_hoy.total_estudiantes > 0 ? (
-                  <>
-                    <div className="grid grid-cols-4 gap-2 text-center mb-3">
-                      <div>
-                        <p className="text-lg font-bold text-emerald-600">{graficos.asistencia_hoy.presentes}</p>
-                        <p className="text-[10px] text-gray-400">Presentes</p>
-                        <p className="text-[9px] text-gray-300">{graficos.asistencia_hoy.total_estudiantes > 0 ? `${Math.round(graficos.asistencia_hoy.presentes / graficos.asistencia_hoy.total_estudiantes * 1000) / 10}%` : ''}</p>
-                      </div>
-                      <div>
-                        <p className="text-lg font-bold text-red-500">{graficos.asistencia_hoy.ausentes}</p>
-                        <p className="text-[10px] text-gray-400">Ausentes</p>
-                        <p className="text-[9px] text-gray-300">{graficos.asistencia_hoy.total_estudiantes > 0 ? `${Math.round(graficos.asistencia_hoy.ausentes / graficos.asistencia_hoy.total_estudiantes * 1000) / 10}%` : ''}</p>
-                      </div>
-                      <div>
-                        <p className="text-lg font-bold text-amber-500">{graficos.asistencia_hoy.excusas ?? 0}</p>
-                        <p className="text-[10px] text-gray-400">Excusas</p>
-                        <p className="text-[9px] text-gray-300">{graficos.asistencia_hoy.total_estudiantes > 0 ? `${Math.round((graficos.asistencia_hoy.excusas ?? 0) / graficos.asistencia_hoy.total_estudiantes * 1000) / 10}%` : ''}</p>
-                      </div>
-                      <div>
-                        <p className="text-lg font-bold text-gray-400">{graficos.asistencia_hoy.no_registrados}</p>
-                        <p className="text-[10px] text-gray-400">No reg.</p>
-                        <p className="text-[9px] text-gray-300">{graficos.asistencia_hoy.total_estudiantes > 0 ? `${Math.round(graficos.asistencia_hoy.no_registrados / graficos.asistencia_hoy.total_estudiantes * 1000) / 10}%` : ''}</p>
-                      </div>
-                    </div>
-                    <div className="text-center pb-2 border-b border-gray-100">
-                      <p className="text-2xl font-bold text-blue-600">
-                        {graficos.asistencia_hoy.porcentaje_asistencia}%
-                      </p>
-                      <p className="text-[10px] text-gray-400">
-                        Asistencia hoy ({graficos.asistencia_hoy.presentes} de {graficos.asistencia_hoy.total_estudiantes})
-                      </p>
-                    </div>
-                  </>
+                </h3>
+                {graficos.asistencia_resumen && (graficos.asistencia_resumen.presentes > 0 || graficos.asistencia_resumen.ausentes > 0) ? (
+                  <div className="grid grid-cols-4 gap-2 text-center">
+                    <div><p className="text-base font-bold text-emerald-600">{graficos.asistencia_resumen.presentes}</p><p className="text-[10px] text-gray-400">Presentes</p></div>
+                    <div><p className="text-base font-bold text-red-500">{graficos.asistencia_resumen.ausentes}</p><p className="text-[10px] text-gray-400">Ausentes</p></div>
+                    <div><p className="text-base font-bold text-amber-500">{graficos.asistencia_resumen.tardanzas}</p><p className="text-[10px] text-gray-400">Tardanzas</p></div>
+                    <div><p className="text-base font-bold text-blue-600">{graficos.asistencia_resumen.porcentaje_asistencia}%</p><p className="text-[10px] text-gray-400">Asistencia</p></div>
+                  </div>
                 ) : (
-                  <div className="text-center py-3 text-gray-400 text-sm border-b border-gray-100 mb-3">Sin registros de asistencia hoy</div>
+                  <div className="text-center py-2 text-gray-400 text-xs">Sin registros este mes</div>
                 )}
-
-                {/* Acumulado del mes (debajo) */}
-                <div className="pt-3">
-                  <h3 className="font-semibold text-gray-700 text-xs mb-2">
-                    Asistencia del mes
-                    {graficos.asistencia_resumen?.periodo_inicio && graficos.asistencia_resumen?.periodo_fin && (
-                      <span className="text-[10px] text-gray-400 font-normal ml-1">
-                        ({new Date(graficos.asistencia_resumen.periodo_inicio + 'T00:00:00').toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })}
-                        {' al '}
-                        {new Date(graficos.asistencia_resumen.periodo_fin + 'T00:00:00').toLocaleDateString('es-DO', { day: '2-digit', month: 'short' })})
-                      </span>
-                    )}
-                  </h3>
-                  {graficos.asistencia_resumen && (graficos.asistencia_resumen.presentes > 0 || graficos.asistencia_resumen.ausentes > 0) ? (
-                    <div className="grid grid-cols-4 gap-2 text-center">
-                      <div><p className="text-base font-bold text-emerald-600">{graficos.asistencia_resumen.presentes}</p><p className="text-[10px] text-gray-400">Presentes</p></div>
-                      <div><p className="text-base font-bold text-red-500">{graficos.asistencia_resumen.ausentes}</p><p className="text-[10px] text-gray-400">Ausentes</p></div>
-                      <div><p className="text-base font-bold text-amber-500">{graficos.asistencia_resumen.tardanzas}</p><p className="text-[10px] text-gray-400">Tardanzas</p></div>
-                      <div><p className="text-base font-bold text-blue-600">{graficos.asistencia_resumen.porcentaje_asistencia}%</p><p className="text-[10px] text-gray-400">Asistencia</p></div>
-                    </div>
-                  ) : (
-                    <div className="text-center py-2 text-gray-400 text-xs">Sin registros este mes</div>
-                  )}
-                </div>
               </div>
-              {/* Mejores promedios */}
+            </div>
+
+            {/* Fila 3 (v2.14): Mejores promedios + En peligro lado a lado —
+                se eliminan las tarjetas horizontales largas medio vacías. */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
               <div className="bg-white rounded-xl shadow-sm border p-4">
                 <h2 className="font-bold text-gray-800 mb-3 text-sm flex items-center gap-2"><span className="text-amber-500">⭐</span> Mejores promedios {graficos.periodo_activo ? `(P${graficos.periodo_activo})` : ''}</h2>
                 {graficos.ranking_mejor && graficos.ranking_mejor.length > 0 ? (
@@ -655,22 +796,28 @@ export const DashboardPage = () => {
                   <div className="text-center py-4 text-gray-400 text-sm">Sin datos aún</div>
                 )}
               </div>
-            </div>
 
-            {/* Estudiantes en peligro */}
-            {graficos.ranking_peligro && graficos.ranking_peligro.length > 0 && (
-              <div className="bg-red-50 rounded-xl border border-red-200 p-4">
-                <h2 className="font-bold text-red-800 flex items-center gap-2 mb-2 text-sm"><AlertTriangle size={16} className="text-red-600" /> Estudiantes en peligro (promedio &lt; 70)</h2>
-                <div className="space-y-1">
-                  {graficos.ranking_peligro.map((e: any, i: number) => (
-                    <div key={i} className="flex items-center justify-between py-1.5 px-2 bg-white rounded-lg border border-red-100">
-                      <div className="min-w-0"><p className="text-xs font-medium text-gray-800 truncate">{e.nombre}</p><p className="text-[10px] text-gray-400 truncate">{e.curso}</p></div>
-                      <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">{e.promedio}</span>
-                    </div>
-                  ))}
-                </div>
+              {/* v2.14: el corte es POR NIVEL (65 primaria / 70 secundaria) —
+                  ya viene calculado del backend en e.corte. Antes el título
+                  decía "< 70" fijo y ponía en peligro injustamente a primaria. */}
+              <div className={`rounded-xl border p-4 ${graficos.ranking_peligro && graficos.ranking_peligro.length > 0 ? 'bg-red-50 border-red-200' : 'bg-white shadow-sm'}`}>
+                <h2 className={`font-bold flex items-center gap-2 mb-2 text-sm ${graficos.ranking_peligro && graficos.ranking_peligro.length > 0 ? 'text-red-800' : 'text-gray-800'}`}>
+                  <AlertTriangle size={16} className={graficos.ranking_peligro && graficos.ranking_peligro.length > 0 ? 'text-red-600' : 'text-gray-400'} /> Estudiantes en peligro (bajo el corte de su nivel)
+                </h2>
+                {graficos.ranking_peligro && graficos.ranking_peligro.length > 0 ? (
+                  <div className="space-y-1">
+                    {graficos.ranking_peligro.map((e: any, i: number) => (
+                      <div key={i} className="flex items-center justify-between py-1.5 px-2 bg-white rounded-lg border border-red-100">
+                        <div className="min-w-0"><p className="text-xs font-medium text-gray-800 truncate">{e.nombre}</p><p className="text-[10px] text-gray-400 truncate">{e.curso}{e.corte ? ` · corte ${e.corte}` : ''}</p></div>
+                        <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">{e.promedio}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-center py-4 text-emerald-600 text-sm font-medium">✓ Ningún estudiante por debajo del corte</div>
+                )}
               </div>
-            )}
+            </div>
 
             {/* Profesores con calificaciones pendientes */}
             {esDireccion && dashDireccion && dashDireccion.profesores_sin_completar && dashDireccion.profesores_sin_completar.length > 0 && (
@@ -698,26 +845,9 @@ export const DashboardPage = () => {
       {/* BLOC DE NOTAS - TODOS LOS ROLES */}
       <BlocDeNotas notas={notas} setNotas={setNotas} />
 
-      {/* ALERTAS */}
-      {alertas.filter((_, i) => !alertasOcultas.includes(i)).length > 0 && (
-        <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
-          <div className="p-4 border-b bg-gray-50 flex items-center justify-between"><h2 className="font-bold text-gray-800 flex items-center gap-2"><Bell className="text-amber-500" /> Alertas</h2><div className="flex items-center gap-2"><span className="bg-red-500 text-white text-xs px-2 py-0.5 rounded-full">{alertas.filter((_, i) => !alertasOcultas.includes(i)).length}</span><button onClick={() => setAlertasOcultas(alertas.map((_, i) => i))} className="text-xs text-gray-400 hover:text-gray-600">Ocultar todas</button></div></div>
-          <div className="divide-y">
-            {alertas.filter((_, i) => !alertasOcultas.includes(i)).map((alerta, idx) => (
-              <div key={idx} className="p-4 flex items-start gap-3 hover:bg-gray-50">
-                <Link to={(alerta as any).link || '#'} className="flex items-start gap-3 flex-1 min-w-0">
-                  <span className={`w-3 h-3 mt-1.5 rounded-full flex-shrink-0 ${alerta.prioridad === 'alta' ? 'bg-red-500 animate-pulse' : alerta.prioridad === 'media' ? 'bg-amber-500' : 'bg-blue-500'}`}></span>
-                  <div className="flex-1 min-w-0"><p className="text-sm font-medium text-gray-800 truncate">{alerta.mensaje}</p><p className="text-xs text-gray-400 mt-1 capitalize">{ALERTA_LABELS[alerta.tipo] || alerta.tipo.replace('_', ' ')}</p></div>
-                  {alerta.count && alerta.count > 0 && <span className={`px-2 py-1 text-xs rounded-full font-bold flex-shrink-0 ${alerta.prioridad === 'alta' ? 'bg-red-100 text-red-600' : 'bg-gray-100 text-gray-600'}`}>{alerta.count}</span>}
-                </Link>
-                <button onClick={() => setAlertasOcultas([...alertasOcultas, alertas.indexOf(alerta)])} className="text-gray-300 hover:text-gray-500 flex-shrink-0 p-1" title="Ocultar">
-                  <X size={14} />
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* ALERTAS: los roles que no son dirección/coordinación las mantienen
+          aquí, en su posición de siempre (al final). */}
+      {!(esDireccion || esCoordinador) && seccionAlertas}
 
       {/* ACCESOS RÁPIDOS */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">

@@ -11,6 +11,7 @@ import {
   MessageSquare,
   Brain,
   FileBarChart,
+  FileText,
   Users,
   Settings,
   LogOut,
@@ -25,7 +26,9 @@ import {
   StickyNote,
   Building2,
   AlertTriangle,
-  Award
+  Award,
+  ChevronDown,
+  ChevronRight
 } from 'lucide-react';
 
 interface NavItem {
@@ -35,7 +38,7 @@ interface NavItem {
   roles: string[];
   badge?: number;
   modulo?: string; // Si depende de un módulo habilitado
-  section?: string; // v2.13.2: agrupación visual en sidebar (Opción 4 plana con separadores)
+  section?: string; // agrupación en sidebar
 }
 
 interface ColegioConfig {
@@ -48,6 +51,11 @@ interface MainLayoutProps {
   children: ReactNode;
 }
 
+// v2.14: secciones abiertas por defecto la PRIMERA vez (luego manda localStorage).
+// Dirección lidia sobre todo con lo académico y las personas (estudiantes,
+// reportes), así que esas dos arrancan abiertas.
+const SECCIONES_DEFAULT_ABIERTAS = ['Académico', 'Personas'];
+
 export const MainLayout = ({ children }: MainLayoutProps) => {
   const { user, logout } = useAuth();
   const location = useLocation();
@@ -56,12 +64,43 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   const [mensajesNoLeidos, setMensajesNoLeidos] = useState(0);
   const [comunicadosNoLeidos, setComunicadosNoLeidos] = useState(0);
   const [alertasCount, setAlertasCount] = useState(0);
+  const [alertasData, setAlertasData] = useState<any[]>([]);
   const [isSidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [modulosConfig, setModulosConfig] = useState<any>(null);
   const [notificaciones, setNotificaciones] = useState<any[]>([]);
   const [notifNoLeidas, setNotifNoLeidas] = useState(0);
   const [showNotifPanel, setShowNotifPanel] = useState(false);
+
+  // v2.14: menú colapsable con memoria. El estado abierto/cerrado de cada
+  // sección se persiste en localStorage POR ROL, así al recargar la página
+  // el menú queda exactamente como el usuario lo dejó (queja resuelta:
+  // "al recargar vuelve al inicio"). Solo aplica a dirección/coordinación
+  // (el menú de profesor/secretaría/psicología es corto y no lo necesita).
+  const esMenuColapsable = user?.role === 'direccion' || user?.role === 'coordinador';
+  const storageKey = `educaone_sidebar_secciones_${user?.role || 'anon'}`;
+  const [seccionesAbiertas, setSeccionesAbiertas] = useState<string[]>(SECCIONES_DEFAULT_ABIERTAS);
+
+  useEffect(() => {
+    if (!user?.role) return;
+    try {
+      const guardado = localStorage.getItem(storageKey);
+      if (guardado) {
+        setSeccionesAbiertas(JSON.parse(guardado));
+        return;
+      }
+    } catch {}
+    setSeccionesAbiertas(SECCIONES_DEFAULT_ABIERTAS);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.role]);
+
+  const toggleSeccion = (seccion: string) => {
+    setSeccionesAbiertas(prev => {
+      const next = prev.includes(seccion) ? prev.filter(s => s !== seccion) : [...prev, seccion];
+      try { localStorage.setItem(storageKey, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  };
 
   useEffect(() => {
     if (user?.role !== 'superadmin') {
@@ -102,6 +141,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
       const comunicados = (alertas.data || []).find((a: any) => a.tipo === 'comunicado');
       setComunicadosNoLeidos(comunicados?.count || 0);
       setAlertasCount((alertas.data || []).length);
+      setAlertasData(alertas.data || []);
       setNotificaciones(notifs.data.notificaciones || []);
       setNotifNoLeidas(notifs.data.no_leidas || 0);
     } catch (e) {
@@ -139,13 +179,21 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     navigate('/login');
   };
 
-  // v2.13.2: cada item lleva una `section` que se renderiza como mini-header
-  // de separación visual en el sidebar. Items sin section (Panel Principal,
-  // Gestión Colegios) se renderizan al tope sin header encima.
+  // v2.14: badges por ruta a partir de las alertas del dashboard. Cada alerta
+  // trae un `link`; sumamos sus counts por ruta y el item del menú muestra el
+  // total en rojo (ej: "Asistencia 🔴3"). /comunicacion se excluye porque ya
+  // tiene su propio badge de mensajes no leídos (evita doble conteo).
+  const pathBadges: Record<string, number> = {};
+  alertasData.forEach((a: any) => {
+    if (a.link && a.link !== '/comunicacion') {
+      pathBadges[a.link] = (pathBadges[a.link] || 0) + (a.count || 1);
+    }
+  });
+
   const NAV_ITEMS: NavItem[] = [
     { path: '/superadmin', label: 'Gestión Colegios', icon: Building2, roles: ['superadmin'] },
     { path: '/dashboard', label: 'Panel Principal', icon: LayoutDashboard, roles: ['direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'] },
-    
+
     // ─── ACADÉMICO ───
     { path: '/academico', label: 'Calificaciones', icon: BookOpen, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/calificaciones-general', label: 'Notas por Período', icon: BarChart3, roles: ['direccion', 'coordinador'], section: 'Académico' },
@@ -156,26 +204,26 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     { path: '/asistencia', label: 'Asistencia', icon: CalendarCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/boletines', label: 'Boletines', icon: FileBarChart, roles: ['direccion', 'coordinador', 'secretaria'], section: 'Académico' },
     { path: '/registro-escolar', label: 'Registro Escolar', icon: FileBarChart, roles: ['direccion', 'coordinador', 'profesor', 'secretaria'], modulo: 'registro_escolar', section: 'Académico' },
-    
+
     // ─── PERSONAS ───
     { path: '/estudiantes', label: 'Estudiantes', icon: GraduationCap, roles: ['direccion', 'coordinador', 'profesor', 'secretaria'], section: 'Personas' },
     { path: '/eval-interna', label: 'Eval. de Estudiantes', icon: ClipboardCheck, roles: ['direccion', 'coordinador', 'profesor'], modulo: 'eval_interna', section: 'Personas' },
     { path: '/psicologia', label: 'Psicología', icon: Brain, roles: ['direccion', 'coordinador', 'profesor', 'psicologia'], modulo: 'psicologia', section: 'Personas' },
     { path: '/reportes', label: 'Reportes Conducta', icon: FileBarChart, roles: ['direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'], modulo: 'reportes_conducta', section: 'Personas' },
-    
+
     // ─── PLANIFICACIÓN ───
     { path: '/horarios', label: 'Horarios', icon: Clock, roles: ['direccion', 'coordinador', 'profesor'], section: 'Planificación' },
     { path: '/asignaciones', label: 'Asignaciones', icon: Users, roles: ['direccion'], section: 'Planificación' },
     { path: '/evaluaciones', label: 'Eval. Profesores', icon: ClipboardCheck, roles: ['direccion', 'coordinador'], modulo: 'eval_profesores', section: 'Planificación' },
-    
+
     // ─── COMUNICACIÓN ───
     { path: '/comunicacion', label: 'Mensajes internos', icon: MessageSquare, roles: ['direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'], badge: mensajesNoLeidos, section: 'Comunicación' },
     { path: '/whatsapp', label: 'WhatsApp', icon: MessageSquare, roles: ['direccion', 'coordinador', 'profesor', 'psicologia'], modulo: 'whatsapp', section: 'Comunicación' },
     { path: '/notas', label: 'Mis Notas', icon: StickyNote, roles: ['direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'], section: 'Comunicación' },
-    
+
     // ─── ANÁLISIS ───
     { path: '/estadisticas', label: 'Estadísticas', icon: BarChart3, roles: ['direccion', 'coordinador', 'psicologia'], section: 'Análisis' },
-    
+
     // ─── ADMINISTRACIÓN ───
     { path: '/usuarios', label: 'Usuarios', icon: Users, roles: ['direccion'], section: 'Administración' },
     { path: '/configuracion', label: 'Configuración', icon: Settings, roles: ['direccion'], section: 'Administración' },
@@ -185,7 +233,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
 
   const filteredNavItems = NAV_ITEMS.filter(item => {
     if (!user || !item.roles.includes(user.role)) return false;
-    
+
     // Verificar si el módulo está habilitado
     if (item.modulo && modulosConfig) {
       const mc = modulosConfig;
@@ -202,6 +250,19 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     return true;
   });
 
+  // v2.14: si la ruta activa está dentro de una sección cerrada, abrirla
+  // automáticamente para que el item activo siempre sea visible.
+  useEffect(() => {
+    if (!esMenuColapsable) return;
+    const activo = filteredNavItems.find(i =>
+      location.pathname === i.path || location.pathname.startsWith(i.path + '/')
+    );
+    if (activo?.section && !seccionesAbiertas.includes(activo.section)) {
+      toggleSeccion(activo.section);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.pathname, esMenuColapsable]);
+
   const getRoleBadge = (role: string) => {
     const badges: Record<string, { label: string; color: string }> = {
       'superadmin': { label: 'SUPER', color: 'bg-red-900 text-red-200' },
@@ -214,6 +275,114 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     return badges[role] || { label: role, color: 'bg-gray-700 text-gray-200' };
   };
 
+  // v2.14: accesos rápidos del sidebar (solo dirección/coordinación).
+  // Se construyen desde filteredNavItems para respetar roles y módulos
+  // contratados (si Reportes está apagado, el atajo no aparece).
+  const ATAJOS_DEF = [
+    { path: '/estudiantes', label: 'Estudiantes', icon: GraduationCap },
+    { path: '/academico', label: 'Calificar', icon: BookOpen },
+    { path: '/reportes', label: 'Reportes', icon: FileText },
+    { path: '/boletines', label: 'Boletines', icon: FileBarChart },
+  ];
+  const atajos = esMenuColapsable
+    ? ATAJOS_DEF.filter(a => filteredNavItems.some(i => i.path === a.path))
+    : [];
+
+  const badgeDe = (item: NavItem): number => {
+    if (item.badge && item.badge > 0) return item.badge;
+    return pathBadges[item.path] || 0;
+  };
+
+  const renderNavLink = (item: NavItem) => {
+    const isActive = location.pathname === item.path || location.pathname.startsWith(item.path + '/');
+    const Icon = item.icon;
+    const badge = badgeDe(item);
+    return (
+      <Link
+        key={item.path}
+        to={item.path}
+        onClick={() => setMobileMenuOpen(false)}
+        className={`flex items-center px-3 py-2.5 mb-1 rounded-lg transition-all group ${
+          isActive
+            ? 'bg-blue-600/90 text-white shadow-md shadow-blue-600/20'
+            : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+        }`}
+      >
+        <Icon size={20} className="min-w-[20px]" />
+        {isSidebarOpen && (
+          <>
+            <span className="ml-3 text-sm font-medium">{item.label}</span>
+            {badge > 0 && (
+              <span className="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full">
+                {badge}
+              </span>
+            )}
+          </>
+        )}
+      </Link>
+    );
+  };
+
+  // v2.14: navegación agrupada por secciones colapsables (dirección/coordinación).
+  // Los items sin section (Panel Principal) van al tope, planos.
+  const renderNavColapsable = () => {
+    const sinSeccion = filteredNavItems.filter(i => !i.section);
+    const secciones: string[] = [];
+    filteredNavItems.forEach(i => {
+      if (i.section && !secciones.includes(i.section)) secciones.push(i.section);
+    });
+    return (
+      <>
+        {sinSeccion.map(renderNavLink)}
+        {secciones.map(seccion => {
+          const items = filteredNavItems.filter(i => i.section === seccion);
+          const abierta = seccionesAbiertas.includes(seccion);
+          const badgeSeccion = items.reduce((acc, i) => acc + badgeDe(i), 0);
+          return (
+            <div key={seccion}>
+              <button
+                onClick={() => toggleSeccion(seccion)}
+                className="w-full flex items-center justify-between px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500 hover:text-slate-300 transition-colors"
+              >
+                <span className="flex items-center gap-2">
+                  {seccion}
+                  {!abierta && badgeSeccion > 0 && (
+                    <span className="bg-red-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full normal-case">
+                      {badgeSeccion}
+                    </span>
+                  )}
+                </span>
+                {abierta ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              </button>
+              {abierta && items.map(renderNavLink)}
+            </div>
+          );
+        })}
+      </>
+    );
+  };
+
+  // Navegación plana con mini-headers (profesor, secretaría, psicología —
+  // menús cortos donde colapsar estorbaría). Comportamiento v2.13.2 intacto.
+  const renderNavPlano = () => (
+    <>
+      {filteredNavItems.map((item, idx) => {
+        const prevItem = idx > 0 ? filteredNavItems[idx - 1] : null;
+        const showSectionHeader = isSidebarOpen && item.section && item.section !== prevItem?.section;
+        return (
+          <div key={item.path}>
+            {showSectionHeader && (
+              <div className="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                {item.section}
+              </div>
+            )}
+            {renderNavLink(item)}
+          </div>
+        );
+      })}
+    </>
+  );
+
   const SidebarContent = () => (
     <>
       {/* Logo Header */}
@@ -221,56 +390,49 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
         {isSidebarOpen && (
           <span className="font-extrabold text-xl tracking-tight bg-gradient-to-r from-blue-400 to-blue-300 bg-clip-text text-transparent">Educa One</span>
         )}
-        <button 
-          onClick={() => setSidebarOpen(!isSidebarOpen)} 
+        <button
+          onClick={() => setSidebarOpen(!isSidebarOpen)}
           className="p-1.5 hover:bg-slate-800 rounded-lg transition-colors hidden lg:block"
         >
           {isSidebarOpen ? <X size={20} /> : <Menu size={20} />}
         </button>
       </div>
 
+      {/* v2.14: Accesos rápidos (solo dirección/coordinación, sidebar expandido) */}
+      {isSidebarOpen && atajos.length > 0 && (
+        <div className="px-3 pt-3">
+          <div className="grid grid-cols-4 gap-1.5">
+            {atajos.map(a => {
+              const Icon = a.icon;
+              const badge = pathBadges[a.path] || 0;
+              const isActive = location.pathname === a.path || location.pathname.startsWith(a.path + '/');
+              return (
+                <Link
+                  key={a.path}
+                  to={a.path}
+                  onClick={() => setMobileMenuOpen(false)}
+                  title={a.label}
+                  className={`relative flex flex-col items-center justify-center py-2 rounded-lg transition-colors ${
+                    isActive ? 'bg-blue-600/90 text-white' : 'bg-slate-800/70 text-slate-300 hover:bg-slate-700 hover:text-white'
+                  }`}
+                >
+                  <Icon size={17} />
+                  <span className="text-[9px] mt-1 font-medium leading-none">{a.label}</span>
+                  {badge > 0 && (
+                    <span className="absolute -top-1 -right-1 min-w-[16px] h-4 bg-red-500 text-white text-[9px] font-bold rounded-full flex items-center justify-center px-1">
+                      {badge}
+                    </span>
+                  )}
+                </Link>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Navigation */}
       <nav className="flex-1 mt-2 overflow-y-auto overflow-x-hidden px-2 sidebar-scroll">
-        {filteredNavItems.map((item, idx) => {
-          const isActive = location.pathname === item.path || location.pathname.startsWith(item.path + '/');
-          const Icon = item.icon;
-          
-          // v2.13.2: insertar mini-header cuando cambia la sección
-          // Solo cuando el sidebar está expandido (en colapsado los headers estorbarían).
-          const prevItem = idx > 0 ? filteredNavItems[idx - 1] : null;
-          const showSectionHeader = isSidebarOpen && item.section && item.section !== prevItem?.section;
-          
-          return (
-            <div key={item.path}>
-              {showSectionHeader && (
-                <div className="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                  {item.section}
-                </div>
-              )}
-              <Link
-                to={item.path}
-                onClick={() => setMobileMenuOpen(false)}
-                className={`flex items-center px-3 py-2.5 mb-1 rounded-lg transition-all group ${
-                  isActive
-                    ? 'bg-blue-600/90 text-white shadow-md shadow-blue-600/20'
-                    : 'text-slate-300 hover:bg-slate-800 hover:text-white'
-                }`}
-              >
-                <Icon size={20} className="min-w-[20px]" />
-                {isSidebarOpen && (
-                  <>
-                    <span className="ml-3 text-sm font-medium">{item.label}</span>
-                    {item.badge && item.badge > 0 && (
-                      <span className="ml-auto bg-red-500 text-white text-xs font-bold px-2 py-0.5 rounded-full">
-                        {item.badge}
-                      </span>
-                    )}
-                  </>
-                )}
-              </Link>
-            </div>
-          );
-        })}
+        {isSidebarOpen && esMenuColapsable ? renderNavColapsable() : renderNavPlano()}
       </nav>
 
       {/* User Section */}
@@ -298,7 +460,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   return (
     <div className="flex h-screen overflow-hidden bg-slate-50">
       {/* Sidebar Desktop */}
-      <aside 
+      <aside
         className={`${isSidebarOpen ? 'w-64' : 'w-20'} bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950 text-white transition-all duration-300 flex-col z-50 hidden lg:flex`}
       >
         <SidebarContent />
@@ -306,14 +468,14 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
 
       {/* Mobile Overlay */}
       {mobileMenuOpen && (
-        <div 
+        <div
           className="lg:hidden fixed inset-0 bg-black/60 z-40 backdrop-blur-sm"
           onClick={() => setMobileMenuOpen(false)}
         />
       )}
 
       {/* Mobile Sidebar */}
-      <aside 
+      <aside
         className={`lg:hidden fixed left-0 top-0 h-full w-64 bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950 text-white z-50 transform transition-transform duration-300 flex flex-col ${
           mobileMenuOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
