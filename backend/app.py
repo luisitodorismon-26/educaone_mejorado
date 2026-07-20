@@ -4556,6 +4556,12 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
     Dirección/coordinación: ven todo el colegio.
     Profesor: solo de sus cursos asignados.
     """
+    # v2.15 AUDITORÍA: las evaluaciones extra son EXCLUSIVAS de secundaria.
+    # Bajo el lente de primaria (coordinador de primaria o switch de dirección)
+    # este flujo no existe: se responde vacío para que nada de secundaria
+    # se filtre en la división de primaria.
+    if nivel_efectivo(current_user, request) == 'primaria':
+        return {'pendientes': [], 'total': 0}
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
         return {'pendientes': []}
@@ -8105,6 +8111,10 @@ async def get_recuperaciones_primaria_pendientes(
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria', 'profesor'))
 ):
     """Áreas de primaria con CF < 65 que requieren recuperación."""
+    # v2.15 AUDITORÍA: espejo del guard de eval extra — las recuperaciones de
+    # primaria no existen en la división de secundaria.
+    if nivel_efectivo(current_user, request) == 'secundaria':
+        return {'pendientes': [], 'resueltas': [], 'minimo': 65}
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
         return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
@@ -10863,6 +10873,53 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
             except Exception as e:
                 logger.warning(f"Error leyendo CalificacionSecundaria de asig {asig.id}: {e}")
         
+        # ─── Modelo PRIMARIA: CalificacionPrimaria (v2.15 AUDITORÍA) ───
+        # Este carril FALTABA: las asignaturas con estudiantes de primaria no
+        # aportaban notas a las estadísticas. 3 competencias por área.
+        # periodo>0: promedio del valor del período (max P,RP) por competencia.
+        # anual: CF = promedio de las 3 finales; proyección si están a medias.
+        if ano_activo:
+            try:
+                comps_pri = tenant_filter(
+                    db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
+                ).filter_by(asignatura_id=asig.id, ano_escolar_id=ano_activo.id).all()
+                por_est_pri: dict = {}
+                for c in comps_pri:
+                    por_est_pri.setdefault(c.estudiante_id, []).append(c)
+                for eid, comps in por_est_pri.items():
+                    if eid in notas_por_est:
+                        continue  # los modelos nunca se cruzan, pero por si acaso
+                    vals = []
+                    if periodo and periodo > 0:
+                        for c in comps:
+                            pv = getattr(c, f'p{periodo}', None)
+                            rv = getattr(c, f'rp{periodo}', None)
+                            if pv is not None and rv is not None:
+                                vals.append(float(max(pv, rv)))
+                            elif rv is not None:
+                                vals.append(float(rv))
+                            elif pv is not None:
+                                vals.append(float(pv))
+                    else:
+                        finals = [float(c.final_competencia) for c in comps if c.final_competencia is not None]
+                        if len(finals) == len(comps) and finals:
+                            vals = finals
+                        else:
+                            for c in comps:
+                                for p in range(1, 5):
+                                    pv = getattr(c, f'p{p}', None)
+                                    rv = getattr(c, f'rp{p}', None)
+                                    if pv is not None and rv is not None:
+                                        vals.append(float(max(pv, rv)))
+                                    elif rv is not None:
+                                        vals.append(float(rv))
+                                    elif pv is not None:
+                                        vals.append(float(pv))
+                    if vals:
+                        notas_por_est[eid] = sum(vals) / len(vals)
+            except Exception as e:
+                logger.warning(f"Error leyendo CalificacionPrimaria de asig {asig.id}: {e}")
+
         # ─── Modelo LEGACY: Calificacion ───
         # Solo para estudiantes que NO tienen datos en modelo nuevo
         calificaciones = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(asignatura_id=asig.id).all()

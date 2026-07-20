@@ -39,6 +39,7 @@ interface NavItem {
   badge?: number;
   modulo?: string; // Si depende de un módulo habilitado
   section?: string; // agrupación en sidebar
+  nivel?: 'primaria' | 'secundaria'; // v2.15: item exclusivo de una división
 }
 
 interface ColegioConfig {
@@ -209,9 +210,9 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     { path: '/academico', label: 'Calificaciones', icon: BookOpen, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/calificaciones-general', label: 'Notas por Período', icon: BarChart3, roles: ['direccion', 'coordinador'], section: 'Académico' },
     { path: '/cuadro-honor', label: 'Cuadro de Honor', icon: Award, roles: ['direccion', 'coordinador', 'secretaria'], section: 'Académico' },
-    { path: '/recuperaciones-primaria', label: 'Recuperaciones (Primaria)', icon: AlertTriangle, roles: ['direccion', 'coordinador', 'secretaria', 'profesor'], section: 'Académico' },
-    { path: '/evaluaciones-extra', label: 'Evaluaciones Extra', icon: AlertTriangle, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
-    { path: '/items-completivos', label: 'Detalle de evaluaciones (Registro)', icon: ClipboardCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
+    { path: '/recuperaciones-primaria', label: 'Recuperaciones (Primaria)', icon: AlertTriangle, roles: ['direccion', 'coordinador', 'secretaria', 'profesor'], section: 'Académico', nivel: 'primaria' },
+    { path: '/evaluaciones-extra', label: 'Evaluaciones Extra', icon: AlertTriangle, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico', nivel: 'secundaria' },
+    { path: '/items-completivos', label: 'Detalle de evaluaciones (Registro)', icon: ClipboardCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico', nivel: 'secundaria' },
     { path: '/asistencia', label: 'Asistencia', icon: CalendarCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/boletines', label: 'Boletines', icon: FileBarChart, roles: ['direccion', 'coordinador', 'secretaria'], section: 'Académico' },
     { path: '/registro-escolar', label: 'Registro Escolar', icon: FileBarChart, roles: ['direccion', 'coordinador', 'profesor', 'secretaria'], modulo: 'registro_escolar', section: 'Académico' },
@@ -242,8 +243,22 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     { path: '/auditoria', label: 'Auditoría', icon: Shield, roles: ['direccion'], section: 'Administración' },
   ];
 
+  // v2.15 AUDITORÍA: lente efectivo para el MENÚ. Dirección usa el switch;
+  // los demás roles su división fija (nivel_asignado). Un item marcado con
+  // `nivel` distinto al lente activo desaparece del menú: bajo el lente de
+  // primaria no existe "Evaluaciones Extra", y bajo secundaria no existe
+  // "Recuperaciones (Primaria)". Sin lente ("Todos" o sin división) se ve todo.
+  const lenteNivelMenu: string | null =
+    user?.role === 'direccion'
+      ? (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null)
+      : (((user as any)?.nivel_asignado === 'primaria' || (user as any)?.nivel_asignado === 'secundaria')
+          ? (user as any).nivel_asignado : null);
+
   const filteredNavItems = NAV_ITEMS.filter(item => {
     if (!user || !item.roles.includes(user.role)) return false;
+
+    // v2.15: items exclusivos de una división se ocultan bajo el lente contrario
+    if (item.nivel && lenteNivelMenu && item.nivel !== lenteNivelMenu) return false;
 
     // Verificar si el módulo está habilitado
     if (item.modulo && modulosConfig) {
