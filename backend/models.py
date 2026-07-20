@@ -277,6 +277,13 @@ class Usuario(Base):
     telefono = Column(String(20))
     cedula = Column(String(15))
     role = Column(String(20), nullable=False)
+    # v2.15 F1: división del usuario dentro del colegio.
+    # 'primaria' | 'secundaria' | NULL (= ambos niveles, comportamiento de siempre).
+    # Es el "lente de nivel": coordinador/secretaría/psicología con nivel fijo
+    # solo ven su división; dirección queda en NULL y conmuta con el switch del
+    # header; a los PROFESORES los rige la ASIGNACIÓN (pueden cruzar niveles,
+    # caso del profesor de inglés) — este campo es solo su división principal.
+    nivel_asignado = Column(String(20), nullable=True)
     tanda_id = Column(Integer, ForeignKey('tandas.id'))
     activo = Column(Boolean, default=True)
     # Si es True, el usuario no puede usar el sistema hasta que cambie su password.
@@ -324,6 +331,7 @@ class Usuario(Base):
             'tandas': [{'id': t.id, 'nombre': t.nombre} for t in self.tandas] if self.tandas else [],
             'activo': self.activo,
             'must_change_password': bool(self.must_change_password),
+            'nivel_asignado': self.nivel_asignado,
             'colegio_id': self.colegio_id
         }
 

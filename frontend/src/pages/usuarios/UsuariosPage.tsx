@@ -13,6 +13,7 @@ interface Usuario {
   role: string;
   tanda_id: number;
   tanda: string;
+  nivel_asignado?: string | null; // v2.15: 'primaria' | 'secundaria' | null (ambos)
   activo: boolean;
 }
 
@@ -23,7 +24,7 @@ interface Tanda {
 
 const initialForm = {
   username: '', nombre: '', apellido: '', email: '', telefono: '',
-  role: 'profesor', tanda_id: 0, password: ''
+  role: 'profesor', tanda_id: 0, nivel_asignado: '', password: ''
 };
 
 export const UsuariosPage = () => {
@@ -108,6 +109,7 @@ export const UsuariosPage = () => {
       telefono: u.telefono || '',
       role: u.role,
       tanda_id: u.tanda_id || 0,
+      nivel_asignado: u.nivel_asignado || '',
       password: ''
     });
     setShowModal(true);
@@ -155,6 +157,15 @@ export const UsuariosPage = () => {
            u.role === 'profesor' ? 'Profesor' :
            u.role === 'psicologia' ? 'Psicología' : u.role}
         </Badge>
+      )
+    },
+    {
+      key: 'nivel_asignado',
+      label: 'División',
+      render: (u: Usuario) => (
+        u.nivel_asignado === 'primaria' ? <Badge variant="info">🎒 Primaria</Badge> :
+        u.nivel_asignado === 'secundaria' ? <Badge variant="default">🏫 Secundaria</Badge> :
+        <span className="text-gray-400 text-sm">Ambos</span>
       )
     },
     {
@@ -276,6 +287,28 @@ export const UsuariosPage = () => {
                 { value: 'direccion', label: '🏫 Dirección' }
               ]}
             />
+            <Select
+              label="División (nivel)"
+              value={form.nivel_asignado}
+              onChange={e => setForm({ ...form, nivel_asignado: e.target.value })}
+              options={[
+                { value: '', label: 'Ambos niveles' },
+                { value: 'primaria', label: '🎒 Nivel Primario' },
+                { value: 'secundaria', label: '🏫 Nivel Secundario' }
+              ]}
+            />
+            {form.role === 'profesor' ? (
+              <p className="text-xs text-gray-500 -mt-2 col-span-2">
+                En profesores es su división <b>principal</b> (organización): su acceso real
+                lo definen las <b>asignaciones</b>, que pueden cruzar niveles (ej. el profesor
+                de inglés de secundaria con cursos de 4to-6to de primaria).
+              </p>
+            ) : (
+              <p className="text-xs text-gray-500 -mt-2 col-span-2">
+                Con una división asignada, este usuario <b>solo verá</b> cursos, estudiantes y
+                datos de ese nivel. "Ambos" = ve todo (como hoy).
+              </p>
+            )}
             {/* Tanda solo para Coordinador y Psicología */}
             {(form.role === 'coordinador' || form.role === 'psicologia') && (
               <Select

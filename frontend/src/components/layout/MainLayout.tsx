@@ -69,6 +69,17 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [modulosConfig, setModulosConfig] = useState<any>(null);
   const [notificaciones, setNotificaciones] = useState<any[]>([]);
+  // v2.15 F1: switch de división (solo dirección). La elección vive en
+  // localStorage y el interceptor de api.ts la manda en cada petición.
+  const [nivelVista, setNivelVista] = useState<string>(
+    () => localStorage.getItem('educaone_nivel_vista') || 'todos'
+  );
+  const cambiarNivelVista = (v: string) => {
+    try { localStorage.setItem('educaone_nivel_vista', v); } catch {}
+    setNivelVista(v);
+    // Recarga completa: TODAS las pantallas re-consultan con el lente nuevo
+    window.location.reload();
+  };
   const [notifNoLeidas, setNotifNoLeidas] = useState(0);
   const [showNotifPanel, setShowNotifPanel] = useState(false);
 
@@ -496,12 +507,42 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
             </button>
             <div>
               <h1 className="text-lg font-semibold text-slate-800">{config?.nombre || 'Educa One'}</h1>
-              {config?.distrito && (
-                <p className="text-xs text-slate-500">{config.distrito}</p>
-              )}
+              <div className="flex items-center gap-2">
+                {config?.distrito && (
+                  <p className="text-xs text-slate-500">{config.distrito}</p>
+                )}
+                {user?.role === 'direccion' && nivelVista !== 'todos' && (
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${nivelVista === 'primaria' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-purple-50 text-purple-700 border-purple-200'}`}>
+                    Viendo: {nivelVista === 'primaria' ? '🎒 División Primaria' : '🏫 División Secundaria'}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
           <div className="flex items-center gap-3">
+            {/* v2.15 F1: switch de división — un clic y todo el sistema se pone
+                el lente de esa división (dashboard, listas, stats, alertas) */}
+            {user?.role === 'direccion' && (
+              <div className="hidden md:flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 gap-0.5">
+                {[
+                  { v: 'primaria', l: '🎒 Primaria' },
+                  { v: 'secundaria', l: '🏫 Secundaria' },
+                  { v: 'todos', l: 'Todos' },
+                ].map(op => (
+                  <button
+                    key={op.v}
+                    onClick={() => op.v !== nivelVista && cambiarNivelVista(op.v)}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                      nivelVista === op.v
+                        ? 'bg-blue-600 text-white shadow-sm'
+                        : 'text-slate-600 hover:bg-slate-200'
+                    }`}
+                  >
+                    {op.l}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="relative">
               <button onClick={() => setShowNotifPanel(!showNotifPanel)} className="relative p-2 text-slate-400 hover:text-blue-600 hover:bg-slate-100 rounded-lg transition-colors">
                 <Bell size={22} />

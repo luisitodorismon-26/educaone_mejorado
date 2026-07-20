@@ -21,6 +21,15 @@ api.interceptors.request.use((config) => {
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
+  // v2.15 F1: lente de nivel — el switch de dirección guarda su elección en
+  // localStorage y TODAS las peticiones la mandan en X-Nivel. El backend la
+  // aplica solo a usuarios sin nivel fijo (dirección); para coordinadores el
+  // lente fijo manda y este header se ignora. Un solo punto: las páginas ni
+  // se enteran de que existe la división.
+  const nivelVista = localStorage.getItem('educaone_nivel_vista');
+  if (nivelVista === 'primaria' || nivelVista === 'secundaria') {
+    config.headers['X-Nivel'] = nivelVista;
+  }
   return config;
 });
 

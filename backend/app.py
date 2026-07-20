@@ -260,6 +260,15 @@ async def lifespan(app):
         # === 6. Agregar must_change_password a usuarios (Sprint 1 seguridad) ===
         if 'usuarios' in inspector.get_table_names():
             user_cols = {c['name'] for c in inspector.get_columns('usuarios')}
+            # v2.15 F1: división por nivel (lente primaria/secundaria)
+            if 'nivel_asignado' not in user_cols:
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text("ALTER TABLE usuarios ADD COLUMN nivel_asignado VARCHAR(20)"))
+                        conn.commit()
+                        logger.info("✅ Migración: columna nivel_asignado agregada a usuarios")
+                    except Exception as e:
+                        logger.warning(f"No se pudo agregar nivel_asignado: {e}")
             if 'must_change_password' not in user_cols:
                 # Sintaxis compatible con SQLite y Postgres:
                 # SQLite acepta tanto "DEFAULT 0" como "DEFAULT FALSE" para BOOLEAN.
@@ -2178,15 +2187,62 @@ async def delete_asignatura(id, request: Request, db: Session = Depends(get_db),
 
 # ============== CURSOS ==============
 
+# ══════════════ v2.15 F1: LENTE DE NIVEL (división primaria/secundaria) ══════════════
+# Espejo conceptual del multitenant, un piso más abajo: así como tenant_filter
+# aísla colegios, el lente de nivel aísla divisiones DENTRO del colegio.
+# - Coordinador/secretaría/psicología con nivel_asignado: lente FIJO.
+# - Dirección (sin nivel): lente CONMUTABLE vía header X-Nivel (switch del frontend).
+# - Profesor: EXENTO — lo rigen sus asignaciones (puede cruzar niveles).
+# - Superadmin: exento.
+NIVELES_DIVISION = ('primaria', 'secundaria')
+
+def _canon_nivel(raw):
+    """Normaliza el nivel del grado al canónico ('primaria'|'secundaria'|'inicial')."""
+    low = (raw or 'secundaria').strip().lower()
+    if low.startswith('prim'):
+        return 'primaria'
+    if low.startswith('ini') or low.startswith('prees') or low.startswith('pre-'):
+        return 'inicial'
+    return 'secundaria'
+
+def nivel_efectivo(current_user, request=None):
+    """Nivel que aplica al usuario actual, o None = sin lente (ve todo)."""
+    rol = getattr(current_user, 'role', None)
+    if rol in ('profesor', 'superadmin'):
+        return None
+    nv = (getattr(current_user, 'nivel_asignado', None) or '').strip().lower()
+    if nv in NIVELES_DIVISION:
+        return nv  # lente fijo: el header NO puede quitarlo
+    if request is not None:
+        h = (request.headers.get('X-Nivel') or '').strip().lower()
+        if h in NIVELES_DIVISION:
+            return h  # switch de dirección
+    return None
+
+def cursos_ids_de_nivel(db, current_user, nivel):
+    """Set de IDs de cursos del colegio cuyo grado pertenece al nivel dado."""
+    if not nivel:
+        return None
+    filas = (tenant_filter(db.query(Curso), Curso, current_user)
+             .join(Grado, Curso.grado_id == Grado.id)
+             .with_entities(Curso.id, Grado.nivel).all())
+    return {cid for cid, gniv in filas if _canon_nivel(gniv) == nivel}
+
+
 @app.get("/api/cursos")
 async def get_cursos(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    ck = f'cursos:{current_user.colegio_id}'
+    # v2.15 F1: el lente entra en la CLAVE del cache — si no, el switch de
+    # dirección serviría datos de una división cacheados para otra.
+    _niv = nivel_efectivo(current_user, request)
+    ck = f'cursos:{current_user.colegio_id}:{_niv or "todos"}'
     cached = cache_get(ck)
     if cached: return cached
     
     cursos = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).join(Grado).outerjoin(Tanda).options(
         selectinload(Curso.estudiantes), selectinload(Curso.grado), selectinload(Curso.tanda)
     ).order_by(Grado.orden, Tanda.nombre, Curso.nombre).all()
+    if _niv is not None:
+        cursos = [c for c in cursos if _canon_nivel(c.grado.nivel if c.grado else None) == _niv]
     # Normalizar nivel a valor canónico en cursos
     def _norm_nivel(raw):
         if not raw: return 'secundaria'
@@ -2362,6 +2418,10 @@ async def crear_usuario(request: Request, db: Session = Depends(get_db), current
     telefono = (data.get('telefono') or '').strip()[:20]
     cedula = (data.get('cedula') or '').strip()[:20]
     role = data['role'].strip().lower()
+    # v2.15 F1: división del usuario ('primaria' | 'secundaria' | vacío = ambos)
+    nivel_asignado = (data.get('nivel_asignado') or '').strip().lower() or None
+    if nivel_asignado is not None and nivel_asignado not in NIVELES_DIVISION:
+        return JSONResponse({'error': "División inválida: usa 'primaria', 'secundaria' o vacío (ambos niveles)"}, status_code=400)
     
     # Validar username (solo alfanumérico y guiones)
     if not re.match(r'^[a-z0-9_-]+$', username):
@@ -2406,6 +2466,7 @@ async def crear_usuario(request: Request, db: Session = Depends(get_db), current
         telefono=telefono or None,
         cedula=cedula or None,
         role=role,
+        nivel_asignado=nivel_asignado,
         tanda_id=data.get('tanda_id') or None,
         colegio_id=current_user.colegio_id,
         must_change_password=must_change,
@@ -2476,6 +2537,13 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
     # Setear role solo si pasó la validación
     if 'role' in data:
         usuario.role = data['role']
+    
+    # v2.15 F1: editar la división del usuario
+    if 'nivel_asignado' in data:
+        _nv = (data.get('nivel_asignado') or '').strip().lower() or None
+        if _nv is not None and _nv not in NIVELES_DIVISION:
+            return JSONResponse({'error': "División inválida: usa 'primaria', 'secundaria' o vacío (ambos niveles)"}, status_code=400)
+        usuario.nivel_asignado = _nv
     
     if data.get('password'):
         usuario.set_password(data['password'])
@@ -2553,6 +2621,13 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
         joinedload(Estudiante.curso).joinedload(Curso.grado),
         joinedload(Estudiante.curso).joinedload(Curso.tanda)
     )
+    
+    # v2.15 F1: lente de nivel. Estudiantes SIN curso solo son visibles sin
+    # lente (dirección en "Todos") para que no queden invisibles para todos.
+    _niv = nivel_efectivo(current_user, request)
+    if _niv is not None:
+        _cids = cursos_ids_de_nivel(db, current_user, _niv)
+        query = query.filter(Estudiante.curso_id.in_(_cids if _cids else {0}))
     
     if not incluir_retirados:
         query = query.filter_by(activo=True)
