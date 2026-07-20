@@ -456,6 +456,34 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
         </div>
       )}
 
+      {/* v2.15 responsive: en MÓVIL el switch del header no existe (era
+          hidden md:flex), así que dirección conmuta la división desde aquí.
+          El lg:hidden evita duplicarlo en el sidebar de escritorio. */}
+      {isSidebarOpen && user?.role === 'direccion' && (
+        <div className="px-3 pt-3 lg:hidden">
+          <p className="text-[9px] uppercase tracking-wider text-slate-500 mb-1.5 font-semibold">División</p>
+          <div className="grid grid-cols-3 gap-1">
+            {[
+              { v: 'primaria', l: '🎒 Prim.' },
+              { v: 'secundaria', l: '🏫 Sec.' },
+              { v: 'todos', l: 'Todos' },
+            ].map(op => (
+              <button
+                key={op.v}
+                onClick={() => op.v !== nivelVista && cambiarNivelVista(op.v)}
+                className={`py-1.5 text-[11px] font-medium rounded-md transition-colors ${
+                  nivelVista === op.v
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-slate-800/70 text-slate-300 hover:bg-slate-700'
+                }`}
+              >
+                {op.l}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Navigation */}
       <nav className="flex-1 mt-2 overflow-y-auto overflow-x-hidden px-2 sidebar-scroll">
         {isSidebarOpen && esMenuColapsable ? renderNavColapsable() : renderNavPlano()}

@@ -1,4 +1,6 @@
+import { useEffect } from 'react';
 import { useNivelesActivos, Nivel } from '../hooks/useNivelesActivos';
+import { useAuth } from '../context/AuthContext';
 import { GraduationCap, BookOpen, Baby } from 'lucide-react';
 
 interface NivelTabsProps {
@@ -38,6 +40,30 @@ const NIVEL_CONFIG: Record<Nivel, { label: string; icon: typeof GraduationCap; c
  */
 export const NivelTabs: React.FC<NivelTabsProps> = ({ value, onChange, showAll = false, compact = false, hint }) => {
   const niveles = useNivelesActivos();
+  const { user } = useAuth();
+
+  // v2.15: LENTE DE DIVISIÓN. Si hay lente activo (switch de dirección o
+  // división fija de coordinador/secretaría/psicología), estas pestañas
+  // desaparecen y el valor se fuerza al nivel del lente — evita el conflicto
+  // "lente en Primaria + pestaña Secundaria = 0 resultados y confusión".
+  // PROFESORES quedan exentos: su acceso lo rigen las asignaciones (el mixto
+  // de inglés necesita ver ambas pestañas), igual que en el backend.
+  const lente: Nivel | null = (() => {
+    if (!user || user.role === 'profesor' || user.role === 'superadmin') return null;
+    if (user.role === 'direccion') {
+      const v = typeof window !== 'undefined' ? localStorage.getItem('educaone_nivel_vista') : null;
+      return v === 'primaria' || v === 'secundaria' ? (v as Nivel) : null;
+    }
+    const nv = (user as any)?.nivel_asignado;
+    return nv === 'primaria' || nv === 'secundaria' ? (nv as Nivel) : null;
+  })();
+
+  useEffect(() => {
+    if (lente && value !== lente) onChange(lente);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lente]);
+
+  if (lente) return null; // la división manda: sin pestañas redundantes
 
   // Si solo hay 1 nivel activo, no tiene sentido mostrar tabs
   if (niveles.loading) return null;
