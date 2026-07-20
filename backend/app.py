@@ -2954,14 +2954,28 @@ async def crear_asignacion(request: Request, db: Session = Depends(get_db), curr
     if profesor.role != 'profesor':
         return JSONResponse({'error': 'profesor_id no corresponde a un usuario con rol profesor'}, status_code=400)
     
-    # Verificar duplicado
+    # v2.14.1 BUGFIX: el chequeo de duplicado no filtraba por `activo` — si
+    # quedó una asignación INACTIVA (reasignación masiva, año anterior), volver
+    # a asignar al mismo profesor daba "ya existe" y no había forma de crearla.
+    # Ahora: si existe activa → error como antes; si existe inactiva → se REACTIVA.
     existe = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
         profesor_id=profesor.id,
         curso_id=curso.id,
         asignatura_id=asignatura.id,
     ).first()
-    if existe:
+    if existe and existe.activo:
         return JSONResponse({'error': 'Esta asignación ya existe', 'id': existe.id}, status_code=400)
+    if existe and not existe.activo:
+        ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+        existe.activo = True
+        existe.es_titular = bool(data.get('es_titular', existe.es_titular))
+        existe.ano_escolar_id = ano_activo.id if ano_activo else existe.ano_escolar_id
+        db.commit()
+        cache_clear_tenant(current_user.colegio_id)
+        return JSONResponse(
+            {'message': 'Asignación reactivada', 'id': existe.id, 'asignacion': existe.to_dict()},
+            status_code=201
+        )
     
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     asig = AsignacionProfesor(
@@ -3568,6 +3582,26 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     # Validar que el nivel del curso del estudiante esté activo (siempre primaria acá)
     estudiante_obj = get_tenant_or_404(db, Estudiante, estudiante_id, current_user, name='estudiante')
     get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+
+    # v2.14.1 SEGURIDAD (bug 11): el profesor solo puede calificar asignaturas
+    # que tenga ASIGNADAS (activas) en el curso del estudiante. Antes cualquier
+    # profesor del colegio podía calificar cualquier curso/materia vía API.
+    # El botón "Maestro titular" de Asignaciones crea el lote completo de áreas.
+    if not estudiante_obj.curso_id:
+        return JSONResponse({'error': 'El estudiante no tiene curso asignado'}, status_code=400)
+    _tiene_asignacion = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(
+        profesor_id=current_user.id,
+        curso_id=estudiante_obj.curso_id,
+        asignatura_id=asignatura_id,
+        activo=True,
+    ).first()
+    if not _tiene_asignacion:
+        return JSONResponse({
+            'error': 'No tienes asignada esta asignatura en el curso del estudiante. '
+                     'Pide a dirección que la asigne en la pantalla de Asignaciones.'
+        }, status_code=403)
     
     # Bloquear calificación de estudiante retirado
     if not estudiante_obj.activo:
@@ -4123,6 +4157,26 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
     
     estudiante_obj = get_tenant_or_404(db, Estudiante, estudiante_id, current_user, name='estudiante')
     get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+
+    # v2.14.1 SEGURIDAD (bug 11): el profesor solo puede calificar asignaturas
+    # que tenga ASIGNADAS (activas) en el curso del estudiante. Antes cualquier
+    # profesor del colegio podía calificar cualquier curso/materia vía API.
+    # El botón "Maestro titular" de Asignaciones crea el lote completo de áreas.
+    if not estudiante_obj.curso_id:
+        return JSONResponse({'error': 'El estudiante no tiene curso asignado'}, status_code=400)
+    _tiene_asignacion = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(
+        profesor_id=current_user.id,
+        curso_id=estudiante_obj.curso_id,
+        asignatura_id=asignatura_id,
+        activo=True,
+    ).first()
+    if not _tiene_asignacion:
+        return JSONResponse({
+            'error': 'No tienes asignada esta asignatura en el curso del estudiante. '
+                     'Pide a dirección que la asigne en la pantalla de Asignaciones.'
+        }, status_code=403)
     
     if not estudiante_obj.activo:
         return JSONResponse({'error': 'Estudiante retirado: no se pueden modificar sus calificaciones'}, status_code=403)
@@ -7659,6 +7713,29 @@ def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
     asistencias = tenant_filter(
         db.query(Asistencia), Asistencia, current_user
     ).filter_by(estudiante_id=estudiante_id).all()
+
+    # v2.14.1 BUGFIX (3 en 1):
+    #  a) Solo asistencias DENTRO del año escolar. Antes entraban registros de
+    #     años anteriores y el fallback "período más cercano" los metía en P1-P4.
+    #  b) Dedup POR DÍA: si el colegio pasa lista por asignatura, un día tiene
+    #     varias filas y cada una sumaba (días inflados). Ahora un día = un voto,
+    #     con la misma prioridad de v2.13.5: presente > tardanza > excusa > ausente.
+    #  c) tardanza cuenta como ASISTENCIA (el estudiante vino) y excusa como
+    #     AUSENCIA (justificada). Antes ambas se descartaban ('ausente_justificado'
+    #     ni siquiera es un estado válido del sistema).
+    _ini = getattr(ano, 'fecha_inicio', None)
+    _fin = getattr(ano, 'fecha_fin', None)
+    if _ini and _fin:
+        asistencias = [a for a in asistencias if a.fecha and _ini <= a.fecha <= _fin]
+
+    _prioridad = {'presente': 4, 'tardanza': 3, 'excusa': 2, 'ausente': 1}
+    _por_dia = {}
+    for a in asistencias:
+        if not a.fecha:
+            continue
+        prev = _por_dia.get(a.fecha)
+        if prev is None or _prioridad.get(a.estado, 0) > _prioridad.get(prev, 0):
+            _por_dia[a.fecha] = a.estado
     
     # Construir rangos de períodos con fallback
     rangos = []
@@ -7717,13 +7794,13 @@ def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
               3: {'a': 0, 'au': 0}, 4: {'a': 0, 'au': 0}}
     total_a = 0
     total_au = 0
-    for a in asistencias:
-        p = periodo_de_fecha(a.fecha) if a.fecha else None
+    for fecha_dia, estado_dia in _por_dia.items():
+        p = periodo_de_fecha(fecha_dia)
         if p:
-            if a.estado == 'presente':
+            if estado_dia in ('presente', 'tardanza'):
                 conteo[p]['a'] += 1
                 total_a += 1
-            elif a.estado in ('ausente', 'ausente_justificado'):
+            elif estado_dia in ('ausente', 'excusa'):
                 conteo[p]['au'] += 1
                 total_au += 1
     
@@ -7780,18 +7857,29 @@ def _construir_areas_primaria(db, estudiante_id, current_user, ano):
     for c in califs:
         por_asig.setdefault(c.asignatura_id, {})[c.competencia_numero] = c
 
+    # v2.14.1 BUGFIX: las recuperaciones YA se capturan en su pantalla
+    # (RecuperacionesPrimariaPage, v2.13.50) pero el boletín seguía con el
+    # TODO viejo de mandarlas en None — nunca se imprimían. Ahora se cargan.
+    recs = tenant_filter(
+        db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user
+    ).filter(
+        RecuperacionPrimaria.estudiante_id == estudiante_id,
+        RecuperacionPrimaria.ano_escolar_id == ano.id,
+    ).all()
+    rec_map = {r.asignatura_id: r for r in recs}
+
     resultado = {}
     for asig_id, comps in por_asig.items():
         nombre = asigs.get(asig_id)
         if not nombre:
             continue
         _, cf_red = calc_cf_area(list(comps.values()))
+        rec = rec_map.get(asig_id)
         resultado[nombre] = {
             'competencias': comps,
             'cf_area': cf_red,
-            # Las recuperaciones de área se cargarán cuando exista su pantalla.
-            'recuperacion_final': None,
-            'recuperacion_especial': None,
+            'recuperacion_final': rec.recuperacion_final if rec else None,
+            'recuperacion_especial': rec.recuperacion_especial if rec else None,
         }
     return resultado
 
@@ -7799,6 +7887,7 @@ def _construir_areas_primaria(db, estudiante_id, current_user, ano):
 def _generar_pdf_primaria(db, estudiante, current_user, ano, config):
     """Genera el buffer del Informe de Aprendizaje de un estudiante de primaria."""
     from boletin_primaria import generar_boletin_primaria
+    from calculo_primaria import situacion_area, condicion_final_estudiante
 
     curso = estudiante.curso
     grado = db.get(Grado, curso.grado_id) if curso and curso.grado_id else None
@@ -7807,15 +7896,54 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config):
     areas = _construir_areas_primaria(db, estudiante.id, current_user, ano)
     asistencias = _construir_asistencias_boletin(db, estudiante.id, current_user, ano)
 
-    # Docente encargado del grado (primer profesor asignado al curso)
+    # v2.14.1 BUGFIX: la asistencia NUNCA se imprimía en el boletín — el helper
+    # devuelve {'p1': {'asistencia', 'ausencia'}} y el PDF espera
+    # {1: {'presentes', 'ausentes'}}. Se adapta aquí sin tocar el contrato del
+    # helper (secundaria y el registro lo consumen con las claves originales).
+    asistencias_pdf = {}
+    for p in range(1, 5):
+        d = (asistencias or {}).get(f'p{p}') or {}
+        if d.get('asistencia') is not None or d.get('ausencia') is not None:
+            asistencias_pdf[p] = {
+                'presentes': d.get('asistencia') or 0,
+                'ausentes': d.get('ausencia') or 0,
+            }
+
+    # v2.14.1 BUGFIX (reportado): el "docente del grado" salía con el PRIMER
+    # profesor asignado al curso (orden arbitrario — podía ser el de inglés).
+    # Ahora: MAESTRO TITULAR (es_titular=True) activo del año; si no hay titular
+    # marcado, el primer profesor activo del año como fallback.
     docente_nombre = ''
-    asignacion = tenant_filter(
-        db.query(AsignacionProfesor), AsignacionProfesor, current_user
-    ).filter_by(curso_id=curso.id).first() if curso else None
-    if asignacion:
-        prof = db.get(Usuario, asignacion.profesor_id)
-        if prof:
-            docente_nombre = f"{prof.nombre} {prof.apellido}".strip()
+    if curso:
+        q_asig = tenant_filter(
+            db.query(AsignacionProfesor), AsignacionProfesor, current_user
+        ).filter_by(curso_id=curso.id, activo=True)
+        asignacion = (
+            q_asig.filter(AsignacionProfesor.ano_escolar_id == ano.id)
+                  .order_by(AsignacionProfesor.es_titular.desc()).first()
+            or q_asig.order_by(AsignacionProfesor.es_titular.desc()).first()
+        )
+        if asignacion:
+            prof = db.get(Usuario, asignacion.profesor_id)
+            if prof:
+                docente_nombre = f"{prof.nombre} {prof.apellido}".strip()
+
+    # v2.14.1 BUGFIX: la portada nunca marcaba la X de Promovido/Aplazado/
+    # Repitente ni escribía la condición — el motor ya lo calcula, solo había
+    # que pasárselo (ahora considerando también las recuperaciones cargadas).
+    situaciones = [
+        situacion_area(d.get('cf_area'), d.get('recuperacion_final'),
+                       d.get('recuperacion_especial'))
+        for d in areas.values()
+    ]
+    situacion_final = None
+    condicion_texto = ''
+    if situaciones:
+        cond = condicion_final_estudiante(situaciones)
+        condicion_texto = cond.get('detalle') or ''
+        mapa_x = {'promovido': 'promovido', 'repite': 'repitente',
+                  'repitente_condicional': 'aplazado'}
+        situacion_final = mapa_x.get(cond.get('condicion'))  # en_proceso → sin X
 
     return generar_boletin_primaria(
         estudiante=estudiante,
@@ -7825,7 +7953,9 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config):
         config=config,
         ano_escolar=ano,
         docente_nombre=docente_nombre,
-        asistencias_por_periodo=asistencias,
+        situacion_final=situacion_final,
+        condicion_final=condicion_texto,
+        asistencias_por_periodo=asistencias_pdf,
     )
 
 
@@ -8053,13 +8183,29 @@ async def boletin_primaria_estudiante_json(
     for c in califs:
         por_asig.setdefault(c.asignatura_id, {})[c.competencia_numero] = c
 
+    # v2.14.1 BUGFIX: la vista previa ignoraba las recuperaciones ya cargadas —
+    # un estudiante que aprobó en recuperación final seguía saliendo como
+    # pendiente/reprobado y la condición final salía mal.
+    recs_prev = tenant_filter(
+        db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user
+    ).filter(
+        RecuperacionPrimaria.estudiante_id == id,
+        RecuperacionPrimaria.ano_escolar_id == ano.id,
+    ).all()
+    rec_map_prev = {r.asignatura_id: r for r in recs_prev}
+
     areas, situaciones = [], []
     for asig_id, comps in sorted(por_asig.items()):
         nombre = asigs.get(asig_id)
         if not nombre:
             continue
         _, cf_red = calc_cf_area(list(comps.values()))
-        sit = situacion_area(cf_red)
+        rec = rec_map_prev.get(asig_id)
+        sit = situacion_area(
+            cf_red,
+            rec.recuperacion_final if rec else None,
+            rec.recuperacion_especial if rec else None,
+        )
         situaciones.append(sit)
 
         detalle = []
@@ -8079,14 +8225,19 @@ async def boletin_primaria_estudiante_json(
             'asignatura': nombre,
             'competencias': detalle,
             'cf_area': cf_red,
+            'recuperacion_final': rec.recuperacion_final if rec else None,
+            'recuperacion_especial': rec.recuperacion_especial if rec else None,
             'estado': sit['estado'],
             'nota_final': sit['nota_final'],
         })
 
     condicion = condicion_final_estudiante(situaciones) if situaciones else None
     asistencia = _construir_asistencias_boletin(db, id, current_user, ano)
-    total_pres = sum((a or {}).get('presentes', 0) for a in (asistencia or {}).values())
-    total_aus = sum((a or {}).get('ausentes', 0) for a in (asistencia or {}).values())
+    # v2.14.1 BUGFIX: se sumaba .get('presentes') sobre un dict cuyas claves
+    # reales son 'asistencia'/'ausencia' — la asistencia de la vista previa
+    # salía SIEMPRE 0 / 0%.
+    total_pres = sum((a or {}).get('asistencia', 0) or 0 for a in (asistencia or {}).values())
+    total_aus = sum((a or {}).get('ausencia', 0) or 0 for a in (asistencia or {}).values())
     total_dias = total_pres + total_aus
 
     cfs = [a['cf_area'] for a in areas if a['cf_area'] is not None]
@@ -10729,6 +10880,9 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
     # Desactivar asignaciones anteriores de este curso
     tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso_id, activo=True).update({'activo': False})
     
+    # v2.14.1 BUGFIX (bug 14): el lote creaba asignaciones SIN ano_escolar_id
+    # (quedaba NULL), a diferencia del endpoint individual. Ahora se setea.
+    _ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     creadas = 0
     for asig in asignaciones_data:
         if asig.get('profesor_id'):  # Solo si tiene profesor asignado
@@ -10736,6 +10890,7 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
                 profesor_id=asig['profesor_id'],
                 curso_id=curso_id,
                 asignatura_id=asig['asignatura_id'],
+                ano_escolar_id=_ano_activo.id if _ano_activo else None,
                 es_titular=asig.get('es_titular', False),
                 activo=True,
                 colegio_id=current_user.colegio_id

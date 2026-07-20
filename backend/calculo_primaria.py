@@ -81,12 +81,15 @@ def calcular_recuperacion_final(cf_area_redondeado, puntos_recuperacion):
     }
 
 
-def situacion_area(cf_area_redondeado, recuperacion_final=None):
+def situacion_area(cf_area_redondeado, recuperacion_final=None, recuperacion_especial=None):
     """Situación de UN área: aprobado / recuperacion_pendiente / reprobado.
 
     - CF >= 65 -> aprobado directo.
     - CF < 65 sin recuperación cargada -> recuperacion_pendiente.
-    - CF < 65 con recuperación -> aprobado o reprobado según el resultado.
+    - CF < 65 con recuperación final -> aprobado o sigue el flujo.
+    - v2.14.1: si tras la final sigue < 65 y hay recuperación ESPECIAL cargada,
+      la especial decide (aprobado_recuperacion o reprobado definitivo).
+      Parámetro opcional: las llamadas existentes no cambian.
     """
     if cf_area_redondeado is None:
         return {'estado': 'sin_notas', 'nota_final': None}
@@ -96,6 +99,11 @@ def situacion_area(cf_area_redondeado, recuperacion_final=None):
         return {'estado': 'recuperacion_pendiente', 'nota_final': cf_area_redondeado}
     if recuperacion_final >= MINIMO_APROBATORIO_PRIMARIA:
         return {'estado': 'aprobado_recuperacion', 'nota_final': recuperacion_final}
+    # Reprobó la final: si hay especial cargada, ella decide
+    if recuperacion_especial is not None:
+        if recuperacion_especial >= MINIMO_APROBATORIO_PRIMARIA:
+            return {'estado': 'aprobado_recuperacion', 'nota_final': recuperacion_especial}
+        return {'estado': 'reprobado', 'nota_final': recuperacion_especial}
     return {'estado': 'reprobado', 'nota_final': recuperacion_final}
 
 

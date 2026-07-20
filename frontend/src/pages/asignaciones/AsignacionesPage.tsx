@@ -6,6 +6,8 @@ interface Curso {
   id: number;
   nombre_completo: string;
   tanda?: string;
+  grado?: string;
+  nivel?: string; // 'primaria' | 'secundaria' | 'inicial' (normalizado por el backend)
 }
 
 interface Profesor {
@@ -21,6 +23,39 @@ interface AsignacionCurso {
   es_titular: boolean;
 }
 
+// v2.14.1: áreas oficiales del Nivel Primario (espejo del normalizador del
+// boletín). El botón "Maestro titular" solo marca estas — así en un curso de
+// primaria no se asignan materias de secundaria (Física, Química, etc.).
+const _quitar_acentos = (s: string) =>
+  (s || '').toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+const AREAS_PRIMARIA_BASE: string[][] = [
+  ['lengua espanola', 'espanol'],
+  ['matematica', 'matematicas'],
+  ['ciencias sociales', 'sociales'],
+  ['ciencias de la naturaleza', 'ciencias naturales', 'naturales'],
+  // OJO: sin alias corto 'fisica' — colisionaría con la asignatura "Física"
+  // (ciencia de secundaria) que vive en la misma lista global del colegio.
+  ['educacion fisica'],
+  ['formacion integral humana y religiosa', 'formacion integral', 'religion'],
+  ['educacion artistica', 'artistica'],
+];
+const AREA_INGLES: string[] = ['lenguas extranjeras (ingles)', 'ingles'];
+
+const esAreaPrimaria = (nombreAsignatura: string, conIngles: boolean): boolean => {
+  const n = _quitar_acentos(nombreAsignatura);
+  for (const sinonimos of AREAS_PRIMARIA_BASE) {
+    if (sinonimos.includes(n)) return true;
+  }
+  if (conIngles && AREA_INGLES.includes(n)) return true;
+  return false;
+};
+
+const gradoTieneIngles = (gradoNombre: string): boolean => {
+  const g = _quitar_acentos(gradoNombre);
+  return ['4', 'cuarto', '5', 'quinto', '6', 'sexto'].some(k => g.includes(k));
+};
+
 export const AsignacionesPage = () => {
   const [cursos, setCursos] = useState<Curso[]>([]);
   const [profesores, setProfesores] = useState<Profesor[]>([]);
@@ -29,9 +64,11 @@ export const AsignacionesPage = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  // v2.14.1: maestro titular de primaria (botón "asignar todas las áreas")
+  const [titularId, setTitularId] = useState<number>(0);
 
   useEffect(() => { loadInicial(); }, []);
-  useEffect(() => { if (cursoSeleccionado) loadAsignacionesCurso(); }, [cursoSeleccionado]);
+  useEffect(() => { if (cursoSeleccionado) { loadAsignacionesCurso(); setTitularId(0); } }, [cursoSeleccionado]);
 
   const loadInicial = async () => {
     try {
@@ -91,6 +128,33 @@ export const AsignacionesPage = () => {
   };
 
   const cursoActual = cursos.find(c => c.id === cursoSeleccionado);
+  const esPrimaria = cursoActual?.nivel === 'primaria';
+
+  // v2.14.1: en primaria, un solo maestro titular suele dar TODAS las áreas.
+  // Este botón marca de una vez las 7-8 áreas oficiales del grado con el
+  // profesor elegido (y el check de titular). NO guarda: la dirección revisa
+  // la tabla y presiona "Guardar Asignaciones" como siempre.
+  const asignarTitularTodas = () => {
+    if (!titularId) {
+      setMessage({ type: 'error', text: 'Selecciona primero al maestro titular' });
+      return;
+    }
+    const conIngles = gradoTieneIngles(cursoActual?.grado || cursoActual?.nombre_completo || '');
+    const areas = asignaciones.filter(a => esAreaPrimaria(a.asignatura, conIngles));
+    if (areas.length === 0) {
+      setMessage({ type: 'error', text: 'No se encontraron áreas oficiales de primaria entre las asignaturas del colegio' });
+      return;
+    }
+    const ids = new Set(areas.map(a => a.asignatura_id));
+    setAsignaciones(prev => prev.map(a =>
+      ids.has(a.asignatura_id) ? { ...a, profesor_id: titularId, es_titular: true } : a
+    ));
+    const prof = profesores.find(p => p.id === titularId);
+    setMessage({
+      type: 'success',
+      text: `✓ ${areas.length} áreas marcadas para ${prof?.nombre_completo || 'el titular'}${conIngles ? ' (incluye Inglés)' : ''} — revisa la tabla y presiona "Guardar Asignaciones"`,
+    });
+  };
 
   if (loading) return <div className="flex justify-center py-12"><div className="animate-spin h-8 w-8 border-2 border-blue-600 rounded-full border-t-transparent"></div></div>;
 
@@ -149,7 +213,29 @@ export const AsignacionesPage = () => {
               💾 Guardar Asignaciones
             </Button>
           </div>
-          
+
+          {esPrimaria && (
+            <div className="p-3 border-b bg-blue-50 flex flex-col sm:flex-row sm:items-center gap-2">
+              <span className="text-sm font-medium text-blue-800 whitespace-nowrap">🎒 Maestro titular (da todas las áreas):</span>
+              <select
+                value={titularId}
+                onChange={e => setTitularId(parseInt(e.target.value) || 0)}
+                className="flex-1 sm:max-w-xs px-3 py-1.5 border border-blue-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 bg-white"
+              >
+                <option value={0}>-- Seleccione al maestro --</option>
+                {profesores.map(p => (
+                  <option key={p.id} value={p.id}>{p.nombre_completo}</option>
+                ))}
+              </select>
+              <button
+                onClick={asignarTitularTodas}
+                className="px-3 py-1.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 whitespace-nowrap"
+              >
+                Asignar todas las áreas
+              </button>
+            </div>
+          )}
+
           <table className="w-full">
             <thead className="bg-gray-50">
               <tr>
