@@ -2229,6 +2229,39 @@ def cursos_ids_de_nivel(db, current_user, nivel):
     return {cid for cid, gniv in filas if _canon_nivel(gniv) == nivel}
 
 
+def validar_nivel_escritura(db, current_user, curso_id=None, estudiante_id=None):
+    """v2.15 F2: CANDADO DE ESCRITURA por división.
+
+    La lectura ya está filtrada por el lente; esto cierra la otra mitad: un
+    usuario con división FIJA (coordinador/secretaría/psicología) no puede
+    CREAR/EDITAR/BORRAR datos del otro nivel ni llamando a la API directo.
+    - Dirección: exenta (sin división fija — el switch es solo un lente de vista).
+    - Profesores: exentos aquí — su candado son las asignaciones (bug 11).
+    Devuelve un JSONResponse 403 si viola la división; None si todo bien.
+    """
+    rol = getattr(current_user, 'role', None)
+    if rol in ('direccion', 'profesor', 'superadmin'):
+        return None
+    nv = (getattr(current_user, 'nivel_asignado', None) or '').strip().lower()
+    if nv not in NIVELES_DIVISION:
+        return None  # sin división fija = comportamiento de siempre
+
+    curso_objetivo = curso_id
+    if curso_objetivo is None and estudiante_id is not None:
+        _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=estudiante_id).first()
+        curso_objetivo = _e.curso_id if _e else None
+    if curso_objetivo is None:
+        return None  # sin curso no hay nivel que validar
+
+    _cids = cursos_ids_de_nivel(db, current_user, nv)
+    if int(curso_objetivo) not in (_cids or set()):
+        return JSONResponse({
+            'error': f'Tu división es {nv}: no puedes modificar datos del otro nivel. '
+                     'Pide a dirección que realice este cambio.'
+        }, status_code=403)
+    return None
+
+
 @app.get("/api/cursos")
 async def get_cursos(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     # v2.15 F1: el lente entra en la CLAVE del cache — si no, el switch de
@@ -2722,6 +2755,11 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
     if not isinstance(data, dict):
         return JSONResponse({'error': 'Body debe ser un objeto JSON'}, status_code=400)
     
+    # v2.15 F2: candado de división (coordinador de un nivel no crea en el otro)
+    _guard = validar_nivel_escritura(db, current_user, curso_id=data.get('curso_id'))
+    if _guard:
+        return _guard
+
     # Validar nombre/apellido — strip() previene "nombres" que son solo espacios
     nombre = (data.get('nombre') or '').strip()
     apellido = (data.get('apellido') or '').strip()
@@ -2846,6 +2884,14 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
     if not isinstance(data, dict):
         return JSONResponse({'error': 'Body debe ser un objeto JSON'}, status_code=400)
     
+    # v2.15 F2: candado de división — ni el estudiante actual ni el curso destino
+    # pueden ser del otro nivel
+    _guard = (validar_nivel_escritura(db, current_user, estudiante_id=est.id)
+              or (validar_nivel_escritura(db, current_user, curso_id=data.get('curso_id'))
+                  if data.get('curso_id') else None))
+    if _guard:
+        return _guard
+
     datos_anteriores = est.to_dict()
     
     # Validar tenant del nuevo curso si cambia
@@ -4454,8 +4500,11 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
         return JSONResponse({'error': 'Estudiante retirado'}, status_code=403)
     
     # Verificar asignación del profesor
-    tiene_asig = db.query(AsignacionProfesor).filter_by(
-        profesor_id=current_user.id, curso_id=estudiante_obj.curso_id, asignatura_id=asignatura_id
+    # v2.15 F2: apretado — con tenant_filter y solo asignaciones ACTIVAS
+    # (antes una asignación desactivada seguía autorizando)
+    tiene_asig = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        profesor_id=current_user.id, curso_id=estudiante_obj.curso_id,
+        asignatura_id=asignatura_id, activo=True,
     ).first()
     if not tiene_asig:
         return JSONResponse({'error': 'No tiene asignación a este curso/asignatura'}, status_code=403)
@@ -6370,6 +6419,11 @@ async def crear_reporte(request: Request, db: Session = Depends(get_db), current
     assert_modulo_activo(db, current_user, 'reportes_conducta')
     
     data = await request.json()
+
+    # v2.15 F2: candado de división
+    _guard = validar_nivel_escritura(db, current_user, estudiante_id=data.get('estudiante_id'))
+    if _guard:
+        return _guard
     
     if not data.get('estudiante_id') or not data.get('titulo'):
         return JSONResponse(
@@ -7015,6 +7069,13 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     
     if 'estudiante_id' not in data or 'estado' not in data:
         return JSONResponse({'error': 'estudiante_id y estado son requeridos'}, status_code=400)
+
+    # v2.15 F2: candado de división
+    _guard = validar_nivel_escritura(db, current_user,
+                                     curso_id=data.get('curso_id'),
+                                     estudiante_id=data.get('estudiante_id'))
+    if _guard:
+        return _guard
     
     # Validar estado contra valores permitidos (anteriormente: cualquier string entraba)
     ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
@@ -7306,6 +7367,15 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         fecha = today_rd()
     
     asistencias = data.get('asistencias', [])
+
+    # v2.15 F2: candado de división (curso del lote, o primer estudiante como referencia)
+    _primer_est = asistencias[0].get('estudiante_id') if (asistencias and isinstance(asistencias[0], dict)) else None
+    _guard = validar_nivel_escritura(db, current_user,
+                                     curso_id=data.get('curso_id'),
+                                     estudiante_id=_primer_est)
+    if _guard:
+        return _guard
+
     if not asistencias:
         return {'message': 'Sin cambios'}
     
@@ -8181,6 +8251,16 @@ async def guardar_recuperacion_primaria(
 
     if not all([est_id, asig_id, tipo]) or puntos is None:
         return JSONResponse({'error': 'Faltan datos (estudiante, asignatura, tipo, puntos)'}, status_code=400)
+
+    # v2.15 F2 (hermano del bug 11): el profesor solo carga recuperaciones de
+    # estudiantes de SUS cursos/asignaturas asignados. Antes no se validaba.
+    _est_rec = get_tenant_or_404(db, Estudiante, est_id, current_user, name='estudiante')
+    _tiene_rec = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        profesor_id=current_user.id, curso_id=_est_rec.curso_id,
+        asignatura_id=asig_id, activo=True,
+    ).first()
+    if not _tiene_rec:
+        return JSONResponse({'error': 'No tienes asignada esta asignatura en el curso del estudiante.'}, status_code=403)
     if tipo not in ('final', 'especial'):
         return JSONResponse({'error': "El tipo debe ser 'final' o 'especial'"}, status_code=400)
 
