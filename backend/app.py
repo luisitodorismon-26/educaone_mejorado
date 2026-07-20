@@ -5008,8 +5008,11 @@ async def get_dashboard_stats(db: Session = Depends(get_db), current_user: Usuar
     return stats
 
 @app.get("/api/dashboard/alertas")
-async def get_dashboard_alertas(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_dashboard_alertas(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     alertas = []
+    # v2.15 F3: lente de división para las alertas académicas
+    _niv_lente = nivel_efectivo(current_user, request)
+    _cids_lente = cursos_ids_de_nivel(db, current_user, _niv_lente) if _niv_lente else None
     
     # ─────────────────────────────────────────────────────────────────
     # ALERTA v2.14: inasistencia semanal (solo direccion/coordinador)
@@ -5029,11 +5032,13 @@ async def get_dashboard_alertas(db: Session = Depends(get_db), current_user: Usu
         _cfg = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
         umbral_semana = (_cfg.dias_ausencia_alerta if _cfg and _cfg.dias_ausencia_alerta else 3)
 
-        rows = (
+        q_rows = (
             tenant_filter(db.query(Asistencia), Asistencia, current_user)
             .filter(Asistencia.fecha >= lunes, Asistencia.fecha <= hoy)
-            .all()
         )
+        if _cids_lente is not None:
+            q_rows = q_rows.filter(Asistencia.curso_id.in_(_cids_lente or {0}))
+        rows = q_rows.all()
         # Agrupar por (estudiante, fecha) → estados de ese día
         dias_est = _dd(set)
         for a in rows:
@@ -5097,8 +5102,10 @@ async def get_dashboard_alertas(db: Session = Depends(get_db), current_user: Usu
         # ─────────────────────────────────────────────────────────────
         HORA_LIMITE_ASISTENCIA = 10
         if hoy.weekday() < 5 and now_rd().hour >= HORA_LIMITE_ASISTENCIA:
-            cursos_activos = (tenant_filter(db.query(Curso), Curso, current_user)
-                              .filter_by(activo=True).all())
+            q_ca = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True)
+            if _cids_lente is not None:
+                q_ca = q_ca.filter(Curso.id.in_(_cids_lente or {0}))
+            cursos_activos = q_ca.all()
             rows_e = (db.query(Estudiante.curso_id, func.count(Estudiante.id))
                       .filter(Estudiante.activo == True,
                               Estudiante.colegio_id == current_user.colegio_id)
@@ -5504,6 +5511,13 @@ async def get_dashboard_alertas(db: Session = Depends(get_db), current_user: Usu
                                 'link': '/academico'
                             })
     
+    # v2.15 F3: bajo el lente de PRIMARIA, las alertas exclusivas del flujo de
+    # secundaria no aplican (evaluaciones extra, profesores atrasados sec.).
+    # El cierre de período NO se oculta: el período es del colegio completo.
+    if _niv_lente == 'primaria':
+        _solo_secundaria = {'evaluacion_extra_pendiente', 'profesores_atrasados_secundaria'}
+        alertas = [a for a in alertas if a.get('tipo') not in _solo_secundaria]
+
     return alertas
 
 
@@ -5572,10 +5586,11 @@ async def get_actividad_reciente(db: Session = Depends(get_db), current_user: Us
 # ============== DASHBOARD GRÁFICOS REALES ==============
 
 @app.get("/api/dashboard/graficos")
-async def get_dashboard_graficos(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_dashboard_graficos(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Datos para gráficos"""
     try:
-        result = get_graficos(db, current_user)
+        # v2.15 F3: lente de división (fijo del usuario o switch de dirección)
+        result = get_graficos(db, current_user, nivel=nivel_efectivo(current_user, request))
         return result
     except Exception as e:
         logger.error(f"Error en graficos: {e}", exc_info=True)
@@ -13011,11 +13026,38 @@ async def get_dashboard_stats_por_rol(request: Request, db: Session = Depends(ge
     
     else:
         # Dirección, coordinador, secretaria - stats globales del colegio
+        # v2.15 F3: con lente de división, cada número es SOLO de ese nivel
+        _niv = nivel_efectivo(current_user, request)
+        _cids = cursos_ids_de_nivel(db, current_user, _niv) if _niv else None
+
+        q_est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True)
+        q_cur = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True)
+        q_prof = tenant_filter(db.query(Usuario), Usuario, current_user).filter_by(role='profesor', activo=True)
+        q_rep = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente')
+
+        if _cids is not None:
+            q_est = q_est.filter(Estudiante.curso_id.in_(_cids or {0}))
+            q_cur = q_cur.filter(Curso.id.in_(_cids or {0}))
+            # Profesores DE la división: con asignación activa en cursos del
+            # nivel O con división principal declarada en ese nivel (así el
+            # profesor de inglés mixto cuenta en ambas al tener cursos en ambas)
+            _prof_ids = {r[0] for r in tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user)
+                         .filter(AsignacionProfesor.activo == True,
+                                 AsignacionProfesor.curso_id.in_(_cids or {0}))
+                         .with_entities(AsignacionProfesor.profesor_id).all()}
+            from sqlalchemy import or_ as _or
+            q_prof = q_prof.filter(_or(Usuario.id.in_(_prof_ids or {0}), Usuario.nivel_asignado == _niv))
+            # Reportes pendientes de estudiantes del nivel
+            _est_ids = {r[0] for r in tenant_filter(db.query(Estudiante), Estudiante, current_user)
+                        .filter(Estudiante.curso_id.in_(_cids or {0}))
+                        .with_entities(Estudiante.id).all()}
+            q_rep = q_rep.filter(ReporteConducta.estudiante_id.in_(_est_ids or {0}))
+
         return {
-            'estudiantes': tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True).count(),
-            'profesores': tenant_filter(db.query(Usuario), Usuario, current_user).filter_by(role='profesor', activo=True).count(),
-            'cursos': tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).count(),
-            'reportes_pendientes': tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente').count(),
+            'estudiantes': q_est.count(),
+            'profesores': q_prof.count(),
+            'cursos': q_cur.count(),
+            'reportes_pendientes': q_rep.count(),
             'casos_psicologia': tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter(CasoPsicologia.estado != 'atendido').count()
         }
 

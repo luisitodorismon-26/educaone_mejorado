@@ -37,7 +37,7 @@ def umbral_de(nivel: str | None) -> int:
     return UMBRAL_APROBACION.get((nivel or '').lower(), UMBRAL_DEFAULT)
 
 
-def get_graficos(db: Session, user) -> dict:
+def get_graficos(db: Session, user, nivel: str = None) -> dict:
     """
     Dashboard gráficos — calcula con Python puro para máxima compatibilidad.
     Usa cf si existe, sino pc del periodo activo.
@@ -46,13 +46,30 @@ def get_graficos(db: Session, user) -> dict:
     CalificacionSecundaria (nuevo MINERD v2.12). Si un estudiante tiene
     datos en el modelo nuevo, prevalece ese.
     """
-    ck = make_cache_key("graficos", user)
+    # v2.15 F3: el lente de división entra en la clave del cache
+    ck = make_cache_key(f"graficos_n{nivel or 'all'}", user)
     cached = cache_get(ck)
     if cached:
         return cached
 
     t0 = time.time()
     cid = user.colegio_id
+
+    # v2.15 F3: LENTE DE DIVISIÓN. Si hay nivel, todo el dashboard se calcula
+    # solo con los cursos de ese nivel (primaria o secundaria).
+    cursos_lente = None
+    if nivel:
+        def _canon_niv(raw):
+            low = (raw or 'secundaria').strip().lower()
+            if low.startswith('prim'):
+                return 'primaria'
+            if low.startswith('ini') or low.startswith('prees') or low.startswith('pre-'):
+                return 'inicial'
+            return 'secundaria'
+        q_cl = db.query(Curso.id, Grado.nivel).join(Grado, Curso.grado_id == Grado.id)
+        if cid:
+            q_cl = q_cl.filter(Curso.colegio_id == cid)
+        cursos_lente = {c for c, nv in q_cl.all() if _canon_niv(nv) == nivel}
 
     # Determinar período activo
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, user).filter_by(activo=True).first()
@@ -75,6 +92,8 @@ def get_graficos(db: Session, user) -> dict:
     )
     if cid:
         q_cal = q_cal.filter(Calificacion.colegio_id == cid)
+    if cursos_lente is not None:
+        q_cal = q_cal.filter(Curso.id.in_(cursos_lente or {0}))
     
     calificaciones = list(q_cal.all())
     
@@ -106,6 +125,8 @@ def get_graficos(db: Session, user) -> dict:
         )
         if cid:
             q_sec = q_sec.filter(CalificacionSecundaria.colegio_id == cid)
+        if cursos_lente is not None:
+            q_sec = q_sec.filter(Curso.id.in_(cursos_lente or {0}))
         
         # Agrupar por (estudiante, asignatura) → list de (comp_n, p1, rp1, p2, rp2, p3, rp3, p4, rp4)
         from collections import defaultdict as _dd_sec
@@ -215,6 +236,8 @@ def get_graficos(db: Session, user) -> dict:
     )
     if cid:
         q_pri = q_pri.filter(CalificacionPrimaria.colegio_id == cid)
+    if cursos_lente is not None:
+        q_pri = q_pri.filter(Curso.id.in_(cursos_lente or {0}))
     
     # Agrupar por estudiante: { estId: {grado, orden, finals: [...], pcs: [...]} }
     from collections import defaultdict as _dd
@@ -279,7 +302,10 @@ def get_graficos(db: Session, user) -> dict:
     ], key=lambda x: grado_orden.get(x['grado'], 0))
 
     # 2. Estado estudiantes
-    total_est = tenant_filter(db.query(func.count(Estudiante.id)), Estudiante, user).filter(Estudiante.activo == True).scalar() or 0
+    q_total = tenant_filter(db.query(func.count(Estudiante.id)), Estudiante, user).filter(Estudiante.activo == True)
+    if cursos_lente is not None:
+        q_total = q_total.filter(Estudiante.curso_id.in_(cursos_lente or {0}))
+    total_est = q_total.scalar() or 0
     
     con_notas = len(estudiante_notas)
     # v2.13.49: el corte de aprobación depende del NIVEL de cada estudiante
@@ -313,6 +339,8 @@ def get_graficos(db: Session, user) -> dict:
     ).filter(Asistencia.fecha >= p1)
     if cid:
         q_asist_raw = q_asist_raw.filter(Asistencia.colegio_id == cid)
+    if cursos_lente is not None:
+        q_asist_raw = q_asist_raw.filter(Asistencia.curso_id.in_(cursos_lente or {0}))
     
     # Agrupar por estudiante+día y determinar estado del día
     from collections import defaultdict
@@ -377,11 +405,15 @@ def get_graficos(db: Session, user) -> dict:
     q_cursos = db.query(Curso).filter(Curso.activo == True)
     if cid:
         q_cursos = q_cursos.filter(Curso.colegio_id == cid)
+    if cursos_lente is not None:
+        q_cursos = q_cursos.filter(Curso.id.in_(cursos_lente or {0}))
     cursos_activos = q_cursos.all()
 
     q_est_curso = db.query(Estudiante.id, Estudiante.curso_id).filter(Estudiante.activo == True)
     if cid:
         q_est_curso = q_est_curso.filter(Estudiante.colegio_id == cid)
+    if cursos_lente is not None:
+        q_est_curso = q_est_curso.filter(Estudiante.curso_id.in_(cursos_lente or {0}))
     est_curso_map: Dict[int, int] = {}
     matricula_curso: Dict[int, int] = defaultdict(int)
     for est_id, curso_id_row in q_est_curso.all():
