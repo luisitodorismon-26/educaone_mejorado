@@ -10520,10 +10520,14 @@ async def get_resumen_calificaciones_curso(curso_id, request: Request, db: Sessi
 # Niveles: Excelencia (95+) y Honor (90+).
 # ═════════════════════════════════════════════════════════════════
 
-def _calcular_cuadro_honor(db, current_user, curso_id=None, umbral=90.0):
+def _calcular_cuadro_honor(db, current_user, curso_id=None, umbral=90.0, nivel=None):
     """Lista de estudiantes con promedio anual (promedio de CF) >= umbral.
-    CF por asignatura = promedio de las 4 competencias (solo asignaturas
-    con las 4 completas). Promedio anual = promedio de esos CF redondeados.
+
+    Secundaria: CF por asignatura = promedio de las 4 competencias.
+    v2.15 F4: AHORA INCLUYE PRIMARIA — CF por área = promedio de las 3
+    competencias finales (antes solo se leía CalificacionSecundaria y los
+    estudiantes de primaria JAMÁS podían entrar al cuadro de honor).
+    `nivel` aplica el lente de división ('primaria'|'secundaria'|None=todos).
     """
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
@@ -10534,14 +10538,27 @@ def _calcular_cuadro_honor(db, current_user, curso_id=None, umbral=90.0):
     q_est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True)
     if curso_id:
         q_est = q_est.filter(Estudiante.curso_id == int(curso_id))
+    if nivel:
+        _cids_ch = cursos_ids_de_nivel(db, current_user, nivel)
+        q_est = q_est.filter(Estudiante.curso_id.in_(_cids_ch or {0}))
     estudiantes = q_est.all()
     est_por_id = {e.id: e for e in estudiantes}
     if not estudiantes:
         return ano, []
     
+    # Separar por nivel del curso: cada carril lee SU modelo (nunca se cruzan)
+    est_primaria_ids = set()
+    for e in estudiantes:
+        try:
+            if e.curso and e.curso.grado and _canon_nivel(e.curso.grado.nivel) == 'primaria':
+                est_primaria_ids.add(e.id)
+        except Exception:
+            pass
+    est_secundaria_ids = set(est_por_id.keys()) - est_primaria_ids
+    
     califs = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter(
         CalificacionSecundaria.ano_escolar_id == ano.id,
-        CalificacionSecundaria.estudiante_id.in_(list(est_por_id.keys())),
+        CalificacionSecundaria.estudiante_id.in_(list(est_secundaria_ids) or [0]),
     ).all()
     grupos = {}
     for c in califs:
@@ -10580,6 +10597,41 @@ def _calcular_cuadro_honor(db, current_user, curso_id=None, umbral=90.0):
         cfs_por_est.setdefault(est_id, []).append(nota_asig)
         completas_por_est.setdefault(est_id, []).append(completa)
     
+    # ─── PRIMARIA (v2.15 F4) ───
+    # CF oficial por área = promedio de las 3 finales de competencia.
+    # Si faltan finales: PROYECCIÓN con los períodos cargados (max P,RP).
+    if est_primaria_ids:
+        califs_pri = tenant_filter(db.query(CalificacionPrimaria), CalificacionPrimaria, current_user).filter(
+            CalificacionPrimaria.ano_escolar_id == ano.id,
+            CalificacionPrimaria.estudiante_id.in_(list(est_primaria_ids)),
+        ).all()
+        grupos_pri = {}
+        for c in califs_pri:
+            grupos_pri.setdefault((c.estudiante_id, c.asignatura_id), {})[c.competencia_numero] = c
+        for (est_id, asig_id), comps in grupos_pri.items():
+            finals = [float(c.final_competencia) for c in comps.values() if c.final_competencia is not None]
+            if len(finals) == 3:
+                nota_asig = round(sum(finals) / 3, 0)
+                completa = True
+            else:
+                vals = []
+                for c in comps.values():
+                    for p in (1, 2, 3, 4):
+                        pv = getattr(c, f'p{p}', None)
+                        rv = getattr(c, f'rp{p}', None)
+                        if pv is not None and rv is not None:
+                            vals.append(float(max(pv, rv)))
+                        elif rv is not None:
+                            vals.append(float(rv))
+                        elif pv is not None:
+                            vals.append(float(pv))
+                if not vals:
+                    continue
+                nota_asig = sum(vals) / len(vals)
+                completa = False
+            cfs_por_est.setdefault(est_id, []).append(nota_asig)
+            completas_por_est.setdefault(est_id, []).append(completa)
+    
     resultado = []
     for est_id, cfs in cfs_por_est.items():
         promedio = round(sum(cfs) / len(cfs), 1)
@@ -10609,7 +10661,8 @@ async def get_cuadro_honor(request: Request, db: Session = Depends(get_db), curr
         umbral = float(request.query_params.get('umbral', 90))
     except (ValueError, TypeError):
         umbral = 90.0
-    ano, lista = _calcular_cuadro_honor(db, current_user, curso_id=curso_id, umbral=umbral)
+    ano, lista = _calcular_cuadro_honor(db, current_user, curso_id=curso_id, umbral=umbral,
+                                        nivel=nivel_efectivo(current_user, request))
     if ano is None:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
     # Modo global: OFICIAL solo si todos los del cuadro tienen CF completos
@@ -10635,7 +10688,8 @@ async def get_cuadro_honor_pdf(request: Request, db: Session = Depends(get_db), 
     from boletin_padres import _dibujar_logo
     
     curso_id = request.query_params.get('curso_id')
-    ano, lista = _calcular_cuadro_honor(db, current_user, curso_id=curso_id, umbral=90.0)
+    ano, lista = _calcular_cuadro_honor(db, current_user, curso_id=curso_id, umbral=90.0,
+                                        nivel=nivel_efectivo(current_user, request))
     if ano is None:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
@@ -10719,6 +10773,10 @@ async def get_estadisticas_cursos(request: Request, db: Session = Depends(get_db
     """Estadísticas por curso - optimizado con bulk queries. Filtro opcional por nivel."""
     periodo = int(request.query_params.get('periodo', 0) or 0)
     nivel = request.query_params.get('nivel')  # 'primaria', 'secundaria', 'todos', o None
+    # v2.15 F4: si hay lente de división (fijo o switch), manda sobre el tab
+    _niv_lente = nivel_efectivo(current_user, request)
+    if _niv_lente:
+        nivel = _niv_lente
     try:
         return get_stats_cursos(db, current_user, periodo, nivel=nivel)
     except Exception as e:
@@ -10748,6 +10806,15 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
          .join(Grado, Curso.grado_id == Grado.id)
          .filter(Estudiante.activo == True).all()
     }
+
+    # v2.15 F4: lente de división — solo estudiantes de cursos del nivel
+    _niv_lente = nivel_efectivo(current_user, request)
+    _est_lente = None
+    if _niv_lente:
+        _cids_lente = cursos_ids_de_nivel(db, current_user, _niv_lente)
+        _est_lente = {r[0] for r in tenant_filter(db.query(Estudiante), Estudiante, current_user)
+                      .filter(Estudiante.curso_id.in_(_cids_lente or {0}))
+                      .with_entities(Estudiante.id).all()}
 
     resultado = []
     
@@ -10822,6 +10889,8 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
                     if pcs:
                         notas_por_est[c.estudiante_id] = sum(pcs) / len(pcs)
         
+        if _est_lente is not None:
+            notas_por_est = {eid: n for eid, n in notas_por_est.items() if eid in _est_lente}
         notas = list(notas_por_est.values())
         if not notas:
             continue
