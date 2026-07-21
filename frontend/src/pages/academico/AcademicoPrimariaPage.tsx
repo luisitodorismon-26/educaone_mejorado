@@ -78,6 +78,19 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
     }
   };
 
+  // v2.16: planilla de calificaciones imprimible (llena o en blanco según lo cargado)
+  const imprimirPlanilla = () => {
+    const token = localStorage.getItem('token');
+    const url = `${(import.meta as any).env.VITE_API_URL || ''}/api/imprimir/planilla-calificaciones/${cursoId}/${asignaturaId}`;
+    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => (r.ok ? r.blob() : Promise.reject(r)))
+      .then(blob => {
+        const u = URL.createObjectURL(blob);
+        window.open(u, '_blank');
+      })
+      .catch(() => alert('No se pudo generar la planilla'));
+  };
+
   if (loading) return <div className="flex justify-center py-10"><Spinner /></div>;
 
   return (
@@ -105,6 +118,14 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
             title="Informes de Aprendizaje de todo el curso"
           >
             Informes de Aprendizaje
+          </Button>
+          <Button
+            variant="secondary"
+            icon={<span>🖨️</span>}
+            onClick={imprimirPlanilla}
+            title="Planilla imprimible: con las notas cargadas, o en blanco para trabajar a lápiz"
+          >
+            Planilla
           </Button>
           <Button variant="secondary" onClick={onVolver}>Volver</Button>
         </div>

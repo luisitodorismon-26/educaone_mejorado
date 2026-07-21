@@ -314,3 +314,38 @@ def test_cuadro_honor_respeta_lente():
     r = client.get('/api/estadisticas/cuadro-honor', headers=H('dir_a', nivel='secundaria')).json()
     nombres = {e['nombre'] for e in r['estudiantes']}
     assert not any('Pedro' in n for n in nombres), 'el lente secundaria mostró un estudiante de primaria'
+
+
+# ─────────────── 11. PLANILLA DE CALIFICACIONES (v2.16) ───────────────
+def _asegurar_asignacion_profe():
+    db = SessionLocal()
+    existe = db.query(AsignacionProfesor).filter_by(
+        profesor_id=seed.ids['profe_a'], curso_id=seed.ids['c_pri'],
+        asignatura_id=seed.ids['asig'], activo=True).first()
+    if not existe:
+        db.add(AsignacionProfesor(profesor_id=seed.ids['profe_a'], curso_id=seed.ids['c_pri'],
+                                  asignatura_id=seed.ids['asig'], activo=True, es_titular=True,
+                                  colegio_id=seed.ids['col_a'], ano_escolar_id=seed.ids['ano_a']))
+        db.commit()
+    db.close()
+
+
+def test_planilla_profesor_con_asignacion():
+    _asegurar_asignacion_profe()
+    r = client.get(f"/api/imprimir/planilla-calificaciones/{seed.ids['c_pri']}/{seed.ids['asig']}",
+                   headers=H('profe_a'))
+    assert r.status_code == 200 and r.content[:4] == b'%PDF', r.text[:200]
+
+
+def test_planilla_en_blanco_curso_sin_notas():
+    # c_sec no tiene calificaciones → debe salir igual (planilla en blanco)
+    r = client.get(f"/api/imprimir/planilla-calificaciones/{seed.ids['c_sec']}/{seed.ids['asig']}",
+                   headers=H('dir_a'))
+    assert r.status_code == 200 and r.content[:4] == b'%PDF'
+
+
+def test_planilla_respeta_division():
+    # coordinador de secundaria no puede imprimir un curso de primaria
+    r = client.get(f"/api/imprimir/planilla-calificaciones/{seed.ids['c_pri']}/{seed.ids['asig']}",
+                   headers=H('coord_sec'))
+    assert r.status_code == 403

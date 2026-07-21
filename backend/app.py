@@ -11202,6 +11202,117 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
 
 # ============== IMPRESIONES PDF (v2.11) ==============
 
+@app.get("/api/imprimir/planilla-calificaciones/{curso_id}/{asignatura_id}")
+async def imprimir_planilla_calificaciones(curso_id: int, asignatura_id: int, request: Request,
+                                             db: Session = Depends(get_db),
+                                             current_user: Usuario = Depends(get_current_user)):
+    """v2.16: Planilla de calificaciones imprimible (curso + asignatura).
+
+    Un solo PDF para todo el ciclo: en blanco si no hay notas, parcial si va a
+    medias, constancia completa si ya se calificó. Valor mostrado = efectivo
+    del período max(P, RP), con «*» cuando la RP mejoró la nota. F y CF solo
+    con datos completos (regla MINERD: nada se autocompleta con parciales).
+
+    Permisos: dirección/coordinación/secretaría cualquier curso (bajo su lente
+    de división); profesor solo cursos con asignación ACTIVA.
+    """
+    from planilla_calificaciones_pdf import generar_planilla_calificaciones_pdf
+
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    asignatura = get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+
+    if current_user.role == 'profesor':
+        tiene = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, activo=True,
+        ).first()
+        if not tiene:
+            return JSONResponse({'error': 'No tiene asignaciones en este curso'}, status_code=403)
+
+    # Lente de división (coordinador de un nivel no imprime cursos del otro)
+    _niv = nivel_efectivo(current_user, request)
+    if _niv and curso.id not in (cursos_ids_de_nivel(db, current_user, _niv) or set()):
+        return JSONResponse({'error': 'Curso fuera de tu división'}, status_code=403)
+
+    grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
+    tanda = db.get(Tanda, curso.tanda_id) if curso.tanda_id else None
+    config = db.query(ConfiguracionColegio).filter_by(colegio_id=current_user.colegio_id).first()
+    colegio = db.get(Colegio, current_user.colegio_id) if current_user.colegio_id else None
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+
+    nivel = _canon_nivel(grado.nivel if grado else None)
+
+    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
+        curso_id=curso_id, activo=True,
+    ).order_by(Estudiante.apellido, Estudiante.nombre).all()
+
+    # ── Notas por carril (primaria y secundaria NUNCA se mezclan) ──
+    notas = {}
+    if ano and estudiantes:
+        est_ids = [e.id for e in estudiantes]
+        if nivel == 'primaria':
+            Modelo = CalificacionPrimaria
+        else:
+            Modelo = CalificacionSecundaria
+        califs = tenant_filter(db.query(Modelo), Modelo, current_user).filter(
+            Modelo.ano_escolar_id == ano.id,
+            Modelo.asignatura_id == asignatura_id,
+            Modelo.estudiante_id.in_(est_ids),
+        ).all()
+        for cal in califs:
+            vals, rp_flags = [], []
+            for p in (1, 2, 3, 4):
+                pv = getattr(cal, f'p{p}', None)
+                rv = getattr(cal, f'rp{p}', None)
+                if pv is not None and rv is not None:
+                    vals.append(float(max(pv, rv)))
+                    rp_flags.append(float(rv) > float(pv))
+                elif rv is not None:
+                    vals.append(float(rv)); rp_flags.append(True)
+                elif pv is not None:
+                    vals.append(float(pv)); rp_flags.append(False)
+                else:
+                    vals.append(None); rp_flags.append(False)
+            if nivel == 'primaria':
+                final = cal.final_competencia
+            else:
+                # PC solo con los 4 períodos completos (regla MINERD)
+                final = round(sum(vals) / 4, 1) if all(v is not None for v in vals) else None
+            notas.setdefault(cal.estudiante_id, {})[cal.competencia_numero] = {
+                'vals': vals, 'rp': rp_flags, 'final': final,
+            }
+
+    if nivel == 'primaria':
+        competencias = [(1, 'C1 · Comunicativa'), (2, 'C2 · Pensamiento Lógico'), (3, 'C3 · Ética y Ciudadana')]
+    else:
+        competencias = [(1, 'Competencia 1'), (2, 'Competencia 2'), (3, 'Competencia 3'), (4, 'Competencia 4')]
+
+    # Docente: maestro titular del curso (mismo criterio del boletín v2.14.1)
+    docente = ''
+    q_asig = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        curso_id=curso.id, activo=True)
+    asignacion = ((q_asig.filter(AsignacionProfesor.ano_escolar_id == ano.id)
+                   .order_by(AsignacionProfesor.es_titular.desc()).first() if ano else None)
+                  or q_asig.order_by(AsignacionProfesor.es_titular.desc()).first())
+    if asignacion:
+        prof = db.get(Usuario, asignacion.profesor_id)
+        if prof:
+            docente = f"{prof.nombre} {prof.apellido}".strip()
+
+    pdf = generar_planilla_calificaciones_pdf(
+        estudiantes=estudiantes, notas=notas, competencias=competencias,
+        curso=curso, tanda=tanda, grado=grado, asignatura=asignatura,
+        config=config, colegio=colegio, nivel=nivel,
+        ano_escolar=(ano.nombre if ano else None), docente_nombre=docente,
+    )
+    import unicodedata as _ud
+    _crudo = f"planilla_{(grado.nombre if grado else 'curso')}_{curso.nombre}_{asignatura.nombre}.pdf"
+    # Headers HTTP son latin-1/ASCII: quitar acentos y ñ del nombre del archivo
+    nombre_pdf = (_ud.normalize('NFKD', _crudo).encode('ascii', 'ignore')
+                  .decode('ascii').replace(' ', '_'))
+    return Response(content=pdf, media_type='application/pdf',
+                    headers={'Content-Disposition': f'inline; filename="{nombre_pdf}"'})
+
+
 @app.get("/api/imprimir/lista-estudiantes/{curso_id}")
 async def imprimir_lista_estudiantes(curso_id: int, request: Request,
                                        db: Session = Depends(get_db),

@@ -91,6 +91,19 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
     },
   ];
 
+  // v2.16: planilla de calificaciones imprimible (llena o en blanco según lo cargado)
+  const imprimirPlanilla = () => {
+    const token = localStorage.getItem('token');
+    const url = `${(import.meta as any).env.VITE_API_URL || ''}/api/imprimir/planilla-calificaciones/${cursoId}/${asignaturaId}`;
+    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => (r.ok ? r.blob() : Promise.reject(r)))
+      .then(blob => {
+        const u = URL.createObjectURL(blob);
+        window.open(u, '_blank');
+      })
+      .catch(() => alert('No se pudo generar la planilla'));
+  };
+
   return (
     <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -101,7 +114,17 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
           </h2>
           <p className="text-sm text-gray-500">{curso?.nombre_completo} — {asignatura?.nombre}</p>
         </div>
-        <Button variant="secondary" onClick={onVolver}>Volver</Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            icon={<span>🖨️</span>}
+            onClick={imprimirPlanilla}
+            title="Planilla imprimible: con las notas cargadas, o en blanco para trabajar a lápiz"
+          >
+            Planilla
+          </Button>
+          <Button variant="secondary" onClick={onVolver}>Volver</Button>
+        </div>
       </div>
 
       <div className="border-b flex gap-1 overflow-x-auto">
