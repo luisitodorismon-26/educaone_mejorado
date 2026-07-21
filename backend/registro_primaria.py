@@ -13,8 +13,10 @@ F1 (esta versión) rellena:
      efectivo max(P,RP)) + Promedio del área con LINAJE ESTRICTO
      (solo si las 3 finales de competencia están completas)
 
-F2/F3 (pendientes, ver mapa): asistencia mensual (columnas de días),
-recuperación pedagógica, actas de fin de año, estadísticas de matrícula.
+F2 (esta versión): ASISTENCIA MENSUAL — 12 formularios (agosto-julio),
+números de día en la banda Fecha, códigos P/A/T/E por estudiante×día,
+mes y días trabajados. F3 pendiente: recuperación pedagógica, actas,
+estadísticas de matrícula.
 Esta versión NO dibuja nada en esas secciones (nada aproximado).
 
 ARQUITECTURA CLAVE — índice dinámico de secciones:
@@ -62,6 +64,18 @@ EST_NOMBRE_MAX = 36    # chars a font 6.5 sin invadir Sexo
 
 FONT_NOTA = 7.5
 FONT_DATO = 6.5
+
+# ── F2: Formulario mensual de ASISTENCIA (12 páginas, medido en pág 18) ──
+ASIST_DIA_X0 = 110.5      # centro de la 1ra celda de día (rects x0=102, ancho 17.05)
+ASIST_DIA_STEP = 17.05
+ASIST_DIAS_MAX = 27       # celdas de día disponibles en el formulario
+ASIST_FECHA_Y = 154.1     # banda "Fecha" donde se escriben los números de día
+ASIST_MES_X = 85          # tras la etiqueta "Mes:____" (x0=57)
+ASIST_DIAS_TRAB_X = 352   # tras "Días trabajados:____"
+ASIST_INFO_Y = 63.0
+ASIST_FILAS_MAX = 45      # un formulario por mes: 45 estudiantes
+# Orden del calendario escolar dominicano: agosto → julio
+MESES_ESCOLARES = [8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7]
 
 # ─────────────────────────── ÁREAS OFICIALES ───────────────────────────
 # nombre canónico → variantes con que puede venir la asignatura del colegio
@@ -123,7 +137,7 @@ def _construir_indice(grado_numero: int) -> Dict:
         return _INDICE_CACHE[grado_numero]
 
     reader = PdfReader(get_template_path(grado_numero))
-    indice = {'portada': None, 'estudiantes': [], 'calificaciones': {}}
+    indice = {'portada': None, 'estudiantes': [], 'asistencia': [], 'calificaciones': {}}
 
     for i, page in enumerate(reader.pages):
         try:
@@ -141,6 +155,17 @@ def _construir_indice(grado_numero: int) -> Dict:
         # estudiantes (10-11) de la página del ÍNDICE, que solo lista el título.
         if 'orden alfabetico' in plano and len(indice['estudiantes']) < 2:
             indice['estudiantes'].append(i)
+            continue
+
+        # Formulario mensual de asistencia (12 páginas): título COMPLETO de la
+        # sección + banda "Fecha" del grid. El título completo evita el falso
+        # positivo de "Datos del docente" (que menciona asistencia y fecha).
+        # Triple ancla del formulario REAL: título de sección + "Semana"
+        # (encabezados 1ra-5ta) + banda "Fecha" del grid. Descarta a la vez la
+        # ficha del docente (sin semana) y las instrucciones (sin fecha).
+        if 'control de asistencia y puntualidad' in plano and 'semana' in plano \
+                and 'fecha' in plano and len(indice['asistencia']) < 12:
+            indice['asistencia'].append(i)
             continue
 
         # Página de calificaciones: menciona las competencias PERO NO es una
@@ -278,13 +303,50 @@ def generar_registro_primaria(
                     c.drawCentredString(COL_PROMEDIO, y, str(int(prom)))
         return draw
 
-    # ── Mapear calificaciones del colegio → páginas del template por área ──
     overlays_por_pagina: Dict[int, list] = {}
 
     def agendar(pg_idx, fn):
         if pg_idx is not None and 0 <= pg_idx < len(reader.pages):
             overlays_por_pagina.setdefault(pg_idx, []).append(fn)
 
+    # ── F2: Asistencia mensual (un formulario del template por mes) ──
+    def draw_asistencia_mes(mes_data: Dict):
+        def draw(c, w, h):
+            # Cabecera: mes y días trabajados configurados
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(ASIST_MES_X, h - ASIST_INFO_Y - 7.5,
+                         str(mes_data.get('mes', '') or '').upper())
+            dt = mes_data.get('dias_trabajados_configurados')
+            if dt:
+                c.drawString(ASIST_DIAS_TRAB_X, h - ASIST_INFO_Y - 7.5, str(dt))
+            # Números de día en la banda "Fecha" (máximo 27 celdas del template)
+            dias = list(mes_data.get('dias') or [])[:ASIST_DIAS_MAX]
+            c.setFont("Helvetica", 6.5)
+            for j, dia in enumerate(dias):
+                c.drawCentredString(ASIST_DIA_X0 + j * ASIST_DIA_STEP,
+                                    h - ASIST_FECHA_Y - 7, str(dia))
+            # Códigos P/A/T/E por estudiante × día (grid de filas compartido)
+            for fila_idx, fila in enumerate((mes_data.get('filas') or [])[:ASIST_FILAS_MAX]):
+                y = _y_fila(h, fila_idx)
+                valores = fila.get('valores') or []
+                for j in range(min(len(valores), len(dias))):
+                    cod = (valores[j] or '').strip()
+                    if cod:
+                        c.setFont("Helvetica", 6.5)
+                        c.drawCentredString(ASIST_DIA_X0 + j * ASIST_DIA_STEP, y, cod)
+        return draw
+
+    # Cada mes del resultado va a SU formulario según el calendario escolar
+    # (formulario 0 = agosto … 11 = julio), no por orden de aparición.
+    paginas_asist = indice.get('asistencia') or []
+    for mes_data in (asistencia_data or []):
+        mes_num = mes_data.get('mes_num')
+        if mes_num in MESES_ESCOLARES:
+            slot = MESES_ESCOLARES.index(mes_num)
+            if slot < len(paginas_asist):
+                agendar(paginas_asist[slot], draw_asistencia_mes(mes_data))
+
+    # ── Mapear calificaciones del colegio → páginas del template por área ──
     agendar(indice['portada'], draw_portada)
     for slot, pg in enumerate(indice['estudiantes'][:2]):
         agendar(pg, draw_estudiantes(slot))
