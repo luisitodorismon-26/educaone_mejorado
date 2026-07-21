@@ -349,3 +349,19 @@ def test_planilla_respeta_division():
     r = client.get(f"/api/imprimir/planilla-calificaciones/{seed.ids['c_pri']}/{seed.ids['asig']}",
                    headers=H('coord_sec'))
     assert r.status_code == 403
+
+
+# ─────────────── 12. REGISTRO DE PRIMARIA (v2.17 F1) ───────────────
+def test_registro_primaria_preview_pdf():
+    """El endpoint BORRADOR genera el registro con el generador F1 real."""
+    r = client.get(f"/api/registros/primaria/{seed.ids['c_pri']}/preview-pdf",
+                   headers=H('dir_a'))
+    assert r.status_code == 200, r.text[:300]
+    assert r.content[:4] == b'%PDF'
+
+
+def test_registro_primaria_rechaza_secundaria():
+    r = client.get(f"/api/registros/primaria/{seed.ids['c_sec']}/preview-pdf",
+                   headers=H('dir_a'))
+    # curso de secundaria: el validador/grado debe rechazarlo (4xx), nunca 200
+    assert r.status_code != 200

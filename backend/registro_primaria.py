@@ -1,73 +1,106 @@
 """
-registro_primaria.py - Generador Registro Escolar MINERD Nivel Primario
-========================================================================
-Llena los PDFs oficiales del MINERD (1ro-6to Primaria) con overlay de datos
-desde el sistema: portada, estudiantes, asistencia por mes, calificaciones
-por competencia (C1, C2, C3) por período.
+registro_primaria.py — Registro Escolar MINERD Nivel Primario (v2.17 · F1)
+===========================================================================
+Llena los PDFs OFICIALES del MINERD (1ro-6to Primaria) por overlay, con
+coordenadas REALES extraídas con pdfplumber (ver MAPA_REGISTRO_PRIMARIA.md).
+Nada estimado: el experimento de aterrizaje 1:1 está verificado (Fase 0.2).
 
-Color tinta azul lapicero (RGB 0, 0, 0.7) — formato MINERD.
+F1 (esta versión) rellena:
+  1. PORTADA — centro, código, año, grado, sección, tanda, regional, distrito
+  2. DATOS DE ESTUDIANTES — No., nombre, sexo, fecha de nacimiento
+     (2 páginas del template: filas 1-45 y 46-90)
+  3. CALIFICACIONES POR ÁREA — P1-P4 por competencia (C1/C2/C3, valor
+     efectivo max(P,RP)) + Promedio del área con LINAJE ESTRICTO
+     (solo si las 3 finales de competencia están completas)
 
-Autor: EducaOne
+F2/F3 (pendientes, ver mapa): asistencia mensual (columnas de días),
+recuperación pedagógica, actas de fin de año, estadísticas de matrícula.
+Esta versión NO dibuja nada en esas secciones (nada aproximado).
+
+ARQUITECTURA CLAVE — índice dinámico de secciones:
+Los 6 templates tienen DISTINTA cantidad de páginas (1ro=142, 6to=114) y las
+secciones se corren. Por eso las páginas se localizan POR TEXTO con pypdf
+(sin dependencias nuevas) y el índice se cachea por grado.
+
+Carril SEPARADO de secundaria: solo datos de CalificacionPrimaria.
+Color tinta azul MINERD. Firma pública compatible con app.py existente.
 """
-
 import io
 import os
-from datetime import date
-from typing import Dict, List, Optional, Any
+import unicodedata
+from typing import Dict, List, Optional
+
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import mm
 from pypdf import PdfReader, PdfWriter
 
-# Color tinta azul
+# ─────────────────────────── CALIBRACIÓN (REAL) ───────────────────────────
 AZUL_TINTA = (0, 0, 0.7)
 
-# Áreas MINERD primaria (orden oficial)
-AREAS_PRIMER_CICLO = [   # 1ro-3ro
-    "Lengua Española",
-    "Matemática",
-    "Ciencias Sociales",
-    "Ciencias de la Naturaleza",
-    "Educación Física",
-    "Educación Artística",
-    "Formación Integral Humana y Religiosa",
-    "Lenguas Extranjeras",  # solo 2do-3ro
-]
+# Grid de filas COMPARTIDO por estudiantes/calificaciones (medido):
+ROW_Y0 = 165.7        # y_top de la fila 1 (pdfplumber, desde arriba)
+ROW_H = 12.88         # espaciado entre filas
+FILAS_POR_PAGINA = 45
+# Ajuste vertical del texto dentro de la fila. El experimento (Fase 0.2):
+# baseline = alto - y_top - 9 dejó el texto 2.3 pts bajo el top de la fila.
+# 7.0 lo alinea con los números impresos del template. Calibrable ±2 al ojo.
+AJUSTE_FILA = 7.0
 
-AREAS_SEGUNDO_CICLO = [  # 4to-6to
-    "Lengua Española",
-    "Matemática",
-    "Ciencias Sociales",
-    "Ciencias de la Naturaleza",
-    "Lenguas Extranjeras - Inglés",
-    "Educación Física",
-    "Educación Artística",
-    "Formación Integral Humana y Religiosa",
-    "Talleres Optativos",
-]
+# Página de CALIFICACIONES — centros de columna (x0+x1)/2 de los headers:
+CAL_COLS = {
+    1: (88.5, 153.5, 218.5, 283.5),    # C1 Comunicativa: P1 P2 P3 P4
+    2: (348.5, 413.0, 478.0, 542.5),   # C2 Pensamiento Lógico
+    3: (700.5, 766.0, 831.0, 896.5),   # C3 Ética y Ciudadana
+}
+COL_PROMEDIO = 1005.5                  # "Promedio de competencia" (965-1046)
+
+# Página de DATOS DE ESTUDIANTES — columnas (headers medidos):
+EST_COL_NO = 46        # centro de la columna No. (entre verticales 36-56)
+EST_COL_NOMBRE = 60    # inicio del nombre (hasta ~185)
+EST_COL_SEXO = 200     # centro (header 'Sexo' x=191)
+EST_COL_FECHA = 265    # inicio fecha nacimiento (header 262-311)
+EST_NOMBRE_MAX = 36    # chars a font 6.5 sin invadir Sexo
+
+FONT_NOTA = 7.5
+FONT_DATO = 6.5
+
+# ─────────────────────────── ÁREAS OFICIALES ───────────────────────────
+# nombre canónico → variantes con que puede venir la asignatura del colegio
+# (espejo del normalizador del boletín de primaria)
+AREAS_CANON = {
+    'lengua espanola': ['lengua espanola', 'espanol', 'lengua'],
+    'matematica': ['matematica', 'matematicas'],
+    'ciencias sociales': ['ciencias sociales', 'sociales'],
+    'ciencias de la naturaleza': ['ciencias de la naturaleza', 'ciencias naturales', 'naturales'],
+    'educacion fisica': ['educacion fisica'],
+    'educacion artistica': ['educacion artistica', 'artistica'],
+    'formacion integral humana y religiosa': ['formacion integral humana y religiosa',
+                                              'formacion integral', 'religion'],
+    'lenguas extranjeras': ['lenguas extranjeras (ingles)', 'lenguas extranjeras', 'ingles',
+                            'lenguas extranjeras - ingles'],
+    'talleres optativos': ['talleres optativos', 'talleres'],
+}
 
 
-def get_areas_por_grado(grado_numero: int) -> List[str]:
-    """Devuelve la lista de áreas según el grado (ciclo MINERD)."""
-    if grado_numero <= 3:
-        return AREAS_PRIMER_CICLO
-    return AREAS_SEGUNDO_CICLO
+def _sin_acentos(s: str) -> str:
+    return unicodedata.normalize('NFKD', (s or '')).encode('ascii', 'ignore').decode('ascii').lower().strip()
+
+
+def area_canonica(nombre_asignatura: str) -> Optional[str]:
+    """Mapea el nombre de la asignatura del colegio al área oficial MINERD."""
+    n = _sin_acentos(nombre_asignatura)
+    for canon, variantes in AREAS_CANON.items():
+        if n == canon or n in variantes:
+            return canon
+    return None
 
 
 def get_template_path(grado_numero: int) -> str:
-    """Ruta al template PDF MINERD del grado."""
-    nombres = {
-        1: "Registro-1er-Grado-Primaria.pdf",
-        2: "Registro-2do-Grado-Primaria.pdf",
-        3: "Registro-3er-Grado-Primaria.pdf",
-        4: "Registro-4to-Grado-Primaria.pdf",
-        5: "Registro-5to-Grado-Primaria.pdf",
-        6: "Registro-6to-Grado-Primaria.pdf",
-    }
+    nombres = {1: "Registro-1er-Grado-Primaria.pdf", 2: "Registro-2do-Grado-Primaria.pdf",
+               3: "Registro-3er-Grado-Primaria.pdf", 4: "Registro-4to-Grado-Primaria.pdf",
+               5: "Registro-5to-Grado-Primaria.pdf", 6: "Registro-6to-Grado-Primaria.pdf"}
     fname = nombres.get(grado_numero)
     if not fname:
         raise ValueError(f"Grado {grado_numero} inválido para primaria (debe ser 1-6)")
-    
     base_dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(base_dir, "templates", "registro_escolar", "primaria", fname)
     if not os.path.exists(path):
@@ -75,221 +108,215 @@ def get_template_path(grado_numero: int) -> str:
     return path
 
 
-def _draw_text(c: canvas.Canvas, x: float, y: float, texto: str, size: int = 10):
-    """Dibuja texto en el overlay con color azul tinta."""
-    c.setFillColorRGB(*AZUL_TINTA)
-    c.setFont("Helvetica", size)
-    c.drawString(x, y, str(texto) if texto else "")
+# ─────────────────── ÍNDICE DINÁMICO DE SECCIONES ───────────────────
+_INDICE_CACHE: Dict[int, Dict] = {}
 
 
-def _create_overlay_page(draw_func, page_size=letter) -> io.BytesIO:
-    """Crea una página de overlay y devuelve su buffer."""
+def _construir_indice(grado_numero: int) -> Dict:
+    """Escanea el template UNA vez con pypdf y localiza secciones por texto.
+
+    Devuelve: {'portada': int, 'estudiantes': [pág 1-45, pág 46-90],
+               'calificaciones': {area_canon: [pág 1-45, pág 46-90]}}
+    Cacheado por grado (el proceso completo toma ~1-2 s y solo la 1ra vez).
+    """
+    if grado_numero in _INDICE_CACHE:
+        return _INDICE_CACHE[grado_numero]
+
+    reader = PdfReader(get_template_path(grado_numero))
+    indice = {'portada': None, 'estudiantes': [], 'calificaciones': {}}
+
+    for i, page in enumerate(reader.pages):
+        try:
+            txt = page.extract_text() or ''
+        except Exception:
+            txt = ''
+        plano = _sin_acentos(txt)
+
+        if indice['portada'] is None and 'registro' in plano and 'nivel primario' in plano \
+                and 'centro educativo' in plano:
+            indice['portada'] = i
+            continue
+
+        # 'orden alfabetico' distingue las páginas REALES de la tabla de
+        # estudiantes (10-11) de la página del ÍNDICE, que solo lista el título.
+        if 'orden alfabetico' in plano and len(indice['estudiantes']) < 2:
+            indice['estudiantes'].append(i)
+            continue
+
+        # Página de calificaciones: menciona las competencias PERO NO es una
+        # página de "Aspectos trabajados" (30-79) ni el índice — verificado
+        # empíricamente: pág 80 no contiene 'aspectos trabajados'; 42 y 5 sí.
+        if 'comunicativa' in plano and 'aspectos trabajados' not in plano:
+            for canon in AREAS_CANON:
+                if canon in plano:
+                    indice['calificaciones'].setdefault(canon, [])
+                    if len(indice['calificaciones'][canon]) < 2:
+                        indice['calificaciones'][canon].append(i)
+                    break
+
+    _INDICE_CACHE[grado_numero] = indice
+    return indice
+
+
+# ─────────────────────────── DIBUJO ───────────────────────────
+def _y_fila(alto_pagina: float, fila: int) -> float:
+    """y de ReportLab (desde abajo) para la fila 0-based dentro de su página."""
+    return alto_pagina - (ROW_Y0 + fila * ROW_H) - AJUSTE_FILA
+
+
+def _fmt_nota(v) -> str:
+    if v is None:
+        return ''
+    f = float(v)
+    return str(int(f)) if f == int(f) else f'{f:.1f}'
+
+
+def _overlay(page, draw_func):
+    """Crea un overlay del tamaño EXACTO del mediabox de la página y lo fusiona.
+    (Verificado Fase 0.2: el espacio del overlay coincide 1:1 con el medido.)"""
+    w = float(page.mediabox.width)
+    h = float(page.mediabox.height)
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=page_size)
-    draw_func(c)
+    c = canvas.Canvas(buf, pagesize=(w, h))
+    c.setFillColorRGB(*AZUL_TINTA)
+    draw_func(c, w, h)
     c.showPage()
     c.save()
     buf.seek(0)
-    return buf
+    page.merge_page(PdfReader(buf).pages[0])
 
 
+def _valor_efectivo(comp_data: Dict, p: int):
+    """Valor del período: max(P, RP) — la RP nunca baja la nota."""
+    pv = comp_data.get(f'p{p}')
+    rv = comp_data.get(f'rp{p}')
+    if pv is not None and rv is not None:
+        return max(float(pv), float(rv))
+    if rv is not None:
+        return float(rv)
+    if pv is not None:
+        return float(pv)
+    return None
+
+
+# ─────────────────────────── GENERADOR ───────────────────────────
 def generar_registro_primaria(
     grado_numero: int,
     datos_centro: Dict,
     datos_portada: Dict,
     estudiantes: List[Dict],
     calificaciones_data: Optional[Dict] = None,
-    asistencia_data: Optional[Dict] = None,
-    dias_trabajados: Optional[Dict] = None,
+    asistencia_data=None,       # F2 — se recibe pero aún no se dibuja
+    dias_trabajados=None,       # F2
 ) -> bytes:
-    """
-    Genera el Registro Escolar Primaria MINERD.
-    
-    Args:
-        grado_numero: 1-6
-        datos_centro: {nombre, regional, distrito, codigo_centro, ...}
-        datos_portada: {anio_inicio, anio_fin, seccion, tanda}
-        estudiantes: [{nombre, sexo, fecha_nacimiento, ...}] hasta 40
-        calificaciones_data: {area_nombre: {estudiante_idx: {c1_p1, c2_p2, cf, ...}}}
-        asistencia_data: {mes_nombre: {estudiante_idx: {dia: estado}}}
-        dias_trabajados: {mes_nombre: int}
-    
-    Returns:
-        bytes del PDF final
-    """
-    template_path = get_template_path(grado_numero)
-    reader = PdfReader(template_path)
+    """Genera el Registro Escolar Primaria MINERD (F1: portada + estudiantes
+    + calificaciones). estudiantes: hasta 90 (45 por página del template)."""
+    reader = PdfReader(get_template_path(grado_numero))
     writer = PdfWriter()
-    
-    # === Crear overlays por página ===
-    # Esta implementación sigue siendo aproximada visualmente, pero ya integra:
-    # - Portada
-    # - Dos páginas de estudiantes
-    # - Resumen de asistencia esperado vs capturado
-    # - Resumen de calificaciones finales por estudiante
-    
-    # Overlay para portada (página 2 del PDF MINERD primaria)
-    # Coordenadas medidas del PDF original:
-    # Líneas (donde escribir): Centro=531, Código=565, Grado=601, Regional=638
-    # Para que el texto descanse SOBRE la línea, y_canvas = 792 - line_y - 1
-    def draw_portada(c):
-        # Centro Educativo (línea en y_top=531)
-        _draw_text(c, 165, 792 - 530, datos_centro.get('nombre', ''), 10)
-        
-        # Código (línea en y_top=565)
-        _draw_text(c, 115, 792 - 564, datos_centro.get('codigo_centro', ''), 10)
-        
-        # Año Escolar — primer "20" termina x≈396, segundo "20" termina x≈491
-        # Las líneas están en x=401-457 (1er) y x=497-558 (2do)
-        _draw_text(c, 415, 792 - 564, datos_portada.get('anio_inicio', ''), 10)
-        _draw_text(c, 510, 792 - 564, datos_portada.get('anio_fin', ''), 10)
-        
-        # Grado (línea en y_top=601, x=104-225)
-        _draw_text(c, 110, 792 - 600, f"{grado_numero}°", 10)
-        
-        # Sección (línea en y_top=601, x=297-408)
-        _draw_text(c, 305, 792 - 600, datos_portada.get('seccion', 'A'), 10)
-        
-        # Tanda (línea en y_top=601, x=468-558)
-        _draw_text(c, 475, 792 - 600, datos_portada.get('tanda', ''), 10)
-        
-        # Regional de Educación (línea en y_top=638, x=225-328)
-        _draw_text(c, 232, 792 - 637, datos_centro.get('regional', ''), 10)
-        
-        # Distrito Educativo (línea en y_top=638, x=474-558)
-        _draw_text(c, 481, 792 - 637, datos_centro.get('distrito', ''), 10)
-    
-    def draw_estudiantes_page(start_idx: int):
-        def draw(c):
-            y_start = 600
-            y_delta = 18
-            subset = estudiantes[start_idx:start_idx + 20]
-            for local_idx, est in enumerate(subset):
-                y = y_start - (local_idx * y_delta)
-                numero = est.get('no_lista', start_idx + local_idx + 1)
-                _draw_text(c, 50, y, str(numero), 8)
-                _draw_text(c, 80, y, est.get('nombre', ''), 8)
-                _draw_text(c, 280, y, est.get('sexo', ''), 8)
+    indice = _construir_indice(grado_numero)
+    estudiantes = list(estudiantes or [])[:FILAS_POR_PAGINA * 2]
+
+    # ── Portada (coordenadas medidas, conservadas del trabajo previo) ──
+    def draw_portada(c, w, h):
+        c.setFont("Helvetica", 10)
+        c.drawString(165, h - 530, str(datos_centro.get('nombre', '') or ''))
+        c.drawString(115, h - 564, str(datos_centro.get('codigo_centro', '') or ''))
+        c.drawString(415, h - 564, str(datos_portada.get('anio_inicio', '') or ''))
+        c.drawString(510, h - 564, str(datos_portada.get('anio_fin', '') or ''))
+        c.drawString(110, h - 600, f"{grado_numero}°")
+        c.drawString(305, h - 600, str(datos_portada.get('seccion', 'A') or 'A'))
+        c.drawString(475, h - 600, str(datos_portada.get('tanda', '') or ''))
+        c.drawString(232, h - 637, str(datos_centro.get('regional', '') or ''))
+        c.drawString(481, h - 637, str(datos_centro.get('distrito', '') or ''))
+
+    # ── Datos de estudiantes (página_slot: 0 = filas 1-45, 1 = 46-90) ──
+    def draw_estudiantes(pagina_slot):
+        def draw(c, w, h):
+            c.setFont("Helvetica", FONT_DATO)
+            ini = pagina_slot * FILAS_POR_PAGINA
+            for local, est in enumerate(estudiantes[ini:ini + FILAS_POR_PAGINA]):
+                y = _y_fila(h, local)
+                c.drawCentredString(EST_COL_NO, y, str(est.get('no_lista', ini + local + 1)))
+                nombre = str(est.get('nombre', '') or '')[:EST_NOMBRE_MAX]
+                c.drawString(EST_COL_NOMBRE, y, nombre)
+                sexo = str(est.get('sexo', '') or '')[:1].upper()
+                if sexo:
+                    c.drawCentredString(EST_COL_SEXO, y, sexo)
                 fn = est.get('fecha_nacimiento')
                 if fn:
-                    _draw_text(c, 320, y, str(fn)[:10], 8)
+                    try:
+                        fecha = fn.strftime('%d/%m/%Y')
+                    except AttributeError:
+                        fecha = str(fn)[:10]
+                    c.drawString(EST_COL_FECHA, y, fecha)
         return draw
 
-    def draw_asistencia_resumen(c):
-        _draw_text(c, 50, 720, "RESUMEN DE ASISTENCIA", 11)
-        y = 695
-        meses_cfg = dias_trabajados or {}
-        _draw_text(c, 50, y, "Dias trabajados configurados por mes:", 9)
-        y -= 16
-        if meses_cfg:
-            for mes, valor in meses_cfg.items():
-                _draw_text(c, 60, y, f"{str(mes).upper()}: {valor}", 8)
-                y -= 13
-        else:
-            _draw_text(c, 60, y, "No hay dias trabajados configurados", 8)
-            y -= 13
+    # ── Calificaciones de un área (pagina_slot igual que arriba) ──
+    def draw_calificaciones(area_data: Dict, pagina_slot: int):
+        def draw(c, w, h):
+            ini = pagina_slot * FILAS_POR_PAGINA
+            for est_idx in range(ini, min(ini + FILAS_POR_PAGINA, len(estudiantes))):
+                comps = area_data.get(est_idx) or area_data.get(str(est_idx)) or {}
+                if not comps:
+                    continue
+                fila = est_idx - ini
+                y = _y_fila(h, fila)
+                c.setFont("Helvetica", FONT_NOTA)
+                finales = []
+                for comp_num in (1, 2, 3):
+                    cd = comps.get(comp_num) or comps.get(str(comp_num)) or {}
+                    cols = CAL_COLS[comp_num]
+                    for p in (1, 2, 3, 4):
+                        val = _valor_efectivo(cd, p)
+                        if val is not None:
+                            c.drawCentredString(cols[p - 1], y, _fmt_nota(val))
+                    finales.append(cd.get('final_competencia'))
+                # Promedio del área — LINAJE ESTRICTO: solo con las 3 finales
+                if len(finales) == 3 and all(f is not None for f in finales):
+                    prom = round(sum(float(f) for f in finales) / 3)
+                    c.setFont("Helvetica-Bold", FONT_NOTA)
+                    c.drawCentredString(COL_PROMEDIO, y, str(int(prom)))
+        return draw
 
-        y -= 8
-        _draw_text(c, 50, y, "Cobertura detectada por mes:", 9)
-        y -= 16
-        for mes_data in (asistencia_data or [])[:10]:
-            linea = (
-                f"{str(mes_data.get('mes', '')).upper()} | "
-                f"dias={mes_data.get('total_dias', 0)} | "
-                f"cfg={mes_data.get('dias_trabajados_configurados', 0)} | "
-                f"cobertura={mes_data.get('cobertura_registro_pct', 0)}%"
-            )
-            _draw_text(c, 60, y, linea, 8)
-            y -= 13
-            if y < 80:
-                break
+    # ── Mapear calificaciones del colegio → páginas del template por área ──
+    overlays_por_pagina: Dict[int, list] = {}
 
-    def draw_calificaciones_resumen(c):
-        _draw_text(c, 50, 720, "RESUMEN DE CALIFICACIONES", 11)
-        areas = list((calificaciones_data or {}).keys())
-        if not areas:
-            _draw_text(c, 50, 700, "No hay calificaciones para imprimir", 9)
-            return
+    def agendar(pg_idx, fn):
+        if pg_idx is not None and 0 <= pg_idx < len(reader.pages):
+            overlays_por_pagina.setdefault(pg_idx, []).append(fn)
 
-        headers = ["No", "Estudiante"] + [a[:14] for a in areas[:4]]
-        x_positions = [45, 75, 275, 370, 465, 550]
-        y = 695
-        for idx, header in enumerate(headers[:len(x_positions)]):
-            _draw_text(c, x_positions[idx], y, header, 8)
-        y -= 16
+    agendar(indice['portada'], draw_portada)
+    for slot, pg in enumerate(indice['estudiantes'][:2]):
+        agendar(pg, draw_estudiantes(slot))
 
-        for idx, est in enumerate(estudiantes[:22]):
-            _draw_text(c, x_positions[0], y, str(est.get('no_lista', idx + 1)), 7)
-            _draw_text(c, x_positions[1], y, est.get('nombre', '')[:28], 7)
-            for area_idx, area in enumerate(areas[:4], start=2):
-                valor_area = ""
-                area_data = (calificaciones_data or {}).get(area, {})
-                competencias = area_data.get(idx, {})
-                finales = [
-                    comp_data.get('final_competencia')
-                    for comp_data in competencias.values()
-                    if isinstance(comp_data, dict) and comp_data.get('final_competencia') is not None
-                ]
-                if finales:
-                    valor_area = f"{round(sum(finales) / len(finales), 1)}"
-                _draw_text(c, x_positions[area_idx], y, valor_area, 7)
-            y -= 13
-            if y < 70:
-                break
-    
-    # Procesar cada página del template
-    for pg_idx in range(len(reader.pages)):
-        page = reader.pages[pg_idx]
-        
-        # Aplicar overlay según página
-        overlay_buf = None
-        if pg_idx == 1:  # Portada (página 2 del PDF)
-            overlay_buf = _create_overlay_page(draw_portada)
-        elif pg_idx == 10:
-            overlay_buf = _create_overlay_page(draw_estudiantes_page(0))
-        elif pg_idx == 11:
-            overlay_buf = _create_overlay_page(draw_estudiantes_page(20))
-        elif pg_idx == 12:
-            overlay_buf = _create_overlay_page(draw_asistencia_resumen)
-        elif pg_idx == 13:
-            overlay_buf = _create_overlay_page(draw_calificaciones_resumen)
-        
-        if overlay_buf:
-            overlay_reader = PdfReader(overlay_buf)
-            overlay_page = overlay_reader.pages[0]
-            page.merge_page(overlay_page)
-        
+    necesita_slot_2 = len(estudiantes) > FILAS_POR_PAGINA
+    for nombre_asig, area_data in (calificaciones_data or {}).items():
+        canon = area_canonica(nombre_asig)
+        if not canon:
+            continue  # asignatura sin área oficial (no se pinta nada aproximado)
+        paginas = indice['calificaciones'].get(canon) or []
+        if paginas:
+            agendar(paginas[0], draw_calificaciones(area_data, 0))
+            if necesita_slot_2 and len(paginas) > 1:
+                agendar(paginas[1], draw_calificaciones(area_data, 1))
+
+    # ── Ensamblar ──
+    for pg_idx, page in enumerate(reader.pages):
+        for fn in overlays_por_pagina.get(pg_idx, []):
+            _overlay(page, fn)
         writer.add_page(page)
-    
-    # Escribir resultado
-    output = io.BytesIO()
-    writer.write(output)
-    return output.getvalue()
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 def generar_registro_primaria_desde_sistema(
-    colegio_info: Dict,
-    curso_info: Dict,
-    ano_escolar: str,
-    estudiantes: List[Dict],
-    calificaciones_por_area: Dict,
-    asistencia_por_mes: List[Dict],
-    dias_trabajados: Dict,
-    grado_numero: int,
+    colegio_info: Dict, curso_info: Dict, ano_escolar: str,
+    estudiantes: List[Dict], calificaciones_por_area: Dict,
+    asistencia_por_mes, dias_trabajados: Dict, grado_numero: int,
 ) -> bytes:
-    """
-    Wrapper que traduce datos del sistema al formato del generador.
-    
-    Args:
-        colegio_info: datos del centro
-        curso_info: {grado, seccion, tanda}
-        ano_escolar: "2024-2025"
-        estudiantes: lista del curso con {id, no_lista, nombre, sexo, fecha_nacimiento}
-        calificaciones_por_area: {area_nombre: {estudiante_idx: {competencia_numero: {p1, p2, p3, p4, cf}}}}
-        asistencia_por_mes: matriz mensual ya normalizada
-        dias_trabajados: {'ago': int, 'sep': int, ...}
-        grado_numero: 1-6
-    """
+    """Wrapper con la MISMA firma que consume app.py (sin cambios allá)."""
     anios = str(ano_escolar).split('-')
     datos_portada = {
         "anio_inicio": anios[0] if len(anios) > 0 else "",
@@ -297,18 +324,12 @@ def generar_registro_primaria_desde_sistema(
         "seccion": curso_info.get('seccion', 'A'),
         "tanda": curso_info.get('tanda', ''),
     }
-    
     datos_centro = {
         "nombre": colegio_info.get('nombre', ''),
         "regional": colegio_info.get('regional', ''),
         "distrito": colegio_info.get('distrito', ''),
         "codigo_centro": colegio_info.get('codigo_centro', ''),
-        "codigo_cartografia": colegio_info.get('codigo_cartografia', ''),
-        "direccion": colegio_info.get('direccion', ''),
-        "director": colegio_info.get('director', ''),
-        "docente": colegio_info.get('docente_titular', ''),
     }
-    
     return generar_registro_primaria(
         grado_numero=grado_numero,
         datos_centro=datos_centro,

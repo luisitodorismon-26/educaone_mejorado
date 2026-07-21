@@ -11730,6 +11730,12 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
     grado = curso.grado
     if not grado:
         return JSONResponse({'error': 'El curso no tiene grado asignado'}, status_code=400)
+
+    # v2.17: este flujo es EXCLUSIVO de primaria — un curso de secundaria
+    # generaría el documento equivocado (su registro es otro template).
+    if _canon_nivel(grado.nivel) != 'primaria':
+        return JSONResponse({'error': 'Este registro es solo para cursos de PRIMARIA. '
+                                      'Para secundaria usa su propio registro.'}, status_code=400)
     
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
@@ -11772,7 +11778,7 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
         'sexo': e.sexo or '',
         'fecha_nacimiento': e.fecha_nacimiento,
         'matricula': e.matricula or '',
-    } for idx, e in enumerate(estudiantes_db[:40])]
+    } for idx, e in enumerate(estudiantes_db[:90])]
     
     # Cargar calificaciones primaria por área
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
@@ -11785,7 +11791,7 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
         if not asignatura:
             continue
         area_data = {}
-        for idx, est in enumerate(estudiantes_db[:40]):
+        for idx, est in enumerate(estudiantes_db[:90]):
             competencias = {}
             for comp_num in [1, 2, 3]:
                 calif = tenant_filter(db.query(CalificacionPrimaria), CalificacionPrimaria, current_user).filter_by(
@@ -11810,7 +11816,7 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
     
     # Asistencia
     from registro_asistencia import build_asistencia_registro
-    asistencia = build_asistencia_registro(db, curso_id, estudiantes=estudiantes_db[:40])
+    asistencia = build_asistencia_registro(db, curso_id, estudiantes=estudiantes_db[:90])
     
     try:
         pdf_bytes = generar_registro_primaria_desde_sistema(
@@ -11903,7 +11909,7 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
         'sexo': e.sexo or '',
         'fecha_nacimiento': e.fecha_nacimiento,
         'matricula': e.matricula or '',
-    } for idx, e in enumerate(estudiantes_db[:40])]
+    } for idx, e in enumerate(estudiantes_db[:90])]
     
     # Cargar calificaciones por área por competencia
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
@@ -11917,7 +11923,7 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
             continue
         
         area_data = {}
-        for idx, est in enumerate(estudiantes_db[:40]):
+        for idx, est in enumerate(estudiantes_db[:90]):
             competencias = {}
             for comp_num in [1, 2, 3]:
                 calif = tenant_filter(db.query(CalificacionPrimaria), CalificacionPrimaria, current_user).filter_by(
@@ -11943,7 +11949,7 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
             calificaciones_por_area[asignatura.nombre] = area_data
     
     from registro_asistencia import build_asistencia_registro
-    asistencia_por_mes = build_asistencia_registro(db, curso_id, estudiantes=estudiantes_db[:40])
+    asistencia_por_mes = build_asistencia_registro(db, curso_id, estudiantes=estudiantes_db[:90])
     
     try:
         pdf_bytes = generar_registro_primaria_desde_sistema(
@@ -12000,6 +12006,12 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     grado = curso.grado
     if not grado:
         return JSONResponse({'error': 'El curso no tiene grado asignado'}, status_code=400)
+
+    # v2.17: este flujo es EXCLUSIVO de primaria — un curso de secundaria
+    # generaría el documento equivocado (su registro es otro template).
+    if _canon_nivel(grado.nivel) != 'primaria':
+        return JSONResponse({'error': 'Este registro es solo para cursos de PRIMARIA. '
+                                      'Para secundaria usa su propio registro.'}, status_code=400)
     
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
@@ -12056,10 +12068,10 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
         'nacionalidad': getattr(e, 'nacionalidad', '') or '',
         'direccion': e.direccion or '',
         'condicion_entrada': getattr(e, 'condicion_entrada', 'nuevo') or 'nuevo',
-    } for idx, e in enumerate(estudiantes_db[:40])]
+    } for idx, e in enumerate(estudiantes_db[:90])]
     
     asignaturas_data = _cargar_datos_asignaturas_secundaria(
-        db, current_user, curso_id, grado_numero, estudiantes_db[:40]
+        db, current_user, curso_id, grado_numero, estudiantes_db[:90]
     )
     
     try:
@@ -12179,11 +12191,11 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
         'nacionalidad': getattr(e, 'nacionalidad', '') or '',
         'direccion': e.direccion or '',
         'condicion_entrada': getattr(e, 'condicion_entrada', 'nuevo') or 'nuevo',
-    } for idx, e in enumerate(estudiantes_db[:40])]
+    } for idx, e in enumerate(estudiantes_db[:90])]
     
     # Cargar asignaturas, profesores, calificaciones, asistencias
     asignaturas_data = _cargar_datos_asignaturas_secundaria(
-        db, current_user, curso_id, grado_numero, estudiantes_db[:40]
+        db, current_user, curso_id, grado_numero, estudiantes_db[:90]
     )
     
     # === 3. GENERAR PDF ===
