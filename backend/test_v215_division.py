@@ -365,3 +365,38 @@ def test_registro_primaria_rechaza_secundaria():
                    headers=H('dir_a'))
     # curso de secundaria: el validador/grado debe rechazarlo (4xx), nunca 200
     assert r.status_code != 200
+
+
+# ─────────────── 13. PROFESOR: SU LENTE SON LAS ASIGNACIONES (v2.17) ───────────────
+def test_profesor_solo_ve_sus_cursos():
+    _asegurar_asignacion_profe()  # profe_a asignado SOLO a c_pri
+    cursos = client.get('/api/cursos', headers=H('profe_a')).json()
+    assert _ids(cursos) == {seed.ids['c_pri']}, f'profesor ve cursos ajenos: {_ids(cursos)}'
+
+
+def test_profesor_solo_ve_sus_estudiantes():
+    r = client.get('/api/estudiantes', headers=H('profe_a')).json()
+    lst = r if isinstance(r, list) else r.get('estudiantes', r.get('data', []))
+    apellidos = {e['apellido'] for e in lst}
+    assert 'Secundaria' not in apellidos and 'ColegioB' not in apellidos, apellidos
+
+
+def test_profesor_no_pasa_lista_en_curso_ajeno():
+    r = client.post('/api/asistencia', headers=H('profe_a'),
+                    json={'estudiante_id': seed.ids['e_sec'], 'estado': 'presente'})
+    assert r.status_code == 403 and 'asignados' in r.json()['error']
+
+
+def test_profesor_si_pasa_lista_en_su_curso():
+    r = client.post('/api/asistencia', headers=H('profe_a'),
+                    json={'estudiante_id': seed.ids['e_pri'], 'estado': 'presente',
+                          'curso_id': seed.ids['c_pri'], 'fecha': '2026-07-20'})
+    assert r.status_code != 403, r.text[:200]
+
+
+def test_cache_cursos_no_envenenado_por_profesor():
+    # El profesor consulta primero (llenaría el cache si estuviera mal) …
+    client.get('/api/cursos', headers=H('profe_a'))
+    # … y dirección debe seguir viendo TODO, no la lista del profesor
+    cursos = client.get('/api/cursos', headers=H('dir_a')).json()
+    assert _ids(cursos) == {seed.ids['c_pri'], seed.ids['c_sec']}, 'CACHE ENVENENADO'

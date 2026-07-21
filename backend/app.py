@@ -2266,16 +2266,26 @@ def validar_nivel_escritura(db, current_user, curso_id=None, estudiante_id=None)
 async def get_cursos(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     # v2.15 F1: el lente entra en la CLAVE del cache — si no, el switch de
     # dirección serviría datos de una división cacheados para otra.
+    # v2.17: el PROFESOR solo ve SUS cursos asignados (su lente son las
+    # asignaciones — el mixto de inglés ve los suyos de ambos niveles). Su
+    # resultado es por-usuario, así que no participa del cache compartido.
     _niv = nivel_efectivo(current_user, request)
+    _es_profesor = current_user.role == 'profesor'
     ck = f'cursos:{current_user.colegio_id}:{_niv or "todos"}'
-    cached = cache_get(ck)
-    if cached: return cached
+    if not _es_profesor:
+        cached = cache_get(ck)
+        if cached: return cached
     
     cursos = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).join(Grado).outerjoin(Tanda).options(
         selectinload(Curso.estudiantes), selectinload(Curso.grado), selectinload(Curso.tanda)
     ).order_by(Grado.orden, Tanda.nombre, Curso.nombre).all()
     if _niv is not None:
         cursos = [c for c in cursos if _canon_nivel(c.grado.nivel if c.grado else None) == _niv]
+    if _es_profesor:
+        _mis_cursos = {r[0] for r in tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user)
+                       .filter_by(profesor_id=current_user.id, activo=True)
+                       .with_entities(AsignacionProfesor.curso_id).all()}
+        cursos = [c for c in cursos if c.id in _mis_cursos]
     # Normalizar nivel a valor canónico en cursos
     def _norm_nivel(raw):
         if not raw: return 'secundaria'
@@ -2299,7 +2309,10 @@ async def get_cursos(request: Request, db: Session = Depends(get_db), current_us
         'aula': c.aula,
         'estudiantes_count': sum(1 for e in c.estudiantes if e.activo)
     } for c in cursos]
-    cache_set(ck, result, 5)
+    # v2.17: el resultado del profesor es por-usuario — NUNCA va al cache
+    # compartido (envenenaría la lista de dirección/coordinación)
+    if not _es_profesor:
+        cache_set(ck, result, 5)
     return result
 
 @app.post("/api/cursos")
@@ -2661,6 +2674,12 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
     if _niv is not None:
         _cids = cursos_ids_de_nivel(db, current_user, _niv)
         query = query.filter(Estudiante.curso_id.in_(_cids if _cids else {0}))
+    # v2.17: el PROFESOR solo ve estudiantes de sus cursos asignados
+    if current_user.role == 'profesor':
+        _mis = {r[0] for r in tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user)
+                .filter_by(profesor_id=current_user.id, activo=True)
+                .with_entities(AsignacionProfesor.curso_id).all()}
+        query = query.filter(Estudiante.curso_id.in_(_mis if _mis else {0}))
     
     if not incluir_retirados:
         query = query.filter_by(activo=True)
@@ -7076,6 +7095,18 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
                                      estudiante_id=data.get('estudiante_id'))
     if _guard:
         return _guard
+
+    # v2.17 (hermano del bug 11): el PROFESOR solo pasa lista en SUS cursos
+    if current_user.role == 'profesor':
+        _cid_asist = data.get('curso_id')
+        if not _cid_asist and data.get('estudiante_id'):
+            _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=data['estudiante_id']).first()
+            _cid_asist = _e.curso_id if _e else None
+        if _cid_asist:
+            _tiene_a = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+                profesor_id=current_user.id, curso_id=_cid_asist, activo=True).first()
+            if not _tiene_a:
+                return JSONResponse({'error': 'Solo puedes registrar asistencia en tus cursos asignados'}, status_code=403)
     
     # Validar estado contra valores permitidos (anteriormente: cualquier string entraba)
     ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
@@ -7375,6 +7406,18 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
                                      estudiante_id=_primer_est)
     if _guard:
         return _guard
+
+    # v2.17: el PROFESOR solo pasa lista en SUS cursos (lote)
+    if current_user.role == 'profesor':
+        _cid_lote = data.get('curso_id')
+        if not _cid_lote and _primer_est:
+            _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=_primer_est).first()
+            _cid_lote = _e.curso_id if _e else None
+        if _cid_lote:
+            _tiene_a = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+                profesor_id=current_user.id, curso_id=_cid_lote, activo=True).first()
+            if not _tiene_a:
+                return JSONResponse({'error': 'Solo puedes registrar asistencia en tus cursos asignados'}, status_code=403)
 
     if not asistencias:
         return {'message': 'Sin cambios'}
