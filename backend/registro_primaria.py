@@ -15,8 +15,11 @@ F1 (esta versión) rellena:
 
 F2 (esta versión): ASISTENCIA MENSUAL — 12 formularios (agosto-julio),
 números de día en la banda Fecha, códigos P/A/T/E por estudiante×día,
-mes y días trabajados. F3 pendiente: recuperación pedagógica, actas,
-estadísticas de matrícula.
+mes y días trabajados. F3 (esta versión): ACTA DE RENDIMIENTO de fin de año — final por área
+con linaje estricto, recuperación final/especial, % asistencia del año y
+observaciones. F4 (esta versión): ESTADÍSTICAS DE MATRÍCULA (cuadro de edad y sexo).
+La recuperación pedagógica queda para llenado manual por diseño: es un
+formulario narrativo (estrategias, evidencias) sin filas predefinidas.
 Esta versión NO dibuja nada en esas secciones (nada aproximado).
 
 ARQUITECTURA CLAVE — índice dinámico de secciones:
@@ -64,6 +67,110 @@ EST_NOMBRE_MAX = 36    # chars a font 6.5 sin invadir Sexo
 
 FONT_NOTA = 7.5
 FONT_DATO = 6.5
+
+# ── F4: ESTADÍSTICAS DE MATRÍCULA — cuadro 1 "Cantidad de estudiantes,
+# sexo y edad" (medido: verticales 50.1/149.8/227.9/306.0, bandas de 23.75).
+# Solo se llena ESTE cuadro: es dato duro (fecha de nacimiento + sexo).
+# Los cuadros 2 (sobreedad), 3 (NEAE por categoría) y 4 (nivel educativo de
+# los padres) quedan para llenado manual: el sistema no tiene esos datos
+# categorizados y NO se inventan criterios en un documento oficial.
+EDAD_COL_EDAD = 100.0      # centro de la columna Edad
+EDAD_COL_MASC = 188.9
+EDAD_COL_FEM = 267.0
+EDAD_FILA_Y0 = 126.1       # borde superior de la primera banda
+EDAD_FILA_H = 23.75
+EDAD_FILAS_MAX = 10        # 10 filas de edad + 1 fila TOTAL
+EDAD_AJUSTE = 16.0         # baseline dentro de la banda
+
+# ── F3: ACTA DE RENDIMIENTO DE FIN DE AÑO (calibración MEDIDA por grado) ──
+# Las páginas se localizan dinámicamente; estas son las COLUMNAS de cada grado.
+# 1ro-2do: 2 columnas por área (Final del área, Recuperación final).
+# 3ro-6to: 3 columnas (Final, Recuperación final, Recuperación ESPECIAL) —
+# coincide con la cascada de calculo_primaria.py. 4to-6to suman Inglés.
+ACTA_ROW_Y0 = 165.0        # y_top de la fila 1 del acta
+ACTA_ROW_H = 12.7          # espaciado entre filas
+ACTA_FILAS_MAX = 45        # el acta cubre 45 estudiantes
+ACTA_COL_NO = 46.0
+ACTA_COL_NOMBRE = 104.8
+ACTA_NOMBRE_MAX = 30
+
+ACTA_CAL = {
+    1: {
+        'areas': {
+            'lengua espanola': {'cara': 0, 'final': 281.4, 'rec_final': 308.4, 'rec_especial': None},
+            'matematica': {'cara': 0, 'final': 343.1, 'rec_final': 370.1, 'rec_especial': None},
+            'ciencias sociales': {'cara': 0, 'final': 404.8, 'rec_final': 431.8, 'rec_especial': None},
+            'ciencias de la naturaleza': {'cara': 0, 'final': 466.5, 'rec_final': 493.5, 'rec_especial': None},
+            'educacion fisica': {'cara': 0, 'final': 528.2, 'rec_final': 555.2, 'rec_especial': None},
+            'formacion integral humana y religiosa': {'cara': 1, 'final': 68.0, 'rec_final': 97.1, 'rec_especial': None},
+            'educacion artistica': {'cara': 1, 'final': 133.8, 'rec_final': 162.8, 'rec_especial': None},
+        },
+        'extras': {'cara': 1, 'pct_asistencia': 200.5, 'pct_ausencia': 228.0, 'pct_excusa': 255.6, 'observaciones': 391.7},
+    },
+    2: {
+        'areas': {
+            'lengua espanola': {'cara': 0, 'final': 281.4, 'rec_final': 308.4, 'rec_especial': None},
+            'matematica': {'cara': 0, 'final': 343.1, 'rec_final': 370.1, 'rec_especial': None},
+            'ciencias sociales': {'cara': 0, 'final': 404.8, 'rec_final': 431.8, 'rec_especial': None},
+            'ciencias de la naturaleza': {'cara': 0, 'final': 466.5, 'rec_final': 493.5, 'rec_especial': None},
+            'educacion fisica': {'cara': 0, 'final': 528.2, 'rec_final': 555.2, 'rec_especial': None},
+            'formacion integral humana y religiosa': {'cara': 1, 'final': 68.0, 'rec_final': 97.1, 'rec_especial': None},
+            'educacion artistica': {'cara': 1, 'final': 133.8, 'rec_final': 162.8, 'rec_especial': None},
+        },
+        'extras': {'cara': 1, 'pct_asistencia': 200.5, 'pct_ausencia': 228.0, 'pct_excusa': 255.6, 'observaciones': 391.7},
+    },
+    3: {
+        'areas': {
+            'lengua espanola': {'cara': 0, 'final': 277.0, 'rec_final': 293.8, 'rec_especial': 314.3},
+            'matematica': {'cara': 0, 'final': 338.7, 'rec_final': 355.5, 'rec_especial': 376.0},
+            'ciencias sociales': {'cara': 0, 'final': 400.4, 'rec_final': 417.2, 'rec_especial': 437.6},
+            'ciencias de la naturaleza': {'cara': 0, 'final': 462.1, 'rec_final': 478.9, 'rec_especial': 499.3},
+            'educacion fisica': {'cara': 0, 'final': 523.7, 'rec_final': 540.6, 'rec_especial': 561.0},
+            'formacion integral humana y religiosa': {'cara': 1, 'final': 63.3, 'rec_final': 81.5, 'rec_especial': 103.3},
+            'educacion artistica': {'cara': 1, 'final': 129.0, 'rec_final': 147.2, 'rec_especial': 169.0},
+        },
+        'extras': {'cara': 1, 'pct_asistencia': 198.2, 'pct_ausencia': 219.6, 'pct_excusa': 240.9, 'observaciones': 415.4},
+    },
+    4: {
+        'areas': {
+            'lengua espanola': {'cara': 0, 'final': 275.6, 'rec_final': 292.4, 'rec_especial': 312.8},
+            'matematica': {'cara': 0, 'final': 337.3, 'rec_final': 354.1, 'rec_especial': 374.5},
+            'ciencias sociales': {'cara': 0, 'final': 398.9, 'rec_final': 415.8, 'rec_especial': 436.2},
+            'ciencias de la naturaleza': {'cara': 0, 'final': 460.6, 'rec_final': 477.4, 'rec_especial': 497.9},
+            'lenguas extranjeras': {'cara': 0, 'final': 522.3, 'rec_final': 539.1, 'rec_especial': 559.6},
+            'educacion fisica': {'cara': 1, 'final': 63.7, 'rec_final': 81.9, 'rec_especial': 103.7},
+            'formacion integral humana y religiosa': {'cara': 1, 'final': 129.5, 'rec_final': 147.7, 'rec_especial': 169.5},
+            'educacion artistica': {'cara': 1, 'final': 195.2, 'rec_final': 213.4, 'rec_especial': 235.2},
+        },
+        'extras': {'cara': 1, 'pct_asistencia': 264.4, 'pct_ausencia': 285.8, 'pct_excusa': 307.2, 'observaciones': 448.4},
+    },
+    5: {
+        'areas': {
+            'lengua espanola': {'cara': 0, 'final': 275.6, 'rec_final': 292.4, 'rec_especial': 312.8},
+            'matematica': {'cara': 0, 'final': 337.3, 'rec_final': 354.1, 'rec_especial': 374.5},
+            'ciencias sociales': {'cara': 0, 'final': 398.9, 'rec_final': 415.8, 'rec_especial': 436.2},
+            'ciencias de la naturaleza': {'cara': 0, 'final': 460.6, 'rec_final': 477.4, 'rec_especial': 497.9},
+            'lenguas extranjeras': {'cara': 0, 'final': 522.3, 'rec_final': 539.1, 'rec_especial': 559.6},
+            'educacion fisica': {'cara': 1, 'final': 63.7, 'rec_final': 81.9, 'rec_especial': 103.7},
+            'formacion integral humana y religiosa': {'cara': 1, 'final': 129.5, 'rec_final': 147.7, 'rec_especial': 169.5},
+            'educacion artistica': {'cara': 1, 'final': 195.2, 'rec_final': 213.4, 'rec_especial': 235.2},
+        },
+        'extras': {'cara': 1, 'pct_asistencia': 264.4, 'pct_ausencia': 285.8, 'pct_excusa': 307.2, 'observaciones': 448.4},
+    },
+    6: {
+        'areas': {
+            'lengua espanola': {'cara': 0, 'final': 275.6, 'rec_final': 292.4, 'rec_especial': 312.8},
+            'matematica': {'cara': 0, 'final': 337.3, 'rec_final': 354.1, 'rec_especial': 374.5},
+            'ciencias sociales': {'cara': 0, 'final': 398.9, 'rec_final': 415.8, 'rec_especial': 436.2},
+            'ciencias de la naturaleza': {'cara': 0, 'final': 460.6, 'rec_final': 477.4, 'rec_especial': 497.9},
+            'lenguas extranjeras': {'cara': 0, 'final': 522.3, 'rec_final': 539.1, 'rec_especial': 559.6},
+            'educacion fisica': {'cara': 1, 'final': 63.7, 'rec_final': 81.9, 'rec_especial': 103.7},
+            'formacion integral humana y religiosa': {'cara': 1, 'final': 129.5, 'rec_final': 147.7, 'rec_especial': 169.5},
+            'educacion artistica': {'cara': 1, 'final': 195.2, 'rec_final': 213.4, 'rec_especial': 235.2},
+        },
+        'extras': {'cara': 1, 'pct_asistencia': 264.4, 'pct_ausencia': 285.8, 'pct_excusa': 307.2, 'observaciones': 448.4},
+    },
+}
 
 # ── F2: Formulario mensual de ASISTENCIA (12 páginas, medido en pág 18) ──
 ASIST_DIA_X0 = 110.5      # centro de la 1ra celda de día (rects x0=102, ancho 17.05)
@@ -137,7 +244,8 @@ def _construir_indice(grado_numero: int) -> Dict:
         return _INDICE_CACHE[grado_numero]
 
     reader = PdfReader(get_template_path(grado_numero))
-    indice = {'portada': None, 'estudiantes': [], 'asistencia': [], 'calificaciones': {}}
+    indice = {'portada': None, 'estudiantes': [], 'asistencia': [], 'acta': [],
+              'estadisticas': None, 'calificaciones': {}}
 
     for i, page in enumerate(reader.pages):
         try:
@@ -155,6 +263,19 @@ def _construir_indice(grado_numero: int) -> Dict:
         # estudiantes (10-11) de la página del ÍNDICE, que solo lista el título.
         if 'orden alfabetico' in plano and len(indice['estudiantes']) < 2:
             indice['estudiantes'].append(i)
+            continue
+
+        # F4: Estadísticas de matrícula (cuadro de edad y sexo)
+        if indice['estadisticas'] is None and 'cantidad de estudiantes, sexo y edad' in plano:
+            indice['estadisticas'] = i
+            continue
+
+        # F3: Acta de rendimiento de fin de año (2 caras del mismo pliego).
+        # 'centro educativo' descarta la página de instrucciones, que menciona
+        # el acta pero no tiene el formulario.
+        if 'acta de rendimiento' in plano and 'centro educativo' in plano \
+                and 'indice' not in plano and len(indice['acta']) < 2:
+            indice['acta'].append(i)
             continue
 
         # Formulario mensual de asistencia (12 páginas): título COMPLETO de la
@@ -231,8 +352,10 @@ def generar_registro_primaria(
     datos_portada: Dict,
     estudiantes: List[Dict],
     calificaciones_data: Optional[Dict] = None,
-    asistencia_data=None,       # F2 — se recibe pero aún no se dibuja
-    dias_trabajados=None,       # F2
+    asistencia_data=None,
+    dias_trabajados=None,
+    recuperaciones_data: Optional[Dict] = None,   # F3: {est_idx: {area: {'final':x,'especial':y}}}
+    condiciones_data: Optional[Dict] = None,      # F3: {est_idx: 'Promovido(a)'|'Repitente'|...}
 ) -> bytes:
     """Genera el Registro Escolar Primaria MINERD (F1: portada + estudiantes
     + calificaciones). estudiantes: hasta 90 (45 por página del template)."""
@@ -346,6 +469,140 @@ def generar_registro_primaria(
             if slot < len(paginas_asist):
                 agendar(paginas_asist[slot], draw_asistencia_mes(mes_data))
 
+    # ── F4: Estadísticas de matrícula — cuadro de edad y sexo ──
+    def draw_estadisticas(c, w, h):
+        from datetime import date as _date
+        try:
+            anio_corte = int(str(datos_portada.get('anio_inicio') or '').strip())
+        except (TypeError, ValueError):
+            anio_corte = _date.today().year
+        # Edad cumplida al 31 de diciembre del año de inicio (criterio MINERD)
+        conteo = {}
+        for est in estudiantes:
+            fn = est.get('fecha_nacimiento')
+            if not fn:
+                continue
+            try:
+                anio_nac = fn.year
+            except AttributeError:
+                try:
+                    anio_nac = int(str(fn)[:4])
+                except (TypeError, ValueError):
+                    continue
+            edad = anio_corte - anio_nac
+            if not (3 <= edad <= 25):
+                continue
+            sexo = str(est.get('sexo', '') or '').strip().upper()[:1]
+            m, f = conteo.get(edad, (0, 0))
+            if sexo == 'M':
+                conteo[edad] = (m + 1, f)
+            elif sexo == 'F':
+                conteo[edad] = (m, f + 1)
+        if not conteo:
+            return
+        c.setFont("Helvetica", 8.5)
+        tot_m = tot_f = 0
+        for i, edad in enumerate(sorted(conteo)[:EDAD_FILAS_MAX]):
+            m, f = conteo[edad]
+            tot_m += m
+            tot_f += f
+            y = h - (EDAD_FILA_Y0 + i * EDAD_FILA_H) - EDAD_AJUSTE
+            c.drawCentredString(EDAD_COL_EDAD, y, str(edad))
+            c.drawCentredString(EDAD_COL_MASC, y, str(m))
+            c.drawCentredString(EDAD_COL_FEM, y, str(f))
+        # Fila TOTAL (la banda 11 del cuadro)
+        y_tot = h - (EDAD_FILA_Y0 + EDAD_FILAS_MAX * EDAD_FILA_H) - EDAD_AJUSTE
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawCentredString(EDAD_COL_MASC, y_tot, str(tot_m))
+        c.drawCentredString(EDAD_COL_FEM, y_tot, str(tot_f))
+
+    agendar(indice.get('estadisticas'), draw_estadisticas)
+
+    # ── F3: ACTA DE RENDIMIENTO DE FIN DE AÑO ──
+    def _final_area_de(est_idx: int, area_canon: str):
+        """Final del área = promedio de las 3 finales de competencia.
+        LINAJE ESTRICTO: None si alguna competencia está incompleta."""
+        for nombre_asig, area_data in (calificaciones_data or {}).items():
+            if area_canonica(nombre_asig) != area_canon:
+                continue
+            comps = area_data.get(est_idx) or area_data.get(str(est_idx)) or {}
+            finales = []
+            for cn in (1, 2, 3):
+                cd = comps.get(cn) or comps.get(str(cn)) or {}
+                finales.append(cd.get('final_competencia'))
+            if len(finales) == 3 and all(f is not None for f in finales):
+                return round(sum(float(f) for f in finales) / 3)
+            return None
+        return None
+
+    def _pct_asistencia_anual(est_idx: int):
+        """% de asistencia/ausencia/excusa del año, sumando todos los meses."""
+        pres = aus = exc = tot = 0
+        for mes in (asistencia_data or []):
+            filas = mes.get('filas') or []
+            if est_idx >= len(filas):
+                continue
+            for cod in (filas[est_idx].get('valores') or []):
+                c = (cod or '').strip().upper()
+                if not c:
+                    continue
+                tot += 1
+                if c in ('P', 'T'):
+                    pres += 1
+                elif c == 'E':
+                    exc += 1
+                elif c == 'A':
+                    aus += 1
+        if not tot:
+            return None, None, None
+        r = lambda n: int(round(n * 100.0 / tot))
+        return r(pres), r(aus), r(exc)
+
+    def draw_acta(cara: int, cal_grado: Dict):
+        def draw(c, w, h):
+            for est_idx, est in enumerate(estudiantes[:ACTA_FILAS_MAX]):
+                y = h - (ACTA_ROW_Y0 + est_idx * ACTA_ROW_H) - AJUSTE_FILA
+                c.setFont("Helvetica", FONT_DATO)
+                # Nº y nombre solo en la cara izquierda
+                if cara == 0:
+                    c.drawCentredString(ACTA_COL_NO, y, str(est.get('no_lista', est_idx + 1)))
+                    nombre = str(est.get('nombre', '') or '')[:ACTA_NOMBRE_MAX]
+                    c.drawString(ACTA_COL_NOMBRE, y, nombre)
+                # Notas por área (cada área sabe en qué cara vive)
+                c.setFont("Helvetica", FONT_NOTA)
+                for area_canon, cols in cal_grado['areas'].items():
+                    if cols['cara'] != cara:
+                        continue
+                    val = _final_area_de(est_idx, area_canon)
+                    if val is not None:
+                        c.drawCentredString(cols['final'] + 5, y, str(int(val)))
+                    rec = ((recuperaciones_data or {}).get(est_idx)
+                           or (recuperaciones_data or {}).get(str(est_idx)) or {}).get(area_canon) or {}
+                    if rec.get('final') is not None and cols.get('rec_final'):
+                        c.drawCentredString(cols['rec_final'] + 5, y, _fmt_nota(rec['final']))
+                    if rec.get('especial') is not None and cols.get('rec_especial'):
+                        c.drawCentredString(cols['rec_especial'] + 5, y, _fmt_nota(rec['especial']))
+                # Extras (% asistencia y observaciones) en la cara derecha
+                if cara == cal_grado['extras']['cara']:
+                    ex = cal_grado['extras']
+                    pa, pau, pe = _pct_asistencia_anual(est_idx)
+                    if pa is not None:
+                        c.drawCentredString(ex['pct_asistencia'] + 5, y, str(pa))
+                        c.drawCentredString(ex['pct_ausencia'] + 5, y, str(pau))
+                        c.drawCentredString(ex['pct_excusa'] + 5, y, str(pe))
+                    cond = ((condiciones_data or {}).get(est_idx)
+                            or (condiciones_data or {}).get(str(est_idx)))
+                    if cond:
+                        c.setFont("Helvetica", FONT_DATO)
+                        c.drawString(ex['observaciones'], y, str(cond)[:26])
+        return draw
+
+    _cal_acta = ACTA_CAL.get(grado_numero)
+    _pags_acta = indice.get('acta') or []
+    if _cal_acta and len(_pags_acta) >= 2:
+        for cara in (0, 1):
+            agendar(_pags_acta[cara], draw_acta(cara, _cal_acta))
+
     # ── Mapear calificaciones del colegio → páginas del template por área ──
     agendar(indice['portada'], draw_portada)
     for slot, pg in enumerate(indice['estudiantes'][:2]):
@@ -377,6 +634,8 @@ def generar_registro_primaria_desde_sistema(
     colegio_info: Dict, curso_info: Dict, ano_escolar: str,
     estudiantes: List[Dict], calificaciones_por_area: Dict,
     asistencia_por_mes, dias_trabajados: Dict, grado_numero: int,
+    recuperaciones_por_area: Optional[Dict] = None,
+    condiciones_finales: Optional[Dict] = None,
 ) -> bytes:
     """Wrapper con la MISMA firma que consume app.py (sin cambios allá)."""
     anios = str(ano_escolar).split('-')
@@ -400,4 +659,6 @@ def generar_registro_primaria_desde_sistema(
         calificaciones_data=calificaciones_por_area,
         asistencia_data=asistencia_por_mes,
         dias_trabajados=dias_trabajados,
+        recuperaciones_data=recuperaciones_por_area,
+        condiciones_data=condiciones_finales,
     )
