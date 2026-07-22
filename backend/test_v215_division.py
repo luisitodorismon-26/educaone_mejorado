@@ -400,3 +400,19 @@ def test_cache_cursos_no_envenenado_por_profesor():
     # … y dirección debe seguir viendo TODO, no la lista del profesor
     cursos = client.get('/api/cursos', headers=H('dir_a')).json()
     assert _ids(cursos) == {seed.ids['c_pri'], seed.ids['c_sec']}, 'CACHE ENVENENADO'
+
+
+# ─────────────── 14. BORRADOR DEL REGISTRO: PERMISOS (v2.17 fix) ───────────────
+def test_borrador_primaria_profesor_de_su_curso():
+    """El profesor asignado SÍ puede ver el borrador (antes: 403 por rol)."""
+    _asegurar_asignacion_profe()
+    r = client.get(f"/api/registros/primaria/{seed.ids['c_pri']}/preview-pdf",
+                   headers=H('profe_a'))
+    assert r.status_code == 200 and r.content[:4] == b'%PDF', r.text[:200]
+
+
+def test_borrador_profesor_curso_ajeno_bloqueado():
+    """Pero NO el de un curso que no le pertenece."""
+    r = client.get(f"/api/registros/secundaria/{seed.ids['c_sec']}/preview-pdf",
+                   headers=H('profe_a'))
+    assert r.status_code == 403 and 'asignados' in r.json()['error']

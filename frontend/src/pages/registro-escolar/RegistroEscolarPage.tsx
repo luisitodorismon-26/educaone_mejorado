@@ -237,7 +237,12 @@ export const RegistroEscolarPage = () => {
     }
   };
 
-  const canGenerate = user?.role === 'direccion' || user?.role === 'coordinador';
+  // v2.17 FIX: el SUPERADMIN quedaba fuera y no veía ningún botón (el backend
+  // sí lo acepta: RolesRequired trata 'superadmin' como rol que siempre pasa).
+  // Además se separa la VISTA PREVIA (borrador, para revisar avance — también
+  // el profesor de sus cursos) del REGISTRO OFICIAL (lo firma la dirección).
+  const canPreview = ['direccion', 'coordinador', 'superadmin', 'profesor'].includes(user?.role || '');
+  const canGenerate = ['direccion', 'coordinador', 'superadmin'].includes(user?.role || '');
   const isBlocked = preview ? !preview.validacion.valid : false;
 
   return (
@@ -447,26 +452,38 @@ export const RegistroEscolarPage = () => {
                   : '✓ El curso superó las validaciones. Puede descargar el registro oficial.'}
               </div>
 
-              {canGenerate && (
+              {(canPreview || canGenerate) && (
                 <div className="flex flex-col md:flex-row gap-3">
-                  {/* Vista previa - SIEMPRE disponible */}
-                  <button
-                    onClick={generarVistaPrevia}
-                    disabled={generating}
-                    className="flex-1 px-6 py-3 bg-amber-100 text-amber-800 border-2 border-amber-300 rounded-lg hover:bg-amber-200 disabled:opacity-50 font-medium flex items-center justify-center gap-2"
-                  >
-                    {generating ? 'Generando...' : `📋 Vista Previa (BORRADOR)`}
-                  </button>
+                  {/* Vista previa (BORRADOR) — disponible aunque haya errores:
+                      su propósito es justamente ver el avance del año */}
+                  {canPreview && (
+                    <button
+                      onClick={generarVistaPrevia}
+                      disabled={generating}
+                      className="flex-1 px-6 py-3 bg-amber-100 text-amber-800 border-2 border-amber-300 rounded-lg hover:bg-amber-200 disabled:opacity-50 font-medium flex items-center justify-center gap-2"
+                    >
+                      {generating ? 'Generando...' : `📋 Vista Previa (BORRADOR)`}
+                    </button>
+                  )}
 
                   {/* Registro oficial - solo si validación pasó */}
-                  <button
-                    onClick={generarPDF}
-                    disabled={generating || isBlocked}
-                    className="flex-1 px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium flex items-center justify-center gap-2"
-                    title={isBlocked ? 'Corrija los errores antes de imprimir el oficial' : 'Imprimir el registro oficial MINERD'}
-                  >
-                    {generating ? 'Generando...' : `🖨️ Imprimir Registro Oficial`}
-                  </button>
+                  {canGenerate && (
+                    <button
+                      onClick={generarPDF}
+                      disabled={generating || isBlocked}
+                      className="flex-1 px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium flex items-center justify-center gap-2"
+                      title={isBlocked ? 'Corrija los errores antes de imprimir el oficial' : 'Imprimir el registro oficial MINERD'}
+                    >
+                      {generating ? 'Generando...' : `🖨️ Imprimir Registro Oficial`}
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {!canPreview && !canGenerate && (
+                <div className="text-sm text-gray-500 italic">
+                  Tu rol no tiene permiso para generar el registro escolar. Puedes revisar
+                  el diagnóstico de arriba; la impresión la realiza dirección o coordinación.
                 </div>
               )}
               

@@ -11755,7 +11755,7 @@ async def get_dias_trabajados(ano_id: int, db: Session = Depends(get_db),
 @app.get("/api/registros/primaria/{curso_id}/preview-pdf")
 async def preview_pdf_primaria(curso_id: int, request: Request,
                                 db: Session = Depends(get_db),
-                                current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+                                current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """
     Vista previa del PDF de primaria con marca de agua BORRADOR.
     Genera SIEMPRE, ignorando errores y warnings.
@@ -11773,6 +11773,14 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
     grado = curso.grado
     if not grado:
         return JSONResponse({'error': 'El curso no tiene grado asignado'}, status_code=400)
+
+    # v2.17: el PROFESOR solo descarga el borrador de SUS cursos asignados
+    # (cierra el hueco: antes en secundaria podía pedir cualquier curso).
+    if current_user.role == 'profesor':
+        _tiene_reg = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
+        if not _tiene_reg:
+            return JSONResponse({'error': 'Solo puedes ver el borrador de tus cursos asignados'}, status_code=403)
 
     # v2.17: este flujo es EXCLUSIVO de primaria — un curso de secundaria
     # generaría el documento equivocado (su registro es otro template).
@@ -12049,6 +12057,14 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     grado = curso.grado
     if not grado:
         return JSONResponse({'error': 'El curso no tiene grado asignado'}, status_code=400)
+
+    # v2.17: el PROFESOR solo descarga el borrador de SUS cursos asignados
+    # (cierra el hueco: antes en secundaria podía pedir cualquier curso).
+    if current_user.role == 'profesor':
+        _tiene_reg = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
+        if not _tiene_reg:
+            return JSONResponse({'error': 'Solo puedes ver el borrador de tus cursos asignados'}, status_code=403)
 
     # v2.17: este flujo es EXCLUSIVO de primaria — un curso de secundaria
     # generaría el documento equivocado (su registro es otro template).
