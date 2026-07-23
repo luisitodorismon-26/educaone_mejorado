@@ -8093,13 +8093,25 @@ def _construir_areas_primaria(db, estudiante_id, current_user, ano):
     return resultado
 
 
-def _generar_pdf_primaria(db, estudiante, current_user, ano, config):
-    """Genera el buffer del Informe de Aprendizaje de un estudiante de primaria."""
+def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curso=None):
+    """Genera el buffer del Informe de Aprendizaje de un estudiante de primaria.
+
+    v2.17 PERF: `_cache_curso` es un dict opcional que el generador POR CURSO
+    pasa para memoizar los datos que son IGUALES para todos los estudiantes del
+    mismo curso (grado y maestro titular). Sin él, el comportamiento es idéntico
+    al de siempre — un boletín individual no cambia en nada.
+    """
     from boletin_primaria import generar_boletin_primaria
     from calculo_primaria import situacion_area, condicion_final_estudiante
 
     curso = estudiante.curso
-    grado = db.get(Grado, curso.grado_id) if curso and curso.grado_id else None
+    _ck = ('grado', curso.id) if curso else None
+    if _cache_curso is not None and _ck in _cache_curso:
+        grado = _cache_curso[_ck]
+    else:
+        grado = db.get(Grado, curso.grado_id) if curso and curso.grado_id else None
+        if _cache_curso is not None and _ck is not None:
+            _cache_curso[_ck] = grado
     grado_nombre = grado.nombre if grado else ''
 
     areas = _construir_areas_primaria(db, estudiante.id, current_user, ano)
@@ -8124,14 +8136,20 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config):
     # marcado, el primer profesor activo del año como fallback.
     docente_nombre = ''
     if curso:
-        q_asig = tenant_filter(
-            db.query(AsignacionProfesor), AsignacionProfesor, current_user
-        ).filter_by(curso_id=curso.id, activo=True)
-        asignacion = (
-            q_asig.filter(AsignacionProfesor.ano_escolar_id == ano.id)
-                  .order_by(AsignacionProfesor.es_titular.desc()).first()
-            or q_asig.order_by(AsignacionProfesor.es_titular.desc()).first()
-        )
+        _tk = ('titular', curso.id)
+        if _cache_curso is not None and _tk in _cache_curso:
+            asignacion = _cache_curso[_tk]
+        else:
+            q_asig = tenant_filter(
+                db.query(AsignacionProfesor), AsignacionProfesor, current_user
+            ).filter_by(curso_id=curso.id, activo=True)
+            asignacion = (
+                q_asig.filter(AsignacionProfesor.ano_escolar_id == ano.id)
+                      .order_by(AsignacionProfesor.es_titular.desc()).first()
+                or q_asig.order_by(AsignacionProfesor.es_titular.desc()).first()
+            )
+            if _cache_curso is not None:
+                _cache_curso[_tk] = asignacion
         if asignacion:
             prof = db.get(Usuario, asignacion.profesor_id)
             if prof:
@@ -8549,9 +8567,10 @@ async def boletin_primaria_curso_pdf(
 
     writer = PdfWriter()
     generados = 0
+    _cache_curso = {}  # v2.17 PERF: memoiza grado y titular del curso
     for est in estudiantes:
         try:
-            buf = _generar_pdf_primaria(db, est, current_user, ano, config)
+            buf = _generar_pdf_primaria(db, est, current_user, ano, config, _cache_curso)
             for page in PdfReader(buf).pages:
                 writer.add_page(page)
             generados += 1

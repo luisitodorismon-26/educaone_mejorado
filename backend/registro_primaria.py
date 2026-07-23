@@ -31,6 +31,7 @@ Carril SEPARADO de secundaria: solo datos de CalificacionPrimaria.
 Color tinta azul MINERD. Firma pública compatible con app.py existente.
 """
 import io
+import json
 import os
 import unicodedata
 from typing import Dict, List, Optional
@@ -231,6 +232,17 @@ def get_template_path(grado_numero: int) -> str:
 
 # ─────────────────── ÍNDICE DINÁMICO DE SECCIONES ───────────────────
 _INDICE_CACHE: Dict[int, Dict] = {}
+# Subir esta versión invalida los índices guardados en disco (si cambian las
+# anclas de búsqueda o la estructura del índice).
+_INDICE_VERSION = 3
+
+
+def _ruta_cache_indice(grado_numero: int) -> str:
+    """Archivo JSON donde se persiste el índice de un grado."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(base_dir, '.cache_registro')
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f'indice_primaria_{grado_numero}.json')
 
 
 def _construir_indice(grado_numero: int) -> Dict:
@@ -243,11 +255,43 @@ def _construir_indice(grado_numero: int) -> Dict:
     if grado_numero in _INDICE_CACHE:
         return _INDICE_CACHE[grado_numero]
 
+    # v2.17 PERF: el índice es DETERMINISTA (el template oficial no cambia).
+    # Escanearlo cuesta ~6 s por grado, así que se persiste en disco: la
+    # primera generación lo calcula, todas las demás lo leen en milisegundos
+    # (sobrevive a reinicios del servidor y sirve a todos los workers).
+    _ruta = _ruta_cache_indice(grado_numero)
+    try:
+        if os.path.exists(_ruta):
+            with open(_ruta, 'r', encoding='utf-8') as fh:
+                guardado = json.load(fh)
+            if guardado.get('_v') == _INDICE_VERSION:
+                indice = guardado['indice']
+                # JSON convierte las claves de dict a string: restaurar tipos
+                indice['calificaciones'] = dict(indice.get('calificaciones') or {})
+                _INDICE_CACHE[grado_numero] = indice
+                return indice
+    except Exception:
+        pass  # cache corrupto o ilegible: se recalcula
+
     reader = PdfReader(get_template_path(grado_numero))
     indice = {'portada': None, 'centro': None, 'estudiantes': [], 'asistencia': [], 'acta': [],
               'estadisticas': None, 'calificaciones': {}}
 
+    # v2.17 PERF: parada temprana. Todas las secciones que buscamos viven en
+    # las primeras ~112 páginas; el resto del template son anexos. Cuando ya
+    # tenemos todo, cortamos el escaneo en vez de leer las 142 páginas.
+    def _indice_completo() -> bool:
+        return (indice['portada'] is not None
+                and indice['centro'] is not None
+                and indice['estadisticas'] is not None
+                and len(indice['estudiantes']) >= 2
+                and len(indice['asistencia']) >= 12
+                and len(indice['acta']) >= 2
+                and len(indice['calificaciones']) >= 7)
+
     for i, page in enumerate(reader.pages):
+        if _indice_completo():
+            break
         try:
             txt = page.extract_text() or ''
         except Exception:
@@ -307,6 +351,11 @@ def _construir_indice(grado_numero: int) -> Dict:
                     break
 
     _INDICE_CACHE[grado_numero] = indice
+    try:
+        with open(_ruta_cache_indice(grado_numero), 'w', encoding='utf-8') as fh:
+            json.dump({'_v': _INDICE_VERSION, 'indice': indice}, fh)
+    except Exception:
+        pass  # si el disco es de solo lectura, seguimos con el cache en memoria
     return indice
 
 
