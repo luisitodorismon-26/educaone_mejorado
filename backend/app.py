@@ -11752,6 +11752,58 @@ async def get_dias_trabajados(ano_id: int, db: Session = Depends(get_db),
     return {'ano_id': ano.id, 'dias_trabajados': ano.get_dias_trabajados()}
 
 
+
+def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_area):
+    """v2.17 F3: arma los datos del ACTA de fin de año del registro de primaria.
+
+    Devuelve (recuperaciones_por_area, condiciones_finales) con índices que
+    coinciden con el orden de `estudiantes_db` (el mismo que usa el generador).
+    Carril primaria puro: RecuperacionPrimaria + calculo_primaria.
+    """
+    from registro_primaria import area_canonica
+    from calculo_primaria import situacion_area, condicion_final_estudiante
+
+    recuperaciones, condiciones = {}, {}
+    if not estudiantes_db:
+        return recuperaciones, condiciones
+
+    idx_por_id = {e.id: i for i, e in enumerate(estudiantes_db)}
+    ano_act = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    asigs = {a.id: a.nombre for a in tenant_filter(db.query(Asignatura), Asignatura, current_user).all()}
+
+    q_rec = tenant_filter(db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user).filter(
+        RecuperacionPrimaria.estudiante_id.in_(list(idx_por_id.keys()) or [0]))
+    if ano_act:
+        q_rec = q_rec.filter(RecuperacionPrimaria.ano_escolar_id == ano_act.id)
+    for r in q_rec.all():
+        idx = idx_por_id.get(r.estudiante_id)
+        canon = area_canonica(asigs.get(r.asignatura_id, '') or '')
+        if idx is None or not canon:
+            continue
+        recuperaciones.setdefault(idx, {})[canon] = {
+            'final': r.recuperacion_final,
+            'especial': r.recuperacion_especial,
+        }
+
+    ETIQUETA = {'promovido': 'Promovido(a)', 'repite': 'Repitente',
+                'repitente_condicional': 'Repitente condicional', 'en_proceso': 'En proceso'}
+    for idx in idx_por_id.values():
+        situaciones = []
+        for nombre_asig, area_data in (calificaciones_por_area or {}).items():
+            comps = area_data.get(idx) or {}
+            finales = [(comps.get(c) or {}).get('final_competencia') for c in (1, 2, 3)]
+            # Linaje estricto: sin las 3 competencias, el área no vota
+            if not all(f is not None for f in finales):
+                continue
+            cf = round(sum(float(f) for f in finales) / 3)
+            rec = (recuperaciones.get(idx) or {}).get(area_canonica(nombre_asig) or '') or {}
+            situaciones.append(situacion_area(cf, rec.get('final'), rec.get('especial')))
+        if situaciones:
+            cond = condicion_final_estudiante(situaciones)
+            condiciones[idx] = ETIQUETA.get(cond.get('condicion'), cond.get('condicion', ''))
+    return recuperaciones, condiciones
+
+
 @app.get("/api/registros/primaria/{curso_id}/preview-pdf")
 async def preview_pdf_primaria(curso_id: int, request: Request,
                                 db: Session = Depends(get_db),
@@ -11805,7 +11857,8 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
         'codigo_cartografia': getattr(config, 'codigo_cartografia', '') or '',
         'direccion': getattr(config, 'direccion', '') or '',
         'telefono': getattr(config, 'telefono', '') or '',
-        'director': getattr(config, 'nombre_director', '') or '',
+        'email': getattr(config, 'email', '') or '',
+        'director': getattr(config, 'director', '') or getattr(config, 'nombre_director', '') or '',
         'docente_titular': titular_nombre,
     }
     
@@ -11873,7 +11926,8 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
         pdf_bytes = generar_registro_primaria_desde_sistema(
             colegio_info, curso_info, ano_escolar,
             estudiantes_raw, calificaciones_por_area, asistencia,
-            dias_trabajados, grado_numero
+            dias_trabajados, grado_numero,
+            *_datos_acta_primaria(db, current_user, estudiantes_db[:90], calificaciones_por_area)
         )
         pdf_bytes = aplicar_marca_borrador(pdf_bytes)
         
@@ -11936,7 +11990,8 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
         'codigo_cartografia': getattr(config, 'codigo_cartografia', '') or '',
         'direccion': getattr(config, 'direccion', '') or '',
         'telefono': getattr(config, 'telefono', '') or '',
-        'director': getattr(config, 'nombre_director', '') or '',
+        'email': getattr(config, 'email', '') or '',
+        'director': getattr(config, 'director', '') or getattr(config, 'nombre_director', '') or '',
         'docente_titular': titular_nombre,
     }
     
@@ -12006,7 +12061,8 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
         pdf_bytes = generar_registro_primaria_desde_sistema(
             colegio_info, curso_info, ano_escolar,
             estudiantes_raw, calificaciones_por_area, asistencia_por_mes,
-            dias_trabajados, grado_numero
+            dias_trabajados, grado_numero,
+            *_datos_acta_primaria(db, current_user, estudiantes_db[:90], calificaciones_por_area)
         )
         
         filename = f"Registro_Primaria_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"

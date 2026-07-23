@@ -244,7 +244,7 @@ def _construir_indice(grado_numero: int) -> Dict:
         return _INDICE_CACHE[grado_numero]
 
     reader = PdfReader(get_template_path(grado_numero))
-    indice = {'portada': None, 'estudiantes': [], 'asistencia': [], 'acta': [],
+    indice = {'portada': None, 'centro': None, 'estudiantes': [], 'asistencia': [], 'acta': [],
               'estadisticas': None, 'calificaciones': {}}
 
     for i, page in enumerate(reader.pages):
@@ -257,6 +257,12 @@ def _construir_indice(grado_numero: int) -> Dict:
         if indice['portada'] is None and 'registro' in plano and 'nivel primario' in plano \
                 and 'centro educativo' in plano:
             indice['portada'] = i
+            continue
+
+        # Datos del Centro Educativo: título + 'paraje' (evita confusiones)
+        if indice['centro'] is None and 'datos del centro educativo' in plano \
+                and 'paraje' in plano:
+            indice['centro'] = i
             continue
 
         # 'orden alfabetico' distingue las páginas REALES de la tabla de
@@ -366,16 +372,57 @@ def generar_registro_primaria(
 
     # ── Portada (coordenadas medidas, conservadas del trabajo previo) ──
     def draw_portada(c, w, h):
+        # Coordenadas calibradas contra la plantilla real (pdfplumber). Cada
+        # dato va DESPUÉS de su etiqueta y sobre la línea, no encima del texto.
         c.setFont("Helvetica", 10)
-        c.drawString(165, h - 530, str(datos_centro.get('nombre', '') or ''))
-        c.drawString(115, h - 564, str(datos_centro.get('codigo_centro', '') or ''))
-        c.drawString(415, h - 564, str(datos_portada.get('anio_inicio', '') or ''))
-        c.drawString(510, h - 564, str(datos_portada.get('anio_fin', '') or ''))
-        c.drawString(110, h - 600, f"{grado_numero}°")
-        c.drawString(305, h - 600, str(datos_portada.get('seccion', 'A') or 'A'))
-        c.drawString(475, h - 600, str(datos_portada.get('tanda', '') or ''))
-        c.drawString(232, h - 637, str(datos_centro.get('regional', '') or ''))
+        # Centro Educativo: (etiqueta termina en x=181, top=516)
+        c.drawString(192, h - 526, str(datos_centro.get('nombre', '') or ''))
+        # Código: (etiqueta termina en x=110)
+        c.drawString(120, h - 564, str(datos_centro.get('codigo_centro', '') or ''))
+        # Año Escolar 20__ - 20__ : la plantilla YA trae "20", solo van 2 dígitos.
+        def _dos_digitos(anio):
+            s = str(anio or '').strip()
+            return s[-2:] if len(s) >= 2 else s
+        c.drawString(405, h - 564, _dos_digitos(datos_portada.get('anio_inicio')))
+        c.drawString(501, h - 564, _dos_digitos(datos_portada.get('anio_fin')))
+        # Grado: / Sección: / Tanda:  (fila top=591)
+        c.drawString(110, h - 601, f"{grado_numero}°")
+        c.drawString(305, h - 601, str(datos_portada.get('seccion', 'A') or 'A'))
+        c.drawString(475, h - 601, str(datos_portada.get('tanda', '') or ''))
+        # Regional de Educación: (termina x=221) / Distrito Educativo: (termina x=474)
+        c.drawString(228, h - 637, str(datos_centro.get('regional', '') or ''))
         c.drawString(481, h - 637, str(datos_centro.get('distrito', '') or ''))
+
+    # ── Datos del Centro Educativo (coordenadas medidas pág 7) ──
+    # Solo se llena lo que el sistema TIENE guardado. Paraje, municipio,
+    # provincia, zona y sector quedan en blanco para llenado manual (no están
+    # en el modelo y no se inventan en un documento oficial).
+    def draw_centro(c, w, h):
+        c.setFont("Helvetica", 9.5)
+        email = str(datos_centro.get('email', '') or '')
+        tel = str(datos_centro.get('telefono', '') or '')
+        direccion = str(datos_centro.get('direccion', '') or '')
+        regional = str(datos_centro.get('regional', '') or '')
+        distrito = str(datos_centro.get('distrito', '') or '')
+        director = str(datos_centro.get('director', '') or '')
+        if email:
+            c.drawString(150, h - 122, email)       # Correo (x1=143.6, top=112)
+        if tel:
+            c.drawString(446, h - 122, tel)          # Teléfono (x1=439.7)
+        if direccion:
+            c.drawString(104, h - 141, direccion[:60])  # Dirección (x1=97.2, top=130.7)
+        if regional:
+            c.drawString(100, h - 277, regional)     # Regional (x1=93.8, top=266.6)
+        if distrito:
+            c.drawString(367, h - 277, distrito)     # Distrito (x1=360.7)
+        if director:
+            c.drawString(219, h - 342, director[:55])   # Director(a) (x1=212, top=331.7)
+        # ── Datos del maestro o la maestra (misma página, parte inferior) ──
+        # Solo el nombre: fecha de ingreso, cédula, estado civil, título, etc.
+        # son datos personales que el sistema no guarda → llenado manual.
+        titular = str(datos_centro.get('docente_titular', '') or '')
+        if titular:
+            c.drawString(176, h - 507, titular[:50])   # Nombre(s) y apellido(s): (x1=169.6, top=497.1)
 
     # ── Datos de estudiantes (página_slot: 0 = filas 1-45, 1 = 46-90) ──
     def draw_estudiantes(pagina_slot):
@@ -605,6 +652,7 @@ def generar_registro_primaria(
 
     # ── Mapear calificaciones del colegio → páginas del template por área ──
     agendar(indice['portada'], draw_portada)
+    agendar(indice.get('centro'), draw_centro)
     for slot, pg in enumerate(indice['estudiantes'][:2]):
         agendar(pg, draw_estudiantes(slot))
 
@@ -650,6 +698,11 @@ def generar_registro_primaria_desde_sistema(
         "regional": colegio_info.get('regional', ''),
         "distrito": colegio_info.get('distrito', ''),
         "codigo_centro": colegio_info.get('codigo_centro', ''),
+        "email": colegio_info.get('email', ''),
+        "telefono": colegio_info.get('telefono', ''),
+        "direccion": colegio_info.get('direccion', ''),
+        "director": colegio_info.get('director', ''),
+        "docente_titular": colegio_info.get('docente_titular', ''),
     }
     return generar_registro_primaria(
         grado_numero=grado_numero,
