@@ -11946,13 +11946,21 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
 @app.get("/api/registros/primaria/{curso_id}")
 async def generar_registro_primaria_v2(curso_id: int, request: Request,
                                         db: Session = Depends(get_db),
-                                        current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+                                        current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """
     Genera el PDF del Registro Escolar MINERD para un curso de PRIMARIA.
     Estructura por competencias (C1, C2, C3).
     """
     from registro_validator import validar_registro_primaria
     from registro_primaria import generar_registro_primaria_desde_sistema
+
+    # v2.17: el PROFESOR puede imprimir el registro OFICIAL, pero SOLO de sus
+    # cursos asignados (en la práctica dominicana es quien lo llena y entrega).
+    if current_user.role == 'profesor':
+        _tiene_of = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
+        if not _tiene_of:
+            return JSONResponse({'error': 'Solo puedes imprimir el registro de tus cursos asignados'}, status_code=403)
     
     force = request.query_params.get('force', 'false').lower() == 'true'
     
@@ -12216,7 +12224,7 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
 @app.get("/api/registros/secundaria/{curso_id}")
 async def generar_registro_secundaria_v2(curso_id: int, request: Request, 
                                           db: Session = Depends(get_db),
-                                          current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+                                          current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """
     Genera el PDF del Registro Escolar MINERD para un curso de SECUNDARIA.
     
@@ -12228,6 +12236,14 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     """
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema, get_asignaturas_por_grado
+
+    # v2.17: el PROFESOR puede imprimir el registro OFICIAL, pero SOLO de sus
+    # cursos asignados.
+    if current_user.role == 'profesor':
+        _tiene_of = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
+        if not _tiene_of:
+            return JSONResponse({'error': 'Solo puedes imprimir el registro de tus cursos asignados'}, status_code=403)
     
     force = request.query_params.get('force', 'false').lower() == 'true'
     

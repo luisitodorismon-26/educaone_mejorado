@@ -241,8 +241,10 @@ export const RegistroEscolarPage = () => {
   // sí lo acepta: RolesRequired trata 'superadmin' como rol que siempre pasa).
   // Además se separa la VISTA PREVIA (borrador, para revisar avance — también
   // el profesor de sus cursos) del REGISTRO OFICIAL (lo firma la dirección).
+  // v2.17: el PROFESOR ve e imprime el registro de SUS cursos (el backend
+  // valida la asignación). En la práctica dominicana es quien lo llena.
   const canPreview = ['direccion', 'coordinador', 'superadmin', 'profesor'].includes(user?.role || '');
-  const canGenerate = ['direccion', 'coordinador', 'superadmin'].includes(user?.role || '');
+  const canGenerate = ['direccion', 'coordinador', 'superadmin', 'profesor'].includes(user?.role || '');
   const isBlocked = preview ? !preview.validacion.valid : false;
 
   return (
@@ -315,6 +317,37 @@ export const RegistroEscolarPage = () => {
                 {preview.curso.grado || 'Sin grado'} • {preview.nivel.toUpperCase()} • Año escolar: {preview.ano_escolar.nombre || 'No definido'}
               </p>
             </div>
+
+            {/* v2.17: barra de acciones STICKY — los botones quedan siempre a
+                la vista, sin tener que bajar por todo el diagnóstico */}
+            {(canPreview || canGenerate) && (
+              <div className="sticky top-0 z-20 bg-white/95 backdrop-blur border-b px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-2">
+                <span className={`text-xs font-semibold px-2 py-1 rounded-full whitespace-nowrap ${isBlocked ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-green-50 text-green-700 border border-green-200'}`}>
+                  {isBlocked ? '⚠ Oficial bloqueado' : '✓ Listo para oficial'}
+                </span>
+                <div className="flex flex-1 gap-2">
+                  {canPreview && (
+                    <button
+                      onClick={generarVistaPrevia}
+                      disabled={generating}
+                      className="flex-1 px-4 py-2 bg-amber-100 text-amber-800 border-2 border-amber-300 rounded-lg hover:bg-amber-200 disabled:opacity-50 font-medium text-sm"
+                    >
+                      {generating ? 'Generando...' : '📋 Vista Previa (BORRADOR)'}
+                    </button>
+                  )}
+                  {canGenerate && (
+                    <button
+                      onClick={generarPDF}
+                      disabled={generating || isBlocked}
+                      className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium text-sm"
+                      title={isBlocked ? 'Corrija los errores antes de imprimir el oficial' : 'Imprimir el registro oficial MINERD'}
+                    >
+                      {generating ? 'Generando...' : '🖨️ Imprimir Oficial'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
 
             <div className="p-6 border-b space-y-4">
               <h3 className="font-semibold text-gray-700">Estado de Generación</h3>
@@ -451,34 +484,6 @@ export const RegistroEscolarPage = () => {
                   ? '⚠ La impresión oficial está bloqueada hasta corregir los errores. Mientras tanto, puede descargar la VISTA PREVIA para revisar avance.'
                   : '✓ El curso superó las validaciones. Puede descargar el registro oficial.'}
               </div>
-
-              {(canPreview || canGenerate) && (
-                <div className="flex flex-col md:flex-row gap-3">
-                  {/* Vista previa (BORRADOR) — disponible aunque haya errores:
-                      su propósito es justamente ver el avance del año */}
-                  {canPreview && (
-                    <button
-                      onClick={generarVistaPrevia}
-                      disabled={generating}
-                      className="flex-1 px-6 py-3 bg-amber-100 text-amber-800 border-2 border-amber-300 rounded-lg hover:bg-amber-200 disabled:opacity-50 font-medium flex items-center justify-center gap-2"
-                    >
-                      {generating ? 'Generando...' : `📋 Vista Previa (BORRADOR)`}
-                    </button>
-                  )}
-
-                  {/* Registro oficial - solo si validación pasó */}
-                  {canGenerate && (
-                    <button
-                      onClick={generarPDF}
-                      disabled={generating || isBlocked}
-                      className="flex-1 px-6 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-40 disabled:cursor-not-allowed font-medium flex items-center justify-center gap-2"
-                      title={isBlocked ? 'Corrija los errores antes de imprimir el oficial' : 'Imprimir el registro oficial MINERD'}
-                    >
-                      {generating ? 'Generando...' : `🖨️ Imprimir Registro Oficial`}
-                    </button>
-                  )}
-                </div>
-              )}
 
               {!canPreview && !canGenerate && (
                 <div className="text-sm text-gray-500 italic">

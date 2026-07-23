@@ -416,3 +416,18 @@ def test_borrador_profesor_curso_ajeno_bloqueado():
     r = client.get(f"/api/registros/secundaria/{seed.ids['c_sec']}/preview-pdf",
                    headers=H('profe_a'))
     assert r.status_code == 403 and 'asignados' in r.json()['error']
+
+
+# ─────────────── 15. REGISTRO OFICIAL: PROFESOR (v2.17) ───────────────
+def test_registro_oficial_profesor_curso_ajeno_bloqueado():
+    """El profesor NO imprime el oficial de un curso que no le pertenece."""
+    r = client.get(f"/api/registros/secundaria/{seed.ids['c_sec']}", headers=H('profe_a'))
+    assert r.status_code == 403 and 'asignados' in r.json()['error']
+
+
+def test_registro_oficial_profesor_su_curso_pasa_permiso():
+    """En su curso pasa el permiso (puede fallar luego por validación de datos,
+    pero NUNCA por rol/asignación)."""
+    _asegurar_asignacion_profe()
+    r = client.get(f"/api/registros/primaria/{seed.ids['c_pri']}", headers=H('profe_a'))
+    assert r.status_code != 403, r.text[:200]
