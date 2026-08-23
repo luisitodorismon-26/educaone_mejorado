@@ -23,11 +23,11 @@ if is_sqlite:
     # SQLite: sin pool, con check_same_thread=False
     engine_kwargs['connect_args'] = {'check_same_thread': False}
 else:
-    # PostgreSQL: pool dimensionado para Render con 2 workers gunicorn.
+    # PostgreSQL: pool conservador para el default de 2 workers de Uvicorn.
     # Cada worker tiene su propio pool. Con pool_size=5 + max_overflow=10
-    # = 15 conexiones por worker = 30 total. Render Postgres Free permite
-    # 97 conexiones, así que tenemos margen. Si pasás a Starter o superior,
-    # esto se puede subir.
+    # = hasta 15 conexiones por worker (30 con 2 workers). Si el servicio
+    # escala o cambia WEB_CONCURRENCY, revisar este presupuesto contra el
+    # límite real del plan PostgreSQL antes de aumentar workers.
     # pool_recycle 280s: por debajo del timeout de Render (300s) para evitar
     # conexiones zombie.
     engine_kwargs['pool_size'] = 5

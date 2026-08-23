@@ -1,4 +1,4 @@
-"""
+r"""
 Script de diagnóstico del PDF de conducta.
 Corré esto en la carpeta backend con tu base de datos real:
 

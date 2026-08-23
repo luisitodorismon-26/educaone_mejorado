@@ -8,6 +8,7 @@ interface Caso {
   id: number;
   estudiante: string;
   estudiante_id: number;
+  curso?: string;
   tipo: string;
   urgencia: string;
   motivo: string;
@@ -26,6 +27,7 @@ interface Estudiante {
   id: number;
   nombre_completo: string;
   curso?: string;
+  curso_id?: number;
 }
 
 export const PsicologiaPage = () => {

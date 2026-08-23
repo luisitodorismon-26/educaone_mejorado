@@ -5,6 +5,7 @@ import { Button, Alert } from '../../components/ui';
 interface Curso {
   id: number;
   nombre_completo: string;
+  nombre?: string;
   tanda?: string;
   grado?: string;
   nivel?: string; // 'primaria' | 'secundaria' | 'inicial' (normalizado por el backend)

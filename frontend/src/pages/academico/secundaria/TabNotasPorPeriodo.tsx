@@ -35,8 +35,8 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
   const periodoActivoCerrado = !!periodosCerrados[`p${periodoActivo}`];
 
   // Nombre del campo P/RP para el período activo (ej. periodo 1 → 'p1' / 'rp1')
-  const campoP = `p${periodoActivo}` as const;
-  const campoRP = `rp${periodoActivo}` as const;
+  const campoP = `p${periodoActivo}` as 'p1' | 'p2' | 'p3' | 'p4';
+  const campoRP = `rp${periodoActivo}` as 'rp1' | 'rp2' | 'rp3' | 'rp4';
 
   // Obtener valor actual (editado o del backend) de un estudiante/competencia
   const getValor = useCallback((est: EstudianteData, compNum: number, tipo: 'p' | 'rp'): number | null => {

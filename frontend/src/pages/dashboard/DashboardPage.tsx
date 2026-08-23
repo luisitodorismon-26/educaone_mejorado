@@ -66,6 +66,7 @@ interface HorarioHoy { id: number; hora_inicio: string; hora_fin: string; asigna
 interface Comunicado { id: number; titulo: string; contenido: string; autor: string; fecha: string; imagen?: string; }
 interface DashboardProfesor {
   dia: string; dia_hoy: string; es_proximo_dia: boolean; fecha: string;
+  es_fin_semana: boolean; todas_pasaron: boolean;
   horario_hoy: HorarioHoy[];
   cursos_asignados: Array<{ curso_id: number; curso: string; asignatura: string; estudiantes: number; tanda?: string }>;
   pendientes_calificar: Array<{ curso: string; asignatura: string; sin_nota: number; curso_id: number; asignatura_id: number }>;

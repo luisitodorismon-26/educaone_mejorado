@@ -1507,6 +1507,284 @@ with client:
         }, headers=auth(sa))
 
 
+    # ─────────────────────────────────────────────────────────────────
+    # SECCIÓN M — REGRESIONES DE SEGURIDAD P0 (v2.18 hardening)
+    # ─────────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== M. HARDENING MULTI-TENANT / BACKUPS ==={RESET}")
+
+    @test("M1. Dirección NO puede generar un backup global")
+    def t():
+        r = client.get('/api/backup', headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 403, f"esperaba 403, obtuvo {r.status_code}: {r.text}"
+
+    @test("M2. Dirección NO puede listar backups globales")
+    def t():
+        r = client.get('/api/backup/lista', headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 403, f"esperaba 403, obtuvo {r.status_code}: {r.text}"
+
+    @test("M3. Dirección NO puede descargar backups globales")
+    def t():
+        r = client.get('/api/backup/descargar/backup_20260101_010101.sql', headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 403, f"esperaba 403, obtuvo {r.status_code}: {r.text}"
+
+    @test("M4. Superadmin sí atraviesa RBAC del backup global")
+    def t():
+        # En la suite se usa SQLite, por eso el handler responde 400
+        # ('solo PostgreSQL'). Lo que validamos aquí es que NO sea 403.
+        r = client.get('/api/backup', headers=auth(SA_TOKEN))
+        assert r.status_code != 403, f"superadmin no debe quedar bloqueado: {r.text}"
+
+    @test("M5. Registro legacy con colegio_id=NULL queda oculto a Dirección")
+    def t():
+        from database import SessionLocal
+        from models import Estudiante
+        db_t = SessionLocal()
+        try:
+            est = db_t.get(Estudiante, A['est'])
+            colegio_original = est.colegio_id
+            est.colegio_id = None
+            db_t.commit()
+
+            r = client.get(f'/api/estudiantes/{A["est"]}', headers=auth(DIR_A_TOKEN))
+            assert r.status_code == 404, \
+                f"registro huérfano no debe ser visible por tenant: {r.status_code}: {r.text}"
+
+            # Superadmin conserva capacidad de saneamiento/diagnóstico.
+            r_sa = client.get(f'/api/estudiantes/{A["est"]}', headers=auth(SA_TOKEN))
+            assert r_sa.status_code == 200, \
+                f"superadmin debe poder acceder al registro legacy: {r_sa.status_code}: {r_sa.text}"
+        finally:
+            est = db_t.get(Estudiante, A['est'])
+            if est is not None:
+                est.colegio_id = colegio_original
+                db_t.commit()
+            db_t.close()
+
+
+    @test("M6. Matrícula duplicada se bloquea dentro del mismo colegio")
+    def t():
+        r = client.post('/api/estudiantes', json={
+            'nombre':'Duplicado','apellido':'Matricula', 'curso_id': A['curso'],
+            'matricula':'M001-a', 'no_lista': 90,
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 409, f"esperaba 409, obtuvo {r.status_code}: {r.text}"
+
+    @test("M7. La misma matrícula puede existir en otro colegio")
+    def t():
+        r = client.post('/api/estudiantes', json={
+            'nombre':'Otro','apellido':'Tenant', 'curso_id': B['curso'],
+            'matricula':'M001-a', 'no_lista': 90,
+        }, headers=auth(DIR_B_TOKEN))
+        assert r.status_code == 201, f"la unicidad debe ser por colegio: {r.status_code}: {r.text}"
+
+    @test("M8. Número de lista duplicado se bloquea dentro del mismo curso")
+    def t():
+        r = client.post('/api/estudiantes', json={
+            'nombre':'Duplicado','apellido':'Lista', 'curso_id': A['curso'],
+            'matricula':'UNICA-M8', 'no_lista': 1,
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 409, f"esperaba 409, obtuvo {r.status_code}: {r.text}"
+
+
+    @test("M9. Impersonación audita al Superadmin como actor real")
+    def t():
+        from database import SessionLocal
+        from models import Usuario, LogAuditoria
+
+        db_t = SessionLocal()
+        try:
+            sa_user = db_t.query(Usuario).filter_by(username='superadmin').first()
+            dir_a = db_t.query(Usuario).filter_by(username='direccion').first()
+            assert sa_user is not None and dir_a is not None
+            colegio_a_id = dir_a.colegio_id
+        finally:
+            db_t.close()
+
+        r = client.post(f'/api/superadmin/impersonar/{colegio_a_id}', headers=auth(SA_TOKEN))
+        assert r.status_code == 200, f"impersonación falló: {r.status_code}: {r.text}"
+        imp_token = r.json()['token']
+
+        # Una escritura efectuada con el token del director impersonado debe
+        # quedar atribuida al Superadmin, sin perder la identidad efectiva.
+        r = client.put(f'/api/estudiantes/{A["est"]}', json={
+            'telefono': '809-555-0009',
+        }, headers=auth(imp_token))
+        assert r.status_code == 200, f"escritura impersonada falló: {r.status_code}: {r.text}"
+
+        db_t = SessionLocal()
+        try:
+            fino = (db_t.query(LogAuditoria)
+                    .filter(LogAuditoria.accion == 'editar',
+                            LogAuditoria.entidad == 'estudiantes',
+                            LogAuditoria.entidad_id == A['est'])
+                    .order_by(LogAuditoria.id.desc()).first())
+            assert fino is not None, "no se creó auditoría fina de la edición"
+            assert fino.usuario_id == sa_user.id, \
+                f"actor debe ser Superadmin {sa_user.id}, quedó {fino.usuario_id}"
+            assert fino.colegio_id == dir_a.colegio_id, \
+                "la auditoría debe conservar el tenant efectivo"
+            assert str(dir_a.id) in (fino.detalles or ''), \
+                "el detalle debe conservar el usuario efectivo impersonado"
+        finally:
+            db_t.close()
+
+
+    @test("M10. Psicología NO acepta estudiante de otro colegio")
+    def t():
+        # Dirección del colegio A no puede crear un caso apuntando al estudiante B.
+        r = client.post('/api/psicologia/solicitar', json={
+            'estudiante_id': B['est'],
+            'tipo': 'emocional',
+            'urgencia': 'media',
+            'motivo': 'Prueba cross-tenant',
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 404, \
+            f"esperaba 404 cross-tenant, obtuvo {r.status_code}: {r.text}"
+
+        # Confirmar que no se persistió ningún caso A -> estudiante B.
+        from database import SessionLocal
+        from models import CasoPsicologia, Usuario
+        db_t = SessionLocal()
+        try:
+            dir_a = db_t.query(Usuario).filter_by(username='direccion').first()
+            assert dir_a is not None
+            count = (db_t.query(CasoPsicologia)
+                     .filter(CasoPsicologia.colegio_id == dir_a.colegio_id,
+                             CasoPsicologia.estudiante_id == B['est'])
+                     .count())
+            assert count == 0, f"se persistieron {count} casos cross-tenant"
+        finally:
+            db_t.close()
+
+
+    @test("M11. Superadmin NO puede crear otro superadmin ligado a un colegio")
+    def t():
+        from database import SessionLocal
+        from models import Usuario
+        db_t = SessionLocal()
+        try:
+            dir_a = db_t.query(Usuario).filter_by(username='direccion').first()
+            colegio_a_id = dir_a.colegio_id
+        finally:
+            db_t.close()
+        r = client.post(f'/api/superadmin/colegios/{colegio_a_id}/crear-usuario', json={
+            'username': 'sa_tenant_m11', 'nombre': 'No', 'role': 'superadmin',
+            'password': 'TemporalM11!'
+        }, headers=auth(SA_TOKEN))
+        assert r.status_code == 400, f"esperaba 400, obtuvo {r.status_code}: {r.text}"
+
+
+    @test("M12. Editar usuario NO acepta tanda de otro colegio")
+    def t():
+        r = client.put(f'/api/usuarios/{A["prof"]}', json={
+            'tanda_id': B['tanda']
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 404, f"esperaba 404, obtuvo {r.status_code}: {r.text}"
+
+
+    @test("M13. Marcar comunicado de otro colegio NO crea relación cross-tenant")
+    def t():
+        r = client.post('/api/comunicados', json={
+            'titulo':'Comunicado B M13','contenido':'Solo B'
+        }, headers=auth(DIR_B_TOKEN))
+        assert r.status_code == 201, r.text
+        comunicado_b = r.json()['id']
+        r = client.post(f'/api/comunicados/{comunicado_b}/marcar-leido', headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 404, f"esperaba 404, obtuvo {r.status_code}: {r.text}"
+
+
+    @test("M14. Notas internas de Psicología NO se exponen al profesor")
+    def t():
+        # Crear usuario psicología en A.
+        r = client.post('/api/usuarios', json={
+            'username':'psi_m14','password':'PsicologiaM14!','nombre':'Psi','apellido':'M14','role':'psicologia'
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code in (201, 400), r.text
+        psi_token = client.post('/api/auth/login', json={'username':'psi_m14','password':'PsicologiaM14!'}).json().get('token')
+        assert psi_token, 'no se pudo loguear psicología M14'
+
+        r = client.post('/api/psicologia/solicitar', json={
+            'estudiante_id': A['est'], 'tipo':'emocional','urgencia':'normal','motivo':'M14'
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, r.text
+        caso_id = r.json()['id']
+        client.post(f'/api/psicologia/casos/{caso_id}/tomar', headers=auth(psi_token))
+        r = client.post(f'/api/psicologia/casos/{caso_id}/actualizar', json={
+            'notas_atencion':'nota interna secreta',
+            'diagnostico':'diagnóstico interno',
+            'recomendacion_profesor':'dar seguimiento académico'
+        }, headers=auth(psi_token))
+        assert r.status_code == 200, r.text
+
+        casos = client.get('/api/psicologia/casos', headers=auth(PROF_A_TOKEN)).json()
+        caso = next((x for x in casos if x['id'] == caso_id), None)
+        assert caso is not None, 'profesor solicitante debe ver el estado de su caso'
+        assert caso.get('notas_atencion') is None, 'profesor no debe ver notas internas'
+        assert caso.get('diagnostico') is None, 'profesor no debe ver diagnóstico interno'
+        assert caso.get('recomendacion_profesor') == 'dar seguimiento académico'
+
+
+    @test("M15. Cambiar password por Dirección revoca tokens anteriores")
+    def t():
+        r = client.post('/api/usuarios', json={
+            'username':'tok_m15','password':'InicialM15!','nombre':'Token','apellido':'M15','role':'profesor'
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 201, r.text
+        uid = r.json()['id']
+        tok = client.post('/api/auth/login', json={'username':'tok_m15','password':'InicialM15!'}).json()['token']
+        assert client.get('/api/auth/me', headers=auth(tok)).status_code == 200
+        r = client.put(f'/api/usuarios/{uid}', json={'password':'NuevaM15!'}, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, r.text
+        assert client.get('/api/auth/me', headers=auth(tok)).status_code == 401, 'token viejo debe quedar revocado'
+
+
+    @test("M16. Rate-limit por cuenta NO bloquea a toda la escuela por IP compartida")
+    def t():
+        for username in ('rl_a_m16','rl_b_m16'):
+            r = client.post('/api/usuarios', json={
+                'username':username,'password':'RateM16!','nombre':'Rate','apellido':username,'role':'profesor'
+            }, headers=auth(DIR_A_TOKEN))
+            assert r.status_code == 201, r.text
+        for _ in range(5):
+            client.post('/api/auth/login', json={'username':'rl_a_m16','password':'incorrecta'})
+        blocked = client.post('/api/auth/login', json={'username':'rl_a_m16','password':'RateM16!'})
+        assert blocked.status_code == 429, f"cuenta atacada debe bloquearse: {blocked.status_code} {blocked.text}"
+        other = client.post('/api/auth/login', json={'username':'rl_b_m16','password':'RateM16!'})
+        assert other.status_code == 200 and other.json().get('token'), \
+            f"otra cuenta en la misma IP debe seguir entrando: {other.status_code} {other.text}"
+
+
+    @test("M17. Desactivar colegio corta inmediatamente una sesión ya emitida")
+    def t():
+        r = client.post('/api/superadmin/colegios', json={
+            'nombre':'Colegio M17','codigo':'m17','plan':'enterprise',
+            'admin_username':'dir_m17','admin_password':'AdminM17!'
+        }, headers=auth(SA_TOKEN))
+        assert r.status_code == 201, r.text
+        cid = r.json()['id']
+        tok = client.post('/api/auth/login', json={'username':'dir_m17','password':'AdminM17!'}).json()['token']
+        assert client.get('/api/auth/me', headers=auth(tok)).status_code == 200
+        r = client.put(f'/api/superadmin/colegios/{cid}', json={'activo':False}, headers=auth(SA_TOKEN))
+        assert r.status_code == 200, r.text
+        assert client.get('/api/auth/me', headers=auth(tok)).status_code == 401, \
+            'sesión de colegio desactivado no debe seguir válida'
+
+
+    @test("M18. Editar username normaliza a minúsculas y mantiene el login usable")
+    def t():
+        r = client.post('/api/usuarios', json={
+            'username':'user_m18','password':'UsuarioM18!','nombre':'User','apellido':'M18','role':'profesor'
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 201, r.text
+        uid = r.json()['id']
+        r = client.put(f'/api/usuarios/{uid}', json={'username':'USER_M18'}, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, r.text
+        login = client.post('/api/auth/login', json={'username':'USER_M18','password':'UsuarioM18!'})
+        assert login.status_code == 200 and login.json().get('token'), \
+            f"username editado debe seguir autenticando: {login.status_code} {login.text}"
+
+
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL
 # ─────────────────────────────────────────────────────────────────

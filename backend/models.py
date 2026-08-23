@@ -1998,8 +1998,8 @@ def _persistir_credenciales_iniciales(creds: dict, ruta_destino: str = None):
     Escribe las credenciales generadas a un archivo INITIAL_CREDENTIALS.txt
     con permisos 0600 (solo el dueño puede leer). El admin debe leerlo,
     cambiar las passwords vía /api/auth/cambiar-password, y borrar el archivo.
-    Si la escritura falla (FS read-only, sin permisos, etc.) las credenciales
-    se loggean para que queden en el log del servidor.
+    Si la escritura falla (FS read-only, sin permisos, etc.), el arranque
+    aborta: las contraseñas administrativas nunca se vuelcan al log.
     """
     import os
     import logging
@@ -2041,11 +2041,14 @@ def _persistir_credenciales_iniciales(creds: dict, ruta_destino: str = None):
         log.warning(f"⚠️  Credenciales iniciales escritas en: {ruta_destino}")
         log.warning("⚠️  LEERLAS UNA VEZ, CAMBIAR PASSWORDS, Y BORRAR EL ARCHIVO.")
     except OSError as e:
-        # FS read-only o sin permisos: caer a log
-        log.error(f"⚠️  No se pudo escribir {ruta_destino}: {e}")
-        log.warning("⚠️  CREDENCIALES INICIALES (cambiar inmediatamente):")
-        for username, pw in creds.items():
-            log.warning(f"   {username} / {pw}")
+        # Nunca volcar passwords administrativas al log. Si no podemos
+        # persistirlas de forma privada en un arranque realmente nuevo, es
+        # más seguro abortar que crear cuentas cuyo secreto quede expuesto.
+        log.error(f"No se pudo escribir el archivo privado de credenciales iniciales: {e}")
+        raise RuntimeError(
+            "No se pudieron persistir de forma segura las credenciales iniciales. "
+            "Corregí permisos/almacenamiento antes de iniciar una instalación nueva."
+        ) from e
 
 
 def init_db():
@@ -2103,36 +2106,22 @@ def init_db():
         creds_a_persistir = {}
         
         # Superadmin: en DEV usa password fija 'superadmin123' para conveniencia.
-        # En PROD genera password aleatoria y la imprime UNA vez al log + escribe a archivo.
+        # En PROD genera password aleatoria y la persiste UNA vez en el archivo
+        # protegido INITIAL_CREDENTIALS.txt. No se imprime el secreto en logs.
         # must_change_password=True para forzar cambio en primer login en PROD.
         if not db.query(Usuario).filter_by(username='superadmin').first():
-            es_dev = _os.environ.get('DEBUG', 'True').lower() == 'true' or _os.environ.get('ENVIRONMENT', 'development') == 'development'
+            _render = _os.environ.get('RENDER', '').strip().lower() in {'1', 'true', 'yes'}
+            _env = _os.environ.get('ENVIRONMENT', 'development').strip().lower()
+            _debug = _os.environ.get('DEBUG', 'True' if _env == 'development' else 'False').lower() == 'true'
+            es_dev = (not _render) and _env == 'development' and _debug
             
             if es_dev:
                 sa_password = 'superadmin123'
                 must_change = False
             else:
-                # En producción: password fuerte aleatoria, escrita a archivo y forzar cambio
-                import secrets, string
-                alphabet = string.ascii_letters + string.digits + '!@#$%^&*'
-                sa_password = ''.join(secrets.choice(alphabet) for _ in range(16))
+                sa_password = _generar_password_inicial()
                 must_change = True
-                
-                creds_path = _os.path.join(_os.path.dirname(__file__), 'INITIAL_CREDENTIALS.txt')
-                try:
-                    with open(creds_path, 'w') as f:
-                        f.write(f"superadmin\n{sa_password}\n")
-                    _os.chmod(creds_path, 0o600)
-                    print("=" * 70)
-                    print("SUPERADMIN INICIAL CREADO")
-                    print(f"Username: superadmin")
-                    print(f"Password: {sa_password}")
-                    print(f"También guardado en: {creds_path}")
-                    print("CAMBIA ESTA PASSWORD EN EL PRIMER LOGIN.")
-                    print("=" * 70)
-                except Exception as e:
-                    print(f"WARNING: No se pudo escribir INITIAL_CREDENTIALS.txt: {e}")
-                    print(f"superadmin password inicial: {sa_password}")
+                creds_a_persistir['superadmin'] = sa_password
             
             superadmin = Usuario(
                 username='superadmin',
@@ -2145,24 +2134,30 @@ def init_db():
             superadmin.set_password(sa_password)
             db.add(superadmin)
         
-        # Direccion default: en DEV usamos must_change_password=False para
-        # que puedas loguear directo con admin123 mientras desarrollás. En
-        # PRODUCCIÓN forzamos must_change_password=True — esto cierra la
-        # ventana de exposición entre el deploy inicial y el primer login del
-        # admin. Sin este flag, si un bot escanea tu dominio justo después
-        # del deploy y prueba admin/admin123, entra. Con el flag, aunque
-        # entre, no puede hacer nada sin cambiar la password primero.
-        es_dev = _os.environ.get('DEBUG', 'True').lower() == 'true'
+        # Dirección default: admin123 SOLO en desarrollo. En producción una
+        # contraseña conocida sigue siendo peligrosa aunque must_change_password
+        # esté activo: quien la conozca podría autenticarse y cambiarla.
+        _render = _os.environ.get('RENDER', '').strip().lower() in {'1', 'true', 'yes'}
+        _env = _os.environ.get('ENVIRONMENT', 'development').strip().lower()
+        _debug = _os.environ.get('DEBUG', 'True' if _env == 'development' else 'False').lower() == 'true'
+        es_dev = (not _render) and _env == 'development' and _debug
         if not db.query(Usuario).filter_by(username='direccion').first():
+            if es_dev:
+                admin_password = 'admin123'
+                admin_must_change = False
+            else:
+                admin_password = _generar_password_inicial()
+                admin_must_change = True
+                creds_a_persistir['direccion'] = admin_password
             admin = Usuario(
                 username='direccion',
                 nombre='Administrador',
                 apellido='Sistema',
                 role='direccion',
                 colegio_id=colegio.id,
-                must_change_password=not es_dev,
+                must_change_password=admin_must_change,
             )
-            admin.set_password('admin123')
+            admin.set_password(admin_password)
             db.add(admin)
         
         if not db.query(AnoEscolar).first():

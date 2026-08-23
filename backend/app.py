@@ -39,6 +39,7 @@ from io import BytesIO
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
+from security import validate_password
 load_dotenv()
 
 from database import engine, SessionLocal, get_db, Base
@@ -56,7 +57,7 @@ from models import (
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
-    create_token, check_rate_limit, register_attempt, get_client_ip,
+    create_token, check_rate_limit, check_account_rate_limit, register_attempt, get_client_ip, decode_token,
     JWT_SECRET_KEY, tenant_filter, set_tenant, current_user_ctx,
     get_tenant_or_404, assert_same_tenant,
 )
@@ -69,7 +70,10 @@ from services import (
 # CONFIGURACIÓN
 # ===========================================
 SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-DEBUG = os.environ.get('DEBUG', 'True' if os.environ.get('ENVIRONMENT', 'development') == 'development' else 'False').lower() == 'true'
+_RUNNING_ON_RENDER = os.environ.get('RENDER', '').strip().lower() in {'1', 'true', 'yes'}
+_ENVIRONMENT = os.environ.get('ENVIRONMENT', 'development').strip().lower()
+_DEBUG_DEFAULT = 'False' if (_RUNNING_ON_RENDER or _ENVIRONMENT in {'production', 'prod'}) else 'True'
+DEBUG = os.environ.get('DEBUG', _DEBUG_DEFAULT).lower() == 'true'
 
 
 # ===========================================
@@ -134,9 +138,28 @@ def _validar_config_produccion():
             "\"import secrets; print(secrets.token_urlsafe(64))\"` y agregalo "
             "como variable de entorno."
         )
+
+    if len(SECRET_KEY) < 32:
+        errores.append(
+            "SECRET_KEY es demasiado corta para producción (mínimo 32 caracteres)."
+        )
+    if len(jwt_sk) < 32:
+        errores.append(
+            "JWT_SECRET_KEY es demasiado corta para producción (mínimo 32 caracteres)."
+        )
     
+    # Producción real debe usar PostgreSQL. SQLite queda permitido solo
+    # en desarrollo/pruebas; no tiene las garantías operativas que exigimos
+    # para un colegio real (concurrencia, constraints/migraciones y recovery).
+    if engine.dialect.name != 'postgresql':
+        errores.append(
+            f"DATABASE_URL usa {engine.dialect.name!r}. En producción EducaOne exige PostgreSQL. "
+            "Configurá DATABASE_URL con la Internal Database URL de Render PostgreSQL."
+        )
+
     allowed = os.environ.get('ALLOWED_ORIGINS', '*')
-    if allowed.strip() == '*':
+    allowed_list = [o.strip().rstrip('/') for o in allowed.split(',') if o.strip()]
+    if not allowed_list or '*' in allowed_list:
         errores.append(
             "ALLOWED_ORIGINS='*' permite que cualquier sitio web haga requests "
             "a la API desde el browser de tus usuarios. En Render configurá "
@@ -145,7 +168,7 @@ def _validar_config_produccion():
         )
     
     if errores:
-        if DEBUG:
+        if DEBUG and not _RUNNING_ON_RENDER:
             log.warning("⚠️  Configuración insegura detectada (DEBUG=True, no se bloquea):")
             for e in errores:
                 log.warning(f"   - {e}")
@@ -171,6 +194,19 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app):
+    # En PostgreSQL cada worker de Uvicorn ejecuta su propio lifespan. Sin una
+    # exclusión mutua, dos o más workers pueden intentar ALTER/CREATE INDEX al
+    # mismo tiempo durante un deploy. El advisory lock es global a la BD y
+    # serializa SOLO este bloque de startup entre procesos/instancias.
+    # SQLite (desarrollo/pruebas) no lo necesita.
+    from sqlalchemy import text
+    _schema_lock_conn = None
+    _SCHEMA_LOCK_KEY = 45445543414  # 'EDUCA' como clave estable del proyecto
+    if engine.dialect.name == 'postgresql':
+        _schema_lock_conn = engine.connect()
+        _schema_lock_conn.execute(text('SELECT pg_advisory_lock(:k)'), {'k': _SCHEMA_LOCK_KEY})
+        logger.info('🔒 Lock de migración PostgreSQL adquirido')
+
     # Startup: crear tablas si no existen (incluye nuevas de primaria)
     Base.metadata.create_all(bind=engine)
     
@@ -196,6 +232,7 @@ async def lifespan(app):
                             conn.commit()
                         except Exception as e:
                             logger.warning(f"No se pudo agregar {col}: {e}")
+                            raise
                 logger.info(f"✅ Migración: agregadas {len(nuevas_cols_calif)} columnas RP por parcial")
         
         # === 2. Grado: agregar campo ciclo ===
@@ -209,6 +246,7 @@ async def lifespan(app):
                         logger.info("✅ Migración: agregado campo ciclo a grados")
                     except Exception as e:
                         logger.warning(f"No se pudo agregar ciclo: {e}")
+                        raise
         
         # === 3. ConfiguracionColegio: módulos de niveles ===
         if 'configuracion_colegio' in inspector.get_table_names():
@@ -228,6 +266,7 @@ async def lifespan(app):
                             conn.commit()
                         except Exception as e:
                             logger.warning(f"No se pudo agregar {col_name}: {e}")
+                            raise
                 logger.info(f"✅ Migración: agregados {len(nuevas_config)} módulos de nivel")
         
         # === 4. Normalizar nivel de grados a valores canónicos ('primaria'|'secundaria'|'inicial') ===
@@ -244,6 +283,7 @@ async def lifespan(app):
                         logger.info(f"✅ Migración: {total} grados normalizados (nivel canónico)")
                 except Exception as e:
                     logger.warning(f"No se pudo normalizar nivel: {e}")
+                    raise
         
         # === 5. Agregar columna dias_trabajados si falta ===
         if 'ano_escolar' in inspector.get_table_names():
@@ -256,6 +296,7 @@ async def lifespan(app):
                         logger.info("✅ Migración: columna dias_trabajados agregada a ano_escolar")
                     except Exception as e:
                         logger.warning(f"No se pudo agregar dias_trabajados: {e}")
+                        raise
         
         # === 6. Agregar must_change_password a usuarios (Sprint 1 seguridad) ===
         if 'usuarios' in inspector.get_table_names():
@@ -269,6 +310,7 @@ async def lifespan(app):
                         logger.info("✅ Migración: columna nivel_asignado agregada a usuarios")
                     except Exception as e:
                         logger.warning(f"No se pudo agregar nivel_asignado: {e}")
+                        raise
             if 'must_change_password' not in user_cols:
                 # Sintaxis compatible con SQLite y Postgres:
                 # SQLite acepta tanto "DEFAULT 0" como "DEFAULT FALSE" para BOOLEAN.
@@ -283,6 +325,7 @@ async def lifespan(app):
                         logger.info("✅ Migración: must_change_password agregada a usuarios")
                     except Exception as e:
                         logger.warning(f"No se pudo agregar must_change_password: {e}")
+                        raise
             
             # token_version (Sprint 4: logout real)
             if 'token_version' not in user_cols:
@@ -296,6 +339,7 @@ async def lifespan(app):
                         logger.info("✅ Migración: token_version agregada a usuarios")
                     except Exception as e:
                         logger.warning(f"No se pudo agregar token_version: {e}")
+                        raise
         
         # === Migración Plan + Uso (módulos del SaaS) ===
         # Agrega columnas plan_X a colegios y usa_X a configuracion_colegio.
@@ -331,6 +375,7 @@ async def lifespan(app):
                             logger.info(f"✅ Migración: {col} agregada a colegios")
                         except Exception as e:
                             logger.warning(f"No se pudo agregar {col}: {e}")
+                            raise
                 
                 # Si las columnas legacy tiene_primaria/tiene_secundaria existían,
                 # copiar sus valores a plan_primaria/plan_secundaria. Esto preserva
@@ -345,6 +390,7 @@ async def lifespan(app):
                         logger.info("✅ Migración: plan_primaria copiada desde tiene_primaria legacy")
                     except Exception as e:
                         logger.warning(f"No se pudo copiar tiene_primaria: {e}")
+                        raise
                 if 'tiene_secundaria' in cole_cols:
                     try:
                         conn.execute(text(
@@ -355,6 +401,7 @@ async def lifespan(app):
                         logger.info("✅ Migración: plan_secundaria copiada desde tiene_secundaria legacy")
                     except Exception as e:
                         logger.warning(f"No se pudo copiar tiene_secundaria: {e}")
+                        raise
         
         if 'configuracion_colegio' in inspector.get_table_names():
             cfg_cols = {c['name'] for c in inspector.get_columns('configuracion_colegio')}
@@ -387,6 +434,7 @@ async def lifespan(app):
                             logger.info(f"✅ Migración: {col} agregada a configuracion_colegio")
                         except Exception as e:
                             logger.warning(f"No se pudo agregar {col}: {e}")
+                            raise
                 
                 # Copiar valores legacy modulo_X → usa_X cuando existan
                 legacy_to_new = [
@@ -410,6 +458,7 @@ async def lifespan(app):
                             conn.commit()
                         except Exception as e:
                             logger.warning(f"No se pudo copiar {old} → {new}: {e}")
+                            raise
         
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
@@ -433,12 +482,121 @@ async def lifespan(app):
                     conn.execute(text(f"CREATE INDEX IF NOT EXISTS {nombre} ON {tabla} {cols}"))
                 except Exception as e:
                     logger.warning(f"No se pudo crear índice {nombre}: {e}")
+                    raise
             conn.commit()
+
+        # === 8. Barreras físicas de integridad para concurrencia ===
+        # Las validaciones de aplicación son necesarias para mensajes amigables,
+        # pero dos requests simultáneos todavía podrían pasar el mismo check.
+        # Estos índices hacen que la BD sea la última línea de defensa.
+        indices_unicos_criticos = [
+            (
+                'uq_estudiante_colegio_matricula',
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_estudiante_colegio_matricula "
+                "ON estudiantes (colegio_id, matricula) "
+                "WHERE matricula IS NOT NULL AND TRIM(matricula) <> ''"
+            ),
+            (
+                'uq_estudiante_curso_no_lista',
+                # El predicado DEBE incluir activo = TRUE para coincidir con la
+                # regla de negocio de _validar_identidad_estudiante(), que solo
+                # bloquea el número de lista contra "otro estudiante ACTIVO".
+                # Sin ese filtro, un estudiante retirado/egresado sigue ocupando
+                # su número para siempre: al reasignarlo a un estudiante nuevo la
+                # app permite el guardado pero el INSERT revienta, y en el
+                # siguiente reinicio este CREATE INDEX falla y el worker no
+                # arranca. Ver también tools/preflight_produccion.py, que valida
+                # duplicados con este mismo criterio (activo = TRUE).
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_estudiante_curso_no_lista "
+                "ON estudiantes (colegio_id, curso_id, no_lista) "
+                "WHERE curso_id IS NOT NULL AND no_lista IS NOT NULL AND activo = TRUE"
+            ),
+            (
+                'uq_asistencia_general_est_fecha',
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_asistencia_general_est_fecha "
+                "ON asistencias (estudiante_id, fecha) WHERE asignatura_id IS NULL"
+            ),
+            (
+                'uq_ano_activo_colegio',
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_ano_activo_colegio "
+                "ON ano_escolar (colegio_id) WHERE activo = TRUE AND colegio_id IS NOT NULL"
+            ),
+        ]
+        # Si alguno falla por datos duplicados, NO ocultamos el error: es más
+        # seguro abortar el nuevo deploy y sanear los datos que seguir operando
+        # con una integridad que el código presupone.
+        with engine.begin() as conn:
+            for nombre, sql in indices_unicos_criticos:
+                conn.execute(text(sql))
+                logger.info(f"✅ Integridad: índice único {nombre} verificado")
         
     except Exception as e:
-        logger.warning(f"Error en migración: {e}")
+        logger.exception(f"Error crítico durante migración de startup: {e}")
+        raise RuntimeError(
+            'La migración de base de datos no pudo completarse de forma segura. '
+            'El nuevo proceso no arrancará para evitar operar con esquema parcial.'
+        ) from e
+    # Verificación final: no basta con que cada ALTER individual no haya lanzado
+    # error. Comparamos el esquema físico contra TODOS los modelos actuales.
+    # Si falta una tabla/columna, el worker no entra en servicio.
+    try:
+        from sqlalchemy import inspect
+        inspector_final = inspect(engine)
+        tablas_fisicas = set(inspector_final.get_table_names())
+        faltantes = []
+        for tabla_nombre, tabla_modelo in Base.metadata.tables.items():
+            if tabla_nombre not in tablas_fisicas:
+                faltantes.append(f'tabla:{tabla_nombre}')
+                continue
+            columnas_fisicas = {c['name'] for c in inspector_final.get_columns(tabla_nombre)}
+            for columna in tabla_modelo.columns:
+                if columna.name not in columnas_fisicas:
+                    faltantes.append(f'columna:{tabla_nombre}.{columna.name}')
+
+        # Comprobar también las cuatro barreras de integridad creadas arriba.
+        indices_requeridos = {
+            'estudiantes': {'uq_estudiante_colegio_matricula', 'uq_estudiante_curso_no_lista'},
+            'asistencias': {'uq_asistencia_general_est_fecha'},
+            'ano_escolar': {'uq_ano_activo_colegio'},
+        }
+        for tabla_nombre, requeridos in indices_requeridos.items():
+            existentes = {idx.get('name') for idx in inspector_final.get_indexes(tabla_nombre)}
+            for nombre in requeridos - existentes:
+                faltantes.append(f'indice:{nombre}')
+
+        if faltantes:
+            raise RuntimeError('Esquema incompleto: ' + ', '.join(faltantes[:30]))
+
+        # La normalización de niveles sí afecta lógica académica; no continuar si
+        # quedaron valores fuera del conjunto canónico.
+        with engine.connect() as conn:
+            invalidos_nivel = conn.execute(text(
+                "SELECT COUNT(*) FROM grados "
+                "WHERE nivel IS NULL OR TRIM(nivel) = '' "
+                "OR LOWER(nivel) NOT IN ('primaria','secundaria','inicial')"
+            )).scalar() or 0
+        if invalidos_nivel:
+            raise RuntimeError(f'{invalidos_nivel} grado(s) conservan nivel no canónico')
+
+        logger.info('✅ Verificación post-migración: esquema e integridad estructural OK')
+    except Exception as e:
+        logger.exception(f'Verificación post-migración falló: {e}')
+        raise RuntimeError(
+            'EducaOne detectó un esquema incompatible después de migrar y no arrancará.'
+        ) from e
     
     init_db()
+
+    # Liberar el lock solo después de que esquema, índices, normalización e
+    # inicialización hayan terminado. Si el startup falla antes, el worker
+    # aborta y PostgreSQL libera automáticamente el lock al cerrarse la sesión.
+    if _schema_lock_conn is not None:
+        try:
+            _schema_lock_conn.execute(text('SELECT pg_advisory_unlock(:k)'), {'k': _SCHEMA_LOCK_KEY})
+            logger.info('🔓 Lock de migración PostgreSQL liberado')
+        finally:
+            _schema_lock_conn.close()
+            _schema_lock_conn = None
     
     # Iniciar backup automático programado
     import asyncio
@@ -498,7 +656,11 @@ async def lifespan(app):
 app = FastAPI(title="Educa One API", version="2.0", lifespan=lifespan)
 
 # CORS — configurable por variable de entorno
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
+ALLOWED_ORIGINS = [
+    origin.strip().rstrip('/')
+    for origin in os.environ.get('ALLOWED_ORIGINS', '*').split(',')
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -671,6 +833,18 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 # ===========================================
 logger = logging.getLogger("educaone")
 if not DEBUG:
+    # Render y otros PaaS conservan stdout/stderr en sus logs, mientras que
+    # el filesystem local puede ser efímero. Mantener salida a consola como
+    # fuente operativa principal y el archivo rotativo solo como apoyo local.
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler)
+               for h in logger.handlers):
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)s: %(message)s [%(name)s]'
+        ))
+        stream_handler.setLevel(logging.INFO)
+        logger.addHandler(stream_handler)
+
     log_dir = os.environ.get('LOG_DIR', 'logs')
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
@@ -698,28 +872,51 @@ if not DEBUG:
 # Redis (REDIS_URL configurado) esto sería compartido; por ahora en memoria
 # es suficiente como red de seguridad básica.
 from collections import deque as _deque
-_rate_global = {}  # ip -> deque de timestamps
-_RATE_MAX = 200    # requests
+_rate_global = {}  # clave (user:id o ip:x) -> deque de timestamps
 _RATE_WINDOW = 60  # segundos
+_RATE_AUTH_MAX = int(os.environ.get('RATE_AUTH_MAX_PER_MINUTE', '600'))
+_RATE_ANON_MAX = int(os.environ.get('RATE_ANON_MAX_PER_MINUTE', '300'))
 
 @app.middleware("http")
 async def global_rate_limit(request: Request, call_next):
-    # No limitar el healthcheck (Render lo llama seguido)
+    """Protección global sin castigar a una escuela completa detrás de NAT.
+
+    - Usuario autenticado: límite por user_id (default 600/min).
+    - Tráfico anónimo: límite por IP real (default 300/min).
+    - Login además tiene su rate-limit persistente por cuenta + IP en BD.
+
+    El cache es por worker y funciona como fusible de abuso, no como control de
+    autorización ni como fuente de verdad de login.
+    """
     if request.url.path in ('/api/health', '/health', '/'):
         return await call_next(request)
-    try:
-        ip = request.client.host if request.client else 'unknown'
-    except Exception:
-        ip = 'unknown'
+    if DEBUG and os.environ.get('DISABLE_GLOBAL_RATE_LIMIT', '').lower() == 'true':
+        return await call_next(request)
+
+    ip = get_client_ip(request) or 'unknown'
+    key = f'ip:{ip}'
+    max_requests = _RATE_ANON_MAX
+
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        try:
+            payload = decode_token(auth_header.split(' ', 1)[1])
+            user_id = payload.get('user_id') if payload else None
+            if user_id is not None:
+                key = f'user:{int(user_id)}'
+                max_requests = _RATE_AUTH_MAX
+        except Exception:
+            # Token inválido: sigue bajo el límite anónimo/IP.
+            pass
+
     ahora = _time.time()
-    dq = _rate_global.get(ip)
+    dq = _rate_global.get(key)
     if dq is None:
         dq = _deque()
-        _rate_global[ip] = dq
-    # Quitar timestamps fuera de la ventana
+        _rate_global[key] = dq
     while dq and dq[0] < ahora - _RATE_WINDOW:
         dq.popleft()
-    if len(dq) >= _RATE_MAX:
+    if len(dq) >= max_requests:
         from fastapi.responses import JSONResponse as _JR
         return _JR(
             {'error': 'Demasiadas solicitudes. Esperá un momento e intentá de nuevo.'},
@@ -727,7 +924,7 @@ async def global_rate_limit(request: Request, call_next):
             headers={'Retry-After': '30'}
         )
     dq.append(ahora)
-    # Limpieza periódica para no acumular IPs viejas (cada ~1000 IPs)
+
     if len(_rate_global) > 5000:
         viejos = [k for k, d in _rate_global.items() if not d or d[-1] < ahora - _RATE_WINDOW]
         for k in viejos:
@@ -759,6 +956,11 @@ async def add_security_headers(request: Request, call_next):
     _audit_debe = (_audit_metodo in ('POST', 'PUT', 'DELETE', 'PATCH')
                    and _audit_path.startswith('/api/')
                    and not _audit_path.startswith('/api/auth/'))  # login se audita aparte
+    # Solo para suites/local: SQLite bloquea toda la BD mientras otra sesión
+    # conserva una transacción de escritura. Permitir desactivar esta capa
+    # automática en DEBUG evita falsos timeouts; producción mantiene auditoría.
+    if DEBUG and os.environ.get('DISABLE_AUTO_AUDIT', '').lower() == 'true':
+        _audit_debe = False
 
     response = await call_next(request)
 
@@ -856,11 +1058,26 @@ def log_auditoria(db: Session, accion, tabla, registro_id=None, datos_anteriores
     """
     client_ip = get_client_ip(request) if request else None
     user_agent = request.headers.get('User-Agent', '')[:200] if request else ''
+
+    # Durante impersonación el actor REAL es el Superadmin, aunque el usuario
+    # efectivo sea el director del colegio. Conservamos ambos en auditoría.
+    actor_id = None
+    detalle_auditoria = {'antes': datos_anteriores, 'despues': datos_nuevos}
+    if user:
+        actor_id = getattr(user, '_impersonator_user_id', None) or user.id
+        if getattr(user, '_impersonator_user_id', None):
+            detalle_auditoria['impersonacion'] = {
+                'actor_superadmin_id': actor_id,
+                'usuario_efectivo_id': user.id,
+                'usuario_efectivo': user.username,
+            }
+
+    tiene_detalle = bool(datos_anteriores or datos_nuevos or detalle_auditoria.get('impersonacion'))
     log = LogAuditoria(
-        usuario_id=user.id if user else None,
+        usuario_id=actor_id,
         colegio_id=user.colegio_id if user and hasattr(user, 'colegio_id') else None,
         accion=accion, entidad=tabla, entidad_id=registro_id,
-        detalles=str({'antes': datos_anteriores, 'despues': datos_nuevos}) if datos_anteriores or datos_nuevos else None,
+        detalles=str(detalle_auditoria) if tiene_detalle else None,
         ip=client_ip, user_agent=user_agent,
         tabla=tabla, registro_id=registro_id,
         datos_anteriores=str(datos_anteriores) if datos_anteriores else None,
@@ -891,17 +1108,23 @@ def _auditar_escritura_automatica(request: Request, metodo: str, path: str, stat
     from auth import decode_token as _decode, get_client_ip as _gcip
 
     usuario_id = None
+    usuario_efectivo_id = None
     colegio_id = None
+    es_impersonacion = False
     auth_header = request.headers.get('Authorization', '')
     if auth_header.startswith('Bearer '):
         payload = _decode(auth_header.split(' ', 1)[1])
         if payload:
-            usuario_id = payload.get('user_id') or payload.get('sub') or payload.get('id')
+            usuario_efectivo_id = payload.get('user_id') or payload.get('sub') or payload.get('id')
+            es_impersonacion = bool(payload.get('impersonating') and payload.get('impersonator_user_id'))
+            usuario_id = payload.get('impersonator_user_id') if es_impersonacion else usuario_efectivo_id
             colegio_id = payload.get('colegio_id')
             try:
                 usuario_id = int(usuario_id) if usuario_id is not None else None
+                usuario_efectivo_id = int(usuario_efectivo_id) if usuario_efectivo_id is not None else None
             except (ValueError, TypeError):
                 usuario_id = None
+                usuario_efectivo_id = None
 
     # Si no hay usuario identificable, no auditamos (endpoints públicos raros)
     if usuario_id is None:
@@ -923,7 +1146,11 @@ def _auditar_escritura_automatica(request: Request, metodo: str, path: str, stat
             ip=ip,
             user_agent=user_agent,
             tabla='_auto',
-            detalles=f'{{"auto": true, "status": {status}}}',
+            detalles=(
+                f'{{"auto": true, "status": {status}, '
+                f'"impersonating": {str(es_impersonacion).lower()}, '
+                f'"effective_user_id": {usuario_efectivo_id if usuario_efectivo_id is not None else "null"}}}'
+            ),
         )
         _db.add(log)
         _db.commit()
@@ -1135,24 +1362,31 @@ async def login(request: Request, db: Session = Depends(get_db)):
     data = await request.json()
     if not data or not data.get('username') or not data.get('password'):
         return JSONResponse({'error': 'Usuario y contraseña requeridos'}, status_code=400)
+
+    username = str(data['username']).strip().lower()
+    password = str(data['password'])
     
     # Obtener IP para rate limiting
     client_ip = get_client_ip(request)
     if client_ip and ',' in client_ip:
         client_ip = client_ip.split(',')[0].strip()
     
-    # Verificar rate limiting (consulta BD para multi-worker / sobrevivir reinicios)
-    allowed, remaining = check_rate_limit(client_ip, db=db)
-    if not allowed:
+    # Dos capas:
+    # 1) por cuenta: 5 fallos/15min persistentes en BD;
+    # 2) por IP: 30 fallos/15min para frenar ataques distribuidos por usernames
+    #    sin bloquear a toda una escuela detrás del mismo NAT tras 5 errores.
+    allowed_account, _ = check_account_rate_limit(username, max_attempts=5, window_minutes=15, db=db)
+    allowed_ip, _ = check_rate_limit(client_ip, max_attempts=30, window_minutes=15, db=db)
+    if not allowed_account or not allowed_ip:
         logger.warning(f'Rate limit excedido para IP: {client_ip}')
         return JSONResponse({
             'error': 'Demasiados intentos de login. Espere 15 minutos.',
             'retry_after': 900
         }, status_code=429)
     
-    user = db.query(Usuario).filter_by(username=data['username'], activo=True).first()
+    user = db.query(Usuario).filter_by(username=username, activo=True).first()
     
-    if user and user.check_password(data['password']):
+    if user and user.check_password(password):
         # Verificar que el colegio esté activo (excepto superadmin)
         if user.role != 'superadmin' and user.colegio_id:
             colegio = db.query(Colegio).get(user.colegio_id)
@@ -1228,14 +1462,14 @@ async def login(request: Request, db: Session = Depends(get_db)):
     audit = LogAuditoria(
         accion='login_fallido',
         entidad='sesion',
-        detalles=f'username: {data.get("username", "?")}',
+        detalles=f'username: {username}',
         ip=client_ip,
         colegio_id=None
     )
     db.add(audit)
     db.commit()
     
-    logger.warning(f'Login fallido para usuario: {data.get("username")} desde {client_ip}')
+    logger.warning(f'Login fallido para usuario: {username} desde {client_ip}')
     
     return JSONResponse({'error': 'Credenciales inválidas'}, status_code=401)
 
@@ -1986,8 +2220,9 @@ async def get_recreos(request: Request, db: Session = Depends(get_db), current_u
 async def crear_recreo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Crear un nuevo recreo"""
     data = await request.json()
+    tanda = get_tenant_or_404(db, Tanda, data.get('tanda_id'), current_user, name='tanda')
     recreo = Recreo(
-        tanda_id=data['tanda_id'],
+        tanda_id=tanda.id,
         colegio_id=current_user.colegio_id,
         nombre=data.get('nombre', 'Recreo'),
         hora_inicio=data['hora_inicio'],
@@ -2032,8 +2267,9 @@ async def get_bloques_horario(request: Request, db: Session = Depends(get_db), c
 async def crear_bloque_horario(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Crear un bloque de horario"""
     data = await request.json()
+    tanda = get_tenant_or_404(db, Tanda, data.get('tanda_id'), current_user, name='tanda')
     bloque = BloqueHorario(
-        tanda_id=data['tanda_id'],
+        tanda_id=tanda.id,
         colegio_id=current_user.colegio_id,
         numero=data['numero'],
         hora_inicio=data['hora_inicio'],
@@ -2503,6 +2739,11 @@ async def crear_usuario(request: Request, db: Session = Depends(get_db), current
     
     if db.query(Usuario).filter_by(username=username).first():
         return JSONResponse({'error': 'El usuario ya existe'}, status_code=400)
+
+    tanda_id = data.get('tanda_id') or None
+    if tanda_id is not None:
+        tanda = get_tenant_or_404(db, Tanda, tanda_id, current_user, name='tanda')
+        tanda_id = tanda.id
     
     usuario = Usuario(
         username=username,
@@ -2513,7 +2754,7 @@ async def crear_usuario(request: Request, db: Session = Depends(get_db), current
         cedula=cedula or None,
         role=role,
         nivel_asignado=nivel_asignado,
-        tanda_id=data.get('tanda_id') or None,
+        tanda_id=tanda_id,
         colegio_id=current_user.colegio_id,
         must_change_password=must_change,
     )
@@ -2563,9 +2804,16 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
     # Cambio de username: permitido, pero validando que sea único y no vacío.
     # El username es el identificador de login, así que no puede repetirse.
     if 'username' in data:
-        nuevo_username = (data['username'] or '').strip()
+        # El login normaliza a minúsculas; guardar un username con mayúsculas
+        # dejaría la cuenta inaccesible porque la búsqueda posterior usa lowercase.
+        nuevo_username = (data['username'] or '').strip().lower()[:50]
         if not nuevo_username:
             return JSONResponse({'error': 'El nombre de usuario no puede estar vacío'}, status_code=400)
+        if not re.match(r'^[a-z0-9_-]+$', nuevo_username):
+            return JSONResponse(
+                {'error': 'Username solo puede contener letras, números, guiones y guiones bajos'},
+                status_code=400,
+            )
         # ¿Existe ya OTRO usuario con ese username? (el username es global)
         existe = db.query(Usuario).filter(
             Usuario.username == nuevo_username,
@@ -2575,10 +2823,18 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
             return JSONResponse({'error': f'El nombre de usuario "{nuevo_username}" ya está en uso'}, status_code=400)
         usuario.username = nuevo_username
 
-    # Lista blanca de campos editables (ya no incluye 'role' acá; se setea aparte)
-    for campo in ['nombre', 'apellido', 'email', 'telefono', 'cedula', 'tanda_id']:
+    # Lista blanca de campos editables. `tanda_id` se valida aparte para
+    # impedir asociar un usuario del colegio actual con una tanda de otro tenant.
+    for campo in ['nombre', 'apellido', 'email', 'telefono', 'cedula']:
         if campo in data:
             setattr(usuario, campo, data[campo] if data[campo] else None)
+
+    if 'tanda_id' in data:
+        tanda_id = data.get('tanda_id') or None
+        if tanda_id is not None:
+            tanda = get_tenant_or_404(db, Tanda, tanda_id, current_user, name='tanda')
+            tanda_id = tanda.id
+        usuario.tanda_id = tanda_id
     
     # Setear role solo si pasó la validación
     if 'role' in data:
@@ -2592,7 +2848,13 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
         usuario.nivel_asignado = _nv
     
     if data.get('password'):
-        usuario.set_password(data['password'])
+        nueva_password = str(data['password'])
+        ok, msg = validate_password(nueva_password)
+        if not ok:
+            return JSONResponse({'error': msg}, status_code=400)
+        usuario.set_password(nueva_password)
+        # Revoca cualquier JWT emitido antes del cambio de contraseña.
+        usuario.token_version = (usuario.token_version or 0) + 1
     
     log_auditoria(db, 'editar', 'usuarios', usuario.id, datos_anteriores, usuario.to_dict(), user=current_user, request=request)
     db.commit()
@@ -2603,6 +2865,7 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
 async def delete_usuario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     usuario = get_tenant_or_404(db, Usuario, id, current_user, name='usuario')
     usuario.activo = False
+    usuario.token_version = (usuario.token_version or 0) + 1
     log_auditoria(db, 'eliminar', 'usuarios', usuario.id, usuario.to_dict(), None, user=current_user, request=request)
     db.commit()
     return {'message': 'Usuario desactivado'}
@@ -2626,9 +2889,15 @@ async def reset_password_usuario(id, request: Request, db: Session = Depends(get
         # Password aleatoria fuerte (cumple validador del endpoint /cambiar-password)
         from models import _generar_password_inicial
         nueva_password = _generar_password_inicial()
+    else:
+        nueva_password = str(nueva_password)
+        ok, msg = validate_password(nueva_password)
+        if not ok:
+            return JSONResponse({'error': msg}, status_code=400)
     
     usuario.set_password(nueva_password)
     usuario.must_change_password = True  # forzar cambio al primer login
+    usuario.token_version = (usuario.token_version or 0) + 1
     log_auditoria(db, 'reset_password', 'usuarios', usuario.id, None, {'reseteado_por': current_user.id}, user=current_user, request=request)
     db.commit()
     
@@ -2763,6 +3032,37 @@ async def get_estudiante(id, request: Request, db: Session = Depends(get_db), cu
     return est.to_dict()
 
 
+def _validar_identidad_estudiante(db: Session, current_user: Usuario, *, matricula=None, curso_id=None, no_lista=None, excluir_id=None):
+    """Valida duplicados operativos dentro del tenant.
+
+    Es una defensa de aplicación. La constraint definitiva en PostgreSQL debe
+    agregarse mediante migración DESPUÉS de sanear posibles duplicados legacy.
+    """
+    matricula_norm = str(matricula).strip() if matricula is not None else ''
+    if matricula_norm:
+        q = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
+            func.lower(func.trim(Estudiante.matricula)) == matricula_norm.lower()
+        )
+        if excluir_id is not None:
+            q = q.filter(Estudiante.id != excluir_id)
+        existente = q.first()
+        if existente:
+            return f'Ya existe un estudiante con la matrícula {matricula_norm} en este colegio.'
+
+    if curso_id is not None and no_lista is not None:
+        q = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
+            Estudiante.curso_id == curso_id,
+            Estudiante.no_lista == no_lista,
+            Estudiante.activo == True,
+        )
+        if excluir_id is not None:
+            q = q.filter(Estudiante.id != excluir_id)
+        existente = q.first()
+        if existente:
+            return f'El número de lista {no_lista} ya está asignado a otro estudiante activo de este curso.'
+    return None
+
+
 @app.post("/api/estudiantes")
 async def crear_estudiante(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
     """Crear estudiante. Valida que curso (si se provee) sea del mismo colegio."""
@@ -2809,6 +3109,25 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
         # bloquear: no tiene sentido cargar estudiantes en un nivel que el
         # colegio no opera.
         assert_nivel_curso_activo(db, current_user, curso.id)
+
+    # Normalizar identidad académica y bloquear duplicados dentro del colegio.
+    matricula = (str(data.get('matricula')).strip() if data.get('matricula') is not None else '') or None
+    no_lista = data.get('no_lista')
+    if no_lista not in (None, ''):
+        try:
+            no_lista = int(no_lista)
+            if no_lista <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'no_lista debe ser un entero positivo'}, status_code=400)
+    else:
+        no_lista = None
+
+    conflicto = _validar_identidad_estudiante(
+        db, current_user, matricula=matricula, curso_id=curso_id, no_lista=no_lista
+    )
+    if conflicto:
+        return JSONResponse({'error': conflicto}, status_code=409)
     
     # Parsear fecha_nacimiento con manejo de error explícito
     fecha_nac = None
@@ -2839,7 +3158,7 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
         # Datos personales (los 13 que tenía + nuevos)
         nombre=data['nombre'],
         apellido=data['apellido'],
-        matricula=data.get('matricula'),
+        matricula=matricula,
         sexo=data.get('sexo'),
         fecha_nacimiento=fecha_nac,
         lugar_nacimiento=data.get('lugar_nacimiento'),
@@ -2847,7 +3166,7 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
         cedula=data.get('cedula'),
         # Académico
         curso_id=curso_id,
-        no_lista=data.get('no_lista'),
+        no_lista=no_lista,
         condicion_entrada=data.get('condicion_entrada') or 'nuevo',
         escuela_procedencia=data.get('escuela_procedencia'),
         # Contacto del estudiante
@@ -2912,6 +3231,33 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
         return _guard
 
     datos_anteriores = est.to_dict()
+
+    # Calcular primero el estado final para validar duplicados ANTES de mutar.
+    curso_destino_id = data.get('curso_id', est.curso_id)
+    matricula_final = est.matricula
+    if 'matricula' in data:
+        matricula_final = (str(data.get('matricula')).strip() if data.get('matricula') is not None else '') or None
+        data['matricula'] = matricula_final
+    no_lista_final = data.get('no_lista', est.no_lista)
+    if no_lista_final not in (None, ''):
+        try:
+            no_lista_final = int(no_lista_final)
+            if no_lista_final <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'no_lista debe ser un entero positivo'}, status_code=400)
+        data['no_lista'] = no_lista_final
+    else:
+        no_lista_final = None
+        if 'no_lista' in data:
+            data['no_lista'] = None
+
+    conflicto = _validar_identidad_estudiante(
+        db, current_user, matricula=matricula_final, curso_id=curso_destino_id,
+        no_lista=no_lista_final, excluir_id=est.id
+    )
+    if conflicto:
+        return JSONResponse({'error': conflicto}, status_code=409)
     
     # Validar tenant del nuevo curso si cambia
     if 'curso_id' in data and data['curso_id'] is not None:
@@ -3029,23 +3375,76 @@ async def importar_estudiantes(request: Request, archivo: UploadFile = File(...)
         
         count = 0
         errores = []
+
+        # Precargar identidades existentes para detectar duplicados sin hacer
+        # una query por fila y también detectar duplicados dentro del propio CSV.
+        existentes_tenant = tenant_filter(db.query(Estudiante), Estudiante, current_user).all()
+        matriculas_usadas = {
+            (e.matricula or '').strip().lower() for e in existentes_tenant if (e.matricula or '').strip()
+        }
+        numeros_usados = {
+            e.no_lista for e in existentes_tenant
+            if e.activo and e.curso_id == curso_id and e.no_lista is not None
+        }
+
+        cupos_restantes = None
+        if current_user.colegio_id:
+            colegio = db.get(Colegio, current_user.colegio_id)
+            if colegio and colegio.max_estudiantes:
+                count_actual = sum(1 for e in existentes_tenant if e.activo)
+                cupos_restantes = max(0, colegio.max_estudiantes - count_actual)
+
         for i, row in enumerate(reader, start=2):
-            if not row.get('nombre') or not row.get('apellido'):
+            nombre = (row.get('nombre') or '').strip()
+            apellido = (row.get('apellido') or '').strip()
+            if not nombre or not apellido:
                 errores.append(f"Fila {i}: nombre y apellido son requeridos")
                 continue
-            
+
+            matricula = (row.get('matricula') or '').strip() or None
+            matricula_key = matricula.lower() if matricula else None
+            if matricula_key and matricula_key in matriculas_usadas:
+                errores.append(f"Fila {i}: matrícula duplicada ({matricula})")
+                continue
+
+            no_lista = None
+            if (row.get('no_lista') or '').strip():
+                try:
+                    no_lista = int(row.get('no_lista'))
+                    if no_lista <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errores.append(f"Fila {i}: no_lista debe ser un entero positivo")
+                    continue
+                if no_lista in numeros_usados:
+                    errores.append(f"Fila {i}: número de lista duplicado en el curso ({no_lista})")
+                    continue
+
+            genero = (row.get('genero') or 'M').strip().upper()[:1]
+            if genero not in ('M', 'F'):
+                errores.append(f"Fila {i}: género inválido ({row.get('genero')}); use M o F")
+                continue
+
+            if cupos_restantes is not None and count >= cupos_restantes:
+                errores.append(f"Fila {i}: límite de estudiantes del plan alcanzado")
+                continue
+
             est = Estudiante(
-                matricula=row.get('matricula') or None,
-                no_lista=int(row.get('no_lista')) if row.get('no_lista') else None,
-                nombre=row.get('nombre').strip(),
-                apellido=row.get('apellido').strip(),
-                sexo=row.get('genero', 'M')[0].upper() if row.get('genero') else 'M',
+                matricula=matricula,
+                no_lista=no_lista,
+                nombre=nombre,
+                apellido=apellido,
+                sexo=genero,
                 curso_id=curso_id,
-                condicion=row.get('condicion') or 'Nuevo',
+                condicion=(row.get('condicion') or 'Nuevo').strip(),
                 activo=True,
                 colegio_id=current_user.colegio_id
             )
             db.add(est)
+            if matricula_key:
+                matriculas_usadas.add(matricula_key)
+            if no_lista is not None:
+                numeros_usados.add(no_lista)
             count += 1
         
         db.commit()
@@ -4881,15 +5280,26 @@ async def crear_permiso_temporal(request: Request, db: Session = Depends(get_db)
     profesor_id = data.get('profesor_id')
     if not profesor_id:
         return JSONResponse({'error': 'Profesor requerido'}, status_code=400)
+
+    profesor = get_tenant_or_404(db, Usuario, profesor_id, current_user, name='profesor')
+    if profesor.role != 'profesor':
+        return JSONResponse({'error': 'El usuario indicado no es profesor'}, status_code=400)
+
+    curso_id = data.get('curso_id')
+    asignatura_id = data.get('asignatura_id')
+    if curso_id is not None:
+        curso_id = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso').id
+    if asignatura_id is not None:
+        asignatura_id = get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura').id
     
     horas = data.get('horas', 24)  # Por defecto 24 horas
     fecha_fin = now_rd() + timedelta(hours=horas)
     
     permiso = PermisoTemporalCalificacion(
         colegio_id=current_user.colegio_id,
-        profesor_id=profesor_id,
-        curso_id=data.get('curso_id'),
-        asignatura_id=data.get('asignatura_id'),
+        profesor_id=profesor.id,
+        curso_id=curso_id,
+        asignatura_id=asignatura_id,
         periodo=data.get('periodo'),
         fecha_fin=fecha_fin,
         motivo=data.get('motivo', 'Corrección de calificaciones'),
@@ -4965,10 +5375,29 @@ async def get_solicitudes_edicion(request: Request, db: Session = Depends(get_db
 async def crear_solicitud_edicion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Crear solicitud de edición de nota en período cerrado"""
     data = await request.json()
+
+    if current_user.role != 'profesor':
+        return JSONResponse({'error': 'Solo los profesores pueden solicitar edición de notas'}, status_code=403)
+
+    calificacion = get_tenant_or_404(
+        db, Calificacion, data.get('calificacion_id'), current_user, name='calificacion'
+    )
+    # El profesor solo puede solicitar cambios sobre calificaciones de una
+    # asignatura/curso que realmente tenga asignada. Evita crear una solicitud
+    # sobre una nota ajena con solo conocer su ID.
+    estudiante = get_tenant_or_404(db, Estudiante, calificacion.estudiante_id, current_user, name='estudiante')
+    tiene_asignacion = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        profesor_id=current_user.id,
+        curso_id=estudiante.curso_id,
+        asignatura_id=calificacion.asignatura_id,
+        activo=True,
+    ).first()
+    if not tiene_asignacion:
+        return JSONResponse({'error': 'No tiene asignación para editar esta calificación'}, status_code=403)
     
     solicitud = SolicitudEdicionNota(
         colegio_id=current_user.colegio_id,
-        calificacion_id=data['calificacion_id'],
+        calificacion_id=calificacion.id,
         profesor_id=current_user.id,
         periodo=data['periodo'],
         campo=data['campo'],
@@ -6701,10 +7130,13 @@ async def get_casos_psicologia(request: Request, db: Session = Depends(get_db), 
     else:
         casos = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).order_by(CasoPsicologia.fecha_solicitud.desc()).all()
     
+    puede_ver_notas_internas = current_user.role in {'psicologia', 'direccion', 'superadmin'}
     return [{
         'id': c.id,
         'estudiante': c.estudiante.nombre_completo if c.estudiante else None,
         'estudiante_id': c.estudiante_id,
+        'curso': c.estudiante.curso.nombre_completo if c.estudiante and c.estudiante.curso else None,
+        'curso_id': c.estudiante.curso_id if c.estudiante else None,
         'tipo': c.tipo,
         'urgencia': c.urgencia,
         'motivo': c.motivo,
@@ -6713,9 +7145,11 @@ async def get_casos_psicologia(request: Request, db: Session = Depends(get_db), 
         'solicitante_id': c.solicitado_por,
         'psicologo': c.psicologo.nombre_completo if c.psicologo else None,
         'fecha_solicitud': c.fecha_solicitud.isoformat() if c.fecha_solicitud else None,
-        'notas_atencion': c.notas_atencion,
+        # Notas internas y diagnóstico son sensibles: coordinación/profesor
+        # reciben solo la recomendación operativa destinada a ellos.
+        'notas_atencion': c.notas_atencion if puede_ver_notas_internas else None,
         'recomendacion_profesor': c.recomendacion_profesor,
-        'diagnostico': c.diagnostico,
+        'diagnostico': c.diagnostico if puede_ver_notas_internas else None,
         'fecha_actualizacion': c.fecha_actualizacion.isoformat() if c.fecha_actualizacion else None
     } for c in casos]
 
@@ -6726,9 +7160,12 @@ async def solicitar_atencion_psicologia(request: Request, db: Session = Depends(
         return JSONResponse({'error': 'No tiene permiso para solicitar atención'}, status_code=403)
     
     data = await request.json()
+    estudiante = get_tenant_or_404(
+        db, Estudiante, data.get('estudiante_id'), current_user, name='estudiante'
+    )
     
     caso = CasoPsicologia(
-        estudiante_id=data['estudiante_id'],
+        estudiante_id=estudiante.id,
         colegio_id=current_user.colegio_id,
         solicitado_por=current_user.id,
         tipo=data.get('tipo', 'emocional'),
@@ -6995,16 +7432,17 @@ async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_
 
 @app.post("/api/comunicados/{id}/marcar-leido")
 async def marcar_comunicado_leido(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Marcar comunicado como leído"""
+    """Marcar comunicado como leído. Valida que el comunicado pertenezca al tenant."""
+    comunicado = get_tenant_or_404(db, Comunicado, id, current_user, name='comunicado')
     
     existing = tenant_filter(db.query(ComunicadoLeido), ComunicadoLeido, current_user).filter_by(
-        comunicado_id=id, 
+        comunicado_id=comunicado.id, 
         usuario_id=current_user.id
     ).first()
     
     if not existing:
         leido = ComunicadoLeido(
-            comunicado_id=id,
+            comunicado_id=comunicado.id,
             usuario_id=current_user.id,
             colegio_id=current_user.colegio_id
         )
@@ -7191,6 +7629,10 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     
     # Obtener asignatura_id (puede ser None para asistencia general en primaria)
     asignatura_id = data.get('asignatura_id')
+    if asignatura_id is not None:
+        asignatura_id = get_tenant_or_404(
+            db, Asignatura, asignatura_id, current_user, name='asignatura'
+        ).id
     
     # Buscar asistencia existente (por estudiante, fecha Y asignatura)
     query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
@@ -7386,42 +7828,60 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
 
 @app.post("/api/asistencia/masivo")
 async def registrar_asistencia_masivo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Registrar asistencia de múltiples estudiantes por materia"""
+    """Registrar asistencia de múltiples estudiantes por materia.
+
+    El lote se valida completo antes de escribir para evitar guardados parciales
+    silenciosos y referencias cross-tenant.
+    """
     data = await request.json()
     fecha_str = data.get('fecha', today_rd().isoformat())
     asignatura_id = data.get('asignatura_id')  # Puede ser None
-    
-    # Parsear fecha
+    curso_id = data.get('curso_id')
+    asistencias = data.get('asistencias', [])
+
     try:
         fecha = datetime.strptime(fecha_str, '%Y-%m-%d').date()
     except (ValueError, TypeError):
-        fecha = today_rd()
-    
-    asistencias = data.get('asistencias', [])
+        return JSONResponse(
+            {'error': f"fecha inválida: {fecha_str!r}. Formato esperado: YYYY-MM-DD"},
+            status_code=400
+        )
+
+    curso = None
+    if curso_id is not None:
+        curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+        curso_id = curso.id
+    if asignatura_id is not None:
+        asignatura_id = get_tenant_or_404(
+            db, Asignatura, asignatura_id, current_user, name='asignatura'
+        ).id
+
+    if not asistencias:
+        return {'message': 'Sin cambios'}
+    if not isinstance(asistencias, list):
+        return JSONResponse({'error': 'asistencias debe ser una lista'}, status_code=400)
 
     # v2.15 F2: candado de división (curso del lote, o primer estudiante como referencia)
-    _primer_est = asistencias[0].get('estudiante_id') if (asistencias and isinstance(asistencias[0], dict)) else None
-    _guard = validar_nivel_escritura(db, current_user,
-                                     curso_id=data.get('curso_id'),
-                                     estudiante_id=_primer_est)
+    _primer_est = asistencias[0].get('estudiante_id') if isinstance(asistencias[0], dict) else None
+    _guard = validar_nivel_escritura(
+        db, current_user, curso_id=curso_id, estudiante_id=_primer_est
+    )
     if _guard:
         return _guard
 
     # v2.17: el PROFESOR solo pasa lista en SUS cursos (lote)
     if current_user.role == 'profesor':
-        _cid_lote = data.get('curso_id')
+        _cid_lote = curso_id
         if not _cid_lote and _primer_est:
             _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=_primer_est).first()
             _cid_lote = _e.curso_id if _e else None
         if _cid_lote:
             _tiene_a = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-                profesor_id=current_user.id, curso_id=_cid_lote, activo=True).first()
+                profesor_id=current_user.id, curso_id=_cid_lote, activo=True
+            ).first()
             if not _tiene_a:
                 return JSONResponse({'error': 'Solo puedes registrar asistencia en tus cursos asignados'}, status_code=403)
 
-    if not asistencias:
-        return {'message': 'Sin cambios'}
-    
     # v2.13.1: Validar día de la semana según configuración del colegio
     dia_semana = fecha.weekday()
     if dia_semana >= 5:
@@ -7438,53 +7898,61 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
                 'fecha': fecha.isoformat(), 'dia': 'domingo',
                 'hint': 'Active "permite_domingo" en Configuración si su colegio tiene clases domingos.',
             }, status_code=400)
-    
-    # Validar nivel UNA VEZ usando el primer estudiante (todos deben ser del
-    # mismo curso típicamente — si no, fallará por tenant individual abajo)
-    primer_est_id = asistencias[0].get('estudiante_id') if asistencias else None
-    if primer_est_id:
-        primer_est = db.get(Estudiante, primer_est_id)
-        if primer_est and primer_est.colegio_id == current_user.colegio_id and primer_est.curso_id:
-            assert_nivel_curso_activo(db, current_user, primer_est.curso_id)
-    
+
+    ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
+    estudiantes_lote = {}
+
+    # Prevalidar TODO antes de escribir: estudiante, tenant, retiro, curso y estado.
     for item in asistencias:
-        estudiante = db.get(Estudiante, item['estudiante_id'])
-        if not estudiante:
-            continue
-        # Validar tenant: skip silently estudiantes de otro colegio
-        if current_user.role != 'superadmin' and estudiante.colegio_id != current_user.colegio_id:
-            continue
-        # Skip silently estudiantes retirados — el frontend ya los muestra
-        # con botones deshabilitados, pero por seguridad backend también ignora.
+        if not isinstance(item, dict) or not item.get('estudiante_id'):
+            return JSONResponse({'error': 'Cada asistencia requiere estudiante_id'}, status_code=400)
+        estado_item = (item.get('estado') or '').strip().lower()
+        if estado_item not in ESTADOS_VALIDOS:
+            return JSONResponse({
+                'error': f"estado inválido para estudiante {item.get('estudiante_id')}: {item.get('estado')!r}"
+            }, status_code=400)
+        estudiante = get_tenant_or_404(
+            db, Estudiante, item.get('estudiante_id'), current_user, name='estudiante'
+        )
         if not estudiante.activo:
-            continue
-        
-        # Buscar asistencia existente por estudiante, fecha y asignatura
+            return JSONResponse({
+                'error': f'El estudiante {estudiante.nombre_completo} está retirado; no se puede marcar asistencia'
+            }, status_code=403)
+        if curso is not None and estudiante.curso_id != curso.id:
+            return JSONResponse({
+                'error': f'El estudiante {estudiante.nombre_completo} no pertenece al curso indicado'
+            }, status_code=400)
+        estudiantes_lote[estudiante.id] = (estudiante, estado_item)
+
+    primer_est = estudiantes_lote.get(int(_primer_est))[0] if _primer_est and int(_primer_est) in estudiantes_lote else None
+    if primer_est and primer_est.curso_id:
+        assert_nivel_curso_activo(db, current_user, primer_est.curso_id)
+
+    for item in asistencias:
+        estudiante, estado_item = estudiantes_lote[int(item['estudiante_id'])]
         query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
-            estudiante_id=item['estudiante_id'],
+            estudiante_id=estudiante.id,
             fecha=fecha
         )
         if asignatura_id:
             query = query.filter_by(asignatura_id=asignatura_id)
         else:
             query = query.filter(Asistencia.asignatura_id.is_(None))
-        
+
         asistencia = query.first()
-        
         if asistencia:
-            asistencia.estado = item['estado']
+            asistencia.estado = estado_item
         else:
-            asistencia = Asistencia(
+            db.add(Asistencia(
                 colegio_id=current_user.colegio_id,
-                estudiante_id=item['estudiante_id'],
+                estudiante_id=estudiante.id,
                 curso_id=estudiante.curso_id,
                 asignatura_id=asignatura_id,
                 fecha=fecha,
-                estado=item['estado'],
+                estado=estado_item,
                 registrado_por=current_user.id
-            )
-            db.add(asistencia)
-    
+            ))
+
     db.commit()
     cache_clear_tenant(current_user.colegio_id)
     cache_clear(f'stats:{current_user.colegio_id}')
@@ -7502,9 +7970,12 @@ async def registrar_comunicacion_padres(request: Request, db: Session = Depends(
     assert_modulo_activo(db, current_user, 'comunicacion_padres')
     
     data = await request.json()
+    estudiante = get_tenant_or_404(
+        db, Estudiante, data.get('estudiante_id'), current_user, name='estudiante'
+    )
     
     comunicacion = HistorialComunicacionPadres(
-        estudiante_id=data.get('estudiante_id'),
+        estudiante_id=estudiante.id,
         tipo_comunicacion=data.get('tipo', 'reporte'),
         referencia_id=data.get('referencia_id'),
         mensaje_enviado=data.get('mensaje'),
@@ -9025,47 +9496,81 @@ async def get_progreso_estudiante(id, db: Session = Depends(get_db), current_use
     """
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
     
-    # ─── Modelo NUEVO: CalificacionSecundaria ───
-    # nota_por_asig_periodo: dict (asig_id, periodo) → nota
+    # Determinar carril académico. Primaria y Secundaria NO comparten fórmula
+    # ni corte aprobatorio. Para estudiantes sin curso conservamos el fallback
+    # legacy de 70 para no inventar un nivel.
+    es_secundaria = bool(estudiante.curso_id and _es_curso_secundaria(db, estudiante.curso_id))
+    es_primaria = bool(estudiante.curso_id and not es_secundaria)
+    minimo_aprobatorio = 65 if es_primaria else 70
+
+    # nota_por_asig_periodo: dict (asig_id, periodo) → nota del ÁREA/MATERIA
     nota_por_asig_periodo: dict = {}
     nombre_por_asig: dict = {}
-    
+
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if ano_activo:
+    if not ano_activo:
+        # El historial/progreso debe seguir siendo visible justo después de
+        # cerrar el año escolar. Usar el más reciente como fallback.
+        ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+
+    if ano_activo and es_primaria:
+        # ─── PRIMARIA: promedio del área por período a partir de sus
+        # competencias. valor_periodo() ya aplica max(P, RP).
+        califs_pri = tenant_filter(
+            db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
+        ).filter_by(estudiante_id=id, ano_escolar_id=ano_activo.id).all()
+
+        from collections import defaultdict as _dd
+        por_asig = _dd(list)
+        for c in califs_pri:
+            por_asig[c.asignatura_id].append(c)
+
+        for aid, comps in por_asig.items():
+            asig_obj = db.get(Asignatura, aid)
+            nombre_por_asig[aid] = asig_obj.nombre if asig_obj else ''
+            for periodo in range(1, 5):
+                vals = [c.valor_periodo(periodo) for c in comps if c.valor_periodo(periodo) is not None]
+                if vals:
+                    nota_por_asig_periodo[(aid, periodo)] = round(sum(vals) / len(vals), 1)
+
+    elif ano_activo:
+        # ─── SECUNDARIA: PC del período = AVG de las competencias usando
+        # valor_periodo(). Carril original conservado.
         califs_sec = tenant_filter(
             db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
         ).filter_by(estudiante_id=id, ano_escolar_id=ano_activo.id).all()
-        
+
         from collections import defaultdict as _dd
         por_asig = _dd(list)
         for c in califs_sec:
             por_asig[c.asignatura_id].append(c)
-        
+
         for aid, comps in por_asig.items():
             asig_obj = db.get(Asignatura, aid)
             nombre_por_asig[aid] = asig_obj.nombre if asig_obj else ''
-            for p in range(1, 5):
+            for periodo in range(1, 5):
                 vals = []
                 for comp in comps:
-                    v = comp.valor_periodo(p) if hasattr(comp, 'valor_periodo') else None
+                    v = comp.valor_periodo(periodo) if hasattr(comp, 'valor_periodo') else None
                     if v is not None:
                         vals.append(v)
                 if vals:
-                    nota_por_asig_periodo[(aid, p)] = round(sum(vals) / len(vals), 1)
-    
-    # ─── Modelo LEGACY: Calificacion ───
-    # Solo agregamos asignaturas que NO están ya en el modelo nuevo
+                    nota_por_asig_periodo[(aid, periodo)] = round(sum(vals) / len(vals), 1)
+
+    # ─── Modelo LEGACY: solo rellena asignaturas ausentes del carril moderno.
+    # Esto mantiene compatibilidad con datos históricos sin mezclar dos fuentes
+    # para una misma materia.
     asig_ids_modelo_nuevo = set(nombre_por_asig.keys())
     calificaciones_legacy = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(estudiante_id=id).all()
     for cal in calificaciones_legacy:
         if cal.asignatura_id in asig_ids_modelo_nuevo:
             continue
         nombre_por_asig[cal.asignatura_id] = cal.asignatura.nombre if cal.asignatura else ''
-        for p in range(1, 5):
-            pc = getattr(cal, f'pc{p}', None)
+        for periodo in range(1, 5):
+            pc = getattr(cal, f'pc{periodo}', None)
             if pc is not None:
-                nota_por_asig_periodo[(cal.asignatura_id, p)] = round(float(pc), 1)
-    
+                nota_por_asig_periodo[(cal.asignatura_id, periodo)] = round(float(pc), 1)
+
     # Construir datos por período (unificado)
     periodos = []
     for p in range(1, 5):
@@ -9080,8 +9585,8 @@ async def get_progreso_estudiante(id, db: Session = Depends(get_db), current_use
             'periodo': p,
             'promedio': promedio,
             'asignaturas': asig_notas,
-            'aprobadas': sum(1 for n in asig_notas if n['nota'] >= 70),
-            'reprobadas': sum(1 for n in asig_notas if n['nota'] < 70),
+            'aprobadas': sum(1 for n in asig_notas if n['nota'] >= minimo_aprobatorio),
+            'reprobadas': sum(1 for n in asig_notas if n['nota'] < minimo_aprobatorio),
             'total': len(asig_notas)
         })
     
@@ -9115,6 +9620,8 @@ async def get_progreso_estudiante(id, db: Session = Depends(get_db), current_use
             'matricula': estudiante.matricula,
             'curso': estudiante.curso.nombre_completo if estudiante.curso else None,
         },
+        'nivel': 'secundaria' if es_secundaria else ('primaria' if es_primaria else 'legacy'),
+        'minimo_aprobatorio': minimo_aprobatorio,
         'periodos': periodos,
         'tendencia': tendencia,
         'mejor_asignatura': mejor_asig,
@@ -9149,49 +9656,87 @@ async def get_historial_estudiante(id, db: Session = Depends(get_db), current_us
     }
     
     # === HISTORIAL ACADÉMICO ===
-    # v2.13.8: lee AMBOS modelos (Calificacion legacy + CalificacionSecundaria nuevo MINERD)
+    # Carriles separados: Primaria usa CalificacionPrimaria y corte 65;
+    # Secundaria usa CalificacionSecundaria y corte 70. El modelo legacy solo
+    # rellena materias que no existan en el modelo moderno correspondiente.
+    es_secundaria = bool(estudiante.curso_id and _es_curso_secundaria(db, estudiante.curso_id))
+    es_primaria = bool(estudiante.curso_id and not es_secundaria)
+    minimo_aprobatorio = 65 if es_primaria else 70
     academico = []
     asig_ids_modelo_nuevo = set()
-    
-    # 1. Modelo NUEVO: CalificacionSecundaria
-    ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if ano_activo:
+
+    ano_hist = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano_hist:
+        ano_hist = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+
+    if ano_hist and es_primaria:
+        from calculo_primaria import cf_area as calc_cf_area
+        from collections import defaultdict as _dd
+
+        califs_pri = tenant_filter(
+            db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
+        ).filter_by(estudiante_id=id, ano_escolar_id=ano_hist.id).all()
+        por_asig = _dd(list)
+        for c in califs_pri:
+            por_asig[c.asignatura_id].append(c)
+
+        for aid, comps in por_asig.items():
+            asig_obj = db.get(Asignatura, aid)
+            pcs, rps = {}, {}
+            for periodo in range(1, 5):
+                vals = [c.valor_periodo(periodo) for c in comps if c.valor_periodo(periodo) is not None]
+                rp_vals = [getattr(c, f'rp{periodo}', None) for c in comps]
+                rp_vals = [v for v in rp_vals if v is not None]
+                pcs[f'pc{periodo}'] = round(sum(vals) / len(vals), 1) if vals else None
+                rps[f'rp{periodo}'] = round(sum(rp_vals) / len(rp_vals), 1) if rp_vals else None
+
+            _, cf = calc_cf_area(comps)
+            # La literal histórica se conserva con la escala A/B/C/F del modelo;
+            # el estado de aprobación del nivel se decide con minimo_aprobatorio.
+            literal = comps[0].get_literal(cf) if comps and cf is not None else ''
+            academico.append({
+                'asignatura': asig_obj.nombre if asig_obj else '',
+                'pc1': pcs['pc1'], 'pc2': pcs['pc2'], 'pc3': pcs['pc3'], 'pc4': pcs['pc4'],
+                'rp1': rps['rp1'], 'rp2': rps['rp2'], 'rp3': rps['rp3'], 'rp4': rps['rp4'],
+                'cf': cf, 'literal': literal
+            })
+            asig_ids_modelo_nuevo.add(aid)
+
+    elif ano_hist:
+        from collections import defaultdict as _dd
         califs_sec = tenant_filter(
             db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-        ).filter_by(estudiante_id=id, ano_escolar_id=ano_activo.id).all()
-        
-        from collections import defaultdict as _dd
+        ).filter_by(estudiante_id=id, ano_escolar_id=ano_hist.id).all()
+
         por_asig = _dd(list)
         for c in califs_sec:
             por_asig[c.asignatura_id].append(c)
-        
+
         for aid, comps in por_asig.items():
             asig_obj = db.get(Asignatura, aid)
-            pcs = {}  # pc1..pc4
-            rps = {}  # rp1..rp4 (mínima por período)
-            for p in range(1, 5):
-                vals = []
-                rps_periodo = []
+            pcs, rps = {}, {}
+            for periodo in range(1, 5):
+                vals, rps_periodo = [], []
                 for comp in comps:
-                    v = comp.valor_periodo(p) if hasattr(comp, 'valor_periodo') else None
+                    v = comp.valor_periodo(periodo) if hasattr(comp, 'valor_periodo') else None
                     if v is not None:
                         vals.append(v)
-                    rp_val = getattr(comp, f'rp{p}', None)
+                    rp_val = getattr(comp, f'rp{periodo}', None)
                     if rp_val is not None:
                         rps_periodo.append(rp_val)
-                pcs[f'pc{p}'] = round(sum(vals) / len(vals), 1) if vals else None
-                rps[f'rp{p}'] = min(rps_periodo) if rps_periodo else None
-            
+                pcs[f'pc{periodo}'] = round(sum(vals) / len(vals), 1) if vals else None
+                rps[f'rp{periodo}'] = min(rps_periodo) if rps_periodo else None
+
             pcs_validos = [v for v in pcs.values() if v is not None]
             cf = int(round(sum(pcs_validos) / len(pcs_validos))) if pcs_validos else None
-            
+
             def _literal(n):
                 if n is None: return ''
                 if n >= 90: return 'A'
                 if n >= 80: return 'B'
                 if n >= 70: return 'C'
                 return 'F'
-            
+
             academico.append({
                 'asignatura': asig_obj.nombre if asig_obj else '',
                 'pc1': pcs['pc1'], 'pc2': pcs['pc2'], 'pc3': pcs['pc3'], 'pc4': pcs['pc4'],
@@ -9199,8 +9744,8 @@ async def get_historial_estudiante(id, db: Session = Depends(get_db), current_us
                 'cf': cf, 'literal': _literal(cf)
             })
             asig_ids_modelo_nuevo.add(aid)
-    
-    # 2. Modelo LEGACY: agregar asignaturas que NO están ya en modelo nuevo
+
+    # Modelo legacy: fallback, nunca duplica una materia moderna.
     calificaciones = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(estudiante_id=id).all()
     for cal in calificaciones:
         if cal.asignatura_id in asig_ids_modelo_nuevo:
@@ -9211,7 +9756,7 @@ async def get_historial_estudiante(id, db: Session = Depends(get_db), current_us
             'rp1': cal.rp1, 'rp2': cal.rp2, 'rp3': cal.rp3, 'rp4': cal.rp4,
             'cf': cal.cf, 'literal': cal.literal or cal.get_literal()
         })
-    
+
     # === HISTORIAL DE CONDUCTA ===
     reportes = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(
         estudiante_id=id
@@ -9223,7 +9768,7 @@ async def get_historial_estudiante(id, db: Session = Depends(get_db), current_us
         'descripcion': r.descripcion,
         'estado': r.estado,
         'gravedad': getattr(r, 'gravedad', None),
-        'reportado_por': r.reportado.nombre_completo if r.reportado else '',
+        'reportado_por': r.reportador.nombre_completo if r.reportador else '',
         'respuesta': getattr(r, 'respuesta', None),
     } for r in reportes]
     
@@ -9264,18 +9809,22 @@ async def get_historial_estudiante(id, db: Session = Depends(get_db), current_us
     # === HISTORIAL DE PSICOLOGÍA ===
     casos = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(
         estudiante_id=id
-    ).order_by(CasoPsicologia.fecha_inicio.desc() if hasattr(CasoPsicologia, 'fecha_inicio') else CasoPsicologia.id.desc()).all()
+    ).order_by(CasoPsicologia.fecha_solicitud.desc()).all()
     psicologia = [{
         'id': c.id,
-        'motivo': getattr(c, 'motivo', ''),
+        'motivo': c.motivo or '',
         'estado': c.estado,
-        'urgencia': getattr(c, 'urgencia', ''),
-        'fecha': c.fecha_inicio.strftime('%d/%m/%Y') if hasattr(c, 'fecha_inicio') and c.fecha_inicio else '',
-        'observaciones': getattr(c, 'observaciones', ''),
-        'recomendacion_profesor': getattr(c, 'recomendacion_profesor', ''),
+        'urgencia': c.urgencia or '',
+        'fecha': c.fecha_solicitud.strftime('%d/%m/%Y') if c.fecha_solicitud else '',
+        # Compatibilidad con el frontend existente: "observaciones" resume la
+        # información clínica/seguimiento disponible sin exponer campos nuevos.
+        'observaciones': c.notas_atencion or c.diagnostico or c.seguimiento or '',
+        'recomendacion_profesor': c.recomendacion_profesor or '',
     } for c in casos]
     
     return {
+        'nivel': 'secundaria' if es_secundaria else ('primaria' if es_primaria else 'legacy'),
+        'minimo_aprobatorio': minimo_aprobatorio,
         'datos_personales': datos_personales,
         'academico': academico,
         'conducta': conducta,
@@ -9294,172 +9843,8 @@ async def get_historial_estudiante(id, db: Session = Depends(get_db), current_us
         }
     }
 
-@app.get("/api/estudiantes/{id}/historial")
-async def get_historial_estudiante(id, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Historial completo de un estudiante: datos, académico, conducta, asistencia, psicología"""
-    estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
-    
-    # Datos personales
-    datos = {
-        'nombre': estudiante.nombre_completo,
-        'matricula': estudiante.matricula,
-        'cedula': estudiante.cedula,
-        'sexo': estudiante.sexo,
-        'fecha_nacimiento': estudiante.fecha_nacimiento.isoformat() if estudiante.fecha_nacimiento else None,
-        'curso': estudiante.curso.nombre_completo if estudiante.curso else None,
-        'condicion': estudiante.condicion,
-        'fecha_ingreso': estudiante.fecha_ingreso.isoformat() if estudiante.fecha_ingreso else None,
-        'direccion': estudiante.direccion,
-        'telefono': estudiante.telefono,
-        'nombre_padre': estudiante.nombre_padre,
-        'telefono_padre': estudiante.telefono_padre,
-        'nombre_madre': estudiante.nombre_madre,
-        'telefono_madre': estudiante.telefono_madre,
-        'tutor': estudiante.tutor,
-        'telefono_tutor': estudiante.telefono_tutor,
-        'contacto_emergencia': estudiante.contacto_emergencia,
-        'telefono_emergencia': estudiante.telefono_emergencia,
-    }
-    
-    # Historial académico - todas las calificaciones
-    # v2.13.8: lee AMBOS modelos (Calificacion legacy + CalificacionSecundaria nuevo MINERD)
-    academico = []
-    asig_ids_modelo_nuevo = set()
-    
-    ano_activo_h = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if ano_activo_h:
-        califs_sec = tenant_filter(
-            db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-        ).filter_by(estudiante_id=id, ano_escolar_id=ano_activo_h.id).all()
-        
-        from collections import defaultdict as _dd
-        por_asig = _dd(list)
-        for c in califs_sec:
-            por_asig[c.asignatura_id].append(c)
-        
-        for aid, comps in por_asig.items():
-            asig_obj = db.get(Asignatura, aid)
-            pcs = {}
-            rps = {}
-            for p in range(1, 5):
-                vals = []
-                rps_periodo = []
-                for comp in comps:
-                    v = comp.valor_periodo(p) if hasattr(comp, 'valor_periodo') else None
-                    if v is not None:
-                        vals.append(v)
-                    rp_val = getattr(comp, f'rp{p}', None)
-                    if rp_val is not None:
-                        rps_periodo.append(rp_val)
-                pcs[f'pc{p}'] = round(sum(vals) / len(vals), 1) if vals else None
-                rps[f'rp{p}'] = min(rps_periodo) if rps_periodo else None
-            
-            pcs_validos = [v for v in pcs.values() if v is not None]
-            cf = int(round(sum(pcs_validos) / len(pcs_validos))) if pcs_validos else None
-            
-            def _literal(n):
-                if n is None: return ''
-                if n >= 90: return 'A'
-                if n >= 80: return 'B'
-                if n >= 70: return 'C'
-                return 'F'
-            
-            academico.append({
-                'asignatura': asig_obj.nombre if asig_obj else '',
-                'pc1': pcs['pc1'], 'rp1': rps['rp1'],
-                'pc2': pcs['pc2'], 'rp2': rps['rp2'],
-                'pc3': pcs['pc3'], 'rp3': rps['rp3'],
-                'pc4': pcs['pc4'], 'rp4': rps['rp4'],
-                'cf': cf, 'literal': _literal(cf)
-            })
-            asig_ids_modelo_nuevo.add(aid)
-    
-    calificaciones = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(estudiante_id=id).all()
-    for cal in calificaciones:
-        if cal.asignatura_id in asig_ids_modelo_nuevo:
-            continue
-        academico.append({
-            'asignatura': cal.asignatura.nombre if cal.asignatura else '',
-            'pc1': cal.pc1, 'rp1': cal.rp1,
-            'pc2': cal.pc2, 'rp2': cal.rp2,
-            'pc3': cal.pc3, 'rp3': cal.rp3,
-            'pc4': cal.pc4, 'rp4': cal.rp4,
-            'cf': cal.cf, 'literal': cal.literal or cal.get_literal()
-        })
-    
-    # Historial conducta - todos los reportes
-    reportes = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(
-        estudiante_id=id
-    ).order_by(ReporteConducta.fecha.desc()).all()
-    conducta = [{
-        'id': r.id,
-        'fecha': r.fecha.strftime('%d/%m/%Y %H:%M') if r.fecha else '',
-        'tipo': r.tipo,
-        'gravedad': r.gravedad,
-        'titulo': r.titulo,
-        'descripcion': r.descripcion[:100] if r.descripcion else '',
-        'estado': r.estado,
-        'respuesta': r.respuesta[:100] if r.respuesta else None,
-        'reportado_por': r.reportador.nombre_completo if r.reportador else '',
-    } for r in reportes]
-    
-    # Historial asistencia - resumen
-    asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(estudiante_id=id).all()
-    asist_conteo = {'presente': 0, 'ausente': 0, 'tardanza': 0, 'excusa': 0}
-    meses = {}
-    for a in asistencias:
-        estado = a.estado or 'presente'
-        asist_conteo[estado] = asist_conteo.get(estado, 0) + 1
-        if a.fecha:
-            mes_key = a.fecha.strftime('%Y-%m')
-            if mes_key not in meses:
-                meses[mes_key] = {'mes': a.fecha.strftime('%b %Y'), 'presente': 0, 'ausente': 0, 'tardanza': 0}
-            if estado in meses[mes_key]:
-                meses[mes_key][estado] += 1
-    
-    total_asist = sum(asist_conteo.values())
-    asistencia = {
-        'presentes': asist_conteo['presente'],
-        'ausentes': asist_conteo['ausente'],
-        'tardanzas': asist_conteo['tardanza'],
-        'excusas': asist_conteo['excusa'],
-        'total': total_asist,
-        'porcentaje': round(asist_conteo['presente'] / total_asist * 100, 1) if total_asist > 0 else 0,
-        'por_mes': sorted(meses.values(), key=lambda x: x['mes'])
-    }
-    
-    # Historial psicología
-    casos = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(
-        estudiante_id=id
-    ).order_by(CasoPsicologia.fecha_solicitud.desc()).all()
-    psicologia = [{
-        'id': c.id,
-        'fecha': c.fecha_solicitud.strftime('%d/%m/%Y') if c.fecha_solicitud else '',
-        'tipo': c.tipo,
-        'urgencia': c.urgencia,
-        'motivo': c.motivo[:100] if c.motivo else '',
-        'estado': c.estado,
-        'diagnostico': c.diagnostico[:100] if c.diagnostico else None,
-        'recomendacion': c.recomendacion_profesor[:100] if c.recomendacion_profesor else None,
-    } for c in casos]
-    
-    return {
-        'datos': datos,
-        'academico': academico,
-        'conducta': conducta,
-        'conducta_resumen': {
-            'total': len(conducta),
-            'pendientes': sum(1 for r in conducta if r['estado'] == 'pendiente'),
-            'resueltos': sum(1 for r in conducta if r['estado'] == 'resuelto'),
-            'graves': sum(1 for r in conducta if r['gravedad'] == 'grave'),
-        },
-        'asistencia': asistencia,
-        'psicologia': psicologia,
-        'psicologia_resumen': {
-            'total': len(psicologia),
-            'activos': sum(1 for c in psicologia if c['estado'] in ('pendiente', 'en_proceso')),
-        }
-    }
+# v2.18: endpoint duplicado de historial eliminado; la implementación única
+# anterior soporta Primaria, Secundaria y legacy con el contrato usado por frontend.
 
 # ============== REPORTE DE NOTAS POR PERÍODO ==============
 
@@ -12940,8 +13325,13 @@ async def health_check(request: Request, db: Session = Depends(get_db)):
 # ============== BACKUP AUTOMÁTICO ==============
 
 @app.get("/api/backup")
-async def crear_backup(db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'superadmin'))):
-    """Crear backup de la base de datos (solo dirección/superadmin)"""
+async def crear_backup(db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('superadmin'))):
+    """Crear backup GLOBAL de PostgreSQL (solo superadmin).
+
+    Un pg_dump contiene datos de todos los colegios; nunca se expone a un
+    administrador/dirección de un tenant. Para exportaciones por colegio deben
+    usarse reportes/exportaciones tenant-scoped, no este endpoint.
+    """
     import subprocess
     database_url = os.environ.get('DATABASE_URL', '')
     
@@ -12990,8 +13380,8 @@ async def crear_backup(db: Session = Depends(get_db), current_user: Usuario = De
         return JSONResponse({'error': str(e)}, status_code=500)
 
 @app.get("/api/backup/descargar/{filename}")
-async def descargar_backup(filename: str, current_user: Usuario = Depends(RolesRequired('direccion', 'superadmin'))):
-    """Descargar un archivo de backup"""
+async def descargar_backup(filename: str, current_user: Usuario = Depends(RolesRequired('superadmin'))):
+    """Descargar un backup GLOBAL (solo superadmin)."""
     import re
     if not re.match(r'^backup_\d{8}_\d{6}\.sql$', filename):
         return JSONResponse({'error': 'Nombre de archivo inválido'}, status_code=400)
@@ -13009,8 +13399,8 @@ async def descargar_backup(filename: str, current_user: Usuario = Depends(RolesR
     )
 
 @app.get("/api/backup/lista")
-async def listar_backups(current_user: Usuario = Depends(RolesRequired('direccion', 'superadmin'))):
-    """Listar backups disponibles"""
+async def listar_backups(current_user: Usuario = Depends(RolesRequired('superadmin'))):
+    """Listar backups GLOBALES disponibles (solo superadmin)."""
     backup_dir = os.path.join(os.path.dirname(__file__), 'backups')
     if not os.path.exists(backup_dir):
         return {'backups': []}
@@ -13080,6 +13470,21 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
     
     if not all([curso_id, asignatura_id, periodo]):
         return JSONResponse({'error': 'curso_id, asignatura_id y periodo son requeridos'}, status_code=400)
+
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    asignatura = get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+    curso_id = curso.id
+    asignatura_id = asignatura.id
+
+    if current_user.role == 'profesor':
+        asignacion = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id,
+            curso_id=curso_id,
+            asignatura_id=asignatura_id,
+            activo=True,
+        ).first()
+        if not asignacion:
+            return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'}, status_code=403)
     
     # Buscar existente
     existente = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter_by(
@@ -13338,10 +13743,13 @@ async def get_evaluaciones_profesor(request: Request, current_user: Usuario = De
 async def crear_evaluacion_profesor(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
     """Crear evaluación de un profesor"""
     data = await request.json()
+    profesor = get_tenant_or_404(db, Usuario, data.get('profesor_id'), current_user, name='profesor')
+    if profesor.role != 'profesor':
+        return JSONResponse({'error': 'El usuario indicado no es profesor'}, status_code=400)
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     
     eva = EvaluacionProfesor(
-        profesor_id=data['profesor_id'],
+        profesor_id=profesor.id,
         evaluador_id=current_user.id,
         ano_escolar_id=ano_activo.id if ano_activo else None,
         periodo=data.get('periodo'),
@@ -13544,7 +13952,7 @@ async def get_dashboard_stats_por_rol(request: Request, db: Session = Depends(ge
 # ============== EVALUACIÓN INTERNA DE ESTUDIANTES ==============
 
 @app.get("/api/eval-interna/config")
-async def get_config_eval_interna(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_config_eval_interna(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """Obtener configuración de pesos del profesor actual"""
     asignatura_id = int(request.query_params.get('asignatura_id', 0) or 0)
     query = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(profesor_id=current_user.id)
@@ -13554,12 +13962,15 @@ async def get_config_eval_interna(request: Request, db: Session = Depends(get_db
     return [c.to_dict() for c in configs]
 
 @app.post("/api/eval-interna/config")
-async def guardar_config_eval_interna(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def guardar_config_eval_interna(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """Guardar/actualizar configuración de pesos"""
     data = await request.json()
     asignatura_id = data.get('asignatura_id')
     if not asignatura_id:
         return JSONResponse({'error': 'Asignatura requerida'}, status_code=400)
+    asignatura_id = get_tenant_or_404(
+        db, Asignatura, asignatura_id, current_user, name='asignatura'
+    ).id
     
     # Validar que los pesos sumen 100
     pesos = ['peso_conducta', 'peso_cuaderno', 'peso_participacion', 'peso_trabajo', 'peso_asistencia', 'peso_exposicion']
@@ -13582,7 +13993,7 @@ async def guardar_config_eval_interna(request: Request, db: Session = Depends(ge
     return config.to_dict()
 
 @app.get("/api/eval-interna")
-async def get_eval_interna(request: Request, current_user: Usuario = Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_eval_interna(request: Request, current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor')), db: Session = Depends(get_db)):
     """Obtener evaluaciones internas - filtrable por curso, asignatura, periodo"""
     curso_id = int(request.query_params.get('curso_id', 0) or 0)
     asignatura_id = int(request.query_params.get('asignatura_id', 0) or 0)
@@ -13604,7 +14015,7 @@ async def get_eval_interna(request: Request, current_user: Usuario = Depends(get
     return [e.to_dict() for e in evals]
 
 @app.post("/api/eval-interna/guardar")
-async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """Guardar evaluaciones internas de múltiples estudiantes"""
     data = await request.json()
     curso_id = data.get('curso_id')
@@ -13614,6 +14025,21 @@ async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), 
     
     if not all([curso_id, asignatura_id, periodo]):
         return JSONResponse({'error': 'Curso, asignatura y período requeridos'}, status_code=400)
+
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    asignatura = get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+    curso_id = curso.id
+    asignatura_id = asignatura.id
+
+    if current_user.role == 'profesor':
+        asignacion = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id,
+            curso_id=curso_id,
+            asignatura_id=asignatura_id,
+            activo=True,
+        ).first()
+        if not asignacion:
+            return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'}, status_code=403)
     
     # Obtener config de pesos
     config = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(
@@ -13625,6 +14051,15 @@ async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), 
         estudiante_id = ev_data.get('estudiante_id')
         if not estudiante_id:
             continue
+        estudiante = get_tenant_or_404(
+            db, Estudiante, estudiante_id, current_user, name='estudiante'
+        )
+        if estudiante.curso_id != curso_id:
+            return JSONResponse(
+                {'error': f'El estudiante {estudiante.nombre_completo} no pertenece al curso indicado'},
+                status_code=400
+            )
+        estudiante_id = estudiante.id
         
         ev = tenant_filter(db.query(EvalInternaEstudiante), EvalInternaEstudiante, current_user).filter_by(
             estudiante_id=estudiante_id, profesor_id=current_user.id,
@@ -13653,8 +14088,9 @@ async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), 
     return {'message': f'{guardadas} evaluaciones guardadas', 'guardadas': guardadas}
 
 @app.get("/api/eval-interna/resumen/{curso_id}")
-async def get_resumen_eval_interna(curso_id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_resumen_eval_interna(curso_id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
     """Resumen de evaluaciones internas de un curso"""
+    curso_id = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso').id
     periodo = int(request.query_params.get('periodo', 0) or 0)
     
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso_id, activo=True).order_by(Estudiante.no_lista).all()
@@ -13916,11 +14352,12 @@ async def crear_colegio(request: Request, db: Session = Depends(get_db), current
     must_change = False
     if admin_password_provista:
         admin_password = admin_password_provista
-        # El caller decide; pero validamos longitud mínima
-        if len(admin_password) < 8:
+        from security import validate_password
+        ok, msg = validate_password(admin_password)
+        if not ok:
             db.rollback()
             return JSONResponse(
-                {'error': 'admin_password debe tener al menos 8 caracteres'},
+                {'error': msg},
                 status_code=400
             )
     else:
@@ -13939,12 +14376,26 @@ async def crear_colegio(request: Request, db: Session = Depends(get_db), current
     admin.set_password(admin_password)
     db.add(admin)
     
-    # Crear año escolar por defecto
+    # Crear año escolar por defecto. Antes estaba hardcodeado a 2024-2025,
+    # lo cual hacía que un colegio creado años después naciera con un período
+    # histórico. Se permite override explícito desde el alta.
     from datetime import date as date_cls
+    hoy_alta = today_rd()
+    inicio_year = hoy_alta.year if hoy_alta.month >= 7 else hoy_alta.year - 1
+    ano_nombre = data.get('ano_escolar_nombre') or f'{inicio_year}-{inicio_year + 1}'
+    try:
+        fecha_inicio = date_cls.fromisoformat(data['ano_fecha_inicio']) if data.get('ano_fecha_inicio') else date_cls(inicio_year, 9, 1)
+        fecha_fin = date_cls.fromisoformat(data['ano_fecha_fin']) if data.get('ano_fecha_fin') else date_cls(inicio_year + 1, 6, 30)
+    except (ValueError, TypeError):
+        db.rollback()
+        return JSONResponse({'error': 'Fechas del año escolar inválidas (use YYYY-MM-DD)'}, status_code=400)
+    if fecha_fin <= fecha_inicio:
+        db.rollback()
+        return JSONResponse({'error': 'La fecha fin del año escolar debe ser posterior a la fecha inicio'}, status_code=400)
     ano = AnoEscolar(
-        nombre='2024-2025',
-        fecha_inicio=date_cls(2024, 9, 1),
-        fecha_fin=date_cls(2025, 6, 30),
+        nombre=ano_nombre,
+        fecha_inicio=fecha_inicio,
+        fecha_fin=fecha_fin,
         activo=True,
         periodo_activo=1,
         colegio_id=colegio.id
@@ -14252,16 +14703,18 @@ async def reset_password_colegio(id, request: Request, db: Session = Depends(get
         from models import _generar_password_inicial
         nueva_password = _generar_password_inicial()
     
-    # Si se provee, validar que cumpla requisitos mínimos
-    if len(nueva_password) < 8:
-        return JSONResponse({'error': 'La contraseña debe tener al menos 8 caracteres'}, status_code=400)
+    # Si se provee, validar con la política central del sistema.
+    ok, msg = validate_password(str(nueva_password))
+    if not ok:
+        return JSONResponse({'error': msg}, status_code=400)
     
     usuario = db.query(Usuario).get(usuario_id)
     if not usuario or usuario.colegio_id != int(id):
         return JSONResponse({'error': 'Usuario no encontrado en este colegio'}, status_code=404)
     
-    usuario.set_password(nueva_password)
+    usuario.set_password(str(nueva_password))
     usuario.must_change_password = True
+    usuario.token_version = (usuario.token_version or 0) + 1
     log_auditoria(db, 'RESET_PASSWORD_SUPERADMIN', 'usuarios', usuario.id, user=current_user, request=request)
     db.commit()
     
@@ -14282,14 +14735,28 @@ async def crear_usuario_colegio(id, request: Request, db: Session = Depends(get_
     colegio = get_tenant_or_404(db, Colegio, id, current_user, name='colegio')
     data = await request.json()
     
-    username = data.get('username', '').strip()
+    username = data.get('username', '').strip().lower()
     if not username or not data.get('nombre'):
         return JSONResponse({'error': 'Username y nombre son requeridos'}, status_code=400)
+    if not re.match(r'^[a-z0-9_-]+$', username):
+        return JSONResponse({'error': 'Username solo puede contener letras, números, guiones y guiones bajos'}, status_code=400)
+
+    role = (data.get('role') or 'direccion').strip().lower()
+    roles_tenant = {'direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'}
+    if role not in roles_tenant:
+        return JSONResponse({'error': 'Rol inválido para un usuario de colegio'}, status_code=400)
     
     if db.query(Usuario).filter_by(username=username).first():
         return JSONResponse({'error': 'El username ya existe'}, status_code=400)
     
-    password = data.get('password', '').strip() or 'Cambiar123'
+    password_provista = data.get('password', '').strip()
+    if password_provista:
+        password = password_provista
+        must_change = False
+    else:
+        from models import _generar_password_inicial
+        password = _generar_password_inicial()
+        must_change = True
     from security import validate_password
     ok, msg = validate_password(password)
     if not ok:
@@ -14299,10 +14766,11 @@ async def crear_usuario_colegio(id, request: Request, db: Session = Depends(get_
         username=username,
         nombre=data['nombre'],
         apellido=data.get('apellido', ''),
-        role=data.get('role', 'direccion'),
+        role=role,
         email=data.get('email'),
         telefono=data.get('telefono'),
-        colegio_id=colegio.id
+        colegio_id=colegio.id,
+        must_change_password=must_change,
     )
     usuario.set_password(password)
     db.add(usuario)
@@ -14312,7 +14780,8 @@ async def crear_usuario_colegio(id, request: Request, db: Session = Depends(get_
         'message': f'Usuario {username} creado en {colegio.nombre}',
         'id': usuario.id,
         'username': username,
-        'password': password
+        'password_temporal': password if must_change else None,
+        'must_change_password': must_change,
     }, status_code=201)
 
 
@@ -14422,6 +14891,8 @@ async def toggle_usuario_colegio(id, request: Request, db: Session = Depends(get
         return JSONResponse({'error': 'Usuario no encontrado en este colegio'}, status_code=404)
     
     usuario.activo = not usuario.activo
+    if not usuario.activo:
+        usuario.token_version = (usuario.token_version or 0) + 1
     db.commit()
     
     estado = 'activado' if usuario.activo else 'desactivado'
@@ -14456,6 +14927,7 @@ async def impersonar_colegio(colegio_id, request: Request, db: Session = Depends
         'colegio_id': colegio.id,
         'impersonating': True,
         'original_role': 'superadmin',
+        'impersonator_user_id': current_user.id,
         'token_version': getattr(director, 'token_version', 0) or 0,
         'iat': datetime.utcnow(),
         'exp': datetime.utcnow() + timedelta(hours=2)

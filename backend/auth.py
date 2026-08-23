@@ -6,7 +6,7 @@ Multi-tenant: JWT incluye colegio_id, filtrado automático por colegio.
 import jwt
 import os
 from contextvars import ContextVar
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -29,14 +29,22 @@ JWT_EXPIRATION_HOURS = int(os.environ.get('JWT_EXPIRATION_HOURS', 8))
 # se comparte entre workers. La memoria es solo aceleración.
 login_attempts = {}
 
+TZ_RD = timezone(timedelta(hours=-4))
+
+
+def _now_rd_naive():
+    """Misma convención temporal usada por models._now_dr (AST, sin tzinfo)."""
+    return datetime.now(TZ_RD).replace(tzinfo=None)
+
 def check_rate_limit(identifier, max_attempts=5, window_minutes=15, db=None):
     """Verifica límite de intentos. Si se pasa db, consulta LogAcceso (multi-worker safe).
     Si no, usa solo memoria (más rápido pero por-worker)."""
-    cutoff = datetime.utcnow() - timedelta(minutes=window_minutes)
+    # Memoria usa UTC porque register_attempt guarda datetime.utcnow().
+    cutoff_mem = datetime.utcnow() - timedelta(minutes=window_minutes)
     
     # 1. Pre-filtro rápido en memoria
     if identifier in login_attempts:
-        attempts_mem = [a for a in login_attempts[identifier] if a > cutoff]
+        attempts_mem = [a for a in login_attempts[identifier] if a > cutoff_mem]
         login_attempts[identifier] = attempts_mem
         if len(attempts_mem) >= max_attempts:
             return False, 0
@@ -45,10 +53,13 @@ def check_rate_limit(identifier, max_attempts=5, window_minutes=15, db=None):
     if db is not None:
         try:
             from models import LogAcceso
+            # LogAcceso.fecha se guarda como hora RD naive (_now_dr). Usar UTC
+            # aquí hacía que los intentos de las últimas ~4h parecieran viejos.
+            cutoff_db = _now_rd_naive() - timedelta(minutes=window_minutes)
             count_db = db.query(LogAcceso).filter(
                 LogAcceso.ip == identifier,
                 LogAcceso.tipo == 'login_failed',
-                LogAcceso.fecha > cutoff,
+                LogAcceso.fecha > cutoff_db,
             ).count()
             if count_db >= max_attempts:
                 return False, 0
@@ -57,6 +68,33 @@ def check_rate_limit(identifier, max_attempts=5, window_minutes=15, db=None):
             pass
     
     return True, max_attempts - len(login_attempts.get(identifier, []))
+
+
+def check_account_rate_limit(username, max_attempts=5, window_minutes=15, db=None):
+    """Límite por cuenta usando el historial de auditoría persistente.
+
+    Evita que cinco errores de cualquier persona detrás del mismo router/NAT
+    bloqueen a todos los maestros de una escuela. Se combina con un límite IP
+    más amplio en el endpoint de login para conservar protección anti-fuerza-bruta.
+    """
+    username = (username or '').strip().lower()
+    if not username or db is None:
+        return True, max_attempts
+    try:
+        from models import LogAuditoria
+        cutoff_db = _now_rd_naive() - timedelta(minutes=window_minutes)
+        count_db = db.query(LogAuditoria).filter(
+            LogAuditoria.accion == 'login_fallido',
+            LogAuditoria.detalles == f'username: {username}',
+            LogAuditoria.fecha > cutoff_db,
+        ).count()
+        if count_db >= max_attempts:
+            return False, 0
+        return True, max_attempts - count_db
+    except Exception:
+        # El límite IP sigue activo como fallback si la auditoría no está
+        # disponible durante un incidente de BD.
+        return True, max_attempts
 
 def register_attempt(identifier, success=False, db=None, user_id=None, user_agent=None):
     """Registra intento de login (en memoria + opcionalmente en BD)."""
@@ -67,7 +105,7 @@ def register_attempt(identifier, success=False, db=None, user_id=None, user_agen
         if db is not None:
             try:
                 from models import LogAcceso
-                cutoff = datetime.utcnow() - timedelta(minutes=15)
+                cutoff = _now_rd_naive() - timedelta(minutes=15)
                 db.query(LogAcceso).filter(
                     LogAcceso.ip == identifier,
                     LogAcceso.tipo == 'login_failed',
@@ -124,6 +162,22 @@ def decode_token(token: str) -> dict | None:
         return None
 
 
+def _attach_token_context(user: Usuario, payload: dict) -> Usuario:
+    """Adjunta contexto transitorio del token al objeto ORM del request.
+
+    No se persiste en la tabla usuarios. Permite que la auditoría distinga al
+    actor real (Superadmin) del usuario efectivo durante impersonación.
+    """
+    impersonator = payload.get('impersonator_user_id') if payload.get('impersonating') else None
+    try:
+        impersonator = int(impersonator) if impersonator is not None else None
+    except (TypeError, ValueError):
+        impersonator = None
+    setattr(user, '_impersonator_user_id', impersonator)
+    setattr(user, '_is_impersonating', bool(impersonator))
+    return user
+
+
 # ===========================================
 # DEPENDENCIAS FASTAPI
 # ===========================================
@@ -158,10 +212,21 @@ def get_current_user_optional(
         return None
     
     fresh = db.execute(
-        text("SELECT id, activo, token_version FROM usuarios WHERE id = :id"),
+        text("""
+            SELECT u.id, u.activo, u.token_version, u.role, u.colegio_id, c.activo AS colegio_activo
+            FROM usuarios u
+            LEFT JOIN colegios c ON c.id = u.colegio_id
+            WHERE u.id = :id
+        """),
         {"id": user_id_to_check}
     ).fetchone()
     if not fresh or not fresh[1]:
+        current_user_ctx.set(None)
+        db.info['current_user'] = None
+        return None
+    # Un usuario tenant solo es válido si su colegio existe y está activo.
+    # Esto corta sesiones ya emitidas cuando Superadmin desactiva el colegio.
+    if fresh[3] != 'superadmin' and (fresh[4] is None or not fresh[5]):
         current_user_ctx.set(None)
         db.info['current_user'] = None
         return None
@@ -176,6 +241,7 @@ def get_current_user_optional(
     db.expire_all()
     user = db.query(Usuario).get(user_id_to_check)
     if user and user.activo:
+        user = _attach_token_context(user, payload)
         current_user_ctx.set(user)
         db.info['current_user'] = user
         return user
@@ -220,13 +286,22 @@ def get_current_user(
         raise HTTPException(status_code=401, detail='Token inválido')
     
     fresh = db.execute(
-        text("SELECT id, activo, token_version FROM usuarios WHERE id = :id"),
+        text("""
+            SELECT u.id, u.activo, u.token_version, u.role, u.colegio_id, c.activo AS colegio_activo
+            FROM usuarios u
+            LEFT JOIN colegios c ON c.id = u.colegio_id
+            WHERE u.id = :id
+        """),
         {"id": user_id_to_check}
     ).fetchone()
     if not fresh or not fresh[1]:  # no existe o inactivo
         current_user_ctx.set(None)
         db.info['current_user'] = None
         raise HTTPException(status_code=401, detail='Token inválido o expirado')
+    if fresh[3] != 'superadmin' and (fresh[4] is None or not fresh[5]):
+        current_user_ctx.set(None)
+        db.info['current_user'] = None
+        raise HTTPException(status_code=403, detail='El colegio está desactivado')
     
     token_ver_payload = payload.get('token_version', 0)
     token_ver_db = fresh[2] or 0
@@ -242,6 +317,7 @@ def get_current_user(
         current_user_ctx.set(None)
         db.info['current_user'] = None
         raise HTTPException(status_code=401, detail='Token inválido o expirado')
+    user = _attach_token_context(user, payload)
     
     # (validación de token_version ya hecha arriba con query SQL directa)
     
@@ -303,6 +379,7 @@ class RolesRequired:
             current_user_ctx.set(None)
             db.info['current_user'] = None
             raise HTTPException(status_code=401, detail='Token inválido o expirado')
+        user = _attach_token_context(user, payload)
         
         # Validar token_version (logout / cambio de password invalida sesión)
         token_ver = payload.get('token_version', 0)
@@ -405,12 +482,17 @@ def get_tenant_or_404(db, model, obj_id, user, *, name: str = None):
         raise HTTPException(status_code=404, detail=f"{name or model.__name__} no encontrado")
     
     # Verificar tenant. Superadmin pasa.
-    if user.role != 'superadmin':
-        if hasattr(model, 'colegio_id') and obj.colegio_id is not None:
-            if obj.colegio_id != user.colegio_id:
-                # 404 (no 403) para no revelar existencia en otro tenant
-                raise HTTPException(status_code=404, detail=f"{name or model.__name__} no encontrado")
-    
+    #
+    # IMPORTANTE: un registro con colegio_id=NULL NO es "global" para los
+    # usuarios normales. Es un registro huérfano/legacy y debe quedar oculto
+    # hasta que una migración explícita lo asigne a un colegio. Aceptar NULL
+    # aquí abría un bypass por acceso directo mediante ID aunque tenant_filter()
+    # sí lo excluyera de los listados.
+    if user.role != 'superadmin' and hasattr(model, 'colegio_id'):
+        if user.colegio_id is None or obj.colegio_id is None or obj.colegio_id != user.colegio_id:
+            # 404 (no 403) para no revelar existencia en otro tenant/legacy
+            raise HTTPException(status_code=404, detail=f"{name or model.__name__} no encontrado")
+
     return obj
 
 

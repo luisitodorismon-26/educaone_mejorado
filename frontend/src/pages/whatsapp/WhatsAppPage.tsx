@@ -24,6 +24,9 @@ interface Estudiante {
 interface Curso {
   id: number;
   nombre_completo: string;
+  grado?: string;
+  nombre?: string;
+  tanda?: string;
 }
 
 export const WhatsAppPage = () => {

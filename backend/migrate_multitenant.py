@@ -20,6 +20,7 @@ import sys
 # Agregar el directorio actual al path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from security import validate_password
 from sqlalchemy import text, inspect
 from database import engine, SessionLocal
 from models import Base, Colegio, Usuario, ConfiguracionColegio
@@ -132,23 +133,49 @@ def migrate():
             print(f"   ⚠️  '{table_name}' → Error: {e}")
 
     # ──────────────────────────────────────────
-    # Paso 5: Crear usuario superadmin
+    # Paso 5: Crear usuario superadmin (solo si no existe)
     # ──────────────────────────────────────────
-    print("\n👤 Paso 5: Creando usuario superadmin...")
+    print("\n👤 Paso 5: Verificando usuario superadmin...")
     superadmin = db.query(Usuario).filter_by(username='superadmin').first()
     if not superadmin:
+        # Este es un migrador histórico/manual. Nunca debe crear una cuenta
+        # global con una contraseña conocida ni escribir el secreto en logs.
+        # El operador debe suministrarla explícitamente en el entorno.
+        migration_password = os.environ.get('MIGRATION_SUPERADMIN_PASSWORD', '')
+        if not migration_password:
+            db.close()
+            raise RuntimeError(
+                "No existe superadmin y falta MIGRATION_SUPERADMIN_PASSWORD. "
+                "Definí una contraseña fuerte temporal en el entorno antes de "
+                "ejecutar este migrador; el valor nunca se imprimirá."
+            )
+        valid, reason = validate_password(migration_password)
+        strict_ok = (
+            len(migration_password) >= 16
+            and any(c.isupper() for c in migration_password)
+            and any(c.islower() for c in migration_password)
+            and any(c.isdigit() for c in migration_password)
+            and any(not c.isalnum() for c in migration_password)
+        )
+        if not valid or not strict_ok:
+            db.close()
+            raise RuntimeError(
+                "MIGRATION_SUPERADMIN_PASSWORD no cumple la política del migrador: "
+                "mínimo 16 caracteres, mayúscula, minúscula, número y símbolo."
+            )
         superadmin = Usuario(
             username='superadmin',
             nombre='Super',
             apellido='Administrador',
             role='superadmin',
-            colegio_id=None  # superadmin no pertenece a ningún colegio
+            colegio_id=None,  # superadmin no pertenece a ningún colegio
+            must_change_password=True,
         )
-        superadmin.set_password('superadmin123')
+        superadmin.set_password(migration_password)
         db.add(superadmin)
         db.commit()
-        print("   ✅ Superadmin creado (username: superadmin, password: superadmin123)")
-        print("   ⚠️  CAMBIAR PASSWORD EN PRODUCCIÓN!")
+        print("   ✅ Superadmin creado con credencial suministrada de forma segura.")
+        print("   ⚠️  Debe cambiarse en el primer login; la contraseña no se muestra en logs.")
     else:
         print("   ✅ Superadmin ya existe")
 
@@ -173,10 +200,10 @@ def migrate():
     print(f"  Colegio: {colegio.nombre} (código: {colegio.codigo})")
     print(f"  Usuarios migrados: {total_usuarios}")
     print(f"  Estudiantes migrados: {total_estudiantes}")
-    print(f"  Superadmin: superadmin / superadmin123")
+    print("  Superadmin: configurado (credencial no mostrada)")
     print("=" * 60)
     print("\n📌 Próximos pasos:")
-    print("   1. Cambiar password del superadmin en producción")
+    print("   1. Si este migrador creó el superadmin, cambiar su password en el primer login")
     print("   2. Acceder como superadmin para crear nuevos colegios")
     print("   3. Los usuarios existentes ya están asignados al colegio por defecto")
     print()

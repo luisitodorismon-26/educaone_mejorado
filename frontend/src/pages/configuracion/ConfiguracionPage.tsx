@@ -12,6 +12,18 @@ interface ConfigColegio {
   regional: string;
   lema: string;
   director: string;
+  codigo_centro?: string;
+  codigo_cartografia?: string;
+  sector?: string;
+  zona?: string;
+  tanda_operacion?: string;
+  modalidad?: string;
+  correo_centro?: string;
+  nombre_director?: string;
+  cedula_director?: string;
+  correo_director?: string;
+  telefono_director?: string;
+  nombre_coordinador?: string;
   umbral_calificacion_baja: number;
   umbral_calificacion_critica: number;
   umbral_asistencia_baja: number;

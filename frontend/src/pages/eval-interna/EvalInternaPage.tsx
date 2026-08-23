@@ -167,7 +167,7 @@ export const EvalInternaPage = () => {
       return;
     }
     try {
-      await api.post('/eval-interna/config', { asignatura_id: asignaturaId, ...config });
+      await api.post('/eval-interna/config', { ...config, asignatura_id: asignaturaId });
       setMessage({ type: 'success', text: 'Configuración de pesos guardada' });
       setShowConfig(false);
       setEvaluaciones(evaluaciones.map(e => ({ ...e, nota_final: calcularNotaLocal(e) })));

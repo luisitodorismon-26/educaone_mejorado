@@ -34,3 +34,13 @@ INITIAL_CREDENTIALS.txt
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Backups
+*.bak
+
+# Cache generado en runtime
+backend/.cache_registro/

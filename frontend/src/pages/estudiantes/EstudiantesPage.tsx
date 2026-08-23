@@ -1203,9 +1203,9 @@ export const EstudiantesPage = () => {
                             <tr key={i} className="hover:bg-gray-50">
                               <td className="p-2 font-medium text-gray-800">{a.asignatura}</td>
                               {[a.pc1, a.pc2, a.pc3, a.pc4].map((n: any, j: number) => (
-                                <td key={j} className={`p-2 text-center ${n !== null && n < 70 ? 'text-red-600 font-bold' : ''}`}>{n !== null ? Math.round(n) : '-'}</td>
+                                <td key={j} className={`p-2 text-center ${n !== null && n < (progresoData.minimo_aprobatorio ?? 70) ? 'text-red-600 font-bold' : ''}`}>{n !== null ? Math.round(n) : '-'}</td>
                               ))}
-                              <td className={`p-2 text-center bg-blue-50 font-bold ${a.cf !== null && a.cf < 70 ? 'text-red-600' : ''}`}>{a.cf !== null ? Math.round(a.cf) : '-'}</td>
+                              <td className={`p-2 text-center bg-blue-50 font-bold ${a.cf !== null && a.cf < (progresoData.minimo_aprobatorio ?? 70) ? 'text-red-600' : ''}`}>{a.cf !== null ? Math.round(a.cf) : '-'}</td>
                               <td className="p-2 text-center">{a.literal || '-'}</td>
                             </tr>
                           ))}
