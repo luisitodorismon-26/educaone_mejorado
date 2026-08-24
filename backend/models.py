@@ -1873,8 +1873,25 @@ class EvalInternaEstudiante(Base):
     curso = relationship('Curso', backref='evaluaciones_internas')
     
     __table_args__ = (
-        UniqueConstraint('estudiante_id', 'profesor_id', 'asignatura_id', 'periodo',
-                         name='unique_eval_interna'),
+        # v2.19 — identidad INSTITUCIONAL de una evaluación interna.
+        #
+        # La regla anterior era (estudiante, profesor, asignatura, periodo):
+        # incluía al profesor, así que al cambiar de docente a mitad de período
+        # el mismo estudiante quedaba con DOS evaluaciones internas para el
+        # mismo período y asignatura, y el resumen del curso mostraba números
+        # inconsistentes.
+        #
+        # La evaluación pertenece al COLEGIO, no a la cuenta del profesor:
+        # colegio + estudiante + curso + asignatura + período. El campo
+        # profesor_id se conserva como AUTORÍA (quién la registró), pero ya no
+        # forma parte de la identidad del registro.
+        #
+        # En bases existentes la constraint vieja se retira en la migración de
+        # startup de app.py, y solo después de que el preflight confirme cero
+        # duplicados. En bases nuevas, create_all() aplica directamente esta.
+        UniqueConstraint('colegio_id', 'estudiante_id', 'curso_id',
+                         'asignatura_id', 'periodo',
+                         name='uq_eval_interna_identidad'),
     )
     
     def calcular_nota(self, config=None):

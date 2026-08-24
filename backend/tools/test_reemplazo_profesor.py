@@ -578,7 +578,7 @@ with client:
             'app.py todavía genera contraseñas automáticamente'
 
     # ------------------------------------------------- 3 y 4. Atómico
-    @test("F3/F4 — Conflicto de horario aborta el reemplazo SIN cambiar nada")
+    @test("F3/F4 — Conflicto REAL de horario con profesor existente → 409 y rollback total")
     def _():
         tok = DIR_A
         grados = client.get('/api/grados', headers=auth(tok)).json()
@@ -597,53 +597,136 @@ with client:
         client.post('/api/asignaciones', json={
             'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
         }, headers=auth(tok))
-        client.post('/api/horarios', json={
+        h_sal = client.post('/api/horarios', json={
             'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
             'dia': 'Lunes', 'hora_inicio': '08:00', 'hora_fin': '09:00',
             'aula': '101', 'tipo_bloque': 'clase',
-        }, headers=auth(tok))
+        }, headers=auth(tok)).json()['id']
 
-        # El "nuevo" ya existe y ya tiene clase el lunes a esa hora.
+        # Profesor EXISTENTE que ya da clase el lunes 08:30-09:30 → SE SOLAPA.
+        curso2 = client.post('/api/cursos', json={
+            'grado_id': grados[2]['id'], 'tanda_id': tandas[0]['id'], 'nombre': 'B2'
+        }, headers=auth(tok)).json()['id']
         ocupado = client.post('/api/usuarios', json={
             'username': 'ya_ocupado', 'password': 'Temporal2026x',
             'nombre': 'Ya', 'apellido': 'Ocupado', 'role': 'profesor',
         }, headers=auth(tok)).json()['id']
         client.post('/api/asignaciones', json={
-            'profesor_id': ocupado, 'curso_id': curso, 'asignatura_id': asig,
+            'profesor_id': ocupado, 'curso_id': curso2, 'asignatura_id': asig,
         }, headers=auth(tok))
-        client.post('/api/horarios', json={
-            'profesor_id': ocupado, 'curso_id': curso, 'asignatura_id': asig,
+        h_ocu = client.post('/api/horarios', json={
+            'profesor_id': ocupado, 'curso_id': curso2, 'asignatura_id': asig,
             'dia': 'Lunes', 'hora_inicio': '08:30', 'hora_fin': '09:30',
             'aula': '202', 'tipo_bloque': 'clase',
-        }, headers=auth(tok))
+        }, headers=auth(tok)).json()['id']
 
-        # Reemplazar sal_conf por una cuenta nueva no colisiona; el caso real es
-        # transferir a alguien ocupado. Forzamos el choque replicando su horario.
-        r = client.post(f'/api/usuarios/{sal}/reemplazar', json={
-            'nuevo': {'username': 'nuevo_conf', 'password': 'Temporal2026x',
-                      'nombre': 'Nuevo', 'apellido': 'Conf'}
-        }, headers=auth(tok))
-        # Una cuenta recién creada no tiene horarios: debe pasar limpio.
-        assert r.status_code == 200, r.text
+        r = client.post(f'/api/usuarios/{sal}/reemplazar',
+                        json={'reemplazar_por_id': ocupado}, headers=auth(tok))
+        assert r.status_code == 409, \
+            f'debió rechazar por conflicto de horario y devolvió {r.status_code}: {r.text}'
+        assert r.json().get('conflictos'), 'no informó cuáles bloques chocan'
 
+        # ROLLBACK TOTAL: nada puede haber cambiado.
         d = db_()
         try:
-            u = d.get(Usuario, sal)
-            assert u.activo is False
+            assert d.get(Usuario, sal).activo is True, 'desactivó al saliente pese al 409'
+            assert d.get(Horario, h_sal).profesor_id == sal, 'transfirió un horario'
+            assert d.get(Horario, h_ocu).profesor_id == ocupado, 'tocó el horario del otro'
+            asig_sal = d.query(AsignacionProfesor).filter_by(
+                profesor_id=sal, activo=True).count()
+            assert asig_sal >= 1, 'desactivó las asignaciones del saliente'
+            assert d.query(PushSubscription).filter_by(usuario_id=sal).count() == 0
         finally:
             d.close()
 
-    @test("F4 — Colisión de asignación: no se duplica el par curso+asignatura")
+    @test("F4 — Reemplazo con profesor EXISTENTE sin conflicto: transfiere y no duplica")
     def _():
+        tok = DIR_A
+        grados = client.get('/api/grados', headers=auth(tok)).json()
+        tandas = client.get('/api/tandas', headers=auth(tok)).json()
+        curso = client.post('/api/cursos', json={
+            'grado_id': grados[3]['id'], 'tanda_id': tandas[0]['id'], 'nombre': 'F'
+        }, headers=auth(tok)).json()['id']
+        asig = client.post('/api/asignaturas', json={'nombre': 'Geografia', 'codigo': 'GE'},
+                           headers=auth(tok)).json()['id']
+        sal = client.post('/api/usuarios', json={
+            'username': 'sal_exist', 'password': 'Temporal2026x',
+            'nombre': 'Sale', 'apellido': 'Existente', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        a_sal = client.post('/api/asignaciones', json={
+            'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
+        }, headers=auth(tok)).json()['id']
+        h_sal = client.post('/api/horarios', json={
+            'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
+            'dia': 'Viernes', 'hora_inicio': '07:00', 'hora_fin': '08:00',
+            'aula': '401', 'tipo_bloque': 'clase',
+        }, headers=auth(tok)).json()['id']
+
+        destino = client.post('/api/usuarios', json={
+            'username': 'destino_exist', 'password': 'Temporal2026x',
+            'nombre': 'Destino', 'apellido': 'Libre', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        # Ya tiene ESA MISMA asignación → no debe duplicarse.
+        client.post('/api/asignaciones', json={
+            'profesor_id': destino, 'curso_id': curso, 'asignatura_id': asig,
+        }, headers=auth(tok))
+
+        r = client.post(f'/api/usuarios/{sal}/reemplazar',
+                        json={'reemplazar_por_id': destino}, headers=auth(tok))
+        assert r.status_code == 200, r.text
+        assert r.json()['nuevo']['cuenta_nueva'] is False, 'creó una cuenta pese a usar una existente'
+        assert r.json()['nuevo']['id'] == destino
+
         d = db_()
         try:
-            nuevo = d.query(Usuario).filter_by(username='nuevo_conf').first()
+            assert d.get(Usuario, sal).activo is False, 'el saliente sigue activo'
+            assert d.get(Horario, h_sal).profesor_id == destino, 'no transfirió el horario'
+            vieja = d.get(AsignacionProfesor, a_sal)
+            assert vieja.profesor_id == sal and vieja.activo is False, \
+                'la asignación del saliente cambió de autor o sigue activa'
             filas = d.query(AsignacionProfesor).filter_by(
-                profesor_id=nuevo.id, activo=True).all()
-            pares = [(f.curso_id, f.asignatura_id) for f in filas]
-            assert len(pares) == len(set(pares)), f'asignaciones duplicadas: {pares}'
+                profesor_id=destino, curso_id=curso, asignatura_id=asig, activo=True).count()
+            assert filas == 1, f'asignación duplicada en el destino ({filas} filas)'
         finally:
             d.close()
+
+    @test("F4 — Validaciones del profesor existente: mismo tenant, rol, activo, distinto")
+    def _():
+        tok = DIR_A
+        sal = client.post('/api/usuarios', json={
+            'username': 'sal_valid', 'password': 'Temporal2026x',
+            'nombre': 'Val', 'apellido': 'Ida', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+
+        # a sí mismo
+        r = client.post(f'/api/usuarios/{sal}/reemplazar',
+                        json={'reemplazar_por_id': sal}, headers=auth(tok))
+        assert r.status_code == 400, 'permitió reemplazarse por sí mismo'
+
+        # rol incorrecto
+        d = db_()
+        try:
+            coord = d.query(Usuario).filter_by(username='direccion').first().id
+        finally:
+            d.close()
+        r = client.post(f'/api/usuarios/{sal}/reemplazar',
+                        json={'reemplazar_por_id': coord}, headers=auth(tok))
+        assert r.status_code == 400, 'aceptó un no-profesor como reemplazo'
+
+        # inactivo
+        inact = client.post('/api/usuarios', json={
+            'username': 'prof_inactivo', 'password': 'Temporal2026x',
+            'nombre': 'In', 'apellido': 'Activo', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        client.delete(f'/api/usuarios/{inact}', headers=auth(tok))
+        r = client.post(f'/api/usuarios/{sal}/reemplazar',
+                        json={'reemplazar_por_id': inact}, headers=auth(tok))
+        assert r.status_code == 400, 'aceptó un profesor inactivo como reemplazo'
+
+        # otro colegio
+        r = client.post(f'/api/usuarios/{sal}/reemplazar',
+                        json={'reemplazar_por_id': B['prof']}, headers=auth(tok))
+        assert r.status_code == 404, f'FUGA: aceptó un profesor de otro colegio ({r.status_code})'
 
     @test("F3 — Un reemplazo fallido no deja NADA a medias")
     def _():
@@ -746,6 +829,394 @@ with client:
             assert n >= 0
             rep = d.query(ReporteConducta).filter_by(reportado_por=A['prof']).count()
             assert rep >= 1, 'se perdió el historial de reportes del saliente'
+        finally:
+            d.close()
+
+
+    # ==================================================================
+    # CORRECCIONES POST-REVISIÓN — puntos 2, 3, 4 y reactivar
+    # ==================================================================
+
+    @test("C2 — La AsignacionProfesor del saliente conserva SU profesor_id (no se reescribe)")
+    def _():
+        tok = DIR_A
+        grados = client.get('/api/grados', headers=auth(tok)).json()
+        tandas = client.get('/api/tandas', headers=auth(tok)).json()
+        curso = client.post('/api/cursos', json={
+            'grado_id': grados[2]['id'], 'tanda_id': tandas[0]['id'], 'nombre': 'C'
+        }, headers=auth(tok)).json()['id']
+        asig = client.post('/api/asignaturas', json={'nombre': 'Ciencias', 'codigo': 'CN'},
+                           headers=auth(tok)).json()['id']
+        sal = client.post('/api/usuarios', json={
+            'username': 'sal_hist', 'password': 'Temporal2026x',
+            'nombre': 'Hist', 'apellido': 'Orico', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        r = client.post('/api/asignaciones', json={
+            'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
+        }, headers=auth(tok))
+        asig_id = r.json()['id']
+
+        r = client.post(f'/api/usuarios/{sal}/reemplazar', json={
+            'nuevo': {'username': 'ent_hist', 'password': 'Temporal2026x',
+                      'nombre': 'Entra', 'apellido': 'Hist'}
+        }, headers=auth(tok))
+        assert r.status_code == 200, r.text
+
+        d = db_()
+        try:
+            vieja = d.get(AsignacionProfesor, asig_id)
+            assert vieja.profesor_id == sal, \
+                'FALSIFICACIÓN: la asignación del saliente cambió de profesor_id'
+            assert vieja.activo is False, 'la asignación del saliente sigue activa'
+
+            nuevo = d.query(Usuario).filter_by(username='ent_hist').first()
+            nueva = d.query(AsignacionProfesor).filter_by(
+                profesor_id=nuevo.id, curso_id=curso, asignatura_id=asig, activo=True).first()
+            assert nueva is not None, 'no se creó la asignación equivalente para el nuevo'
+            assert nueva.id != asig_id, 'se reutilizó la fila del saliente'
+        finally:
+            d.close()
+
+    @test("C2 — Si el nuevo ya tuvo esa asignación inactiva, se REACTIVA sin duplicar")
+    def _():
+        tok = DIR_A
+        d = db_()
+        try:
+            nuevo = d.query(Usuario).filter_by(username='ent_hist').first()
+            filas = d.query(AsignacionProfesor).filter_by(profesor_id=nuevo.id).all()
+            pares = [(f.curso_id, f.asignatura_id) for f in filas]
+            assert len(pares) == len(set(pares)), f'asignaciones duplicadas: {pares}'
+        finally:
+            d.close()
+
+    @test("C3 — Los horarios INACTIVOS del saliente no cambian de profesor")
+    def _():
+        tok = DIR_A
+        grados = client.get('/api/grados', headers=auth(tok)).json()
+        tandas = client.get('/api/tandas', headers=auth(tok)).json()
+        curso = client.post('/api/cursos', json={
+            'grado_id': grados[3]['id'], 'tanda_id': tandas[0]['id'], 'nombre': 'D'
+        }, headers=auth(tok)).json()['id']
+        asig = client.post('/api/asignaturas', json={'nombre': 'Arte', 'codigo': 'AR'},
+                           headers=auth(tok)).json()['id']
+        sal = client.post('/api/usuarios', json={
+            'username': 'sal_horario', 'password': 'Temporal2026x',
+            'nombre': 'Hor', 'apellido': 'Ario', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        client.post('/api/asignaciones', json={
+            'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
+        }, headers=auth(tok))
+        h_act = client.post('/api/horarios', json={
+            'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
+            'dia': 'Martes', 'hora_inicio': '10:00', 'hora_fin': '11:00',
+            'aula': '301', 'tipo_bloque': 'clase',
+        }, headers=auth(tok)).json()['id']
+        h_old = client.post('/api/horarios', json={
+            'profesor_id': sal, 'curso_id': curso, 'asignatura_id': asig,
+            'dia': 'Miércoles', 'hora_inicio': '10:00', 'hora_fin': '11:00',
+            'aula': '302', 'tipo_bloque': 'clase',
+        }, headers=auth(tok)).json()['id']
+
+        # Simular un horario de período cerrado.
+        d = db_()
+        try:
+            d.get(Horario, h_old).activo = False
+            d.commit()
+        finally:
+            d.close()
+
+        r = client.post(f'/api/usuarios/{sal}/reemplazar', json={
+            'nuevo': {'username': 'ent_horario', 'password': 'Temporal2026x',
+                      'nombre': 'Entra', 'apellido': 'Hor'}
+        }, headers=auth(tok))
+        assert r.status_code == 200, r.text
+
+        d = db_()
+        try:
+            nuevo = d.query(Usuario).filter_by(username='ent_horario').first()
+            assert d.get(Horario, h_act).profesor_id == nuevo.id, \
+                'el horario vigente no se transfirió'
+            assert d.get(Horario, h_old).profesor_id == sal, \
+                'FALSIFICACIÓN: se reescribió un horario histórico inactivo'
+        finally:
+            d.close()
+
+    @test("C4 — Sin config propia NO se usan los pesos de otro profesor")
+    def _():
+        tok = DIR_A
+        grados = client.get('/api/grados', headers=auth(tok)).json()
+        tandas = client.get('/api/tandas', headers=auth(tok)).json()
+        curso = client.post('/api/cursos', json={
+            'grado_id': grados[4]['id'], 'tanda_id': tandas[0]['id'], 'nombre': 'E'
+        }, headers=auth(tok)).json()['id']
+        asig = client.post('/api/asignaturas', json={'nombre': 'Musica', 'codigo': 'MU'},
+                           headers=auth(tok)).json()['id']
+        est = client.post('/api/estudiantes', json={
+            'nombre': 'Test', 'apellido': 'Config', 'sexo': 'F',
+            'fecha_nacimiento': '2011-01-01', 'curso_id': curso,
+            'no_lista': 1, 'matricula': 'MCONF-1',
+        }, headers=auth(tok)).json()['id']
+
+        # Profesor A define pesos MUY particulares para esa asignatura.
+        pa = client.post('/api/usuarios', json={
+            'username': 'prof_pesos', 'password': 'Temporal2026x',
+            'nombre': 'Pesos', 'apellido': 'Raros', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        client.post('/api/asignaciones', json={
+            'profesor_id': pa, 'curso_id': curso, 'asignatura_id': asig,
+        }, headers=auth(tok))
+        tok_a = login_activo('prof_pesos', 'Temporal2026x')
+        client.post('/api/eval-interna/config', json={
+            'asignatura_id': asig, 'peso_conducta': 100, 'peso_cuaderno': 0,
+            'peso_participacion': 0, 'peso_trabajo': 0, 'peso_asistencia': 0,
+            'peso_exposicion': 0,
+        }, headers=auth(tok_a))
+
+        # Profesor B, sin config propia, en el MISMO curso y asignatura.
+        pb = client.post('/api/usuarios', json={
+            'username': 'prof_sinpesos', 'password': 'Temporal2026x',
+            'nombre': 'Sin', 'apellido': 'Pesos', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        client.post('/api/asignaciones', json={
+            'profesor_id': pb, 'curso_id': curso, 'asignatura_id': asig,
+        }, headers=auth(tok))
+        tok_b = login_activo('prof_sinpesos', 'Temporal2026x')
+
+        r = client.post('/api/eval-interna/guardar', json={
+            'curso_id': curso, 'asignatura_id': asig, 'periodo': 1,
+            'evaluaciones': [{'estudiante_id': est, 'conducta': 100, 'cuaderno': 0,
+                              'participacion': 0, 'trabajo': 0, 'asistencia_eval': 0,
+                              'exposicion': 0}],
+        }, headers=auth(tok_b))
+        assert r.status_code == 200, r.text
+
+        d = db_()
+        try:
+            ev = d.query(EvalInternaEstudiante).filter_by(
+                estudiante_id=est, asignatura_id=asig, periodo=1).first()
+            assert ev is not None
+            # Con los pesos de prof_pesos (conducta=100) el total sería 100.
+            # Con el default del sistema debe ser MENOR, porque el resto está en 0.
+            assert ev.nota_final < 100, \
+                f'usó los pesos de otro profesor: nota_final={ev.nota_final} (esperado < 100)'
+        finally:
+            d.close()
+
+        d = db_()
+        try:
+            u = d.query(Usuario).filter_by(username='prof_sinpesos').first()
+            assert d.query(ConfigEvalInterna).filter_by(profesor_id=u.id).count() == 0, \
+                'se creó config para un profesor que nunca la definió'
+        finally:
+            d.close()
+
+    @test("C5 — Reactivar usuario funciona y es idempotente")
+    def _():
+        tok = DIR_A
+        uid = client.post('/api/usuarios', json={
+            'username': 'para_reactivar', 'password': 'Temporal2026x',
+            'nombre': 'Re', 'apellido': 'Activar', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        client.delete(f'/api/usuarios/{uid}', headers=auth(tok))
+
+        d = db_()
+        try:
+            assert d.get(Usuario, uid).activo is False
+        finally:
+            d.close()
+
+        r = client.post(f'/api/usuarios/{uid}/reactivar', headers=auth(tok))
+        assert r.status_code == 200, r.text
+        d = db_()
+        try:
+            assert d.get(Usuario, uid).activo is True
+        finally:
+            d.close()
+
+        # Reactivar dos veces debe rechazarse, no romper.
+        r = client.post(f'/api/usuarios/{uid}/reactivar', headers=auth(tok))
+        assert r.status_code == 400, 'reactivó un usuario que ya estaba activo'
+
+    @test("C5 — Reactivar respeta el aislamiento entre colegios")
+    def _():
+        r = client.post(f"/api/usuarios/{B['prof']}/reactivar", headers=auth(DIR_A))
+        assert r.status_code in (400, 404), f'FUGA: tocó otro colegio ({r.status_code})'
+
+
+    # ==================================================================
+    # R3 — desactivación segura, editar sin password, unicidad eval interna
+    # ==================================================================
+
+    @test("R3-1 — Desactivar con asignaciones/horarios activos → 409, no se desactiva")
+    def _():
+        tok = DIR_A
+        grados = client.get('/api/grados', headers=auth(tok)).json()
+        tandas = client.get('/api/tandas', headers=auth(tok)).json()
+        curso = client.post('/api/cursos', json={
+            'grado_id': grados[5]['id'], 'tanda_id': tandas[0]['id'], 'nombre': 'G'
+        }, headers=auth(tok)).json()['id']
+        asig = client.post('/api/asignaturas', json={'nombre': 'Deporte', 'codigo': 'DP'},
+                           headers=auth(tok)).json()['id']
+        uid = client.post('/api/usuarios', json={
+            'username': 'con_carga', 'password': 'Temporal2026x',
+            'nombre': 'Con', 'apellido': 'Carga', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        client.post('/api/asignaciones', json={
+            'profesor_id': uid, 'curso_id': curso, 'asignatura_id': asig,
+        }, headers=auth(tok))
+
+        r = client.delete(f'/api/usuarios/{uid}', headers=auth(tok))
+        assert r.status_code == 409, f'lo desactivó dejando cursos huérfanos ({r.status_code})'
+        assert r.json().get('asignaciones_activas', 0) >= 1
+        d = db_()
+        try:
+            assert d.get(Usuario, uid).activo is True, 'quedó desactivado pese al 409'
+        finally:
+            d.close()
+
+    @test("R3-1 — Desactivación válida: inactivo, token revocado y push eliminados")
+    def _():
+        tok = DIR_A
+        uid = client.post('/api/usuarios', json={
+            'username': 'sin_carga', 'password': 'Temporal2026x',
+            'nombre': 'Sin', 'apellido': 'Carga', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        utok = login_activo('sin_carga', 'Temporal2026x')
+        for disp in ('tel', 'lap'):
+            client.post('/api/push/suscribir', json={
+                'endpoint': f'https://fcm.googleapis.com/fcm/send/sincarga-{disp}',
+                'keys': {'p256dh': 'k', 'auth': 'a'},
+            }, headers=auth(utok))
+        d = db_()
+        try:
+            tv_antes = d.get(Usuario, uid).token_version or 0
+            assert d.query(PushSubscription).filter_by(usuario_id=uid).count() == 2
+        finally:
+            d.close()
+
+        r = client.delete(f'/api/usuarios/{uid}', headers=auth(tok))
+        assert r.status_code == 200, r.text
+        d = db_()
+        try:
+            u = d.get(Usuario, uid)
+            assert u.activo is False
+            assert (u.token_version or 0) > tv_antes, 'no revocó la sesión'
+            assert d.query(PushSubscription).filter_by(usuario_id=uid).count() == 0, \
+                'quedaron dispositivos push del usuario dado de baja'
+        finally:
+            d.close()
+
+    @test("R3-2 — PUT /usuarios no puede resetear la contraseña")
+    def _():
+        tok = DIR_A
+        uid = client.post('/api/usuarios', json={
+            'username': 'no_reset_put', 'password': 'Temporal2026x',
+            'nombre': 'No', 'apellido': 'Reset', 'role': 'profesor',
+        }, headers=auth(tok)).json()['id']
+        r = client.put(f'/api/usuarios/{uid}',
+                       json={'nombre': 'No', 'password': 'Hackeada2026x'},
+                       headers=auth(tok))
+        assert r.status_code == 400, f'el PUT reseteó la contraseña ({r.status_code})'
+        # La contraseña original sigue funcionando.
+        assert login('no_reset_put', 'Temporal2026x') is not None, \
+            'la contraseña cambió pese al rechazo'
+
+    @test("R3-2 — Editar sin campo password sigue funcionando")
+    def _():
+        tok = DIR_A
+        d = db_()
+        try:
+            uid = d.query(Usuario).filter_by(username='no_reset_put').first().id
+        finally:
+            d.close()
+        r = client.put(f'/api/usuarios/{uid}',
+                       json={'nombre': 'Nombre', 'apellido': 'Editado'}, headers=auth(tok))
+        assert r.status_code == 200, r.text
+
+    @test("R3-5 — La unicidad institucional impide duplicar evaluación interna")
+    def _():
+        from sqlalchemy import text as _text
+        d = db_()
+        try:
+            idx = [r[0] for r in d.execute(_text(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='eval_interna_estudiante'")).fetchall()]
+            assert 'uq_eval_interna_identidad' in idx, \
+                f'falta el índice de unicidad institucional: {idx}'
+        finally:
+            d.close()
+
+    @test("R3-5 — El preflight consulta duplicados de evaluación interna")
+    def _():
+        codigo = open(os.path.join(_BASE, 'tools', 'preflight_produccion.py')).read()
+        assert 'eval_interna_estudiante' in codigo, 'el preflight no revisa evaluación interna'
+        assert 'GROUP BY colegio_id, estudiante_id, curso_id, asignatura_id, periodo' in codigo, \
+            'la consulta no usa la identidad institucional completa'
+        assert 'DELETE' not in codigo.upper().split('EVAL_INTERNA_ESTUDIANTE')[1][:800], \
+            'el preflight borraría datos: debe ser solo lectura'
+
+
+    @test("R4 — Base NUEVA: la unicidad de eval interna NO depende de profesor_id")
+    def _():
+        from models import EvalInternaEstudiante as _E
+        cons = [c for c in _E.__table__.constraints
+                if c.__class__.__name__ == 'UniqueConstraint']
+        assert cons, 'el modelo no declara ninguna UniqueConstraint'
+        nombres = {c.name for c in cons}
+        assert 'unique_eval_interna' not in nombres, \
+            'la constraint vieja (con profesor_id) sigue en el modelo'
+        assert 'uq_eval_interna_identidad' in nombres, \
+            f'falta la barrera institucional: {nombres}'
+        cols = {col.name for c in cons if c.name == 'uq_eval_interna_identidad'
+                for col in c.columns}
+        assert 'profesor_id' not in cols, \
+            f'la identidad sigue incluyendo profesor_id: {sorted(cols)}'
+        assert cols == {'colegio_id', 'estudiante_id', 'curso_id', 'asignatura_id', 'periodo'}, \
+            f'identidad incorrecta: {sorted(cols)}'
+
+    @test("R4 — Base MIGRADA: el índice físico es el institucional, sin profesor_id")
+    def _():
+        from sqlalchemy import text as _text
+        d = db_()
+        try:
+            filas = d.execute(_text(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='eval_interna_estudiante'")).fetchall()
+            nombres = [f[0] for f in filas]
+            assert 'uq_eval_interna_identidad' in nombres, \
+                f'la base migrada no tiene la barrera institucional: {nombres}'
+            sql_idx = next(f[1] for f in filas if f[0] == 'uq_eval_interna_identidad')
+            assert 'profesor_id' not in (sql_idx or ''), \
+                f'el índice físico todavía usa profesor_id: {sql_idx}'
+            for n, q in filas:
+                if n == 'unique_eval_interna':
+                    raise AssertionError('la constraint legacy sigue presente en la base')
+        finally:
+            d.close()
+
+    @test("R4 — Dos profesores distintos NO pueden duplicar la misma evaluación")
+    def _():
+        from sqlalchemy.exc import IntegrityError
+        d = db_()
+        try:
+            ev = d.query(EvalInternaEstudiante).first()
+            assert ev is not None, 'hace falta al menos una evaluación interna'
+            otro = d.query(Usuario).filter(
+                Usuario.role == 'profesor',
+                Usuario.colegio_id == ev.colegio_id,
+                Usuario.id != ev.profesor_id).first()
+            assert otro is not None, 'hace falta otro profesor del mismo colegio'
+            d.add(EvalInternaEstudiante(
+                colegio_id=ev.colegio_id, estudiante_id=ev.estudiante_id,
+                curso_id=ev.curso_id, asignatura_id=ev.asignatura_id,
+                periodo=ev.periodo, profesor_id=otro.id, conducta=50))
+            try:
+                d.commit()
+                raise AssertionError(
+                    'se creó una segunda evaluación para el mismo estudiante/curso/'
+                    'asignatura/período solo por cambiar de profesor')
+            except IntegrityError:
+                d.rollback()  # correcto: la barrera institucional lo impidió
         finally:
             d.close()
 

@@ -563,6 +563,19 @@ async def lifespan(app):
                 "WHERE evento_key IS NOT NULL"
             ),
             (
+                'uq_eval_interna_identidad',
+                # v2.19: la identidad institucional de una evaluación interna es
+                # estudiante + curso + asignatura + período. NO incluye al
+                # profesor: si cambia el docente a mitad del período se continúa
+                # el MISMO registro. Sin esta barrera, un reemplazo volvía a
+                # generar filas paralelas y el estudiante quedaba con dos notas
+                # internas para el mismo período.
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_interna_identidad "
+                "ON eval_interna_estudiante "
+                "(colegio_id, estudiante_id, curso_id, asignatura_id, periodo) "
+                "WHERE curso_id IS NOT NULL AND asignatura_id IS NOT NULL"
+            ),
+            (
                 'uq_push_subscription_endpoint',
                 # Fase B: el endpoint identifica al dispositivo+navegador. Si el
                 # mismo navegador vuelve a suscribirse (o lo hace otro usuario en
@@ -580,7 +593,35 @@ async def lifespan(app):
             for nombre, sql in indices_unicos_criticos:
                 conn.execute(text(sql))
                 logger.info(f"✅ Integridad: índice único {nombre} verificado")
-        
+
+        # === 9. Retirar la constraint vieja de evaluación interna ===
+        # unique_eval_interna era (estudiante, profesor, asignatura, periodo):
+        # incluía al profesor, así que un cambio de docente a mitad de período
+        # generaba una segunda fila para el mismo estudiante y asignatura.
+        # La reemplaza uq_eval_interna_identidad, ya creada arriba.
+        #
+        # ORDEN DELIBERADO: primero se crea la barrera institucional y recién
+        # después se retira la vieja. Si hubiera duplicados, el CREATE UNIQUE
+        # INDEX de arriba ya habría fallado y abortado el arranque, así que
+        # nunca se llega acá con datos inconsistentes ni se queda la tabla sin
+        # ninguna protección.
+        #
+        # No se borra ni se fusiona una sola fila: si hay duplicados, el deploy
+        # se bloquea y el colegio decide cuál conservar.
+        if engine.dialect.name == 'postgresql':
+            with engine.begin() as conn:
+                # Idempotente: en un redeploy la constraint ya no existe y el
+                # IF EXISTS lo convierte en un no-op.
+                conn.execute(text(
+                    'ALTER TABLE eval_interna_estudiante '
+                    'DROP CONSTRAINT IF EXISTS unique_eval_interna'
+                ))
+            logger.info('✅ Integridad: constraint legacy unique_eval_interna retirada')
+        else:
+            # SQLite no soporta DROP CONSTRAINT. En desarrollo la base se
+            # recrea desde los modelos, que ya traen la definición nueva.
+            logger.info('ℹ️  SQLite: unique_eval_interna se recrea desde el modelo')
+
     except Exception as e:
         logger.exception(f"Error crítico durante migración de startup: {e}")
         raise RuntimeError(
@@ -611,6 +652,7 @@ async def lifespan(app):
             'ano_escolar': {'uq_ano_activo_colegio'},
             'notificaciones': {'uq_notificacion_usuario_evento'},
             'push_subscriptions': {'uq_push_subscription_endpoint'},
+            'eval_interna_estudiante': {'uq_eval_interna_identidad'},
         }
         for tabla_nombre, requeridos in indices_requeridos.items():
             existentes = {idx.get('name') for idx in inspector_final.get_indexes(tabla_nombre)}
@@ -3122,14 +3164,17 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
             return JSONResponse({'error': "División inválida: usa 'primaria', 'secundaria' o vacío (ambos niveles)"}, status_code=400)
         usuario.nivel_asignado = _nv
     
-    if data.get('password'):
-        nueva_password = str(data['password'])
-        ok, msg = validate_password(nueva_password)
-        if not ok:
-            return JSONResponse({'error': msg}, status_code=400)
-        usuario.set_password(nueva_password)
-        # Revoca cualquier JWT emitido antes del cambio de contraseña.
-        usuario.token_version = (usuario.token_version or 0) + 1
+    # v2.19: editar un usuario NO cambia su contraseña.
+    # Antes este endpoint aceptaba `password` y la reseteaba en silencio, sin
+    # marcar must_change_password ni dejar rastro de "reset" en auditoría: era
+    # una vía paralela al flujo oficial. Restablecer contraseña es una acción
+    # separada y explícita (POST /api/usuarios/{id}/reset-password).
+    if 'password' in data:
+        return JSONResponse(
+            {'error': 'La contraseña no se cambia desde Editar usuario. '
+                      'Use la acción "Restablecer contraseña".'},
+            status_code=400
+        )
     
     log_auditoria(db, 'editar', 'usuarios', usuario.id, datos_anteriores, usuario.to_dict(), user=current_user, request=request)
     db.commit()
@@ -3138,21 +3183,87 @@ async def update_usuario(id, request: Request, db: Session = Depends(get_db), cu
 
 @app.delete("/api/usuarios/{id}")
 async def delete_usuario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Desactivar un usuario. Nunca borra: el historial sigue apuntando a su cuenta.
+
+    v2.19: si el profesor todavía tiene asignaciones u horarios VIGENTES, se
+    rechaza con 409. Desactivarlo dejaría cursos sin docente asignado y bloques
+    de horario apuntando a alguien que ya no puede entrar — el colegio no vería
+    el hueco hasta que un profesor no apareciera en el aula.
+    Dirección debe reemplazarlo (que transfiere todo) o desasignarlo primero.
+    """
     usuario = get_tenant_or_404(db, Usuario, id, current_user, name='usuario')
+
+    asigs = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        profesor_id=usuario.id, activo=True
+    ).count()
+    horas = tenant_filter(db.query(Horario), Horario, current_user).filter_by(
+        profesor_id=usuario.id, activo=True
+    ).count()
+    if asigs or horas:
+        partes = []
+        if asigs:
+            partes.append(f'{asigs} asignación(es) activa(s)')
+        if horas:
+            partes.append(f'{horas} bloque(s) de horario vigente(s)')
+        return JSONResponse({
+            'error': f'{usuario.nombre_completo} todavía tiene {" y ".join(partes)}. '
+                     f'Reemplácelo por otro profesor o quítele las asignaciones antes de desactivarlo.',
+            'asignaciones_activas': asigs,
+            'horarios_activos': horas,
+        }, status_code=409)
+
     usuario.activo = False
     usuario.token_version = (usuario.token_version or 0) + 1
-    log_auditoria(db, 'eliminar', 'usuarios', usuario.id, usuario.to_dict(), None, user=current_user, request=request)
+    # Baja completa: se eliminan TODOS sus dispositivos push (distinto del
+    # logout normal, que da de baja solo el dispositivo actual).
+    push_borrados = db.query(PushSubscription).filter(
+        PushSubscription.usuario_id == usuario.id
+    ).delete(synchronize_session=False)
+    log_auditoria(db, 'eliminar', 'usuarios', usuario.id, usuario.to_dict(),
+                  {'push_revocados': push_borrados}, user=current_user, request=request)
     db.commit()
     return {'message': 'Usuario desactivado'}
+
+
+@app.post("/api/usuarios/{id}/reactivar")
+async def reactivar_usuario(id, request: Request, db: Session = Depends(get_db),
+                            current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    v2.19 — Reactivar un usuario que había quedado inactivo.
+
+    Caso real: un profesor se fue y volvió al año siguiente, o Dirección
+    desactivó a alguien por error. Su cuenta y todo su historial siguen ahí.
+
+    NO reactiva sus asignaciones ni horarios: eso lo decide Dirección después,
+    porque el profesor puede volver a otros cursos. Tampoco toca la contraseña:
+    si no la recuerda, se usa Restablecer contraseña, que es otra acción.
+    """
+    usuario = get_tenant_or_404(db, Usuario, id, current_user, name='usuario')
+    if usuario.activo:
+        return JSONResponse({'error': 'Ese usuario ya está activo'}, status_code=400)
+
+    usuario.activo = True
+    log_auditoria(db, 'reactivar', 'usuarios', usuario.id, None,
+                  {'reactivado_por': current_user.id}, user=current_user, request=request)
+    db.commit()
+    return {
+        'message': f'{usuario.nombre_completo} fue reactivado',
+        'usuario': usuario.username,
+        'activo': True,
+    }
 
 
 @app.post("/api/usuarios/{id}/reset-password")
 async def reset_password_usuario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Resetear contraseña de un usuario (solo dirección).
-    
-    El usuario reseteado queda con must_change_password=True y debe cambiar
-    la password al primer login. La password temporal se devuelve al admin
-    una sola vez para que se la pase al usuario por canal seguro.
+
+    v2.19: la contraseña temporal la ESCRIBE Dirección; el sistema ya no genera
+    ninguna. Por eso tampoco se devuelve en la respuesta — quien la escribió ya
+    la conoce, y una clave en un JSON queda en el historial de red y en los logs.
+
+    El usuario reseteado queda con must_change_password=True y debe cambiarla en
+    su próximo acceso; su sesión actual se revoca vía token_version.
     """
     usuario = get_tenant_or_404(db, Usuario, id, current_user, name='usuario')
     data = await request.json() or {}
@@ -3176,9 +3287,11 @@ async def reset_password_usuario(id, request: Request, db: Session = Depends(get
     log_auditoria(db, 'reset_password', 'usuarios', usuario.id, None, {'reseteado_por': current_user.id}, user=current_user, request=request)
     db.commit()
     
+    # v2.19: la contraseña la escribió Dirección, así que ya la conoce. No se
+    # devuelve nunca en la respuesta: una clave que viaja en un JSON queda en el
+    # historial de red del navegador y en cualquier log intermedio.
     return {
         'message': f'Contraseña reseteada para {usuario.nombre_completo}',
-        'password_temporal': nueva_password,
         'usuario': usuario.username,
         'must_change_password': True,
     }
@@ -3225,46 +3338,75 @@ async def reemplazar_profesor(id, request: Request, db: Session = Depends(get_db
         data = await request.json()
     except Exception:
         return JSONResponse({'error': 'Body inválido'}, status_code=400)
-    nuevo_data = (data or {}).get('nuevo') or {}
+    data = data or {}
 
-    username = (nuevo_data.get('username') or '').strip().lower()[:50]
-    password = (nuevo_data.get('password') or '').strip()
-    nombre = (nuevo_data.get('nombre') or '').strip()[:100]
-    if not username or not nombre:
-        return JSONResponse({'error': 'username y nombre del nuevo profesor son requeridos'},
-                            status_code=400)
-    if not password:
-        return JSONResponse(
-            {'error': 'La contraseña inicial es requerida. Escríbala y compártala con el nuevo '
-                      'profesor; el sistema le pedirá cambiarla en su primer acceso.'},
-            status_code=400
+    # v2.19: dos caminos.
+    #   a) reemplazar_por_id → un profesor que YA trabaja en el colegio asume
+    #      los cursos del saliente (lo más común a mitad de año).
+    #   b) nuevo → se contrata a alguien y se le crea la cuenta.
+    reemplazar_por_id = data.get('reemplazar_por_id')
+    nuevo_data = data.get('nuevo') or {}
+
+    if reemplazar_por_id:
+        # get_tenant_or_404 ya garantiza el mismo colegio.
+        nuevo = get_tenant_or_404(db, Usuario, reemplazar_por_id, current_user,
+                                  name='profesor de reemplazo')
+        if nuevo.id == saliente.id:
+            return JSONResponse(
+                {'error': 'El profesor de reemplazo no puede ser el mismo que sale'},
+                status_code=400
+            )
+        if nuevo.role != 'profesor':
+            return JSONResponse(
+                {'error': 'El reemplazo debe ser un usuario con rol profesor'},
+                status_code=400
+            )
+        if not nuevo.activo:
+            return JSONResponse(
+                {'error': f'{nuevo.nombre_completo} está inactivo. Reactívelo antes de asignarle cursos.'},
+                status_code=400
+            )
+        cuenta_nueva = False
+    else:
+        username = (nuevo_data.get('username') or '').strip().lower()[:50]
+        password = (nuevo_data.get('password') or '').strip()
+        nombre = (nuevo_data.get('nombre') or '').strip()[:100]
+        if not username or not nombre:
+            return JSONResponse({'error': 'username y nombre del nuevo profesor son requeridos'},
+                                status_code=400)
+        if not password:
+            return JSONResponse(
+                {'error': 'La contraseña inicial es requerida. Escríbala y compártala con el nuevo '
+                          'profesor; el sistema le pedirá cambiarla en su primer acceso.'},
+                status_code=400
+            )
+        ok, msg = validate_password(password)
+        if not ok:
+            return JSONResponse({'error': msg}, status_code=400)
+        if db.query(Usuario).filter_by(username=username).first():
+            return JSONResponse({'error': 'Ese nombre de usuario ya existe'}, status_code=400)
+
+        # --- 1. Cuenta nueva, independiente ---
+        nuevo = Usuario(
+            username=username,
+            nombre=nombre,
+            apellido=(nuevo_data.get('apellido') or '').strip()[:100],
+            email=(nuevo_data.get('email') or '').strip().lower()[:100] or None,
+            telefono=(nuevo_data.get('telefono') or '').strip()[:20] or None,
+            cedula=(nuevo_data.get('cedula') or '').strip()[:20] or None,
+            role='profesor',
+            colegio_id=current_user.colegio_id,
+            nivel_asignado=(nuevo_data.get('nivel_asignado') or saliente.nivel_asignado),
+            tanda_id=saliente.tanda_id,
+            activo=True,
+            # Clave temporal escrita por Dirección: la conoce una segunda persona,
+            # así que el profesor debe cambiarla en su primer acceso.
+            must_change_password=True,
         )
-    ok, msg = validate_password(password)
-    if not ok:
-        return JSONResponse({'error': msg}, status_code=400)
-    if db.query(Usuario).filter_by(username=username).first():
-        return JSONResponse({'error': 'Ese nombre de usuario ya existe'}, status_code=400)
-
-    # --- 1. Cuenta nueva, independiente ---
-    nuevo = Usuario(
-        username=username,
-        nombre=nombre,
-        apellido=(nuevo_data.get('apellido') or '').strip()[:100],
-        email=(nuevo_data.get('email') or '').strip().lower()[:100] or None,
-        telefono=(nuevo_data.get('telefono') or '').strip()[:20] or None,
-        cedula=(nuevo_data.get('cedula') or '').strip()[:20] or None,
-        role='profesor',
-        colegio_id=current_user.colegio_id,
-        nivel_asignado=(nuevo_data.get('nivel_asignado') or saliente.nivel_asignado),
-        tanda_id=saliente.tanda_id,
-        activo=True,
-        # Clave temporal escrita por Dirección: la conoce una segunda persona,
-        # así que el profesor debe cambiarla en su primer acceso.
-        must_change_password=True,
-    )
-    nuevo.set_password(password)
-    db.add(nuevo)
-    db.flush()
+        nuevo.set_password(password)
+        db.add(nuevo)
+        db.flush()
+        cuenta_nueva = True
 
     # --- 2. VALIDAR TODO antes de mover nada ---
     # El reemplazo es una sola transacción: se valida primero y recién después
@@ -3286,18 +3428,19 @@ async def reemplazar_profesor(id, request: Request, db: Session = Depends(get_db
         (a_desactivar if ya else a_transferir).append(a)
 
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    q_horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(profesor_id=saliente.id)
-    if ano_activo and hasattr(Horario, 'ano_escolar_id'):
-        q_horarios = q_horarios.filter(
-            or_(Horario.ano_escolar_id == ano_activo.id, Horario.ano_escolar_id.is_(None))
-        )
-    horarios = q_horarios.all()
+    # Solo los bloques VIGENTES. Horario.activo == False es un horario retirado
+    # de un período anterior: forma parte del historial y no debe cambiar de
+    # profesor. (Horario no tiene ano_escolar_id, así que `activo` es el único
+    # alcance disponible y es el correcto: el año viejo se desactiva al cerrar.)
+    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(
+        profesor_id=saliente.id, activo=True
+    ).all()
 
     # Colisión de horario: si el nuevo ya tiene un bloque que se solapa en el
     # mismo día, no se puede transferir — quedaría en dos aulas a la vez.
     # Se detecta ANTES de tocar nada y se aborta el reemplazo completo.
     propios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(
-        profesor_id=nuevo.id
+        profesor_id=nuevo.id, activo=True
     ).all()
     conflictos = []
     for h in horarios:
@@ -3320,9 +3463,35 @@ async def reemplazar_profesor(id, request: Request, db: Session = Depends(get_db
     # --- 3. Aplicar (ya validado) ---
     for a in a_desactivar:
         a.activo = False
+
+    # La AsignacionProfesor del saliente es un HECHO HISTÓRICO: "Juan tuvo 3ro A
+    # Matemática en este año escolar". Reescribir su profesor_id borraría ese
+    # hecho y haría parecer que María estuvo asignada desde el principio.
+    # En su lugar: se desactiva la del saliente (conservando su profesor_id
+    # original) y se CREA una equivalente para el nuevo. Si el nuevo ya tuvo esa
+    # asignación y quedó inactiva, se reactiva en vez de duplicar la fila.
+    transferidas = 0
     for a in a_transferir:
-        a.profesor_id = nuevo.id
-    transferidas = len(a_transferir)
+        a.activo = False
+        previa = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=nuevo.id, curso_id=a.curso_id, asignatura_id=a.asignatura_id
+        ).first()
+        if previa:
+            previa.activo = True
+            previa.ano_escolar_id = a.ano_escolar_id
+            previa.es_titular = a.es_titular
+        else:
+            db.add(AsignacionProfesor(
+                colegio_id=current_user.colegio_id,
+                profesor_id=nuevo.id,
+                curso_id=a.curso_id,
+                asignatura_id=a.asignatura_id,
+                ano_escolar_id=a.ano_escolar_id,
+                es_titular=a.es_titular,
+                activo=True,
+            ))
+        transferidas += 1
+
     for h in horarios:
         h.profesor_id = nuevo.id
 
@@ -3374,6 +3543,7 @@ async def reemplazar_profesor(id, request: Request, db: Session = Depends(get_db
             'saliente_username': saliente.username,
             'nuevo_id': nuevo.id,
             'nuevo_username': nuevo.username,
+            'cuenta_nueva': cuenta_nueva,
             'asignaciones_transferidas': transferidas,
             'horarios_transferidos': len(horarios),
             'configs_eval_copiadas': configs_copiadas,
@@ -3400,7 +3570,8 @@ async def reemplazar_profesor(id, request: Request, db: Session = Depends(get_db
                    f'{nuevo.nombre_completo} recibió sus asignaciones vigentes.',
         'saliente': {'id': saliente.id, 'username': saliente.username, 'activo': False},
         'nuevo': {'id': nuevo.id, 'username': nuevo.username,
-                  'must_change_password': True},
+                  'cuenta_nueva': cuenta_nueva,
+                  'must_change_password': bool(cuenta_nueva)},
         'transferido': {
             'asignaciones': transferidas,
             'horarios': len(horarios),
@@ -14855,14 +15026,11 @@ async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), 
     config = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(
         profesor_id=current_user.id, asignatura_id=asignatura_id
     ).first()
-    if not config:
-        # v2.19: profesor recién asignado que todavía no definió sus pesos.
-        # Se usan los pesos vigentes de la asignatura en el colegio para no
-        # recalcular el curso con valores por defecto distintos a los que venía
-        # aplicando. No se reasigna el propietario de esa configuración.
-        config = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(
-            asignatura_id=asignatura_id
-        ).first()
+    # v2.19: NO hay fallback a la configuración de otro profesor. Tomar
+    # `.filter_by(asignatura_id=...).first()` devolvería los pesos de un docente
+    # cualquiera del colegio y calcularía la nota con criterios que este
+    # profesor nunca definió. En un reemplazo, la config del saliente ya se
+    # copia explícitamente al entrante. Sin config propia se usa el default.
     
     guardadas = 0
     for ev_data in evaluaciones:
@@ -15143,9 +15311,11 @@ async def crear_colegio(request: Request, db: Session = Depends(get_db), current
     db.add(config)
     
     # Crear usuario dirección para el colegio.
-    # Si el caller no proveyó admin_password, generamos una fuerte y forzamos
-    # cambio al primer login. Si sí la proveyó, el caller (superadmin) es
-    # responsable de comunicarla por canal seguro al director.
+    # v2.19: admin_password es OBLIGATORIA y la escribe el Superadmin. El
+    # sistema ya no genera contraseñas en flujos administrativos humanos, y no
+    # las devuelve en la respuesta. El Superadmin es responsable de comunicarla
+    # al director por un canal seguro; el director debe cambiarla en su primer
+    # acceso (must_change_password=True).
     #
     # username único: si el caller no proveyó admin_username, derivamos del
     # código del colegio (que ya es único). Si el caller proveyó un username
@@ -15552,10 +15722,10 @@ async def reset_password_colegio(id, request: Request, db: Session = Depends(get
     log_auditoria(db, 'RESET_PASSWORD_SUPERADMIN', 'usuarios', usuario.id, user=current_user, request=request)
     db.commit()
     
+    # v2.19: la contraseña la escribió el Superadmin; no se devuelve en el JSON.
     return {
         'message': f'Password reseteado para {usuario.nombre_completo}',
         'username': usuario.username,
-        'password_temporal': nueva_password,
         'must_change_password': True,
     }
 
@@ -15612,11 +15782,11 @@ async def crear_usuario_colegio(id, request: Request, db: Session = Depends(get_
     db.add(usuario)
     db.commit()
     
+    # v2.19: la contraseña la escribió el Superadmin; no se devuelve en el JSON.
     return JSONResponse({
         'message': f'Usuario {username} creado en {colegio.nombre}',
         'id': usuario.id,
         'username': username,
-        'password_temporal': password if must_change else None,
         'must_change_password': must_change,
     }, status_code=201)
 

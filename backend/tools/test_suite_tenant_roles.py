@@ -1777,7 +1777,7 @@ with client:
         assert caso.get('recomendacion_profesor') == 'dar seguimiento académico'
 
 
-    @test("M15. Cambiar password por Dirección revoca tokens anteriores")
+    @test("M15. Restablecer password por Dirección revoca tokens anteriores")
     def t():
         r = client.post('/api/usuarios', json={
             'username':'tok_m15','password':'InicialM15!','nombre':'Token','apellido':'M15','role':'profesor'
@@ -1786,7 +1786,15 @@ with client:
         uid = r.json()['id']
         tok = _login_prueba( json={'username':'tok_m15','password':'InicialM15!'}).json()['token']
         assert client.get('/api/auth/me', headers=auth(tok)).status_code == 200
+        # v2.19: el PUT ya NO cambia contraseñas — es una vía paralela al flujo
+        # oficial, sin must_change_password ni rastro de "reset" en auditoría.
         r = client.put(f'/api/usuarios/{uid}', json={'password':'NuevaM15!'}, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 400, 'el PUT no debe aceptar contraseñas'
+        assert client.get('/api/auth/me', headers=auth(tok)).status_code == 200, \
+            'un PUT rechazado no puede revocar la sesión'
+        # La acción correcta y separada:
+        r = client.post(f'/api/usuarios/{uid}/reset-password',
+                        json={'password':'NuevaM15!'}, headers=auth(DIR_A_TOKEN))
         assert r.status_code == 200, r.text
         assert client.get('/api/auth/me', headers=auth(tok)).status_code == 401, 'token viejo debe quedar revocado'
 

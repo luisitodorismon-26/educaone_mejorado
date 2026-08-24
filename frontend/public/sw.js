@@ -61,6 +61,20 @@ self.addEventListener('fetch', (event) => {
 // notificación. No se enriquece ni se completa con datos de la API: los avisos
 // de Psicología vienen redactados a propósito sin nombre del estudiante ni
 // motivo, porque este texto aparece en la pantalla bloqueada del teléfono.
+// Solo se acepta una ruta INTERNA de EducaOne. El payload viaja firmado por
+// VAPID, pero si alguna vez se filtrara la clave privada, un link malicioso
+// convertiría la notificación en un vector de phishing con la marca del
+// colegio. Se exige '/' inicial y se rechaza '//host' (que el navegador
+// interpreta como protocolo relativo → sitio externo) y cualquier esquema.
+function rutaInternaSegura(link) {
+  if (typeof link !== 'string') return '/';
+  const l = link.trim();
+  if (!l.startsWith('/')) return '/';   // 'https://…', 'javascript:', 'data:'
+  if (l.startsWith('//')) return '/';   // '//evil.com' = protocolo relativo
+  if (l.startsWith('/\\')) return '/'; // '/\\evil.com' lo normalizan algunos navegadores
+  return l;
+}
+
 self.addEventListener('push', (event) => {
   let datos = {};
   try {
@@ -72,7 +86,7 @@ self.addEventListener('push', (event) => {
 
   const titulo = datos.titulo || 'EducaOne';
   const cuerpo = datos.mensaje || 'Tiene una notificación nueva.';
-  const link = datos.link || '/';
+  const link = rutaInternaSegura(datos.link);
   const prioridad = datos.prioridad || 'normal';
 
   const opciones = {
@@ -94,7 +108,7 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  const link = (event.notification.data && event.notification.data.link) || '/';
+  const link = rutaInternaSegura(event.notification.data && event.notification.data.link);
 
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientes) => {

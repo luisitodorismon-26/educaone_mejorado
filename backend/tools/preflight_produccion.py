@@ -226,6 +226,33 @@ def main() -> int:
             if datt: critical(f'{datt} grupo(s) de asistencia general duplicada estudiante/fecha.')
             else: ok('Asistencia general sin duplicados estudiante/fecha.')
 
+        if 'eval_interna_estudiante' in tables:
+            # v2.19: la identidad institucional de una evaluación interna es
+            # estudiante + curso + asignatura + período. Antes del arreglo, un
+            # cambio de profesor a mitad de período creaba una fila paralela y
+            # el estudiante quedaba con dos notas internas para el mismo período.
+            # SOLO LECTURA: se reporta y se BLOQUEA el deploy. No se borra ni se
+            # fusiona nada automáticamente — cuál de las dos filas es la buena
+            # lo decide el colegio, no un script.
+            dev = scalar(conn, """
+                SELECT COUNT(*) FROM (
+                    SELECT colegio_id, estudiante_id, curso_id, asignatura_id, periodo,
+                           COUNT(*) c
+                    FROM eval_interna_estudiante
+                    WHERE curso_id IS NOT NULL AND asignatura_id IS NOT NULL
+                    GROUP BY colegio_id, estudiante_id, curso_id, asignatura_id, periodo
+                    HAVING COUNT(*)>1
+                ) x
+            """)
+            if dev:
+                critical(
+                    f'{dev} grupo(s) de evaluación interna duplicada '
+                    f'(estudiante+curso+asignatura+período). Revíselos y decida cuál conservar '
+                    f'ANTES de desplegar: el índice único uq_eval_interna_identidad no se podrá crear.'
+                )
+            else:
+                ok('Evaluación interna sin duplicados estudiante/curso/asignatura/período.')
+
         if 'grados' in tables:
             invalid_levels = scalar(conn, """
                 SELECT COUNT(*) FROM grados

@@ -198,9 +198,14 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return;
     const alRecibirMensaje = (evento: MessageEvent) => {
-      if (evento.data?.tipo === 'educaone:navegar' && evento.data?.link) {
-        navigate(evento.data.link);
-      }
+      if (evento.data?.tipo !== 'educaone:navegar') return;
+      const link = evento.data?.link;
+      // Solo rutas internas. navigate() con 'https://…' o '//evil.com' sacaría
+      // al usuario del sitio; '//' es protocolo relativo y apunta afuera.
+      if (typeof link !== 'string') return;
+      const l = link.trim();
+      if (!l.startsWith('/') || l.startsWith('//') || l.startsWith('/\\')) return;
+      navigate(l);
     };
     navigator.serviceWorker.addEventListener('message', alRecibirMensaje);
     return () => navigator.serviceWorker.removeEventListener('message', alRecibirMensaje);
