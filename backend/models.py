@@ -1576,6 +1576,21 @@ class Notificacion(Base):
     tipo = Column(String(30), default='info')  # info, alerta, comunicado, sistema
     link = Column(String(200))
     leida = Column(Boolean, default=False)
+    # v2.19 — Fase A del sistema unificado de notificaciones.
+    # evento_key identifica el EVENTO, no al destinatario: 'reporte:123:creado'.
+    # La unicidad se aplica como índice compuesto (usuario_id, evento_key) creado
+    # en el startup de app.py, no aquí, porque create_all() no agrega constraints
+    # a tablas que ya existen en producción.
+    # NULL en evento_key es intencional: las notificaciones antiguas y las que no
+    # necesiten deduplicación lo dejan vacío, y PostgreSQL permite múltiples NULL
+    # dentro de un índice único.
+    evento_key = Column(String(120), nullable=True, index=True)
+    # prioridad es independiente de 'tipo': tipo = categoría (comunicado, alerta),
+    # prioridad = cómo se presenta (info, normal, importante, urgente).
+    prioridad = Column(String(20), default='normal')
+    # Solo indica que al menos una suscripción push aceptó el envío. No es
+    # confirmación de entrega ni tracking por dispositivo. Se usa en Fase C.
+    push_enviado_at = Column(DateTime, nullable=True)
     fecha = Column(DateTime, default=_now_dr, index=True)
     
     usuario = relationship('Usuario', backref='notificaciones')
@@ -1589,6 +1604,7 @@ class Notificacion(Base):
             'link': self.link,
             'leida': self.leida,
             'fecha': self.fecha.strftime('%d/%m/%Y %H:%M') if self.fecha else None,
+            'prioridad': self.prioridad or 'normal',
             'tiempo_relativo': self._tiempo_relativo()
         }
     
@@ -1603,6 +1619,44 @@ class Notificacion(Base):
         mins = diff.seconds // 60
         if mins > 0: return f'Hace {mins}m'
         return 'Ahora'
+
+class PushSubscription(Base):
+    """
+    v2.19 Fase B — un dispositivo autorizado para recibir Web Push.
+
+    Un usuario puede tener varias filas (teléfono, laptop, PC del colegio).
+    La identidad es el `endpoint` que entrega el navegador: es único por
+    dispositivo+navegador, así que una re-suscripción actualiza en vez de
+    duplicar.
+
+    colegio_id se guarda desnormalizado a propósito: al enviar el push ya no
+    hay request ni current_user, y necesitamos poder acotar por tenant sin
+    depender de un JOIN con usuarios.
+    """
+    __tablename__ = 'push_subscriptions'
+    id = Column(Integer, primary_key=True)
+    usuario_id = Column(Integer, ForeignKey('usuarios.id'), nullable=False, index=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
+    # El endpoint puede superar los 500 caracteres en algunos navegadores.
+    endpoint = Column(Text, nullable=False)
+    p256dh = Column(String(255), nullable=False)
+    auth = Column(String(255), nullable=False)
+    user_agent = Column(String(255))
+    creada = Column(DateTime, default=_now_dr)
+    # Solo diagnóstico: última vez que el proveedor rechazó un envío. Una
+    # suscripción muerta (404/410) se BORRA, no se marca; esto sirve para
+    # errores transitorios que aún no justifican eliminarla.
+    ultimo_error = Column(DateTime, nullable=True)
+
+    usuario = relationship('Usuario', backref='push_subscriptions')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_agent': self.user_agent,
+            'creada': self.creada.isoformat() if self.creada else None,
+        }
+
 
 # ============== PERMISOS TEMPORALES ==============
 
@@ -1819,8 +1873,25 @@ class EvalInternaEstudiante(Base):
     curso = relationship('Curso', backref='evaluaciones_internas')
     
     __table_args__ = (
-        UniqueConstraint('estudiante_id', 'profesor_id', 'asignatura_id', 'periodo',
-                         name='unique_eval_interna'),
+        # v2.19 — identidad INSTITUCIONAL de una evaluación interna.
+        #
+        # La regla anterior era (estudiante, profesor, asignatura, periodo):
+        # incluía al profesor, así que al cambiar de docente a mitad de período
+        # el mismo estudiante quedaba con DOS evaluaciones internas para el
+        # mismo período y asignatura, y el resumen del curso mostraba números
+        # inconsistentes.
+        #
+        # La evaluación pertenece al COLEGIO, no a la cuenta del profesor:
+        # colegio + estudiante + curso + asignatura + período. El campo
+        # profesor_id se conserva como AUTORÍA (quién la registró), pero ya no
+        # forma parte de la identidad del registro.
+        #
+        # En bases existentes la constraint vieja se retira en la migración de
+        # startup de app.py, y solo después de que el preflight confirme cero
+        # duplicados. En bases nuevas, create_all() aplica directamente esta.
+        UniqueConstraint('colegio_id', 'estudiante_id', 'curso_id',
+                         'asignatura_id', 'periodo',
+                         name='uq_eval_interna_identidad'),
     )
     
     def calcular_nota(self, config=None):

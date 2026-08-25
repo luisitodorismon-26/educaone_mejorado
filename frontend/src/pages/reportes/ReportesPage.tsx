@@ -429,7 +429,15 @@ export const ReportesPage = () => {
               className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-sm"
             >
               <option value={0}>Todos los cursos</option>
-              {cursos.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+              {/* Curso.nombre es SOLO la sección ('A', 'B'): sin el grado el
+                  selector mostraba siete opciones idénticas llamadas "A" y era
+                  imposible saber cuál elegir. nombre_completo trae
+                  "1ro Primaria A - Matutina". */}
+              {cursos.map(c => (
+                <option key={c.id} value={c.id}>
+                  {c.nombre_completo || (c.grado ? `${c.grado} ${c.nombre}` : c.nombre)}
+                </option>
+              ))}
             </select>
           </div>
         </div>

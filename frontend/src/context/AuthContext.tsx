@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import api from '../services/api';
+import { endpointDeEsteDispositivo, obtenerSuscripcionActual } from '../services/push';
 
 interface User {
   id: number;
@@ -71,7 +72,25 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   const logout = async () => {
     try {
-      await api.post('/auth/logout');
+      // Fase C: dar de baja ÚNICAMENTE el dispositivo actual. Si el profesor
+      // cierra sesión en la PC del aula, su teléfono personal sigue recibiendo
+      // notificaciones. El endpoint se obtiene ANTES del logout, mientras el
+      // token todavía es válido.
+      let pushEndpoint: string | null = null;
+      try {
+        pushEndpoint = await endpointDeEsteDispositivo();
+      } catch {
+        // Sin push activo o navegador sin soporte: el logout sigue igual.
+      }
+      await api.post('/auth/logout', pushEndpoint ? { push_endpoint: pushEndpoint } : {});
+      if (pushEndpoint) {
+        try {
+          const sub = await obtenerSuscripcionActual();
+          if (sub) await sub.unsubscribe();
+        } catch {
+          // El navegador ya la había soltado.
+        }
+      }
     } catch {
       // Ignorar errores
     } finally {

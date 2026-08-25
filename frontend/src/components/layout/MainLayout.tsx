@@ -1,4 +1,5 @@
 import { useState, useEffect, ReactNode } from 'react';
+import BotonActivarNotificaciones from './BotonActivarNotificaciones';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { LanguageSelector } from '../../i18n';
@@ -190,6 +191,25 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     await logout();
     navigate('/login');
   };
+
+  // Fase C: en iOS/Safari el service worker no siempre puede usar
+  // client.navigate() al tocar un push, así que manda el link por postMessage
+  // y el routing lo hacemos acá dentro.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const alRecibirMensaje = (evento: MessageEvent) => {
+      if (evento.data?.tipo !== 'educaone:navegar') return;
+      const link = evento.data?.link;
+      // Solo rutas internas. navigate() con 'https://…' o '//evil.com' sacaría
+      // al usuario del sitio; '//' es protocolo relativo y apunta afuera.
+      if (typeof link !== 'string') return;
+      const l = link.trim();
+      if (!l.startsWith('/') || l.startsWith('//') || l.startsWith('/\\')) return;
+      navigate(l);
+    };
+    navigator.serviceWorker.addEventListener('message', alRecibirMensaje);
+    return () => navigator.serviceWorker.removeEventListener('message', alRecibirMensaje);
+  }, [navigate]);
 
   // v2.14: badges por ruta a partir de las alertas del dashboard. Cada alerta
   // trae un `link`; sumamos sus counts por ruta y el item del menú muestra el
@@ -627,6 +647,9 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
                         <p className="text-xs text-blue-600 font-medium">📬 {mensajesNoLeidos} mensaje(s) sin leer</p>
                       </div>
                     )}
+                    {/* Fase C: activar Web Push en ESTE dispositivo. El permiso
+                        del navegador se pide solo al pulsar el botón. */}
+                    <BotonActivarNotificaciones />
                   </div>
                 </>
               )}

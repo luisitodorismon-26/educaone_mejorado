@@ -37,11 +37,31 @@ export const UsuariosPage = () => {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  useEffect(() => { loadData(); }, []);
+  // v2.19: los profesores que dejan el colegio quedan INACTIVOS, nunca se
+  // borran, porque su historial (reportes, asistencias, evaluaciones) sigue
+  // apuntando a su cuenta. Dirección necesita poder verlos.
+  const [estado, setEstado] = useState<'activos' | 'inactivos' | 'todos'>('activos');
+
+  // Restablecer contraseña y Reemplazar profesor son acciones separadas.
+  const [resetUser, setResetUser] = useState<Usuario | null>(null);
+  const [resetPw, setResetPw] = useState('');
+  const [reemplazarUser, setReemplazarUser] = useState<Usuario | null>(null);
+  const [nuevoProf, setNuevoProf] = useState({
+    username: '', password: '', nombre: '', apellido: '', email: '', telefono: '',
+  });
+  // v2.19: a mitad de año lo habitual es que otro profesor DEL COLEGIO asuma
+  // los cursos, no que se contrate a alguien. Por eso hay dos modos.
+  const [modoReemplazo, setModoReemplazo] = useState<'existente' | 'nuevo'>('existente');
+  const [profesorDestino, setProfesorDestino] = useState<number>(0);
+
+  useEffect(() => { loadData(); }, [estado]);
 
   const loadData = async () => {
     try {
-      const [u, t] = await Promise.all([api.get('/usuarios'), api.get('/tandas')]);
+      const [u, t] = await Promise.all([
+        api.get(`/usuarios?estado=${estado}`),
+        api.get('/tandas'),
+      ]);
       setUsuarios(u.data);
       setTandas(t.data);
     } catch (e) {
@@ -51,9 +71,86 @@ export const UsuariosPage = () => {
     }
   };
 
-  const handleSave = async () => {
+  const handleReactivar = async (u: Usuario) => {
+    if (!confirm(`¿Reactivar a ${u.nombre_completo}?`)) return;
+    try {
+      await api.post(`/usuarios/${u.id}/reactivar`);
+      setMessage({ type: 'success', text: `${u.nombre_completo} fue reactivado` });
+      loadData();
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al reactivar' });
+    }
+  };
+
+  const handleReset = async () => {
+    if (!resetUser) return;
+    if (!resetPw.trim()) {
+      setMessage({ type: 'error', text: 'Escriba la contraseña temporal.' });
+      return;
+    }
     setSaving(true);
-    // Validaciones
+    try {
+      await api.post(`/usuarios/${resetUser.id}/reset-password`, { password: resetPw });
+      setMessage({
+        type: 'success',
+        text: `Contraseña restablecida. ${resetUser.nombre_completo} deberá cambiarla en su próximo acceso.`,
+      });
+      setResetUser(null);
+      setResetPw('');
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al restablecer' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleReemplazar = async () => {
+    if (!reemplazarUser) return;
+    let payload: any;
+    if (modoReemplazo === 'existente') {
+      if (!profesorDestino) {
+        setMessage({ type: 'error', text: 'Seleccione el profesor que asumirá los cursos.' });
+        return;
+      }
+      payload = { reemplazar_por_id: profesorDestino };
+    } else {
+      if (!nuevoProf.username.trim() || !nuevoProf.nombre.trim()) {
+        setMessage({ type: 'error', text: 'Usuario y nombre del nuevo profesor son requeridos.' });
+        return;
+      }
+      if (!nuevoProf.password.trim()) {
+        setMessage({ type: 'error', text: 'Escriba la contraseña inicial del nuevo profesor.' });
+        return;
+      }
+      payload = { nuevo: nuevoProf };
+    }
+    setSaving(true);
+    try {
+      const r = await api.post(`/usuarios/${reemplazarUser.id}/reemplazar`, payload);
+      const t = r.data.transferido || {};
+      setMessage({
+        type: 'success',
+        text: `${r.data.message} Se transfirieron ${t.asignaciones ?? 0} asignación(es) y ${t.horarios ?? 0} bloque(s) de horario.`,
+      });
+      setReemplazarUser(null);
+      setNuevoProf({ username: '', password: '', nombre: '', apellido: '', email: '', telefono: '' });
+      setProfesorDestino(0);
+      loadData();
+    } catch (e: any) {
+      const d = e.response?.data;
+      setMessage({
+        type: 'error',
+        text: d?.conflictos ? `${d.error} ${d.conflictos.join(' · ')}` : (d?.error || 'Error al reemplazar'),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSave = async () => {
+    // Las validaciones van ANTES de setSaving(true): si faltaba un campo, los
+    // return dejaban el botón en "cargando" para siempre y había que cerrar el
+    // modal para recuperarlo.
     if (!form.username.trim()) {
       setMessage({ type: 'error', text: 'El nombre de usuario es requerido' });
       return;
@@ -71,12 +168,21 @@ export const UsuariosPage = () => {
       return;
     }
     
+    setSaving(true);
     try {
       if (editando) {
-        await api.put(`/usuarios/${editando.id}`, form);
+        // v2.19: el PUT ya no acepta `password` (devuelve 400). Se excluye del
+        // payload para no mandar el campo vacío que arrastra el estado del form.
+        const { password: _omitida, ...datosEdicion } = form;
+        await api.put(`/usuarios/${editando.id}`, datosEdicion);
         setMessage({ type: 'success', text: 'Usuario actualizado correctamente' });
       } else {
-        await api.post('/usuarios', { ...form, password: form.password || '123456' });
+        // v2.19: la contraseña la escribe Dirección, sin fallback. El
+        // `|| '123456'` anterior era una contraseña automática encubierta: si
+        // el campo llegaba vacío se creaba la cuenta con una clave conocida.
+        // Hoy además el backend la rechazaría por débil, así que el usuario
+        // vería un error confuso en vez de "falta la contraseña".
+        await api.post('/usuarios', form);
         setMessage({ type: 'success', text: 'Usuario creado correctamente' });
       }
       loadData();
@@ -94,8 +200,14 @@ export const UsuariosPage = () => {
       await api.delete(`/usuarios/${id}`);
       setMessage({ type: 'success', text: 'Usuario desactivado' });
       loadData();
-    } catch (e) {
-      setMessage({ type: 'error', text: 'Error al desactivar usuario' });
+    } catch (e: any) {
+      // El backend devuelve 409 con el motivo exacto ("todavía tiene N
+      // asignación(es) activa(s)... Reemplácelo o quítele las asignaciones").
+      // Mostrar un genérico dejaba a Dirección sin saber qué hacer.
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.error || 'Error al desactivar usuario',
+      });
     }
   };
 
@@ -126,7 +238,8 @@ export const UsuariosPage = () => {
       direccion: 'info',
       coordinador: 'warning',
       profesor: 'success',
-      psicologia: 'default'
+      psicologia: 'default',
+      secretaria: 'info'
     };
     return variants[role] || 'default';
   };
@@ -155,7 +268,8 @@ export const UsuariosPage = () => {
           {u.role === 'direccion' ? 'Dirección' :
            u.role === 'coordinador' ? 'Coordinador' :
            u.role === 'profesor' ? 'Profesor' :
-           u.role === 'psicologia' ? 'Psicología' : u.role}
+           u.role === 'psicologia' ? 'Psicología' :
+           u.role === 'secretaria' ? 'Secretaría' : u.role}
         </Badge>
       )
     },
@@ -194,11 +308,26 @@ export const UsuariosPage = () => {
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">👥 Usuarios</h1>
-          <p className="text-gray-500">{usuarios.length} usuarios registrados</p>
+          <p className="text-gray-500">
+            {usuarios.length} {estado === 'activos' ? 'activos' : estado === 'inactivos' ? 'inactivos' : 'en total'}
+          </p>
         </div>
-        <Button onClick={() => setShowModal(true)} icon={<span>+</span>}>
-          Nuevo Usuario
-        </Button>
+        <div className="flex items-center gap-3">
+          <div className="flex rounded-lg border border-gray-200 overflow-hidden">
+            {(['activos', 'inactivos', 'todos'] as const).map(op => (
+              <button
+                key={op}
+                onClick={() => setEstado(op)}
+                className={`px-3 py-1.5 text-sm capitalize ${estado === op ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}
+              >
+                {op}
+              </button>
+            ))}
+          </div>
+          <Button onClick={() => setShowModal(true)} icon={<span>+</span>}>
+            Nuevo Usuario
+          </Button>
+        </div>
       </div>
 
       {/* Mensajes */}
@@ -216,13 +345,29 @@ export const UsuariosPage = () => {
         exportFilename="usuarios"
         emptyMessage="No hay usuarios registrados"
         actions={(u) => (
-          <div className="flex gap-2 justify-end">
-            <button onClick={() => openEdit(u)} className="text-blue-600 hover:text-blue-800 text-sm">
-              Editar
-            </button>
-            <button onClick={() => handleDelete(u.id)} className="text-red-600 hover:text-red-800 text-sm">
-              Desactivar
-            </button>
+          <div className="flex gap-2 justify-end flex-wrap">
+            {u.activo ? (
+              <>
+                <button onClick={() => openEdit(u)} className="text-blue-600 hover:text-blue-800 text-sm">
+                  Editar
+                </button>
+                <button onClick={() => { setResetUser(u); setResetPw(''); }} className="text-amber-600 hover:text-amber-800 text-sm">
+                  Restablecer contraseña
+                </button>
+                {u.role === 'profesor' && (
+                  <button onClick={() => setReemplazarUser(u)} className="text-purple-600 hover:text-purple-800 text-sm">
+                    Reemplazar
+                  </button>
+                )}
+                <button onClick={() => handleDelete(u.id)} className="text-red-600 hover:text-red-800 text-sm">
+                  Desactivar
+                </button>
+              </>
+            ) : (
+              <button onClick={() => handleReactivar(u)} className="text-green-600 hover:text-green-800 text-sm">
+                Reactivar
+              </button>
+            )}
           </div>
         )}
       />
@@ -284,6 +429,7 @@ export const UsuariosPage = () => {
                 { value: 'profesor', label: '👨‍🏫 Profesor' },
                 { value: 'coordinador', label: '👔 Coordinador' },
                 { value: 'psicologia', label: '🧠 Psicología' },
+                { value: 'secretaria', label: '📋 Secretaría' },
                 { value: 'direccion', label: '🏫 Dirección' }
               ]}
             />
@@ -327,16 +473,130 @@ export const UsuariosPage = () => {
               </p>
             )}
           </div>
-          <Input
-            label={editando ? "Nueva Contraseña (dejar vacío para mantener)" : "Contraseña"}
-            type="password"
-            value={form.password}
-            onChange={e => setForm({ ...form, password: e.target.value })}
-            placeholder={editando ? "••••••••" : ""}
-          />
+          {/* v2.19: al EDITAR no se muestra el campo de contraseña. Cambiarla
+              es una acción separada y explícita ("Restablecer contraseña"), que
+              además revoca las sesiones abiertas y fuerza el cambio en el
+              próximo acceso. */}
           {!editando && (
+            <>
+              <Input
+                label="Contraseña inicial *"
+                type="password"
+                value={form.password}
+                onChange={e => setForm({ ...form, password: e.target.value })}
+                placeholder="Mínimo 8 caracteres"
+              />
+              <p className="text-sm text-gray-500">
+                La contraseña inicial es obligatoria. Escríbala y compártala con el usuario:
+                el sistema le pedirá cambiarla en su primer acceso.
+              </p>
+            </>
+          )}
+          {editando && (
             <p className="text-sm text-gray-500">
-              Si no especifica una contraseña, se asignará "123456" por defecto.
+              Para cambiar la contraseña use la acción <strong>Restablecer contraseña</strong>
+              desde la lista de usuarios.
+            </p>
+          )}
+        </div>
+      </Modal>
+
+      {/* Restablecer contraseña — acción SEPARADA de editar usuario */}
+      <Modal
+        isOpen={!!resetUser}
+        onClose={() => { setResetUser(null); setResetPw(''); }}
+        title={`Restablecer contraseña — ${resetUser?.nombre_completo || ''}`}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => { setResetUser(null); setResetPw(''); }}>Cancelar</Button>
+            <Button onClick={handleReset} loading={saving}>Restablecer</Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <Input
+            label="Contraseña temporal *"
+            type="password"
+            value={resetPw}
+            onChange={e => setResetPw(e.target.value)}
+            placeholder="Mínimo 8 caracteres"
+          />
+          <p className="text-sm text-gray-500">
+            Escríbala y compártala con el usuario. Se cerrarán sus sesiones abiertas
+            y el sistema le pedirá cambiarla en su próximo acceso.
+          </p>
+        </div>
+      </Modal>
+
+      {/* Reemplazar profesor — el saliente queda inactivo y conserva su historial */}
+      <Modal
+        isOpen={!!reemplazarUser}
+        onClose={() => setReemplazarUser(null)}
+        title={`Reemplazar a ${reemplazarUser?.nombre_completo || ''}`}
+        size="lg"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setReemplazarUser(null)}>Cancelar</Button>
+            <Button onClick={handleReemplazar} loading={saving}>Reemplazar</Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <Alert variant="info">
+            {reemplazarUser?.nombre_completo} quedará <strong>inactivo</strong> y{' '}
+            {modoReemplazo === 'existente'
+              ? <>el <strong>profesor seleccionado asumirá las asignaciones</strong> y horarios vigentes.</>
+              : <>se creará una <strong>cuenta nueva</strong> que recibirá sus asignaciones y horarios vigentes.</>}
+            {' '}Todo su historial —reportes, asistencias, evaluaciones— se conserva a su nombre
+            y no cambia de autor.
+          </Alert>
+          <div className="flex rounded-lg border border-gray-200 overflow-hidden w-fit">
+            {([['existente', 'Profesor del colegio'], ['nuevo', 'Crear cuenta nueva']] as const).map(([v, l]) => (
+              <button key={v} onClick={() => setModoReemplazo(v)}
+                className={`px-4 py-2 text-sm ${modoReemplazo === v ? 'bg-blue-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>
+                {l}
+              </button>
+            ))}
+          </div>
+
+          {modoReemplazo === 'existente' ? (
+            <Select
+              label="Profesor que asumirá los cursos *"
+              value={profesorDestino}
+              onChange={e => setProfesorDestino(Number(e.target.value))}
+              options={[
+                { value: 0, label: 'Seleccione un profesor…' },
+                ...usuarios
+                  .filter(u => u.role === 'profesor' && u.activo && u.id !== reemplazarUser?.id)
+                  .map(u => ({ value: u.id, label: u.nombre_completo })),
+              ]}
+            />
+          ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Input label="Usuario *" value={nuevoProf.username}
+              onChange={e => setNuevoProf({ ...nuevoProf, username: e.target.value })} />
+            <Input label="Contraseña inicial *" type="password" value={nuevoProf.password}
+              placeholder="Mínimo 8 caracteres"
+              onChange={e => setNuevoProf({ ...nuevoProf, password: e.target.value })} />
+            <Input label="Nombre *" value={nuevoProf.nombre}
+              onChange={e => setNuevoProf({ ...nuevoProf, nombre: e.target.value })} />
+            <Input label="Apellido" value={nuevoProf.apellido}
+              onChange={e => setNuevoProf({ ...nuevoProf, apellido: e.target.value })} />
+            <Input label="Email" type="email" value={nuevoProf.email}
+              onChange={e => setNuevoProf({ ...nuevoProf, email: e.target.value })} />
+            <Input label="Teléfono" value={nuevoProf.telefono}
+              onChange={e => setNuevoProf({ ...nuevoProf, telefono: e.target.value })} />
+          </div>
+          )}
+          {modoReemplazo === 'nuevo' ? (
+            <p className="text-sm text-gray-500">
+              La contraseña inicial es obligatoria. El nuevo profesor deberá cambiarla
+              en su primer acceso.
+            </p>
+          ) : (
+            <p className="text-sm text-gray-500">
+              Si el profesor elegido ya tiene clases en los mismos horarios, el sistema
+              rechazará el reemplazo y no aplicará ningún cambio.
             </p>
           )}
         </div>

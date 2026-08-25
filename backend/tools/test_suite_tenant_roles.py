@@ -39,6 +39,37 @@ from app import app
 
 # Globales del test
 client = TestClient(app)
+
+# ---------------------------------------------------------------------------
+# v2.19: toda cuenta nueva nace con must_change_password=True y cualquier
+# endpoint responde 423 hasta que el usuario cambie la clave. Estas suites
+# prueban roles, aislamiento y notificaciones — NO la política de contraseñas,
+# que tiene su propio archivo (test_reemplazo_profesor.py).
+#
+# Para no reescribir decenas de fixtures, limpiamos la marca directamente en la
+# base antes de cada login. Es un atajo de PRUEBA: no toca código de producción
+# y el 423 se sigue verificando donde corresponde.
+def _limpiar_must_change(username):
+    from database import SessionLocal as _SL
+    from models import Usuario as _U
+    _d = _SL()
+    try:
+        _u = _d.query(_U).filter_by(username=username).first()
+        if _u is not None and _u.must_change_password:
+            _u.must_change_password = False
+            _d.commit()
+    finally:
+        _d.close()
+
+
+def _login_prueba(**kwargs):
+    """Sustituye a las llamadas directas de login en las fixtures."""
+    payload = kwargs.get('json') or {}
+    if payload.get('username'):
+        _limpiar_must_change(payload['username'])
+    return client.post('/api/auth/login', **kwargs)
+
+
 fallos = []
 pasados = 0
 total = 0
@@ -79,7 +110,7 @@ print(f"{BOLD}\n=== SETUP ==={RESET}")
 
 with client:
     # Login superadmin
-    r = client.post('/api/auth/login', json={'username':'superadmin','password':'superadmin123'})
+    r = _login_prueba( json={'username':'superadmin','password':'superadmin123'})
     assert r.status_code == 200, f"login superadmin falló: {r.text}"
     SA_TOKEN = r.json()['token']
     
@@ -93,8 +124,8 @@ with client:
     assert r.status_code in (200, 201), f"crear colegio B falló: {r.text}"
     
     # Login director A (el default)
-    DIR_A_TOKEN = client.post('/api/auth/login', json={'username':'direccion','password':'admin123'}).json()['token']
-    DIR_B_TOKEN = client.post('/api/auth/login', json={'username':'dir_b','password':'admin123b'}).json()['token']
+    DIR_A_TOKEN = _login_prueba( json={'username':'direccion','password':'admin123'}).json()['token']
+    DIR_B_TOKEN = _login_prueba( json={'username':'dir_b','password':'admin123b'}).json()['token']
     
     print(f"  {GREEN}✓{RESET} 2 colegios creados, 2 directores logueados")
     
@@ -165,13 +196,13 @@ with client:
     print(f"  {GREEN}✓{RESET} Colegio B: curso={B['curso']} asig={B['asig']} prof={B['prof']} est={B['est']}")
     
     # Login profesor del A y del B
-    PROF_A_TOKEN = client.post('/api/auth/login', json={
+    PROF_A_TOKEN = _login_prueba( json={
         'username': f'profe_{A["sufijo"]}', 'password':'profesor123'
     }).json()['token']
-    PROF_B_TOKEN = client.post('/api/auth/login', json={
+    PROF_B_TOKEN = _login_prueba( json={
         'username': f'profe_{B["sufijo"]}', 'password':'profesor123'
     }).json()['token']
-    SEC_A_TOKEN = client.post('/api/auth/login', json={
+    SEC_A_TOKEN = _login_prueba( json={
         'username': f'sec_{A["sufijo"]}', 'password':'secretaria123'
     }).json()['token']
     
@@ -561,7 +592,7 @@ with client:
     
     @test("E14. Coordinador puede crear estudiantes (rol válido)")
     def t():
-        coord_a_token = client.post('/api/auth/login', json={
+        coord_a_token = _login_prueba( json={
             'username': f'coord_{A["sufijo"]}', 'password':'coordinador123'
         }).json()['token']
         r = client.post('/api/estudiantes', json={
@@ -624,7 +655,7 @@ with client:
     @test("F5. Logout invalida la sesión (token previo deja de funcionar)")
     def t():
         # Login fresco para no afectar otros tests
-        r = client.post('/api/auth/login', json={'username':'direccion','password':'admin123'})
+        r = _login_prueba( json={'username':'direccion','password':'admin123'})
         tok = r.json()['token']
         # Verificar que funciona
         r = client.get('/api/cursos', headers=auth(tok))
@@ -643,7 +674,7 @@ with client:
         # invalidado. Eso es comportamiento CORRECTO del sistema. Hacemos un
         # refresh para continuar el test.
         global DIR_A_TOKEN
-        DIR_A_TOKEN = client.post('/api/auth/login', json={
+        DIR_A_TOKEN = _login_prueba( json={
             'username':'direccion','password':'admin123'
         }).json()['token']
         # Crear usuario temporal para no afectar otras secciones
@@ -653,7 +684,7 @@ with client:
         }, headers=auth(DIR_A_TOKEN))
         assert r.status_code == 201, f"crear usuario falló: {r.text}"
         # Login
-        r = client.post('/api/auth/login', json={'username':'usr_test_pw','password':'PasswordOld1'})
+        r = _login_prueba( json={'username':'usr_test_pw','password':'PasswordOld1'})
         tok = r.json()['token']
         # Funciona con ese token
         r = client.get('/api/auth/me', headers=auth(tok))
@@ -702,12 +733,12 @@ with client:
     
     @test("G2. Director del nuevo colegio se loguea")
     def t():
-        r = client.post('/api/auth/login', json={'username':'dir_e2e','password':'AdminE2E2024'})
+        r = _login_prueba( json={'username':'dir_e2e','password':'AdminE2E2024'})
         assert r.status_code == 200, f"login director falló: {r.text}"
     
     @test("G3. Director crea profesor y secretaria")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
         # Profesor
         r = client.post('/api/usuarios', json={
             'username':'prof_e2e','password':'ProfE2E2024','nombre':'Juan','apellido':'Perez',
@@ -723,7 +754,7 @@ with client:
     
     @test("G4. Director crea curso, asignatura y asignación")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
         grados = client.get('/api/grados', headers=auth(tok)).json()
         tandas = client.get('/api/tandas', headers=auth(tok)).json()
         prof_id = next(u['id'] for u in client.get('/api/usuarios', headers=auth(tok)).json() if u['username']=='prof_e2e')
@@ -749,7 +780,7 @@ with client:
     
     @test("G5. Director crea horario en secundaria")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
         r = client.post('/api/horarios', json={
             'curso_id': _E2E_curso, 'asignatura_id': _E2E_asig, 'profesor_id': _E2E_prof,
             'dia':'Lunes', 'hora_inicio':'07:30', 'hora_fin':'08:20', 'tipo_bloque':'clase',
@@ -758,7 +789,7 @@ with client:
     
     @test("G6. Director crea estudiante")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
         r = client.post('/api/estudiantes', json={
             'nombre':'Maria','apellido':'Lopez','sexo':'F','fecha_nacimiento':'2010-06-15',
             'curso_id': _E2E_curso, 'no_lista': 1, 'matricula':'E2E001'
@@ -768,7 +799,7 @@ with client:
     
     @test("G7. Profesor califica estudiante con 4 parciales (PC1 calculado)")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'prof_e2e','password':'ProfE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'prof_e2e','password':'ProfE2E2024'}).json()['token']
         r = client.post('/api/calificaciones', json={
             'estudiante_id': _E2E_est, 'asignatura_id': _E2E_asig,
             'p1_p1': 90, 'p1_p2': 85, 'p1_p3': 80, 'p1_p4': 75,
@@ -779,7 +810,7 @@ with client:
     
     @test("G8. Profesor registra asistencia")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'prof_e2e','password':'ProfE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'prof_e2e','password':'ProfE2E2024'}).json()['token']
         for fecha in ['2024-09-02', '2024-09-03', '2024-09-04']:
             r = client.post('/api/asistencia', json={
                 'estudiante_id': _E2E_est, 'asignatura_id': _E2E_asig,
@@ -789,7 +820,7 @@ with client:
     
     @test("G9. Director ve calificaciones del curso")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
         r = client.get(f'/api/calificaciones/curso/{_E2E_curso}/asignatura/{_E2E_asig}', headers=auth(tok))
         assert r.status_code == 200, f"ver calificaciones: {r.text}"
         body = r.json()
@@ -800,7 +831,7 @@ with client:
     
     @test("G10. Secretaria NO puede calificar (verificación de rol)")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'sec_e2e','password':'SecE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'sec_e2e','password':'SecE2E2024'}).json()['token']
         r = client.post('/api/calificaciones', json={
             'estudiante_id': _E2E_est, 'asignatura_id': _E2E_asig, 'p2_p1': 85,
         }, headers=auth(tok))
@@ -808,13 +839,13 @@ with client:
     
     @test("G11. Secretaria SÍ puede ver estudiantes (rol válido)")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'sec_e2e','password':'SecE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'sec_e2e','password':'SecE2E2024'}).json()['token']
         r = client.get('/api/estudiantes', headers=auth(tok))
         assert r.status_code == 200, f"esperaba 200, obtuvo {r.status_code}: {r.text}"
     
     @test("G12. Director ve resumen de asistencia del curso")
     def t():
-        tok = client.post('/api/auth/login', json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
+        tok = _login_prueba( json={'username':'dir_e2e','password':'AdminE2E2024'}).json()['token']
         r = client.get(f'/api/asistencia/resumen/{_E2E_curso}?mes=9&ano=2024', headers=auth(tok))
         assert r.status_code == 200, f"resumen: {r.text}"
         data = r.json()
@@ -830,7 +861,7 @@ with client:
     print(f"{BOLD}\n=== H. MÉTRICAS DE ASISTENCIA (sin doble conteo) ==={RESET}")
     
     # Setup aislado: colegio H con cantidades exactas y predecibles
-    sa = client.post('/api/auth/login', json={'username':'superadmin','password':'superadmin123'}).json()['token']
+    sa = _login_prueba( json={'username':'superadmin','password':'superadmin123'}).json()['token']
     r = client.post('/api/superadmin/colegios', json={
         'nombre':'Colegio H','codigo':'h_metrica','plan':'enterprise',
         'admin_username':'dir_h','admin_password':'AdminHColegio2024',
@@ -842,7 +873,7 @@ with client:
         # Fallback: buscar por nombre
         cs = client.get('/api/superadmin/colegios', headers=auth(sa)).json()
         COLEGIO_H_ID = next(c['id'] for c in cs if c['codigo'] == 'h_metrica')
-    DIR_H = client.post('/api/auth/login', json={'username':'dir_h','password':'AdminHColegio2024'}).json()['token']
+    DIR_H = _login_prueba( json={'username':'dir_h','password':'AdminHColegio2024'}).json()['token']
     
     grados_h = client.get('/api/grados', headers=auth(DIR_H)).json()
     tandas_h = client.get('/api/tandas', headers=auth(DIR_H)).json()
@@ -872,9 +903,30 @@ with client:
     
     # Profesor registra asistencia de hoy: en 2 materias distintas
     # Si el sistema doble-contara, sumaría 10 marcas. Debe sumar 5 (1 por estudiante por día).
-    PROF_H = client.post('/api/auth/login', json={'username':'prof_h','password':'profesor123'}).json()['token']
+    PROF_H = _login_prueba( json={'username':'prof_h','password':'profesor123'}).json()['token']
     from datetime import date as _date
     hoy_iso = _date.today().isoformat()
+
+    # v2.19: estas pruebas miden la asistencia de HOY contra /api/dashboard/graficos,
+    # así que la fecha no se puede fijar a un lunes cualquiera. Pero por defecto el
+    # sistema RECHAZA asistencia en sábado y domingo (app.py, validación de
+    # permite_sabado/permite_domingo), y eso hacía fallar H1/H3/H4/H5/H6 solo
+    # los fines de semana.
+    # Solución: habilitar fin de semana ÚNICAMENTE en este colegio de prueba,
+    # como haría un colegio con clases los sábados. No se toca la lógica de
+    # producción ni el default (lunes-viernes) de ningún otro colegio.
+    from database import SessionLocal as _SessionLocal
+    from models import ConfiguracionColegio as _ConfigColegio
+    _db_cfg = _SessionLocal()
+    try:
+        _cfg_h = _db_cfg.query(_ConfigColegio).filter_by(colegio_id=COLEGIO_H_ID).first()
+        if _cfg_h is not None:
+            _cfg_h.permite_sabado = True
+            _cfg_h.permite_domingo = True
+            _db_cfg.commit()
+    finally:
+        _db_cfg.close()
+
     # Estudiantes 0,1,2 → presente en ambas materias
     # Estudiante 3 → ausente en ambas
     # Estudiante 4 → presente en mate, ausente en lengua (debe contar como presente)
@@ -1106,7 +1158,7 @@ with client:
         'plan_eval_profesores': True,
     }, headers=auth(sa))
     assert r.status_code in (200, 201), f"crear colegio J: {r.text}"
-    DIR_J = client.post('/api/auth/login', json={'username':'dir_j','password':'AdminJ2024'}).json()['token']
+    DIR_J = _login_prueba( json={'username':'dir_j','password':'AdminJ2024'}).json()['token']
     
     @test("J1. GET /api/configuracion devuelve plan, usa, activo por módulo")
     def t():
@@ -1248,7 +1300,7 @@ with client:
         'nombre':'Colegio K','codigo':'k_nivel','plan':'enterprise',
         'admin_username':'dir_k','admin_password':'AdminK2024',
     }, headers=auth(sa))
-    DIR_K = client.post('/api/auth/login', json={'username':'dir_k','password':'AdminK2024'}).json()['token']
+    DIR_K = _login_prueba( json={'username':'dir_k','password':'AdminK2024'}).json()['token']
     K_cole_id = client.get('/api/configuracion', headers=auth(DIR_K)).json()['colegio_id']
     
     # Crear grado primaria + curso primaria + estudiante (con primaria activa)
@@ -1281,7 +1333,7 @@ with client:
     client.put(f'/api/superadmin/colegios/{K_cole_id}/modulos',
                json={'modulos': {'primaria': False}}, headers=auth(sa))
     
-    PROF_K = client.post('/api/auth/login', json={'username':'prof_k','password':'profesor123'}).json()['token']
+    PROF_K = _login_prueba( json={'username':'prof_k','password':'profesor123'}).json()['token']
     
     @test("K1. POST /api/estudiantes en curso de nivel desactivado → bloqueado")
     def t():
@@ -1381,7 +1433,7 @@ with client:
     }, headers=auth(sa))
     assert r.status_code in (200, 201), f"crear: {r.text}"
     L_id = r.json()['id']
-    DIR_L = client.post('/api/auth/login', json={'username':'dir_l','password':'AdminL2024'}).json()['token']
+    DIR_L = _login_prueba( json={'username':'dir_l','password':'AdminL2024'}).json()['token']
     
     @test("L1. Colegio basico nuevo: NINGÚN módulo funcional aparece como activo")
     def t():
@@ -1701,7 +1753,7 @@ with client:
             'username':'psi_m14','password':'PsicologiaM14!','nombre':'Psi','apellido':'M14','role':'psicologia'
         }, headers=auth(DIR_A_TOKEN))
         assert r.status_code in (201, 400), r.text
-        psi_token = client.post('/api/auth/login', json={'username':'psi_m14','password':'PsicologiaM14!'}).json().get('token')
+        psi_token = _login_prueba( json={'username':'psi_m14','password':'PsicologiaM14!'}).json().get('token')
         assert psi_token, 'no se pudo loguear psicología M14'
 
         r = client.post('/api/psicologia/solicitar', json={
@@ -1725,16 +1777,24 @@ with client:
         assert caso.get('recomendacion_profesor') == 'dar seguimiento académico'
 
 
-    @test("M15. Cambiar password por Dirección revoca tokens anteriores")
+    @test("M15. Restablecer password por Dirección revoca tokens anteriores")
     def t():
         r = client.post('/api/usuarios', json={
             'username':'tok_m15','password':'InicialM15!','nombre':'Token','apellido':'M15','role':'profesor'
         }, headers=auth(DIR_A_TOKEN))
         assert r.status_code == 201, r.text
         uid = r.json()['id']
-        tok = client.post('/api/auth/login', json={'username':'tok_m15','password':'InicialM15!'}).json()['token']
+        tok = _login_prueba( json={'username':'tok_m15','password':'InicialM15!'}).json()['token']
         assert client.get('/api/auth/me', headers=auth(tok)).status_code == 200
+        # v2.19: el PUT ya NO cambia contraseñas — es una vía paralela al flujo
+        # oficial, sin must_change_password ni rastro de "reset" en auditoría.
         r = client.put(f'/api/usuarios/{uid}', json={'password':'NuevaM15!'}, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 400, 'el PUT no debe aceptar contraseñas'
+        assert client.get('/api/auth/me', headers=auth(tok)).status_code == 200, \
+            'un PUT rechazado no puede revocar la sesión'
+        # La acción correcta y separada:
+        r = client.post(f'/api/usuarios/{uid}/reset-password',
+                        json={'password':'NuevaM15!'}, headers=auth(DIR_A_TOKEN))
         assert r.status_code == 200, r.text
         assert client.get('/api/auth/me', headers=auth(tok)).status_code == 401, 'token viejo debe quedar revocado'
 
@@ -1747,10 +1807,10 @@ with client:
             }, headers=auth(DIR_A_TOKEN))
             assert r.status_code == 201, r.text
         for _ in range(5):
-            client.post('/api/auth/login', json={'username':'rl_a_m16','password':'incorrecta'})
-        blocked = client.post('/api/auth/login', json={'username':'rl_a_m16','password':'RateM16!'})
+            _login_prueba( json={'username':'rl_a_m16','password':'incorrecta'})
+        blocked = _login_prueba( json={'username':'rl_a_m16','password':'RateM16!'})
         assert blocked.status_code == 429, f"cuenta atacada debe bloquearse: {blocked.status_code} {blocked.text}"
-        other = client.post('/api/auth/login', json={'username':'rl_b_m16','password':'RateM16!'})
+        other = _login_prueba( json={'username':'rl_b_m16','password':'RateM16!'})
         assert other.status_code == 200 and other.json().get('token'), \
             f"otra cuenta en la misma IP debe seguir entrando: {other.status_code} {other.text}"
 
@@ -1763,7 +1823,7 @@ with client:
         }, headers=auth(SA_TOKEN))
         assert r.status_code == 201, r.text
         cid = r.json()['id']
-        tok = client.post('/api/auth/login', json={'username':'dir_m17','password':'AdminM17!'}).json()['token']
+        tok = _login_prueba( json={'username':'dir_m17','password':'AdminM17!'}).json()['token']
         assert client.get('/api/auth/me', headers=auth(tok)).status_code == 200
         r = client.put(f'/api/superadmin/colegios/{cid}', json={'activo':False}, headers=auth(SA_TOKEN))
         assert r.status_code == 200, r.text
@@ -1780,7 +1840,7 @@ with client:
         uid = r.json()['id']
         r = client.put(f'/api/usuarios/{uid}', json={'username':'USER_M18'}, headers=auth(DIR_A_TOKEN))
         assert r.status_code == 200, r.text
-        login = client.post('/api/auth/login', json={'username':'USER_M18','password':'UsuarioM18!'})
+        login = _login_prueba( json={'username':'USER_M18','password':'UsuarioM18!'})
         assert login.status_code == 200 and login.json().get('token'), \
             f"username editado debe seguir autenticando: {login.status_code} {login.text}"
 
