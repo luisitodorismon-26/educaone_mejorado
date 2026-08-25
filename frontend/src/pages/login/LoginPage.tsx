@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { GraduationCap, Eye, EyeOff, Loader2 } from 'lucide-react';
 
@@ -11,16 +11,26 @@ export const LoginPage = () => {
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
+  // Mensaje que llega desde el cambio obligatorio de contraseña: el token
+  // quedó invalidado y el usuario tiene que volver a entrar con la nueva.
+  const location = useLocation();
+  const [aviso, setAviso] = useState<string>((location.state as any)?.mensaje || '');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setAviso('');
     setLoading(true);
     try {
       await login(username, password);
-      // Redirect superadmin to their panel
       const storedUser = JSON.parse(localStorage.getItem('user') || '{}');
-      if (storedUser.role === 'superadmin') {
+      // v2.19: si la cuenta arrastra una contraseña temporal puesta por
+      // Dirección, se va DIRECTO al formulario de cambio. Antes se navegaba al
+      // dashboard y el usuario chocaba con un 423 en la primera petición: veía
+      // una pantalla rota antes de que el interceptor lo redirigiera.
+      if (storedUser.must_change_password) {
+        navigate('/cambiar-password', { replace: true });
+      } else if (storedUser.role === 'superadmin') {
         navigate('/superadmin');
       } else {
         navigate('/dashboard');
@@ -97,6 +107,13 @@ export const LoginPage = () => {
               Ingresa tus credenciales para acceder al sistema
             </p>
           </div>
+
+          {aviso && (
+            <div className="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded-xl mb-6 text-sm font-medium flex items-start gap-2 animate-fade-in">
+              <span className="text-green-600 mt-0.5">✓</span>
+              {aviso}
+            </div>
+          )}
 
           {error && (
             <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-xl mb-6 text-sm font-medium flex items-start gap-2 animate-fade-in">

@@ -5,7 +5,7 @@ API Backend FastAPI
 Versión: 2.0 (Producción) - Migrado de Flask a FastAPI
 Incluye: JWT, Rate Limiting, Auditoría, Validaciones
 """
-from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi import FastAPI, Request, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -22,7 +22,7 @@ def today_rd():
     """Retorna date actual en zona horaria RD."""
     return datetime.now(TZ_RD).date()
 from sqlalchemy.orm import Session, joinedload, selectinload
-from sqlalchemy import func, extract, or_, and_
+from sqlalchemy import func, extract, or_, and_, false as sa_false
 import os
 import re
 import jwt
@@ -53,7 +53,7 @@ from models import (
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
     HistorialComunicacionPadres, IndicadorLogro, ItemCompletivo, Notificacion,
     AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
-    AlertaAtendida, init_db
+    AlertaAtendida, PushSubscription, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -460,6 +460,34 @@ async def lifespan(app):
                             logger.warning(f"No se pudo copiar {old} → {new}: {e}")
                             raise
         
+        # === 6b. Notificaciones: campos de Fase A (v2.19) ===
+        # OBLIGATORIO: la verificación post-migración de más abajo compara cada
+        # columna de cada modelo contra el esquema físico y aborta el arranque si
+        # falta alguna. create_all() crea tablas nuevas pero NUNCA agrega columnas
+        # a una tabla que ya existe, así que estos ALTER no son opcionales.
+        if 'notificaciones' in inspector.get_table_names():
+            notif_cols = {c['name'] for c in inspector.get_columns('notificaciones')}
+            nuevas_notif = [
+                ('evento_key', 'VARCHAR(120)'),
+                ('prioridad', 'VARCHAR(20)'),
+                ('push_enviado_at', 'TIMESTAMP'),
+            ]
+            pendientes_notif = [(c, t) for c, t in nuevas_notif if c not in notif_cols]
+            if pendientes_notif:
+                with engine.connect() as conn:
+                    for col, tipo_sql in pendientes_notif:
+                        try:
+                            conn.execute(text(
+                                f'ALTER TABLE notificaciones ADD COLUMN {col} {tipo_sql}'
+                            ))
+                            conn.commit()
+                        except Exception as e:
+                            logger.warning(f"No se pudo agregar notificaciones.{col}: {e}")
+                            raise
+                logger.info(
+                    f"✅ Migración: agregadas {len(pendientes_notif)} columnas a notificaciones"
+                )
+
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
         # Acelera queries frecuentes:
@@ -521,6 +549,29 @@ async def lifespan(app):
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_ano_activo_colegio "
                 "ON ano_escolar (colegio_id) WHERE activo = TRUE AND colegio_id IS NOT NULL"
             ),
+            (
+                'uq_notificacion_usuario_evento',
+                # Deduplicación de Fase A: el mismo evento no puede generar dos
+                # notificaciones al mismo usuario. El predicado excluye NULL de
+                # forma explícita para que las notificaciones históricas (creadas
+                # antes de v2.19, todas con evento_key NULL) no colisionen entre
+                # sí. PostgreSQL ya trata cada NULL como distinto, pero dejarlo
+                # escrito evita que un cambio futuro del motor lo rompa en
+                # silencio y mantiene idéntico el comportamiento en SQLite.
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_notificacion_usuario_evento "
+                "ON notificaciones (usuario_id, evento_key) "
+                "WHERE evento_key IS NOT NULL"
+            ),
+            (
+                'uq_push_subscription_endpoint',
+                # Fase B: el endpoint identifica al dispositivo+navegador. Si el
+                # mismo navegador vuelve a suscribirse (o lo hace otro usuario en
+                # una PC compartida), se ACTUALIZA la fila existente en vez de
+                # crear una segunda, que provocaría pushes duplicados o dirigidos
+                # al usuario equivocado.
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_push_subscription_endpoint "
+                "ON push_subscriptions (endpoint)"
+            ),
         ]
         # Si alguno falla por datos duplicados, NO ocultamos el error: es más
         # seguro abortar el nuevo deploy y sanear los datos que seguir operando
@@ -558,6 +609,8 @@ async def lifespan(app):
             'estudiantes': {'uq_estudiante_colegio_matricula', 'uq_estudiante_curso_no_lista'},
             'asistencias': {'uq_asistencia_general_est_fecha'},
             'ano_escolar': {'uq_ano_activo_colegio'},
+            'notificaciones': {'uq_notificacion_usuario_evento'},
+            'push_subscriptions': {'uq_push_subscription_endpoint'},
         }
         for tabla_nombre, requeridos in indices_requeridos.items():
             existentes = {idx.get('name') for idx in inspector_final.get_indexes(tabla_nombre)}
@@ -1043,6 +1096,196 @@ def notificar_rol(db: Session, colegio_id: int, role: str, titulo: str, mensaje:
     for u in usuarios:
         crear_notificacion(db, u.id, titulo, mensaje, tipo, link, colegio_id)
 
+
+# ====================================================================
+# v2.19 — Fase A: función central de notificaciones
+# ====================================================================
+# ====================================================================
+# v2.19 — CONTINUIDAD INSTITUCIONAL
+# ====================================================================
+# Los datos generados dentro de EducaOne pertenecen al COLEGIO, no a la cuenta
+# personal del profesor. `profesor_id` conserva la AUTORÍA (quién lo registró y
+# cuándo) pero no debe bloquear que el profesor actualmente asignado continúe
+# el trabajo del curso.
+#
+# Antes, estos listados filtraban por `profesor_id == current_user.id`. Cuando
+# un profesor se iba a mitad del período, el que entraba veía el curso vacío:
+# los indicadores, ítems completivos y evaluaciones internas del anterior le
+# resultaban invisibles, y terminaba cargándolos de nuevo en paralelo.
+#
+# La autorización pasa a depender de: colegio + asignación ACTIVA + curso +
+# asignatura. No amplía el acceso: un profesor sigue viendo únicamente los
+# cursos y asignaturas que tiene asignados hoy, dentro de su colegio.
+def filtrar_por_asignacion_activa(query, modelo, db: Session, current_user):
+    """
+    Acotar un listado de material del curso a las asignaciones ACTIVAS del
+    profesor, en vez de a lo que él mismo creó.
+
+    Solo aplica a rol 'profesor'. Dirección y coordinación ya pasan por
+    tenant_filter y ven todo el colegio.
+
+    El modelo debe tener curso_id y asignatura_id. Si el profesor no tiene
+    ninguna asignación activa, el listado queda vacío (no "todo el colegio").
+    """
+    if not current_user or current_user.role != 'profesor':
+        return query
+
+    pares = db.query(
+        AsignacionProfesor.curso_id, AsignacionProfesor.asignatura_id
+    ).filter(
+        AsignacionProfesor.profesor_id == current_user.id,
+        AsignacionProfesor.colegio_id == current_user.colegio_id,
+        AsignacionProfesor.activo == True,
+    ).all()
+
+    if not pares:
+        # Sin asignaciones activas no ve nada. Nunca se degrada a "sin filtro".
+        return query.filter(sa_false())
+
+    condiciones = [
+        and_(modelo.curso_id == c, modelo.asignatura_id == a)
+        for c, a in pares if c and a
+    ]
+    if not condiciones:
+        return query.filter(sa_false())
+    return query.filter(or_(*condiciones))
+
+
+def puede_editar_registro_ajeno(current_user, registro) -> bool:
+    """
+    ¿Puede este usuario MODIFICAR un registro que creó otra persona?
+
+    Continuidad institucional aplica a la LECTURA y a continuar procesos
+    abiertos. Para edición y borrado somos conservadores: el profesor nuevo no
+    reescribe ni borra en silencio el material del anterior. Dirección y
+    coordinación sí pueden, porque es su rol supervisar.
+    """
+    if not current_user:
+        return False
+    if current_user.role in ('direccion', 'coordinador', 'superadmin'):
+        return True
+    autor = getattr(registro, 'profesor_id', None)
+    return autor is None or autor == current_user.id
+
+
+def resolver_destinatarios(db: Session, colegio_id: int, roles=None, usuario_ids=None,
+                           excluir_usuario_id: int = None):
+    """
+    Resolver a qué usuario_id enviar, SIEMPRE acotado a un colegio.
+
+    colegio_id es obligatorio y no acepta None: sin él, una consulta por rol
+    devolvería usuarios de todos los colegios. Es la barrera multi-tenant de
+    este módulo y por eso se valida acá y no en cada llamador.
+    """
+    if not colegio_id:
+        return []
+    ids = set()
+    if roles:
+        if isinstance(roles, str):
+            roles = [roles]
+        filas = db.query(Usuario.id).filter(
+            Usuario.colegio_id == colegio_id,
+            Usuario.role.in_(roles),
+            Usuario.activo == True,
+        ).all()
+        ids.update(f[0] for f in filas)
+    if usuario_ids:
+        if isinstance(usuario_ids, int):
+            usuario_ids = [usuario_ids]
+        # Incluso con IDs explícitos verificamos el colegio: un ID que venga de
+        # un objeto de negocio podría pertenecer a otro tenant.
+        filas = db.query(Usuario.id).filter(
+            Usuario.id.in_([i for i in usuario_ids if i]),
+            Usuario.colegio_id == colegio_id,
+            Usuario.activo == True,
+        ).all()
+        ids.update(f[0] for f in filas)
+    if excluir_usuario_id:
+        ids.discard(excluir_usuario_id)
+    return sorted(ids)
+
+
+def notify(db: Session, colegio_id: int, titulo: str, mensaje: str = '',
+           roles=None, usuario_ids=None, tipo: str = 'info', prioridad: str = 'normal',
+           link: str = '', evento_key: str = None, excluir_usuario_id: int = None):
+    """
+    Punto único de creación de notificaciones (Fase A).
+
+    Contrato: NUNCA lanza excepción y NUNCA hace commit. El llamador ya hizo
+    commit del evento académico; esta función solo agrega filas a la misma
+    sesión para que entren en el commit siguiente o queden descartadas sin
+    afectar la operación original.
+
+    evento_key identifica el EVENTO ('reporte:123:creado'). El índice único
+    (usuario_id, evento_key) impide que el mismo evento notifique dos veces al
+    mismo usuario; acá lo comprobamos antes de insertar para no depender de
+    capturar un IntegrityError, que abortaría la transacción del llamador.
+    """
+    try:
+        destinatarios = resolver_destinatarios(
+            db, colegio_id, roles=roles, usuario_ids=usuario_ids,
+            excluir_usuario_id=excluir_usuario_id
+        )
+        if not destinatarios:
+            return []
+
+        ya_notificados = set()
+        if evento_key:
+            filas = db.query(Notificacion.usuario_id).filter(
+                Notificacion.evento_key == evento_key,
+                Notificacion.usuario_id.in_(destinatarios),
+            ).all()
+            ya_notificados = {f[0] for f in filas}
+
+        creadas = []
+        for uid in destinatarios:
+            if uid in ya_notificados:
+                continue
+            n = Notificacion(
+                usuario_id=uid,
+                colegio_id=colegio_id,
+                titulo=titulo,
+                mensaje=mensaje or '',
+                tipo=tipo,
+                prioridad=prioridad,
+                link=link or '',
+                evento_key=evento_key,
+            )
+            db.add(n)
+            creadas.append(n)
+        if creadas:
+            db.flush()
+        return creadas
+    except Exception as e:
+        # Una notificación jamás debe tumbar la operación académica que la originó.
+        logging.getLogger('educaone.notify').warning(f'notify() falló: {e}')
+        return []
+
+
+def despachar_push(background_tasks, notificaciones):
+    """
+    Programar el envío Web Push de notificaciones ya creadas (Fase B).
+
+    Se llama DESPUÉS del db.commit() del llamador: solo entonces las filas
+    tienen ID definitivo y existen de verdad en la base.
+
+    Pasa únicamente IDs primitivos, nunca objetos ORM: la tarea corre cuando la
+    respuesta HTTP ya salió y la sesión del request está cerrada.
+
+    Como todo en este módulo, nunca lanza excepción.
+    """
+    try:
+        if not background_tasks or not notificaciones:
+            return
+        from push_service import push_configurado, enviar_push_para_notificaciones
+        if not push_configurado():
+            return
+        ids = [n.id for n in notificaciones if getattr(n, 'id', None)]
+        if ids:
+            background_tasks.add_task(enviar_push_para_notificaciones, ids)
+    except Exception as e:
+        logging.getLogger('educaone.notify').warning(f'despachar_push() falló: {e}')
+
 def log_auditoria(db: Session, accion, tabla, registro_id=None, datos_anteriores=None,
                    datos_nuevos=None, user=None, request: Request = None):
     """Registra acción en auditoría.
@@ -1503,6 +1746,22 @@ async def logout(request: Request, db: Session = Depends(get_db), current_user: 
         colegio_id=current_user.colegio_id
     )
     db.add(audit)
+
+    # v2.19 Fase B — PC compartida del colegio.
+    # Si el frontend manda el endpoint push de ESTE navegador, lo damos de baja.
+    # Solo ese: un profesor que cierra sesión en la PC del aula no debe perder
+    # las notificaciones de su propio teléfono.
+    try:
+        _body = await request.json()
+    except Exception:
+        _body = {}
+    _endpoint_actual = (_body or {}).get('push_endpoint')
+    if _endpoint_actual:
+        db.query(PushSubscription).filter(
+            PushSubscription.endpoint == _endpoint_actual,
+            PushSubscription.usuario_id == current_user.id,
+        ).delete(synchronize_session=False)
+
     db.commit()
     return {'message': 'Logout exitoso'}
 
@@ -2666,7 +2925,23 @@ async def delete_curso(id, request: Request, db: Session = Depends(get_db), curr
 
 @app.get("/api/usuarios")
 async def get_usuarios(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    usuarios = tenant_filter(db.query(Usuario), Usuario, current_user).filter_by(activo=True).all()
+    """
+    Listado de usuarios del colegio.
+
+    v2.19: ?estado=activos (por defecto) | inactivos | todos.
+    Los profesores que dejaron el colegio quedan INACTIVOS, nunca se borran:
+    su historial (reportes, asistencias, evaluaciones) sigue apuntando a su
+    cuenta. Dirección necesita poder verlos para consultar ese historial.
+    El default sigue siendo 'activos' para no cambiar lo que ve el frontend
+    existente.
+    """
+    estado = (request.query_params.get('estado') or 'activos').strip().lower()
+    query = tenant_filter(db.query(Usuario), Usuario, current_user)
+    if estado == 'inactivos':
+        query = query.filter(Usuario.activo == False)
+    elif estado != 'todos':
+        query = query.filter(Usuario.activo == True)
+    usuarios = query.order_by(Usuario.activo.desc(), Usuario.nombre).all()
     return [u.to_dict() for u in usuarios]
 
 @app.get("/api/usuarios/{id}")
@@ -2718,24 +2993,26 @@ async def crear_usuario(request: Request, db: Session = Depends(get_db), current
     if email and not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
         return JSONResponse({'error': 'Formato de email inválido'}, status_code=400)
     
-    # Validar contraseña.
-    # Si el caller no provee password, generamos una fuerte y forzamos
-    # cambio al primer login del usuario (must_change_password=True).
-    # Si el caller la provee, asumimos que ya la coordinó por canal seguro
-    # con el usuario; pero igualmente exigimos longitud mínima 8.
-    password_provista = (data.get('password') or '').strip()
-    must_change = False
-    if password_provista:
-        password = password_provista
-        # Usa validación centralizada en security.py (mín 8, mayús, minús, número)
-        from security import validate_password
-        ok, msg = validate_password(password)
-        if not ok:
-            return JSONResponse({'error': msg}, status_code=400)
-    else:
-        from models import _generar_password_inicial
-        password = _generar_password_inicial()
-        must_change = True
+    # v2.19: la contraseña inicial la escribe SIEMPRE Dirección. Ya no se
+    # genera automáticamente: una clave que el sistema inventa y muestra en
+    # pantalla termina anotada en un papel o en un WhatsApp.
+    #
+    # Y toda cuenta nueva nace con must_change_password=True, incluso cuando la
+    # escribió Dirección: esa clave es TEMPORAL y la conoce una segunda
+    # persona, así que el usuario debe cambiarla en su primer acceso.
+    password = (data.get('password') or '').strip()
+    if not password:
+        return JSONResponse(
+            {'error': 'La contraseña inicial es requerida. Escríbala y compártala con el usuario; '
+                      'el sistema le pedirá cambiarla en su primer acceso.'},
+            status_code=400
+        )
+    # Validación centralizada en security.py (mín 8, mayús, minús, número)
+    from security import validate_password
+    ok, msg = validate_password(password)
+    if not ok:
+        return JSONResponse({'error': msg}, status_code=400)
+    must_change = True
     
     if db.query(Usuario).filter_by(username=username).first():
         return JSONResponse({'error': 'El usuario ya existe'}, status_code=400)
@@ -2768,11 +3045,9 @@ async def crear_usuario(request: Request, db: Session = Depends(get_db), current
     logger.info(f'Usuario creado: {username} por {current_user.username}')
     
     response_body = {'message': 'Usuario creado', 'id': usuario.id, 'must_change_password': must_change}
-    # Si la password fue generada, devolverla UNA SOLA VEZ al admin para que
-    # se la pase al usuario por canal seguro. Si fue provista, no la repetimos.
-    if not password_provista:
-        response_body['password_temporal'] = password
-    
+    # v2.19: la contraseña la escribió Dirección, así que ya la conoce. No se
+    # devuelve nunca en la respuesta: una clave que viaja en un JSON termina en
+    # los logs del navegador y en el historial de red.
     return JSONResponse(response_body, status_code=201)
 
 @app.put("/api/usuarios/{id}")
@@ -2882,18 +3157,18 @@ async def reset_password_usuario(id, request: Request, db: Session = Depends(get
     usuario = get_tenant_or_404(db, Usuario, id, current_user, name='usuario')
     data = await request.json() or {}
     
-    # Nueva contraseña o generar una temporal fuerte
-    nueva_password = data.get('password')
-    
+    # v2.19: la contraseña la escribe SIEMPRE quien administra. Ya no se genera
+    # automáticamente en acciones humanas de gestión de usuarios.
+    nueva_password = (data.get('password') or '').strip()
     if not nueva_password:
-        # Password aleatoria fuerte (cumple validador del endpoint /cambiar-password)
-        from models import _generar_password_inicial
-        nueva_password = _generar_password_inicial()
-    else:
-        nueva_password = str(nueva_password)
-        ok, msg = validate_password(nueva_password)
-        if not ok:
-            return JSONResponse({'error': msg}, status_code=400)
+        return JSONResponse(
+            {'error': 'La contraseña temporal es requerida. Escríbala y compártala con el '
+                      'usuario; el sistema le pedirá cambiarla en su próximo acceso.'},
+            status_code=400
+        )
+    ok, msg = validate_password(nueva_password)
+    if not ok:
+        return JSONResponse({'error': msg}, status_code=400)
     
     usuario.set_password(nueva_password)
     usuario.must_change_password = True  # forzar cambio al primer login
@@ -2907,6 +3182,234 @@ async def reset_password_usuario(id, request: Request, db: Session = Depends(get
         'usuario': usuario.username,
         'must_change_password': True,
     }
+
+@app.post("/api/usuarios/{id}/reemplazar")
+async def reemplazar_profesor(id, request: Request, db: Session = Depends(get_db),
+                              current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    v2.19 — Reemplazo de un profesor que deja el colegio.
+
+    Filosofía: los datos pertenecen al COLEGIO, la cuenta pertenece a la
+    PERSONA. Por eso:
+
+      - La cuenta saliente queda INACTIVA. Nunca se borra ni se reutiliza:
+        reutilizarla haría que el historial del anterior apareciera como del
+        nuevo, y que el nuevo heredara notificaciones y sesiones ajenas.
+      - Se crea una cuenta NUEVA e independiente para quien entra.
+      - Se transfieren SOLO las asignaciones activas y los horarios vigentes:
+        lo que define el trabajo de hoy.
+      - NO se reescribe ninguna autoría. Reportes, asistencias, evaluaciones,
+        indicadores e ítems siguen diciendo quién los registró y cuándo.
+      - La continuidad del material la resuelve filtrar_por_asignacion_activa():
+        el nuevo VE el material del curso por tener la asignación, sin que su
+        nombre aparezca como creador de nada anterior.
+      - Se revocan sesión y dispositivos push del saliente.
+      - Todo queda en auditoría.
+
+    Body:
+        {"nuevo": {username, password, nombre, apellido, email?, telefono?,
+                   cedula?, nivel_asignado?}}
+    """
+    saliente = get_tenant_or_404(db, Usuario, id, current_user, name='usuario')
+    if saliente.role != 'profesor':
+        return JSONResponse(
+            {'error': 'Solo se puede reemplazar a un usuario con rol profesor'},
+            status_code=400
+        )
+    if not saliente.activo:
+        return JSONResponse({'error': 'Ese profesor ya está inactivo'}, status_code=400)
+    if saliente.id == current_user.id:
+        return JSONResponse({'error': 'No puede reemplazarse a sí mismo'}, status_code=400)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+    nuevo_data = (data or {}).get('nuevo') or {}
+
+    username = (nuevo_data.get('username') or '').strip().lower()[:50]
+    password = (nuevo_data.get('password') or '').strip()
+    nombre = (nuevo_data.get('nombre') or '').strip()[:100]
+    if not username or not nombre:
+        return JSONResponse({'error': 'username y nombre del nuevo profesor son requeridos'},
+                            status_code=400)
+    if not password:
+        return JSONResponse(
+            {'error': 'La contraseña inicial es requerida. Escríbala y compártala con el nuevo '
+                      'profesor; el sistema le pedirá cambiarla en su primer acceso.'},
+            status_code=400
+        )
+    ok, msg = validate_password(password)
+    if not ok:
+        return JSONResponse({'error': msg}, status_code=400)
+    if db.query(Usuario).filter_by(username=username).first():
+        return JSONResponse({'error': 'Ese nombre de usuario ya existe'}, status_code=400)
+
+    # --- 1. Cuenta nueva, independiente ---
+    nuevo = Usuario(
+        username=username,
+        nombre=nombre,
+        apellido=(nuevo_data.get('apellido') or '').strip()[:100],
+        email=(nuevo_data.get('email') or '').strip().lower()[:100] or None,
+        telefono=(nuevo_data.get('telefono') or '').strip()[:20] or None,
+        cedula=(nuevo_data.get('cedula') or '').strip()[:20] or None,
+        role='profesor',
+        colegio_id=current_user.colegio_id,
+        nivel_asignado=(nuevo_data.get('nivel_asignado') or saliente.nivel_asignado),
+        tanda_id=saliente.tanda_id,
+        activo=True,
+        # Clave temporal escrita por Dirección: la conoce una segunda persona,
+        # así que el profesor debe cambiarla en su primer acceso.
+        must_change_password=True,
+    )
+    nuevo.set_password(password)
+    db.add(nuevo)
+    db.flush()
+
+    # --- 2. VALIDAR TODO antes de mover nada ---
+    # El reemplazo es una sola transacción: se valida primero y recién después
+    # se aplica. Un fallo a mitad de camino dejaría al saliente inactivo sin
+    # que el nuevo tenga sus cursos, y el colegio se quedaría sin nadie.
+    asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        profesor_id=saliente.id, activo=True
+    ).all()
+
+    a_transferir = []
+    a_desactivar = []
+    for a in asignaciones:
+        # Colisión: el nuevo YA tiene ese curso+asignatura. No se duplica el
+        # par; se desactiva la del saliente y se conserva la que ya existía.
+        ya = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=nuevo.id, curso_id=a.curso_id,
+            asignatura_id=a.asignatura_id, activo=True
+        ).first()
+        (a_desactivar if ya else a_transferir).append(a)
+
+    ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    q_horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(profesor_id=saliente.id)
+    if ano_activo and hasattr(Horario, 'ano_escolar_id'):
+        q_horarios = q_horarios.filter(
+            or_(Horario.ano_escolar_id == ano_activo.id, Horario.ano_escolar_id.is_(None))
+        )
+    horarios = q_horarios.all()
+
+    # Colisión de horario: si el nuevo ya tiene un bloque que se solapa en el
+    # mismo día, no se puede transferir — quedaría en dos aulas a la vez.
+    # Se detecta ANTES de tocar nada y se aborta el reemplazo completo.
+    propios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(
+        profesor_id=nuevo.id
+    ).all()
+    conflictos = []
+    for h in horarios:
+        for p in propios:
+            if p.dia != h.dia:
+                continue
+            # Se solapan si empieza antes de que el otro termine y viceversa.
+            if str(h.hora_inicio) < str(p.hora_fin) and str(p.hora_inicio) < str(h.hora_fin):
+                conflictos.append(
+                    f'{h.dia} {h.hora_inicio}-{h.hora_fin} choca con un bloque que '
+                    f'{nuevo.nombre_completo} ya tiene ({p.hora_inicio}-{p.hora_fin})'
+                )
+    if conflictos:
+        db.rollback()
+        return JSONResponse({
+            'error': 'El profesor nuevo tiene conflictos de horario. No se hizo ningún cambio.',
+            'conflictos': conflictos,
+        }, status_code=409)
+
+    # --- 3. Aplicar (ya validado) ---
+    for a in a_desactivar:
+        a.activo = False
+    for a in a_transferir:
+        a.profesor_id = nuevo.id
+    transferidas = len(a_transferir)
+    for h in horarios:
+        h.profesor_id = nuevo.id
+
+    # --- 4. ConfigEvalInterna: copiar los pesos, sin tocar la del saliente ---
+    # Solo de las asignaturas REALMENTE transferidas: si una asignación no se
+    # movió (porque el nuevo ya la tenía), su config tampoco se copia — el
+    # nuevo ya venía trabajando esa asignatura con sus propios criterios.
+    configs_copiadas = 0
+    asignaturas_transferidas = {a.asignatura_id for a in a_transferir if a.asignatura_id}
+    for asignatura_id in asignaturas_transferidas:
+        propia = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(
+            profesor_id=nuevo.id, asignatura_id=asignatura_id
+        ).first()
+        if propia:
+            continue  # ya tiene la suya: NO se sobrescribe
+        # Exclusivamente la del SALIENTE, nunca "alguna config vigente" del colegio.
+        vieja = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(
+            profesor_id=saliente.id, asignatura_id=asignatura_id
+        ).first()
+        if not vieja:
+            continue
+        copia = ConfigEvalInterna(
+            colegio_id=current_user.colegio_id,
+            profesor_id=nuevo.id,
+            asignatura_id=asignatura_id,
+        )
+        # Copiar solo los pesos; la configuración original queda intacta y
+        # sigue perteneciendo al profesor anterior.
+        for campo in ('peso_conducta', 'peso_cuaderno', 'peso_participacion',
+                      'peso_trabajo', 'peso_asistencia', 'peso_exposicion'):
+            if hasattr(vieja, campo) and hasattr(copia, campo):
+                setattr(copia, campo, getattr(vieja, campo))
+        db.add(copia)
+        configs_copiadas += 1
+
+    # --- 5. Cerrar el acceso del saliente ---
+    saliente.activo = False
+    # token_version invalida cualquier JWT suyo que siga vivo.
+    saliente.token_version = (saliente.token_version or 0) + 1
+    push_borrados = db.query(PushSubscription).filter(
+        PushSubscription.usuario_id == saliente.id
+    ).delete(synchronize_session=False)
+
+    # --- 6. Auditoría del reemplazo ---
+    log_auditoria(
+        db, 'reemplazo_profesor', 'usuarios', saliente.id, None,
+        {
+            'saliente_id': saliente.id,
+            'saliente_username': saliente.username,
+            'nuevo_id': nuevo.id,
+            'nuevo_username': nuevo.username,
+            'asignaciones_transferidas': transferidas,
+            'horarios_transferidos': len(horarios),
+            'configs_eval_copiadas': configs_copiadas,
+            'push_revocados': push_borrados,
+        },
+        user=current_user, request=request
+    )
+
+    try:
+        db.commit()
+    except Exception as e:
+        # Cualquier fallo al persistir deshace TODO: la cuenta nueva, las
+        # transferencias, la copia de configuración y la baja del saliente.
+        # No puede quedar un estado a medias con el colegio sin profesor.
+        db.rollback()
+        logger.exception(f'Reemplazo de profesor falló, rollback completo: {e}')
+        return JSONResponse(
+            {'error': 'No se pudo completar el reemplazo. No se aplicó ningún cambio.'},
+            status_code=500
+        )
+
+    return {
+        'message': f'{saliente.nombre_completo} quedó inactivo. '
+                   f'{nuevo.nombre_completo} recibió sus asignaciones vigentes.',
+        'saliente': {'id': saliente.id, 'username': saliente.username, 'activo': False},
+        'nuevo': {'id': nuevo.id, 'username': nuevo.username,
+                  'must_change_password': True},
+        'transferido': {
+            'asignaciones': transferidas,
+            'horarios': len(horarios),
+            'configuraciones_eval_interna': configs_copiadas,
+        },
+        'historial_conservado': True,
+        'push_revocados': push_borrados,
+    }
+
 
 @app.get("/api/profesores")
 async def get_profesores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
@@ -3472,7 +3975,7 @@ async def get_asignaciones(request: Request, db: Session = Depends(get_db), curr
 
 
 @app.post("/api/asignaciones")
-async def crear_asignacion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def crear_asignacion(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Asignar profesor a (curso, asignatura). Valida que TODOS los FK sean del mismo colegio."""
     try:
         data = await request.json()
@@ -3510,6 +4013,22 @@ async def crear_asignacion(request: Request, db: Session = Depends(get_db), curr
         existe.es_titular = bool(data.get('es_titular', existe.es_titular))
         existe.ano_escolar_id = ano_activo.id if ano_activo else existe.ano_escolar_id
         db.commit()
+
+        # v2.19 Fase A — reactivar es una reasignación: el profesor debe saberlo.
+        _notifs = notify(
+            db,
+            colegio_id=current_user.colegio_id,
+            usuario_ids=[profesor.id],
+            titulo='📚 Asignatura reasignada',
+            mensaje=f'{asignatura.nombre} — {curso.nombre_completo}',
+            tipo='asignacion',
+            prioridad='importante',
+            link='/asignaciones',
+            evento_key=f'asignacion:{existe.id}:reactivada',
+        )
+        db.commit()
+        despachar_push(background_tasks, _notifs)
+
         cache_clear_tenant(current_user.colegio_id)
         return JSONResponse(
             {'message': 'Asignación reactivada', 'id': existe.id, 'asignacion': existe.to_dict()},
@@ -3528,6 +4047,22 @@ async def crear_asignacion(request: Request, db: Session = Depends(get_db), curr
     )
     db.add(asig)
     db.commit()
+
+    # v2.19 Fase A — el profesor tiene una obligación nueva: debe enterarse.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=[profesor.id],
+        titulo='📚 Nueva asignación de asignatura',
+        mensaje=f'{asignatura.nombre} — {curso.nombre_completo}',
+        tipo='asignacion',
+        prioridad='importante',
+        link='/asignaciones',
+        evento_key=f'asignacion:{asig.id}:creada',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     cache_clear_tenant(current_user.colegio_id)
     return JSONResponse(
         {'message': 'Asignación creada', 'id': asig.id, 'asignacion': asig.to_dict()},
@@ -3617,7 +4152,7 @@ def _validar_hora(valor: str, campo: str):
 
 
 @app.post("/api/horarios")
-async def crear_horario(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def crear_horario(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Crear horario. Valida que curso, asignatura y profesor pertenezcan al colegio del caller."""
     try:
         data = await request.json()
@@ -3671,12 +4206,29 @@ async def crear_horario(request: Request, db: Session = Depends(get_db), current
     )
     db.add(horario)
     db.commit()
+
+    # v2.19 Fase A — cambio de horario/aula: el profesor debe saber dónde estar.
+    _aula = f' — Aula {horario.aula}' if horario.aula else ''
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=[profesor.id],
+        titulo='🗓️ Nuevo bloque en su horario',
+        mensaje=f'{horario.dia} {horario.hora_inicio}-{horario.hora_fin}{_aula}',
+        tipo='horario',
+        prioridad='importante',
+        link='/horarios',
+        evento_key=f'horario:{horario.id}:creado',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     cache_clear_tenant(current_user.colegio_id)
     return JSONResponse({'message': 'Horario creado', 'id': horario.id, 'horario': horario.to_dict()}, status_code=201)
 
 
 @app.put("/api/horarios/{id}")
-async def update_horario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def update_horario(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Editar un horario existente. Valida tenant del horario y de los nuevos FK."""
     # Validar que el horario sea del colegio del caller
     horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
@@ -3703,6 +4255,7 @@ async def update_horario(id, request: Request, db: Session = Depends(get_db), cu
             horario.asignatura_id = None
     
     # Profesor (validar tenant)
+    _profesor_anterior_id = horario.profesor_id
     if 'profesor_id' in data and data['profesor_id'] is not None:
         profesor = get_tenant_or_404(db, Usuario, data['profesor_id'], current_user, name='profesor')
         if profesor.role != 'profesor':
@@ -3735,10 +4288,36 @@ async def update_horario(id, request: Request, db: Session = Depends(get_db), cu
     if horario.hora_inicio >= horario.hora_fin:
         return JSONResponse({'error': 'hora_fin debe ser mayor que hora_inicio'}, status_code=400)
     
+    _aula_antes = horario.aula
     if 'aula' in data:
         horario.aula = data['aula'] or None
-    
+
+    # v2.19 Fase A — capturar a quién avisar ANTES del commit. Si dirección
+    # reasignó el bloque a otro profesor, el saliente también debe enterarse.
+    _profesores_a_avisar = {horario.profesor_id}
+    if _profesor_anterior_id and _profesor_anterior_id != horario.profesor_id:
+        _profesores_a_avisar.add(_profesor_anterior_id)
+    _cambio_aula = ('aula' in data) and (_aula_antes != horario.aula)
+
     db.commit()
+
+    _aula_txt = f' — Aula {horario.aula}' if horario.aula else ''
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=sorted(_profesores_a_avisar),
+        titulo=('🚪 Cambio de aula' if _cambio_aula else '🗓️ Cambio en su horario'),
+        mensaje=f'{horario.dia} {horario.hora_inicio}-{horario.hora_fin}{_aula_txt}',
+        tipo='horario',
+        prioridad='importante',
+        link='/horarios',
+        # La marca de tiempo hace que cada edición sea un evento distinto: un
+        # segundo cambio de aula el mismo día SÍ debe volver a avisar.
+        evento_key=f'horario:{horario.id}:modificado:{int(now_rd().timestamp())}',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     cache_clear_tenant(current_user.colegio_id)
     return {'message': 'Horario actualizado', 'horario': horario.to_dict()}
 
@@ -5372,7 +5951,7 @@ async def get_solicitudes_edicion(request: Request, db: Session = Depends(get_db
     } for s in solicitudes]
 
 @app.post("/api/solicitudes-edicion")
-async def crear_solicitud_edicion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def crear_solicitud_edicion(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Crear solicitud de edición de nota en período cerrado"""
     data = await request.json()
 
@@ -5407,11 +5986,26 @@ async def crear_solicitud_edicion(request: Request, db: Session = Depends(get_db
     )
     db.add(solicitud)
     db.commit()
-    
+
+    # v2.19 Fase A — Dirección es quien aprueba/rechaza: debe enterarse sin recargar.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        roles=['direccion'],
+        titulo='📝 Nueva solicitud de edición de nota',
+        mensaje=f'{current_user.nombre_completo} solicita editar una calificación.',
+        tipo='solicitud',
+        prioridad='importante',
+        link='/solicitudes-edicion',
+        evento_key=f'solicitud:{solicitud.id}:creada',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     return JSONResponse({'message': 'Solicitud creada', 'id': solicitud.id}, status_code=201)
 
 @app.post("/api/solicitudes-edicion/{id}/aprobar")
-async def aprobar_solicitud_edicion(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def aprobar_solicitud_edicion(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Aprobar solicitud y aplicar cambio"""
     solicitud = get_tenant_or_404(db, SolicitudEdicionNota, id, current_user, name='solicitudedicionnota')
     data = await request.json()
@@ -5441,10 +6035,26 @@ async def aprobar_solicitud_edicion(id, request: Request, db: Session = Depends(
                   {'campo': solicitud.campo, 'valor_nuevo': solicitud.valor_nuevo}, user=current_user, request=request)
     
     db.commit()
+
+    # v2.19 Fase A — devolver la respuesta al profesor que la originó.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=[solicitud.profesor_id],
+        titulo='✅ Su solicitud de edición fue aprobada',
+        mensaje='El cambio de calificación ya fue aplicado.',
+        tipo='solicitud',
+        prioridad='normal',
+        link='/calificaciones',
+        evento_key=f'solicitud:{solicitud.id}:aprobada',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     return {'message': 'Solicitud aprobada y cambio aplicado'}
 
 @app.post("/api/solicitudes-edicion/{id}/rechazar")
-async def rechazar_solicitud_edicion(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def rechazar_solicitud_edicion(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Rechazar solicitud de edición"""
     solicitud = get_tenant_or_404(db, SolicitudEdicionNota, id, current_user, name='solicitudedicionnota')
     data = await request.json()
@@ -5455,6 +6065,22 @@ async def rechazar_solicitud_edicion(id, request: Request, db: Session = Depends
     solicitud.comentario_revision = data.get('comentario', 'Rechazada sin comentario')
     
     db.commit()
+
+    # v2.19 Fase A — el profesor debe saber que fue rechazada y por qué.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=[solicitud.profesor_id],
+        titulo='❌ Su solicitud de edición fue rechazada',
+        mensaje=(solicitud.comentario_revision or 'Consulte con Dirección.')[:150],
+        tipo='solicitud',
+        prioridad='importante',
+        link='/calificaciones',
+        evento_key=f'solicitud:{solicitud.id}:rechazada',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     return {'message': 'Solicitud rechazada'}
 
 # ============== PLANTILLAS ==============
@@ -6853,7 +7479,7 @@ def _generar_numero_reporte(db: Session, colegio_id: int) -> str:
 
 
 @app.post("/api/reportes")
-async def crear_reporte(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """
     Crear nuevo reporte de conducta.
     
@@ -6911,7 +7537,26 @@ async def crear_reporte(request: Request, db: Session = Depends(get_db), current
     )
     db.add(reporte)
     db.commit()
-    
+
+    # v2.19 Fase A — avisar a quienes deben atender el reporte.
+    # Va DESPUÉS del commit: el reporte ya está persistido pase lo que pase acá.
+    _grav = (reporte.gravedad or 'leve').lower()
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        roles=['direccion', 'coordinador'],
+        excluir_usuario_id=current_user.id,
+        titulo=('🔴 URGENTE: nuevo reporte de conducta' if _grav == 'grave'
+                else '📋 Nuevo reporte de conducta'),
+        mensaje=(reporte.titulo or '')[:150],
+        tipo='reporte',
+        prioridad='urgente' if _grav == 'grave' else 'importante',
+        link='/reportes',
+        evento_key=f'reporte:{reporte.id}:creado',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     cache_clear(f'stats:{current_user.colegio_id}')
     cache_clear(f'dash_all:{current_user.id}')
     return JSONResponse({
@@ -6922,7 +7567,7 @@ async def crear_reporte(request: Request, db: Session = Depends(get_db), current
 
 
 @app.post("/api/reportes/{id}/responder")
-async def responder_reporte(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
+async def responder_reporte(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
     """
     Responder/completar un reporte de conducta con los 3 campos guiados v2.11:
     - acciones_centro: qué hizo el centro educativo (obligatorio)
@@ -6954,6 +7599,23 @@ async def responder_reporte(id, request: Request, db: Session = Depends(get_db),
     reporte.fecha_respuesta = now_rd()
     
     db.commit()
+
+    # v2.19 Fase A — avisar a quien levantó el reporte que ya fue atendido.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=[reporte.reportado_por],
+        excluir_usuario_id=current_user.id,
+        titulo='✅ Su reporte fue respondido',
+        mensaje=(reporte.titulo or '')[:150],
+        tipo='reporte',
+        prioridad='normal',
+        link='/reportes',
+        evento_key=f'reporte:{reporte.id}:respondido',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     return {
         'message': 'Reporte respondido',
         'estado': reporte.estado,
@@ -7154,7 +7816,7 @@ async def get_casos_psicologia(request: Request, db: Session = Depends(get_db), 
     } for c in casos]
 
 @app.post("/api/psicologia/solicitar")
-async def solicitar_atencion_psicologia(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def solicitar_atencion_psicologia(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Solicitar atención psicológica para un estudiante - Profesor, Coordinador pueden solicitar"""
     if current_user.role not in ['profesor', 'coordinador', 'direccion']:
         return JSONResponse({'error': 'No tiene permiso para solicitar atención'}, status_code=403)
@@ -7175,21 +7837,59 @@ async def solicitar_atencion_psicologia(request: Request, db: Session = Depends(
     )
     db.add(caso)
     db.commit()
-    
+
+    # v2.19 Fase A — avisar a Psicología.
+    # PRIVACIDAD: el texto NO nombra al estudiante ni describe el motivo. Este
+    # título puede terminar en la pantalla bloqueada de un teléfono; el detalle
+    # solo se ve dentro de EducaOne, después de autenticar y autorizar.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        roles=['psicologia'],
+        excluir_usuario_id=current_user.id,
+        titulo=('🔴 Nueva solicitud urgente de Psicología'
+                if (caso.urgencia or '').lower() == 'urgente'
+                else '🧠 Nueva solicitud de Psicología'),
+        mensaje='Hay una solicitud de atención disponible en EducaOne.',
+        tipo='psicologia',
+        prioridad='urgente' if (caso.urgencia or '').lower() == 'urgente' else 'importante',
+        link='/psicologia',
+        evento_key=f'psicologia:{caso.id}:solicitado',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     return JSONResponse({'message': 'Solicitud creada', 'id': caso.id}, status_code=201)
 
 @app.post("/api/psicologia/casos/{id}/tomar")
-async def tomar_caso_psicologia(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('psicologia'))):
+async def tomar_caso_psicologia(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('psicologia'))):
     """Psicólogo toma un caso"""
     caso = get_tenant_or_404(db, CasoPsicologia, id, current_user, name='casopsicologia')
     caso.asignado_a = current_user.id
     caso.estado = 'en_proceso'
     caso.fecha_actualizacion = now_rd()
     db.commit()
+
+    # v2.19 Fase A — quien solicitó sabe que ya fue tomado. Sin datos del menor.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=[caso.solicitado_por],
+        excluir_usuario_id=current_user.id,
+        titulo='🧠 Su solicitud de Psicología fue tomada',
+        mensaje='El caso está siendo atendido. Consulte el detalle en EducaOne.',
+        tipo='psicologia',
+        prioridad='normal',
+        link='/psicologia',
+        evento_key=f'psicologia:{caso.id}:tomado',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     return {'message': 'Caso tomado'}
 
 @app.post("/api/psicologia/casos/{id}/actualizar")
-async def actualizar_caso_psicologia(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('psicologia'))):
+async def actualizar_caso_psicologia(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('psicologia'))):
     """Actualizar estado de un caso de psicología con notas y recomendaciones"""
     caso = get_tenant_or_404(db, CasoPsicologia, id, current_user, name='casopsicologia')
     data = await request.json()
@@ -7207,6 +7907,30 @@ async def actualizar_caso_psicologia(id, request: Request, db: Session = Depends
     
     caso.fecha_actualizacion = now_rd()
     db.commit()
+
+    # v2.19 Fase A — solo se avisa cuando hay algo que el solicitante deba mirar:
+    # el caso quedó atendido, o Psicología dejó una recomendación para él.
+    # Un cambio de notas internas NO genera aviso (son confidenciales).
+    _atendido = (caso.estado or '').lower() == 'atendido'
+    _hay_recomendacion = 'recomendacion_profesor' in data and bool(caso.recomendacion_profesor)
+    if _atendido or _hay_recomendacion:
+        _notifs = notify(
+            db,
+            colegio_id=current_user.colegio_id,
+            usuario_ids=[caso.solicitado_por],
+            excluir_usuario_id=current_user.id,
+            titulo=('🧠 Recomendación de Psicología disponible' if _hay_recomendacion
+                    else '✅ Caso de Psicología atendido'),
+            mensaje='Nueva actualización disponible en EducaOne.',
+            tipo='psicologia',
+            prioridad='importante' if _hay_recomendacion else 'normal',
+            link='/psicologia',
+            evento_key=(f'psicologia:{caso.id}:recomendacion' if _hay_recomendacion
+                        else f'psicologia:{caso.id}:atendido'),
+        )
+        db.commit()
+        despachar_push(background_tasks, _notifs)
+
     return {'message': 'Caso actualizado'}
 
 # ============== MENSAJES Y COMUNICADOS ==============
@@ -9476,6 +10200,90 @@ async def marcar_notificacion_leida(id, db: Session = Depends(get_db), current_u
         notif.leida = True
         db.commit()
     return {'message': 'OK'}
+
+@app.get("/api/push/clave-publica")
+async def get_push_clave_publica(current_user: Usuario = Depends(get_current_user)):
+    """
+    Clave pública VAPID + si el push está disponible en esta instalación.
+
+    El frontend consulta esto ANTES de mostrar el botón "Activar notificaciones
+    en este dispositivo": sin VAPID configurado, no tiene sentido pedirle el
+    permiso al usuario.
+    """
+    from push_service import push_configurado, clave_publica
+    return {'disponible': push_configurado(), 'clave_publica': clave_publica()}
+
+
+@app.post("/api/push/suscribir")
+async def suscribir_push(request: Request, db: Session = Depends(get_db),
+                         current_user: Usuario = Depends(get_current_user)):
+    """
+    Registrar ESTE dispositivo para recibir Web Push.
+
+    Se llama solo después de que el usuario pulsó el botón y el navegador
+    concedió el permiso. Un usuario puede tener varios dispositivos.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+
+    endpoint = (data.get('endpoint') or '').strip()
+    keys = data.get('keys') or {}
+    p256dh = (keys.get('p256dh') or '').strip()
+    auth_key = (keys.get('auth') or '').strip()
+    if not endpoint or not p256dh or not auth_key:
+        return JSONResponse(
+            {'error': 'Suscripción incompleta (endpoint, p256dh y auth son requeridos)'},
+            status_code=400
+        )
+
+    user_agent = (request.headers.get('user-agent') or '')[:255]
+
+    # El endpoint es único por dispositivo+navegador. Si ya existe, se REASIGNA
+    # al usuario actual: es exactamente el caso de la PC compartida del colegio,
+    # donde el navegador es el mismo pero la persona sentada es otra.
+    sub = db.query(PushSubscription).filter_by(endpoint=endpoint).first()
+    if sub:
+        sub.usuario_id = current_user.id
+        sub.colegio_id = current_user.colegio_id
+        sub.p256dh = p256dh
+        sub.auth = auth_key
+        sub.user_agent = user_agent
+        sub.ultimo_error = None
+    else:
+        sub = PushSubscription(
+            usuario_id=current_user.id,
+            colegio_id=current_user.colegio_id,
+            endpoint=endpoint,
+            p256dh=p256dh,
+            auth=auth_key,
+            user_agent=user_agent,
+        )
+        db.add(sub)
+    db.commit()
+    return {'message': 'Dispositivo registrado para notificaciones', 'id': sub.id}
+
+
+@app.post("/api/push/desuscribir")
+async def desuscribir_push(request: Request, db: Session = Depends(get_db),
+                           current_user: Usuario = Depends(get_current_user)):
+    """Dar de baja SOLO el dispositivo indicado, nunca todos los del usuario."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    endpoint = (data.get('endpoint') or '').strip()
+    if not endpoint:
+        return JSONResponse({'error': 'endpoint requerido'}, status_code=400)
+
+    borradas = db.query(PushSubscription).filter(
+        PushSubscription.endpoint == endpoint,
+        PushSubscription.usuario_id == current_user.id,
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {'message': 'Dispositivo dado de baja', 'eliminadas': borradas}
+
 
 @app.put("/api/notificaciones/leer-todas")
 async def marcar_todas_leidas(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
@@ -13452,8 +14260,9 @@ async def get_indicadores_logro(request: Request, db: Session = Depends(get_db),
         query = query.filter_by(asignatura_id=int(asignatura_id))
     if periodo:
         query = query.filter_by(periodo=int(periodo))
-    if current_user.role == 'profesor':
-        query = query.filter_by(profesor_id=current_user.id)
+    # v2.19 continuidad institucional: el profesor asignado ve los indicadores
+    # de SU curso+asignatura, los haya creado él o el profesor anterior.
+    query = filtrar_por_asignacion_activa(query, IndicadorLogro, db, current_user)
     
     return [i.to_dict() for i in query.all()]
 
@@ -13545,8 +14354,9 @@ async def get_items_completivos(request: Request, db: Session = Depends(get_db),
         query = query.filter_by(asignatura_id=int(asignatura_id))
     if periodo:
         query = query.filter_by(periodo=int(periodo))
-    if current_user.role == 'profesor':
-        query = query.filter_by(profesor_id=current_user.id)
+    # v2.19 continuidad institucional: los ítems completivos son del curso, no
+    # de la persona que los cargó.
+    query = filtrar_por_asignacion_activa(query, ItemCompletivo, db, current_user)
     
     items = query.order_by(ItemCompletivo.periodo, ItemCompletivo.fecha.desc().nullslast()).all()
     return [i.to_dict() for i in items]
@@ -14001,8 +14811,8 @@ async def get_eval_interna(request: Request, current_user: Usuario = Depends(Rol
     
     query = tenant_filter(db.query(EvalInternaEstudiante), EvalInternaEstudiante, current_user)
     
-    if current_user.role == 'profesor':
-        query = query.filter_by(profesor_id=current_user.id)
+    # v2.19 continuidad institucional: la evaluación interna sigue al curso.
+    query = filtrar_por_asignacion_activa(query, EvalInternaEstudiante, db, current_user)
     
     if curso_id:
         query = query.filter_by(curso_id=curso_id)
@@ -14045,6 +14855,14 @@ async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), 
     config = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(
         profesor_id=current_user.id, asignatura_id=asignatura_id
     ).first()
+    if not config:
+        # v2.19: profesor recién asignado que todavía no definió sus pesos.
+        # Se usan los pesos vigentes de la asignatura en el colegio para no
+        # recalcular el curso con valores por defecto distintos a los que venía
+        # aplicando. No se reasigna el propietario de esa configuración.
+        config = tenant_filter(db.query(ConfigEvalInterna), ConfigEvalInterna, current_user).filter_by(
+            asignatura_id=asignatura_id
+        ).first()
     
     guardadas = 0
     for ev_data in evaluaciones:
@@ -14061,8 +14879,13 @@ async def guardar_eval_interna(request: Request, db: Session = Depends(get_db), 
             )
         estudiante_id = estudiante.id
         
+        # v2.19 continuidad institucional: la clave del registro es
+        # estudiante + curso + asignatura + período. NO incluye al profesor:
+        # si cambió el docente a mitad del período se continúa la MISMA fila en
+        # vez de crear una paralela. La autoría original (profesor_id) queda
+        # intacta; la acción nueva se registra en auditoría.
         ev = tenant_filter(db.query(EvalInternaEstudiante), EvalInternaEstudiante, current_user).filter_by(
-            estudiante_id=estudiante_id, profesor_id=current_user.id,
+            estudiante_id=estudiante_id, curso_id=curso_id,
             asignatura_id=asignatura_id, periodo=periodo
         ).first()
         
@@ -14096,8 +14919,9 @@ async def get_resumen_eval_interna(curso_id, request: Request, db: Session = Dep
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso_id, activo=True).order_by(Estudiante.no_lista).all()
     
     query = tenant_filter(db.query(EvalInternaEstudiante), EvalInternaEstudiante, current_user).filter_by(curso_id=curso_id)
-    if current_user.role == 'profesor':
-        query = query.filter_by(profesor_id=current_user.id)
+    # v2.19 continuidad institucional: sin esto el listado mostraba los datos
+    # del profesor anterior pero el resumen salía vacío.
+    query = filtrar_por_asignacion_activa(query, EvalInternaEstudiante, db, current_user)
     if periodo:
         query = query.filter_by(periodo=periodo)
     
@@ -14349,7 +15173,9 @@ async def crear_colegio(request: Request, db: Session = Depends(get_db), current
     
     admin_password_provista = data.get('admin_password')
     
-    must_change = False
+    # v2.19: la clave la escribe el Superadmin, así que la conoce una segunda
+    # persona. El director la cambia obligatoriamente en su primer acceso.
+    must_change = True
     if admin_password_provista:
         admin_password = admin_password_provista
         from security import validate_password
@@ -14361,9 +15187,14 @@ async def crear_colegio(request: Request, db: Session = Depends(get_db), current
                 status_code=400
             )
     else:
-        from models import _generar_password_inicial
-        admin_password = _generar_password_inicial()
-        must_change = True
+        # v2.19: alta administrativa humana → la contraseña la escribe el
+        # Superadmin. No se genera automáticamente.
+        db.rollback()
+        return JSONResponse(
+            {'error': 'admin_password es requerida. Escriba la contraseña inicial del director; '
+                      'el sistema le pedirá cambiarla en su primer acceso.'},
+            status_code=400
+        )
     
     admin = Usuario(
         username=admin_username,
@@ -14698,12 +15529,15 @@ async def reset_password_colegio(id, request: Request, db: Session = Depends(get
     usuario_id = data.get('usuario_id')
     nueva_password = data.get('password')
     
-    # Si no se provee, generar una fuerte automáticamente
-    if not nueva_password:
-        from models import _generar_password_inicial
-        nueva_password = _generar_password_inicial()
+    # v2.19: acción humana de gestión → contraseña explícita, nunca generada.
+    if not nueva_password or not str(nueva_password).strip():
+        return JSONResponse(
+            {'error': 'La contraseña temporal es requerida. Escríbala y compártala con el '
+                      'usuario; el sistema le pedirá cambiarla en su próximo acceso.'},
+            status_code=400
+        )
     
-    # Si se provee, validar con la política central del sistema.
+    # Validar con la política central del sistema.
     ok, msg = validate_password(str(nueva_password))
     if not ok:
         return JSONResponse({'error': msg}, status_code=400)
@@ -14749,14 +15583,16 @@ async def crear_usuario_colegio(id, request: Request, db: Session = Depends(get_
     if db.query(Usuario).filter_by(username=username).first():
         return JSONResponse({'error': 'El username ya existe'}, status_code=400)
     
-    password_provista = data.get('password', '').strip()
-    if password_provista:
-        password = password_provista
-        must_change = False
-    else:
-        from models import _generar_password_inicial
-        password = _generar_password_inicial()
-        must_change = True
+    # v2.19: contraseña escrita por el Superadmin, y la cuenta nace con
+    # must_change_password=True porque esa clave la conoce una segunda persona.
+    password = (data.get('password') or '').strip()
+    if not password:
+        return JSONResponse(
+            {'error': 'La contraseña inicial es requerida. Escríbala y compártala con el '
+                      'usuario; el sistema le pedirá cambiarla en su primer acceso.'},
+            status_code=400
+        )
+    must_change = True
     from security import validate_password
     ok, msg = validate_password(password)
     if not ok:

@@ -55,17 +55,21 @@ export const CambiarPasswordPage = () => {
         password_nuevo: passwordNuevo,
       });
       setExito(true);
+      // El backend incrementa token_version al cambiar la contraseña, así que
+      // el token que tenemos en mano queda MUERTO en ese mismo instante.
+      // Antes navegábamos a /dashboard: la primera petición devolvía 401, el
+      // interceptor limpiaba todo y el usuario terminaba en el login sin
+      // entender qué pasó. Ahora cerramos la sesión nosotros y lo mandamos al
+      // login con el aviso de que la contraseña se actualizó.
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+      localStorage.removeItem('superadmin_token');
+      localStorage.removeItem('superadmin_user');
       setTimeout(() => {
-        // Después del cambio, redirigir según rol
-        const userJson = localStorage.getItem('user') || localStorage.getItem('superadmin_user');
-        let destino = '/dashboard';
-        if (userJson) {
-          try {
-            const u = JSON.parse(userJson);
-            destino = u.role === 'superadmin' ? '/superadmin' : '/dashboard';
-          } catch {}
-        }
-        navigate(destino);
+        navigate('/login', {
+          replace: true,
+          state: { mensaje: 'Contraseña actualizada. Inicie sesión con su nueva contraseña.' },
+        });
       }, 1200);
     } catch (err: any) {
       const msg =

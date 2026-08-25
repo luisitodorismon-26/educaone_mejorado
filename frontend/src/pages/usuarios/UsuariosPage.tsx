@@ -76,7 +76,12 @@ export const UsuariosPage = () => {
         await api.put(`/usuarios/${editando.id}`, form);
         setMessage({ type: 'success', text: 'Usuario actualizado correctamente' });
       } else {
-        await api.post('/usuarios', { ...form, password: form.password || '123456' });
+        // v2.19: la contraseña la escribe Dirección, sin fallback. El
+        // `|| '123456'` anterior era una contraseña automática encubierta: si
+        // el campo llegaba vacío se creaba la cuenta con una clave conocida.
+        // Hoy además el backend la rechazaría por débil, así que el usuario
+        // vería un error confuso en vez de "falta la contraseña".
+        await api.post('/usuarios', form);
         setMessage({ type: 'success', text: 'Usuario creado correctamente' });
       }
       loadData();
