@@ -1149,14 +1149,51 @@ export const EstudiantesPage = () => {
                     </div>
                     <p className="text-[10px] text-gray-400">Tendencia</p>
                   </div>
-                  <div className="bg-white rounded-lg border p-2 text-center">
-                    <p className="text-xs font-bold text-emerald-600">{progresoData.mejor_asignatura?.nota || '-'}</p>
-                    <p className="text-[10px] text-gray-400 truncate">{progresoData.mejor_asignatura?.asignatura || 'Mejor'}</p>
-                  </div>
-                  <div className="bg-white rounded-lg border p-2 text-center">
-                    <p className="text-xs font-bold text-red-600">{progresoData.peor_asignatura?.nota || '-'}</p>
-                    <p className="text-[10px] text-gray-400 truncate">{progresoData.peor_asignatura?.asignatura || 'Peor'}</p>
-                  </div>
+                  {/* v2.19.1: si el estudiante tiene UNA sola asignatura con
+                      notas, mejor y peor son la misma materia y se mostraba dos
+                      veces (una en verde y otra en rojo, con el mismo número).
+                      Y el rojo se aplicaba por ser "la más baja" aunque
+                      estuviera aprobada: una materia con 78 sobre un corte de 70
+                      aparecía como si fuera un problema.
+                      Ahora el rojo depende del mínimo aprobatorio real del nivel
+                      (65 primaria / 70 secundaria), que el backend ya envía. */}
+                  {(() => {
+                    const mejor = progresoData.mejor_asignatura;
+                    const peor = progresoData.peor_asignatura;
+                    const minimo = progresoData.minimo_aprobatorio ?? 70;
+                    const unicaMateria =
+                      !peor || !mejor || peor.asignatura === mejor.asignatura;
+                    const colorNota = (n: number | null | undefined) =>
+                      n != null && n < minimo ? 'text-red-600' : 'text-emerald-600';
+
+                    if (unicaMateria) {
+                      const u = mejor || peor;
+                      return (
+                        <div className="bg-white rounded-lg border p-2 text-center col-span-2">
+                          <p className={`text-xs font-bold ${colorNota(u?.nota)}`}>{u?.nota ?? '-'}</p>
+                          <p className="text-[10px] text-gray-400 truncate">
+                            {u?.asignatura ? `${u.asignatura} · única materia con calificaciones` : 'Sin calificaciones'}
+                          </p>
+                        </div>
+                      );
+                    }
+                    return (
+                      <>
+                        <div className="bg-white rounded-lg border p-2 text-center">
+                          <p className="text-xs font-bold text-emerald-600">{mejor?.nota ?? '-'}</p>
+                          <p className="text-[10px] text-gray-400 truncate">
+                            {mejor?.asignatura ? `${mejor.asignatura} · mejor desempeño` : 'Mejor desempeño'}
+                          </p>
+                        </div>
+                        <div className="bg-white rounded-lg border p-2 text-center">
+                          <p className={`text-xs font-bold ${colorNota(peor?.nota)}`}>{peor?.nota ?? '-'}</p>
+                          <p className="text-[10px] text-gray-400 truncate">
+                            {peor?.asignatura ? `${peor.asignatura} · promedio más bajo` : 'Promedio más bajo'}
+                          </p>
+                        </div>
+                      </>
+                    );
+                  })()}
                 </div>
                 {progresoData.periodos.some((p: any) => p.promedio !== null) && (
                   <div className="bg-white rounded-lg border p-3">

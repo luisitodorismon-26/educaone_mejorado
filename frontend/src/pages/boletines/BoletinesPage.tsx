@@ -527,8 +527,13 @@ export const BoletinesPage = () => {
                   `Para ver el boletín completo, favor acercarse al colegio.`;
                 window.open(`https://wa.me/?text=${mensaje}`, '_blank');
               }} 
-              variant="secondary" 
-              className="bg-green-600 hover:bg-green-700 text-white"
+              /* v2.19.1: variant="secondary" aplica `bg-white text-gray-700`,
+                 que competía con el className verde. Ambas reglas tienen la
+                 misma especificidad, así que ganaba la que Tailwind emitiera
+                 última: el botón se veía blanco con texto gris —casi
+                 invisible— y solo tomaba color al pasar el mouse.
+                 La variante `success` ya es verde con texto blanco. */
+              variant="success"
             >
               📱 Enviar por WhatsApp
             </Button>

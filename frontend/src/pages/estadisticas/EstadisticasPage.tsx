@@ -73,9 +73,20 @@ export const EstadisticasPage = () => {
       if (periodo > 0) params.append('periodo', String(periodo));
       if (nivelFiltro !== 'todos') params.append('nivel', nivelFiltro);
       const qs = params.toString() ? `?${params.toString()}` : '';
+
+      // v2.19.1: /dashboard/stats y /dashboard/graficos NO leen el query param
+      // `nivel`; usan el lente de división que viaja en la cabecera X-Nivel.
+      // Antes se llamaban sin ella, así que al elegir Primaria los gráficos y
+      // KPIs de arriba seguían mostrando el colegio completo mientras las
+      // tablas de abajo sí se filtraban: dos cifras distintas en la misma
+      // pantalla. Se manda el filtro local de esta página como cabecera.
+      const cfgNivel = nivelFiltro !== 'todos'
+        ? { headers: { 'X-Nivel': nivelFiltro } }
+        : undefined;
+
       const [statsRes, graficosRes, cursosRes, asignaturasRes] = await Promise.all([
-        api.get('/dashboard/stats'),
-        api.get('/dashboard/graficos'),
+        api.get('/dashboard/stats', cfgNivel),
+        api.get('/dashboard/graficos', cfgNivel),
         api.get(`/estadisticas/cursos${qs}`).catch(() => ({ data: [] })),
         api.get(`/estadisticas/asignaturas${qs}`).catch(() => ({ data: [] }))
       ]);

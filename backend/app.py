@@ -6286,19 +6286,54 @@ async def crear_plantilla(request: Request, db: Session = Depends(get_db), curre
 # ============== DASHBOARD ==============
 
 @app.get("/api/dashboard/stats")
-async def get_dashboard_stats(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_dashboard_stats(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+    """
+    KPIs del panel.
+
+    v2.19.1: aplica el MISMO lente de división que /dashboard/graficos y
+    /dashboard/alertas. Antes contaba siempre todo el colegio, así que al
+    cambiar a Primaria en Estadísticas los gráficos se filtraban pero los
+    números de arriba seguían mostrando el total — parecían contradecirse.
+
+    Solo cuenta: no toca ninguna fórmula de notas ni cortes.
+    """
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    
-    ck = f'stats:{current_user.colegio_id}'
+
+    _niv = nivel_efectivo(current_user, request)
+    # La clave de caché incluye el nivel: sin esto, la primera consulta (por
+    # ejemplo Primaria) se servía durante 30s a quien pidiera Secundaria.
+    ck = f'stats:{current_user.colegio_id}:{_niv or "todos"}'
     cached = cache_get(ck)
     if cached: return cached
-    
+
+    _cids = cursos_ids_de_nivel(db, current_user, _niv) if _niv else None
+
+    q_est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True)
+    q_cur = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True)
+    q_rep = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente')
+    q_psi = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter(CasoPsicologia.estado != 'atendido')
+    if _cids is not None:
+        # Un set vacío debe devolver 0, no "todo": el {0} evita que el IN() vacío
+        # se comporte de forma distinta entre motores.
+        _ids = _cids or {0}
+        q_est = q_est.filter(Estudiante.curso_id.in_(_ids))
+        q_cur = q_cur.filter(Curso.id.in_(_ids))
+        # Reportes y casos no tienen curso_id propio: cuelgan del estudiante,
+        # así que el filtro va por el curso de ese estudiante.
+        _est_ids = [e[0] for e in tenant_filter(
+            db.query(Estudiante.id), Estudiante, current_user
+        ).filter(Estudiante.curso_id.in_(_ids)).all()] or [0]
+        q_rep = q_rep.filter(ReporteConducta.estudiante_id.in_(_est_ids))
+        q_psi = q_psi.filter(CasoPsicologia.estudiante_id.in_(_est_ids))
+
     stats = {
-        'estudiantes': tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True).count(),
+        'estudiantes': q_est.count(),
+        # Los profesores no cuelgan de un curso: el conteo no se filtra por nivel.
         'profesores': tenant_filter(db.query(Usuario), Usuario, current_user).filter_by(role='profesor', activo=True).count(),
-        'cursos': tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).count(),
-        'reportes_pendientes': tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente').count(),
-        'casos_psicologia': tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter(CasoPsicologia.estado != 'atendido').count(),
+        'cursos': q_cur.count(),
+        'reportes_pendientes': q_rep.count(),
+        'casos_psicologia': q_psi.count(),
+        'nivel_aplicado': _niv or 'todos',
         'colegio': {
             'nombre': config.nombre if config else 'Educa One',
             'logo': config.logo if config else None

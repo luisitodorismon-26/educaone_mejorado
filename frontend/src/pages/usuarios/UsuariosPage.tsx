@@ -1,6 +1,85 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { MoreVertical, Eye, EyeOff } from 'lucide-react';
 import api from '../../services/api';
 import { DataTable, Modal, Input, Select, Button, Badge, Alert } from '../../components/ui';
+
+/**
+ * v2.19.1 — Campo de contraseña con botón 👁 mostrar/ocultar.
+ *
+ * Dirección escribe la contraseña a mano y se la dicta al usuario; sin poder
+ * verla, un dedo mal puesto se descubre recién cuando la persona no puede
+ * entrar. autocomplete="new-password" evita que el navegador autocomplete
+ * la contraseña guardada del propio director.
+ */
+function InputPassword({ label, value, onChange, placeholder }: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="relative">
+      <Input
+        label={label}
+        type={visible ? 'text' : 'password'}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        autoComplete="new-password"
+      />
+      <button
+        type="button"
+        onClick={() => setVisible(v => !v)}
+        aria-label={visible ? 'Ocultar contraseña' : 'Mostrar contraseña'}
+        className="absolute right-3 top-9 text-gray-400 hover:text-gray-600"
+      >
+        {visible ? <EyeOff size={16} /> : <Eye size={16} />}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * v2.19.1 — Menú compacto de acciones.
+ *
+ * Cuatro botones en línea saturaban la fila y en pantallas angostas se
+ * envolvían. Los permisos NO cambian: quien ve una opción es exactamente
+ * quien la veía antes.
+ */
+function MenuAcciones({ children }: { children: (cerrar: () => void) => React.ReactNode }) {
+  const [abierto, setAbierto] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!abierto) return;
+    const alClickAfuera = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setAbierto(false);
+    };
+    document.addEventListener('mousedown', alClickAfuera);
+    return () => document.removeEventListener('mousedown', alClickAfuera);
+  }, [abierto]);
+
+  return (
+    <div className="relative inline-block text-left" ref={ref}>
+      <button
+        onClick={() => setAbierto(o => !o)}
+        aria-label="Acciones"
+        className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-500"
+      >
+        <MoreVertical size={16} />
+      </button>
+      {abierto && (
+        <div className="absolute right-0 mt-1 w-56 bg-white border border-gray-200 rounded-lg shadow-lg z-20 py-1">
+          {children(() => setAbierto(false))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const itemMenu =
+  'w-full text-left px-3 py-2 text-sm hover:bg-gray-50 transition-colors';
 
 interface Usuario {
   id: number;
@@ -345,29 +424,27 @@ export const UsuariosPage = () => {
         exportFilename="usuarios"
         emptyMessage="No hay usuarios registrados"
         actions={(u) => (
-          <div className="flex gap-2 justify-end flex-wrap">
-            {u.activo ? (
-              <>
-                <button onClick={() => openEdit(u)} className="text-blue-600 hover:text-blue-800 text-sm">
-                  Editar
-                </button>
-                <button onClick={() => { setResetUser(u); setResetPw(''); }} className="text-amber-600 hover:text-amber-800 text-sm">
-                  Restablecer contraseña
-                </button>
-                {u.role === 'profesor' && (
-                  <button onClick={() => setReemplazarUser(u)} className="text-purple-600 hover:text-purple-800 text-sm">
-                    Reemplazar
-                  </button>
-                )}
-                <button onClick={() => handleDelete(u.id)} className="text-red-600 hover:text-red-800 text-sm">
-                  Desactivar
-                </button>
-              </>
-            ) : (
-              <button onClick={() => handleReactivar(u)} className="text-green-600 hover:text-green-800 text-sm">
-                Reactivar
-              </button>
-            )}
+          <div className="flex justify-end">
+            <MenuAcciones>
+              {(cerrar) => (u.activo ? (
+                <>
+                  <button onClick={() => { cerrar(); openEdit(u); }}
+                    className={`${itemMenu} text-gray-700`}>Editar</button>
+                  <button onClick={() => { cerrar(); setResetUser(u); setResetPw(''); }}
+                    className={`${itemMenu} text-gray-700`}>Restablecer contraseña</button>
+                  {u.role === 'profesor' && (
+                    <button onClick={() => { cerrar(); setReemplazarUser(u); }}
+                      className={`${itemMenu} text-gray-700`}>Reemplazar profesor</button>
+                  )}
+                  <div className="border-t my-1" />
+                  <button onClick={() => { cerrar(); handleDelete(u.id); }}
+                    className={`${itemMenu} text-red-600`}>Desactivar</button>
+                </>
+              ) : (
+                <button onClick={() => { cerrar(); handleReactivar(u); }}
+                  className={`${itemMenu} text-green-700`}>Reactivar</button>
+              ))}
+            </MenuAcciones>
           </div>
         )}
       />
@@ -479,11 +556,10 @@ export const UsuariosPage = () => {
               próximo acceso. */}
           {!editando && (
             <>
-              <Input
+              <InputPassword
                 label="Contraseña inicial *"
-                type="password"
                 value={form.password}
-                onChange={e => setForm({ ...form, password: e.target.value })}
+                onChange={v => setForm({ ...form, password: v })}
                 placeholder="Mínimo 8 caracteres"
               />
               <p className="text-sm text-gray-500">
@@ -514,11 +590,10 @@ export const UsuariosPage = () => {
         }
       >
         <div className="space-y-3">
-          <Input
+          <InputPassword
             label="Contraseña temporal *"
-            type="password"
             value={resetPw}
-            onChange={e => setResetPw(e.target.value)}
+            onChange={setResetPw}
             placeholder="Mínimo 8 caracteres"
           />
           <p className="text-sm text-gray-500">
@@ -575,9 +650,9 @@ export const UsuariosPage = () => {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Input label="Usuario *" value={nuevoProf.username}
               onChange={e => setNuevoProf({ ...nuevoProf, username: e.target.value })} />
-            <Input label="Contraseña inicial *" type="password" value={nuevoProf.password}
+            <InputPassword label="Contraseña inicial *" value={nuevoProf.password}
               placeholder="Mínimo 8 caracteres"
-              onChange={e => setNuevoProf({ ...nuevoProf, password: e.target.value })} />
+              onChange={v => setNuevoProf({ ...nuevoProf, password: v })} />
             <Input label="Nombre *" value={nuevoProf.nombre}
               onChange={e => setNuevoProf({ ...nuevoProf, nombre: e.target.value })} />
             <Input label="Apellido" value={nuevoProf.apellido}

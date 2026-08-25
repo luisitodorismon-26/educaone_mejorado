@@ -1221,6 +1221,59 @@ with client:
             d.close()
 
 
+    # ==================================================================
+    # v2.19.1 — lente de nivel en los KPIs del panel
+    # ==================================================================
+
+    @test("v2.19.1 — /dashboard/stats respeta el lente de nivel (X-Nivel)")
+    def _():
+        tok = DIR_A
+        sin = client.get('/api/dashboard/stats', headers=auth(tok))
+        assert sin.status_code == 200, sin.text
+        assert sin.json().get('nivel_aplicado') == 'todos'
+        total = sin.json()['estudiantes']
+
+        h = dict(auth(tok)); h['X-Nivel'] = 'primaria'
+        prim = client.get('/api/dashboard/stats', headers=h)
+        assert prim.status_code == 200, prim.text
+        assert prim.json().get('nivel_aplicado') == 'primaria', \
+            'ignoró el lente de nivel'
+
+        h2 = dict(auth(tok)); h2['X-Nivel'] = 'secundaria'
+        sec = client.get('/api/dashboard/stats', headers=h2)
+        assert sec.json().get('nivel_aplicado') == 'secundaria'
+
+        # Los filtrados nunca pueden superar al total del colegio, y entre los
+        # dos niveles no pueden sumar más que el total.
+        assert prim.json()['estudiantes'] <= total
+        assert sec.json()['estudiantes'] <= total
+        assert prim.json()['estudiantes'] + sec.json()['estudiantes'] <= total, \
+            'primaria + secundaria supera el total: el filtro está duplicando'
+
+    @test("v2.19.1 — La caché de stats no mezcla niveles entre sí")
+    def _():
+        tok = DIR_A
+        h = dict(auth(tok)); h['X-Nivel'] = 'primaria'
+        p1 = client.get('/api/dashboard/stats', headers=h).json()
+        h2 = dict(auth(tok)); h2['X-Nivel'] = 'secundaria'
+        s1 = client.get('/api/dashboard/stats', headers=h2).json()
+        # Segunda vuelta inmediata: si la clave de caché no incluyera el nivel,
+        # la segunda consulta devolvería los números de la primera.
+        p2 = client.get('/api/dashboard/stats', headers=h).json()
+        assert p2['nivel_aplicado'] == 'primaria'
+        assert s1['nivel_aplicado'] == 'secundaria'
+        assert p1['estudiantes'] == p2['estudiantes'], 'la caché devolvió otro nivel'
+
+    @test("v2.19.1 — El lente de stats no cruza colegios")
+    def _():
+        h = dict(auth(DIR_A)); h['X-Nivel'] = 'primaria'
+        a = client.get('/api/dashboard/stats', headers=h).json()
+        h2 = dict(auth(DIR_B)); h2['X-Nivel'] = 'primaria'
+        b = client.get('/api/dashboard/stats', headers=h2).json()
+        assert a['colegio']['nombre'] != b['colegio']['nombre'] or a['estudiantes'] != b['estudiantes'], \
+            'ambos colegios devuelven exactamente lo mismo: revisar aislamiento'
+
+
 print(f"\n{BOLD}{'=' * 60}{RESET}")
 print(f"{BOLD}  RESUMEN: {pasados}/{total} tests pasaron{RESET}")
 print(f"{BOLD}{'=' * 60}{RESET}\n")

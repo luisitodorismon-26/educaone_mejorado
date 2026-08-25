@@ -149,7 +149,7 @@ export const ReportesPage = () => {
         respuesta,
         estado: 'resuelto'
       });
-      setMessage({ type: 'success', text: 'Reporte respondido' });
+      setMessage({ type: 'success', text: 'Reporte resuelto. Si desea informar a la familia, use "Enviar a padres".' });
       loadData();
       setShowDetalleModal(false);
       setSelectedReporte(null);
@@ -597,8 +597,12 @@ export const ReportesPage = () => {
                 Imprimir PDF
               </Button>
             )}
-            {/* Botón Marcar firmado por padre — dirección/coordinador/psicología, solo si no está confirmado aún */}
-            {canRespond && selectedReporte && !selectedReporte.confirmado_padre && selectedReporte.estado !== 'pendiente' && (
+            {/* v2.19.1: "Marcar firmado por padre" solo tiene sentido si el
+                reporte SE ENVIÓ a la familia. Antes aparecía en cualquier
+                reporte resuelto, y permitía marcar como "firmado por el padre"
+                algo que el padre nunca recibió. */}
+            {canRespond && selectedReporte && selectedReporte.enviado_padres
+              && !selectedReporte.confirmado_padre && selectedReporte.estado !== 'pendiente' && (
               <Button
                 variant="secondary"
                 onClick={() => handleConfirmarPadre(selectedReporte.id)}
@@ -607,10 +611,14 @@ export const ReportesPage = () => {
                 Marcar firmado por padre
               </Button>
             )}
-            {/* Botón Responder — solo si pendiente y tiene permiso */}
+            {/* v2.19.1: el botón decía "Aprobar y enviar a padre" pero
+                handleResponder() solo resuelve el reporte — nunca envió nada.
+                Dirección creía haber notificado a la familia y no era así.
+                Enviar a padres sigue existiendo como acción separada y
+                opcional: un caso puede resolverse dentro de la escuela. */}
             {canRespond && selectedReporte?.estado === 'pendiente' && (
               <Button onClick={handleResponder} icon={<MessageSquare size={16} />}>
-                Aprobar y enviar a padre
+                Resolver reporte
               </Button>
             )}
           </>
