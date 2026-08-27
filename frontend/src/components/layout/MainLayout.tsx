@@ -268,11 +268,33 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   // `nivel` distinto al lente activo desaparece del menú: bajo el lente de
   // primaria no existe "Evaluaciones Extra", y bajo secundaria no existe
   // "Recuperaciones (Primaria)". Sin lente ("Todos" o sin división) se ve todo.
+  // v2.19.2 — Regla ÚNICA de división, en un solo lugar.
+  //
+  // nivel_asignado vacío = autorizado para AMBOS niveles (no "sin división").
+  // Antes el selector se mostraba solo a dirección, así que un coordinador o
+  // psicólogo autorizado para ambos quedaba atrapado viendo el colegio entero
+  // sin poder enfocar una división. Y el lente del menú los trataba como si
+  // tuvieran nivel fijo, ocultándoles items que sí les corresponden.
+  //
+  // El backend ya aplica exactamente esta regla en nivel_efectivo(): si
+  // nivel_asignado es primaria/secundaria, ese lente es FIJO y la cabecera
+  // X-Nivel no puede quitarlo. Acá solo se refleja en la UI; la autoridad
+  // sigue siendo el backend.
+  const nivelFijo: string | null =
+    ((user as any)?.nivel_asignado === 'primaria' || (user as any)?.nivel_asignado === 'secundaria')
+      ? (user as any).nivel_asignado
+      : null;
+
+  const puedeCambiarDivision: boolean =
+    user?.role === 'direccion' ||
+    (['coordinador', 'psicologia'].includes(user?.role || '') && !nivelFijo);
+
   const lenteNivelMenu: string | null =
-    user?.role === 'direccion'
-      ? (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null)
-      : (((user as any)?.nivel_asignado === 'primaria' || (user as any)?.nivel_asignado === 'secundaria')
-          ? (user as any).nivel_asignado : null);
+    nivelFijo
+      ? nivelFijo   // lente fijo: manda siempre, sin importar nivelVista
+      : (puedeCambiarDivision && (nivelVista === 'primaria' || nivelVista === 'secundaria')
+          ? nivelVista
+          : null);
 
   const filteredNavItems = NAV_ITEMS.filter(item => {
     if (!user || !item.roles.includes(user.role)) return false;
@@ -479,7 +501,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
       {/* v2.15 responsive: en MÓVIL el switch del header no existe (era
           hidden md:flex), así que dirección conmuta la división desde aquí.
           El lg:hidden evita duplicarlo en el sidebar de escritorio. */}
-      {isSidebarOpen && user?.role === 'direccion' && (
+      {isSidebarOpen && puedeCambiarDivision && (
         <div className="px-3 pt-3 lg:hidden">
           <p className="text-[9px] uppercase tracking-wider text-slate-500 mb-1.5 font-semibold">División</p>
           <div className="grid grid-cols-3 gap-1">
@@ -574,9 +596,12 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
                 {config?.distrito && (
                   <p className="text-xs text-slate-500">{config.distrito}</p>
                 )}
-                {user?.role === 'direccion' && nivelVista !== 'todos' && (
-                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${nivelVista === 'primaria' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-purple-50 text-purple-700 border-purple-200'}`}>
-                    Viendo: {nivelVista === 'primaria' ? '🎒 División Primaria' : '🏫 División Secundaria'}
+                {/* v2.19.2: con nivel FIJO el badge muestra su división asignada
+                    (antes leía nivelVista, que para ellos siempre era "todos" y
+                    dejaba el badge en blanco o con la división equivocada). */}
+                {(nivelFijo || (puedeCambiarDivision && nivelVista !== 'todos')) && (
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${(nivelFijo || nivelVista) === 'primaria' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-purple-50 text-purple-700 border-purple-200'}`}>
+                    Viendo: {(nivelFijo || nivelVista) === 'primaria' ? '🎒 División Primaria' : '🏫 División Secundaria'}
                   </span>
                 )}
               </div>
@@ -585,7 +610,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
           <div className="flex items-center gap-3">
             {/* v2.15 F1: switch de división — un clic y todo el sistema se pone
                 el lente de esa división (dashboard, listas, stats, alertas) */}
-            {user?.role === 'direccion' && (
+            {puedeCambiarDivision && (
               <div className="hidden md:flex items-center bg-slate-100 border border-slate-200 rounded-lg p-0.5 gap-0.5">
                 {[
                   { v: 'primaria', l: '🎒 Primaria' },

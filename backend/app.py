@@ -22,7 +22,7 @@ def today_rd():
     """Retorna date actual en zona horaria RD."""
     return datetime.now(TZ_RD).date()
 from sqlalchemy.orm import Session, joinedload, selectinload
-from sqlalchemy import func, extract, or_, and_, false as sa_false
+from sqlalchemy import func, extract, or_, and_, case, false as sa_false
 import os
 import re
 import jwt
@@ -1827,20 +1827,25 @@ async def cambiar_password(request: Request, db: Session = Depends(get_db), curr
         return JSONResponse({'error': 'Contraseña actual incorrecta'}, status_code=400)
     
     password_nuevo = data['password_nuevo']
-    
-    # Validaciones de contraseña fuerte
-    if len(password_nuevo) < 8:
-        return JSONResponse({'error': 'La nueva contraseña debe tener al menos 8 caracteres'}, status_code=400)
-    
-    if not re.search(r'[A-Z]', password_nuevo):
-        return JSONResponse({'error': 'La contraseña debe tener al menos una letra mayúscula'}, status_code=400)
-    
-    if not re.search(r'[a-z]', password_nuevo):
-        return JSONResponse({'error': 'La contraseña debe tener al menos una letra minúscula'}, status_code=400)
-    
-    if not re.search(r'\d', password_nuevo):
-        return JSONResponse({'error': 'La contraseña debe tener al menos un número'}, status_code=400)
-    
+
+    # v2.19.2 R2 — UNA sola fuente de verdad para la política de contraseñas.
+    # Este endpoint tenía su propia validación con regex (mayúscula, minúscula,
+    # número) mientras validate_password() —usada por crear usuario, reset de
+    # Dirección y reemplazo— solo exige 8 caracteres. Resultado: una clave que
+    # Dirección podía asignar era rechazada cuando el usuario intentaba
+    # cambiarla, y quedaba atrapado en la pantalla de cambio obligatorio.
+    ok, msg = validate_password(password_nuevo)
+    if not ok:
+        return JSONResponse({'error': msg}, status_code=400)
+
+    # La nueva no puede ser la misma que la actual: si no, "cambiar la
+    # contraseña temporal" se cumple sin cambiar nada.
+    if current_user.check_password(password_nuevo):
+        return JSONResponse(
+            {'error': 'La nueva contraseña debe ser diferente de la actual'},
+            status_code=400
+        )
+
     current_user.set_password(password_nuevo)
     # Si el usuario estaba forzado a cambiar password (init_db, reset por admin),
     # ya cumplió el requisito — limpiar el flag para que pueda usar el sistema.
@@ -2755,6 +2760,48 @@ def nivel_efectivo(current_user, request=None):
         if h in NIVELES_DIVISION:
             return h  # switch de dirección
     return None
+
+def nivel_de_estudiante(db, current_user, estudiante_id):
+    """
+    Nivel ('primaria'/'secundaria') al que pertenece un estudiante, vía su
+    curso y grado. None si no se puede determinar.
+
+    v2.19.2: el nivel de un caso de psicología se deriva del ESTUDIANTE, nunca
+    de quién lo creó — un profesor de primaria puede solicitar atención para un
+    estudiante de secundaria.
+    """
+    if not estudiante_id:
+        return None
+    fila = (tenant_filter(db.query(Estudiante), Estudiante, current_user)
+            .join(Curso, Estudiante.curso_id == Curso.id)
+            .join(Grado, Curso.grado_id == Grado.id)
+            .with_entities(Grado.nivel)
+            .filter(Estudiante.id == estudiante_id).first())
+    return _canon_nivel(fila[0]) if fila else None
+
+
+def usuarios_autorizados_para_nivel(db, colegio_id, role, nivel):
+    """
+    IDs de usuarios de un rol autorizados para ver una división.
+
+    nivel_asignado vacío = AMBAS divisiones, así que entra siempre.
+    Un usuario fijo en la división contraria NO entra: no debe recibir
+    notificaciones de casos que después no podrá abrir.
+    """
+    if not colegio_id:
+        return []
+    filas = db.query(Usuario.id, Usuario.nivel_asignado).filter(
+        Usuario.colegio_id == colegio_id,
+        Usuario.role == role,
+        Usuario.activo == True,
+    ).all()
+    salida = []
+    for uid, nv in filas:
+        nv = (nv or '').strip().lower()
+        if nv not in NIVELES_DIVISION or not nivel or nv == nivel:
+            salida.append(uid)
+    return salida
+
 
 def cursos_ids_de_nivel(db, current_user, nivel):
     """Set de IDs de cursos del colegio cuyo grado pertenece al nivel dado."""
@@ -6515,9 +6562,28 @@ async def get_dashboard_alertas(request: Request, db: Session = Depends(get_db),
     
     # Casos de psicología - filtrados por rol
     if current_user.role == 'psicologia':
-        # Psicología ve todos los pendientes
-        casos_pendientes = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(estado='pendiente').count()
-        casos_urgentes = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(urgencia='urgente', estado='pendiente').count()
+        # v2.19.2 R2: las alertas del panel respetan el lente de división.
+        # Ojo con la distinción: esto NO cambia las notificaciones ni el Web
+        # Push. Una psicóloga autorizada para ambas divisiones SIGUE recibiendo
+        # el aviso urgente de la otra división aunque tenga el selector en
+        # Primaria — una urgencia no puede quedar invisible. Lo que se filtra
+        # acá es lo que muestra el panel bajo el lente activo.
+        _niv_al = nivel_efectivo(current_user, request)
+        _est_al = None
+        if _niv_al:
+            _cids_al = cursos_ids_de_nivel(db, current_user, _niv_al) or {0}
+            _est_al = [e[0] for e in tenant_filter(
+                db.query(Estudiante.id), Estudiante, current_user
+            ).filter(Estudiante.curso_id.in_(_cids_al)).all()] or [0]
+
+        def _qal():
+            q = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user)
+            if _est_al is not None:
+                q = q.filter(CasoPsicologia.estudiante_id.in_(_est_al))
+            return q
+
+        casos_pendientes = _qal().filter_by(estado='pendiente').count()
+        casos_urgentes = _qal().filter_by(urgencia='urgente', estado='pendiente').count()
         if casos_urgentes > 0:
             alertas.append({
                 'tipo': 'psicologia',
@@ -7991,12 +8057,42 @@ async def get_historial_envios_reporte(id, request: Request, db: Session = Depen
 
 @app.get("/api/psicologia/casos")
 async def get_casos_psicologia(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Obtener casos de psicología"""
+    """
+    Obtener casos de psicología.
+
+    v2.19.2: aplica el lente de división. El nivel de un caso se deriva del
+    ESTUDIANTE → curso → grado, nunca de quién lo creó: un profesor de primaria
+    puede solicitar atención para un estudiante de secundaria.
+
+    Antes este endpoint devolvía el colegio completo, así que una psicóloga
+    fija en Primaria veía casos de Secundaria y el selector de división no
+    tenía ningún efecto sobre la lista.
+    """
+    q = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user)
+
     # Si es profesor, solo ve los casos que él solicitó
     if current_user.role == 'profesor':
-        casos = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(solicitado_por=current_user.id).order_by(CasoPsicologia.fecha_solicitud.desc()).all()
+        q = q.filter_by(solicitado_por=current_user.id)
     else:
-        casos = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).order_by(CasoPsicologia.fecha_solicitud.desc()).all()
+        _niv = nivel_efectivo(current_user, request)
+        if _niv:
+            _cids = cursos_ids_de_nivel(db, current_user, _niv) or {0}
+            _est_ids = [e[0] for e in tenant_filter(
+                db.query(Estudiante.id), Estudiante, current_user
+            ).filter(Estudiante.curso_id.in_(_cids)).all()] or [0]
+            q = q.filter(CasoPsicologia.estudiante_id.in_(_est_ids))
+
+    # v2.19.2 — orden OPERATIVO: lo que hay que atender primero, primero.
+    # Es solo presentación: no se altera ningún estado para conseguirlo.
+    #   1) urgentes pendientes  2) pendientes  3) en proceso  4) atendidos
+    _orden = case(
+        (and_(CasoPsicologia.estado == 'pendiente',
+              func.lower(CasoPsicologia.urgencia) == 'urgente'), 0),
+        (CasoPsicologia.estado == 'pendiente', 1),
+        (CasoPsicologia.estado == 'en_proceso', 2),
+        else_=3,
+    )
+    casos = q.order_by(_orden, CasoPsicologia.fecha_solicitud.desc()).all()
     
     puede_ver_notas_internas = current_user.role in {'psicologia', 'direccion', 'superadmin'}
     return [{
@@ -8032,6 +8128,15 @@ async def solicitar_atencion_psicologia(request: Request, background_tasks: Back
         db, Estudiante, data.get('estudiante_id'), current_user, name='estudiante'
     )
     
+    # v2.19.2 R2 — candado de escritura por división. La lectura ya está
+    # filtrada por el lente; esto cierra la otra mitad: un coordinador fijo en
+    # Primaria no puede abrir un caso de un estudiante de Secundaria llamando
+    # a la API directo. Dirección y profesor quedan exentos dentro del helper,
+    # y un usuario con nivel_asignado vacío (Ambos) tampoco se bloquea.
+    _guard_niv = validar_nivel_escritura(db, current_user, estudiante_id=estudiante.id)
+    if _guard_niv:
+        return _guard_niv
+
     caso = CasoPsicologia(
         estudiante_id=estudiante.id,
         colegio_id=current_user.colegio_id,
@@ -8048,14 +8153,24 @@ async def solicitar_atencion_psicologia(request: Request, background_tasks: Back
     # PRIVACIDAD: el texto NO nombra al estudiante ni describe el motivo. Este
     # título puede terminar en la pantalla bloqueada de un teléfono; el detalle
     # solo se ve dentro de EducaOne, después de autenticar y autorizar.
+    # v2.19.2 — solo se notifica a psicólogos AUTORIZADOS para la división del
+    # estudiante. Una psicóloga fija en Primaria no debe recibir avisos de
+    # Secundaria; una autorizada para ambas los recibe aunque tenga el selector
+    # puesto en la otra división, para que una urgencia no quede invisible.
+    _niv_caso = nivel_de_estudiante(db, current_user, caso.estudiante_id)
+    _destinos = usuarios_autorizados_para_nivel(
+        db, current_user.colegio_id, 'psicologia', _niv_caso)
+    # El sufijo de división es genérico y NO expone datos clínicos ni al menor:
+    # es lo único que llega a la pantalla bloqueada del teléfono.
+    _sufijo = f' — {_niv_caso.capitalize()}' if _niv_caso else ''
     _notifs = notify(
         db,
         colegio_id=current_user.colegio_id,
-        roles=['psicologia'],
+        usuario_ids=_destinos,
         excluir_usuario_id=current_user.id,
-        titulo=('🔴 Nueva solicitud urgente de Psicología'
+        titulo=('🔴 Caso urgente de Psicología' + _sufijo
                 if (caso.urgencia or '').lower() == 'urgente'
-                else '🧠 Nueva solicitud de Psicología'),
+                else '🧠 Nueva solicitud de Psicología' + _sufijo),
         mensaje='Hay una solicitud de atención disponible en EducaOne.',
         tipo='psicologia',
         prioridad='urgente' if (caso.urgencia or '').lower() == 'urgente' else 'importante',
@@ -8071,6 +8186,15 @@ async def solicitar_atencion_psicologia(request: Request, background_tasks: Back
 async def tomar_caso_psicologia(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('psicologia'))):
     """Psicólogo toma un caso"""
     caso = get_tenant_or_404(db, CasoPsicologia, id, current_user, name='casopsicologia')
+
+    # v2.19.2 R2 — candado por división sobre el ESTUDIANTE del caso. Sin esto,
+    # una psicóloga fija en Primaria podía tomar/modificar un caso de
+    # Secundaria llamando a la API con el ID directo: la lista se lo ocultaba,
+    # pero el endpoint lo dejaba pasar.
+    _guard_niv = validar_nivel_escritura(db, current_user, estudiante_id=caso.estudiante_id)
+    if _guard_niv:
+        return _guard_niv
+
     caso.asignado_a = current_user.id
     caso.estado = 'en_proceso'
     caso.fecha_actualizacion = now_rd()
@@ -8098,6 +8222,14 @@ async def tomar_caso_psicologia(id, request: Request, background_tasks: Backgrou
 async def actualizar_caso_psicologia(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('psicologia'))):
     """Actualizar estado de un caso de psicología con notas y recomendaciones"""
     caso = get_tenant_or_404(db, CasoPsicologia, id, current_user, name='casopsicologia')
+
+    # v2.19.2 R2 — candado por división sobre el ESTUDIANTE del caso. Sin esto,
+    # una psicóloga fija en Primaria podía tomar/modificar un caso de
+    # Secundaria llamando a la API con el ID directo: la lista se lo ocultaba,
+    # pero el endpoint lo dejaba pasar.
+    _guard_niv = validar_nivel_escritura(db, current_user, estudiante_id=caso.estudiante_id)
+    if _guard_niv:
+        return _guard_niv
     data = await request.json()
     
     if 'estado' in data:
@@ -14836,39 +14968,63 @@ async def get_resumen_evaluaciones(db: Session = Depends(get_db), current_user: 
 # ============== DASHBOARD PSICOLOGÍA ==============
 
 @app.get("/api/dashboard/psicologia")
-async def get_dashboard_psicologia(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Dashboard específico para psicología"""
+async def get_dashboard_psicologia(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+    """
+    Dashboard específico para psicología.
+
+    v2.19.2: TODOS los conteos aplican el lente de división. Antes contaban el
+    colegio completo, así que una psicóloga fija en Primaria veía en sus KPIs
+    casos de Secundaria que ni siquiera podía abrir, y con el selector en
+    Primaria los números de arriba no se movían.
+
+    El nivel del caso se deriva del ESTUDIANTE → curso → grado.
+    """
     if current_user.role != 'psicologia':
         return JSONResponse({'error': 'Solo para psicología'}, status_code=403)
-    
+
+    _niv = nivel_efectivo(current_user, request)
+    _est_ids = None
+    if _niv:
+        _cids = cursos_ids_de_nivel(db, current_user, _niv) or {0}
+        _est_ids = [e[0] for e in tenant_filter(
+            db.query(Estudiante.id), Estudiante, current_user
+        ).filter(Estudiante.curso_id.in_(_cids)).all()] or [0]
+
+    def _q():
+        q = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user)
+        if _est_ids is not None:
+            q = q.filter(CasoPsicologia.estudiante_id.in_(_est_ids))
+        return q
+
     # Casos por estado
-    pendientes = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(estado='pendiente').count()
-    en_proceso = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(estado='en_proceso').count()
-    atendidos = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(estado='atendido').count()
-    
+    pendientes = _q().filter_by(estado='pendiente').count()
+    en_proceso = _q().filter_by(estado='en_proceso').count()
+    atendidos = _q().filter_by(estado='atendido').count()
+
     # Casos urgentes
-    urgentes = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(urgencia='urgente', estado='pendiente').count()
-    
-    # Mis casos asignados
-    mis_casos = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(
+    urgentes = _q().filter_by(urgencia='urgente', estado='pendiente').count()
+
+    # Mis casos asignados: los que ESTA psicóloga tomó y todavía no cerró.
+    # Un caso pendiente sin tomar NO entra acá — entra en 'pendientes'.
+    mis_casos = _q().filter_by(
         asignado_a=current_user.id
     ).filter(CasoPsicologia.estado != 'atendido').order_by(
         CasoPsicologia.urgencia.desc(), CasoPsicologia.fecha_solicitud.desc()
     ).limit(10).all()
-    
-    # Casos por tipo
-    tipos_q = db.query(
+
+    # v2.19.2: se llamaba "casos activos por tipo" pero incluía pendientes sin
+    # tomar, así que podía decir "Mis casos activos: 0" y abajo "1 emocional".
+    # Ahora el nombre dice lo que cuenta: abiertos = pendientes + en proceso.
+    tipos_q = _q().with_entities(
         CasoPsicologia.tipo, func.count(CasoPsicologia.id)
     ).filter(CasoPsicologia.estado != 'atendido')
-    if current_user.colegio_id:
-        tipos_q = tipos_q.filter(CasoPsicologia.colegio_id == current_user.colegio_id)
     tipos = tipos_q.group_by(CasoPsicologia.tipo).all()
-    
+
     casos_por_tipo = [{'tipo': t[0] or 'sin_tipo', 'cantidad': t[1]} for t in tipos]
-    
+
     # Casos recientes (últimos 7 días)
     hace_7_dias = now_rd() - timedelta(days=7)
-    casos_recientes = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter(
+    casos_recientes = _q().filter(
         CasoPsicologia.fecha_solicitud >= hace_7_dias
     ).count()
     
@@ -14887,7 +15043,9 @@ async def get_dashboard_psicologia(db: Session = Depends(get_db), current_user: 
             'fecha': c.fecha_solicitud.isoformat() if c.fecha_solicitud else None,
             'solicitante': c.solicitante.nombre_completo if c.solicitante else None
         } for c in mis_casos],
-        'casos_por_tipo': casos_por_tipo
+        'casos_por_tipo': casos_por_tipo,
+        'casos_abiertos_por_tipo': casos_por_tipo,  # nombre correcto (v2.19.2)
+        'nivel_aplicado': _niv or 'todos',
     }
 
 # ============== STATS FILTRADAS POR ROL ==============
@@ -14917,14 +15075,35 @@ async def get_dashboard_stats_por_rol(request: Request, db: Session = Depends(ge
         }
     
     elif role == 'psicologia':
+        # v2.19.2 R2: los 4 KPI superiores del panel de Psicología salen de
+        # ACÁ, no de /dashboard/psicologia. Contaban el colegio completo, así
+        # que al cambiar el selector a Primaria los números de arriba no se
+        # movían y contradecían a la lista de abajo, que sí filtraba.
+        # El nivel del caso se deriva del ESTUDIANTE → curso → grado.
+        _niv = nivel_efectivo(current_user, request)
+        _est_ids = None
+        if _niv:
+            _cids = cursos_ids_de_nivel(db, current_user, _niv) or {0}
+            _est_ids = [e[0] for e in tenant_filter(
+                db.query(Estudiante.id), Estudiante, current_user
+            ).filter(Estudiante.curso_id.in_(_cids)).all()] or [0]
+
+        def _qp():
+            q = tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user)
+            if _est_ids is not None:
+                q = q.filter(CasoPsicologia.estudiante_id.in_(_est_ids))
+            return q
+
         return {
-            'casos_pendientes': tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(estado='pendiente').count(),
-            'casos_en_proceso': tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(estado='en_proceso', asignado_a=current_user.id).count(),
-            'casos_urgentes': tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter_by(urgencia='urgente', estado='pendiente').count(),
-            'casos_atendidos_mes': tenant_filter(db.query(CasoPsicologia), CasoPsicologia, current_user).filter(
+            'casos_pendientes': _qp().filter_by(estado='pendiente').count(),
+            'casos_en_proceso': _qp().filter_by(estado='en_proceso', asignado_a=current_user.id).count(),
+            'casos_urgentes': _qp().filter_by(urgencia='urgente', estado='pendiente').count(),
+            # Definición temporal SIN CAMBIOS: desde el día 1 del mes en curso.
+            'casos_atendidos_mes': _qp().filter(
                 CasoPsicologia.estado == 'atendido',
                 CasoPsicologia.fecha_atencion >= today_rd().replace(day=1)
-            ).count()
+            ).count(),
+            'nivel_aplicado': _niv or 'todos',
         }
     
     else:

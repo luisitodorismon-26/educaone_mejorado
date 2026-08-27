@@ -519,7 +519,10 @@ export const DashboardPage = () => {
         </div>
         {dashPsicologia.casos_por_tipo.length > 0 && (
           <div className="bg-white rounded-xl shadow-sm border p-6">
-            <h2 className="text-lg font-bold text-gray-800 mb-4">Casos Activos por Tipo</h2>
+            {/* v2.19.2: este conteo incluye pendientes SIN tomar, así que
+                decir "activos" contradecía a "Mis Casos Activos: ninguno"
+                justo arriba. "Abiertos" = pendientes + en proceso. */}
+            <h2 className="text-lg font-bold text-gray-800 mb-4">Casos abiertos por tipo</h2>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               {dashPsicologia.casos_por_tipo.map((t, idx) => {
                 const colores: Record<string, string> = { emocional: 'bg-pink-50 border-pink-200 text-pink-700', conductual: 'bg-orange-50 border-orange-200 text-orange-700', academico: 'bg-blue-50 border-blue-200 text-blue-700', familiar: 'bg-purple-50 border-purple-200 text-purple-700' };

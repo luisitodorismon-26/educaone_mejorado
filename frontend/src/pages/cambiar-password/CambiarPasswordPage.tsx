@@ -43,10 +43,11 @@ export const CambiarPasswordPage = () => {
       setError('La contraseña nueva debe ser distinta a la actual.');
       return;
     }
-    if (!/[A-Z]/.test(passwordNuevo) || !/[a-z]/.test(passwordNuevo) || !/\d/.test(passwordNuevo)) {
-      setError('La contraseña debe incluir mayúsculas, minúsculas y al menos un número.');
-      return;
-    }
+    // v2.19.2 R2: se retiró la exigencia de mayúscula/minúscula/número.
+    // El backend (validate_password) solo pide 8 caracteres, así que esta
+    // validación rechazaba en pantalla claves que el servidor sí aceptaba —
+    // y dejaba al usuario atrapado en el cambio obligatorio con una clave que
+    // Dirección le había asignado.
 
     setLoading(true);
     try {
@@ -138,7 +139,7 @@ export const CambiarPasswordPage = () => {
                 required
                 minLength={8}
                 className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Mínimo 8 caracteres con mayúsculas, minúsculas y números"
+                placeholder="Mínimo 8 caracteres"
               />
             </div>
 
