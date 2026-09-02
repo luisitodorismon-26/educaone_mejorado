@@ -1210,6 +1210,61 @@ def puede_editar_registro_ajeno(current_user, registro) -> bool:
     return autor is None or autor == current_user.id
 
 
+# ====================================================================
+# v2.19.3-A — Alcance del PROFESOR sobre documentos por ID
+# ====================================================================
+# tenant_filter y get_tenant_or_404 garantizan que nadie salga de su colegio,
+# pero DENTRO del colegio varios endpoints de boletín aceptaban cualquier
+# estudiante_id/curso_id: un profesor autenticado podía pedir por API el
+# boletín de un estudiante que no tiene en ninguna de sus clases.
+#
+# La regla que aplicamos es la que YA usan /api/cursos (v2.17), los registros
+# MINERD y filtrar_por_asignacion_activa: el profesor alcanza los cursos donde
+# tiene asignación ACTIVA. Como el selector de cursos del frontend se alimenta
+# de /api/cursos —que para un profesor ya viene filtrado a sus asignaciones—,
+# esto no cambia ningún flujo legítimo de la UI: cierra el acceso por ID
+# directo a la API.
+#
+# Solo restringe al rol 'profesor'. Dirección, coordinación, secretaría y
+# superadmin conservan exactamente el comportamiento anterior.
+def guard_profesor_curso(db: Session, current_user, curso_id, *, que: str = 'este documento'):
+    """
+    Devuelve JSONResponse(403) si un PROFESOR pide un curso que no tiene
+    asignado; None si puede continuar.
+
+    Sigue el mismo patrón de "guard que se retorna" que validar_nivel_escritura:
+
+        _guard = guard_profesor_curso(db, current_user, estudiante.curso_id)
+        if _guard:
+            return _guard
+
+    El mensaje no revela nada del estudiante ni del curso pedido.
+    """
+    if not current_user or current_user.role != 'profesor':
+        return None
+
+    if not curso_id:
+        return JSONResponse(
+            {'error': f'No tenés acceso a {que}: no estás asignado a ese curso.'},
+            status_code=403
+        )
+
+    tiene_asignacion = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(
+        profesor_id=current_user.id,
+        curso_id=curso_id,
+        activo=True,
+    ).first()
+
+    if not tiene_asignacion:
+        return JSONResponse(
+            {'error': f'No tenés acceso a {que}: no estás asignado a ese curso.'},
+            status_code=403
+        )
+    return None
+
+
 def resolver_destinatarios(db: Session, colegio_id: int, roles=None, usuario_ids=None,
                            excluir_usuario_id: int = None):
     """
@@ -3032,6 +3087,46 @@ async def get_usuarios(request: Request, db: Session = Depends(get_db), current_
         query = query.filter(Usuario.activo == True)
     usuarios = query.order_by(Usuario.activo.desc(), Usuario.nombre).all()
     return [u.to_dict() for u in usuarios]
+
+# IMPORTANTE: esta ruta va ANTES de /api/usuarios/{id}. Starlette resuelve por
+# orden de declaración, y si {id} se registrara primero capturaría la cadena
+# "directorio" como si fuera un ID.
+@app.get("/api/usuarios/directorio")
+async def get_directorio_usuarios(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+    """Directorio mínimo de destinatarios para la mensajería interna.
+
+    v2.19.3-A — Por qué existe:
+
+    GET /api/usuarios es —y sigue siendo— exclusivo de Dirección: devuelve
+    username, email, teléfono, estado, nivel asignado, must_change_password.
+    Pero la pantalla de Comunicación lo llamaba para TODOS los roles; el 403
+    quedaba silenciado por un .catch() y el desplegable de destinatarios se
+    mostraba vacío. Resultado real: un profesor no podía enviar NINGÚN mensaje
+    individual, y su única vía era la difusión masiva — la misma que esta
+    versión cierra. Sin este endpoint, cerrar el masivo dejaría al profesor sin
+    ningún canal de mensajería.
+
+    Qué expone: únicamente lo imprescindible para elegir a quién escribirle
+    —id, nombre_completo, role— de usuarios ACTIVOS del MISMO colegio.
+    Deliberadamente NO incluye email, teléfono, username, last_login,
+    must_change_password, nivel_asignado ni ningún otro dato administrativo.
+    Para eso está GET /api/usuarios, que sigue siendo de Dirección.
+
+    Se excluye al propio usuario (nadie se escribe a sí mismo) y a las cuentas
+    superadmin, que no pertenecen al colegio ni participan de su mensajería.
+    """
+    usuarios = tenant_filter(db.query(Usuario), Usuario, current_user).filter(
+        Usuario.activo == True,
+        Usuario.role != 'superadmin',
+        Usuario.id != current_user.id,
+    ).order_by(Usuario.nombre, Usuario.apellido).all()
+
+    return [{
+        'id': u.id,
+        'nombre_completo': u.nombre_completo,
+        'role': u.role,
+    } for u in usuarios]
+
 
 @app.get("/api/usuarios/{id}")
 async def get_usuario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
@@ -5288,6 +5383,14 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
     import base64 as _b64
     
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+
+    # v2.19.3-A: un profesor solo genera el reporte de padres de sus cursos
+    # asignados (el endpoint acepta además ?estudiante_id, siempre acotado a
+    # este curso más abajo).
+    _guard = guard_profesor_curso(db, current_user, curso.id, que='el reporte de ese curso')
+    if _guard:
+        return _guard
+
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
         # v2.13.19: si el año está cerrado (tras promover) no hay año activo.
@@ -8056,9 +8159,22 @@ async def get_historial_envios_reporte(id, request: Request, db: Session = Depen
 # ============== PSICOLOGÍA ==============
 
 @app.get("/api/psicologia/casos")
-async def get_casos_psicologia(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_casos_psicologia(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'psicologia'))):
     """
     Obtener casos de psicología.
+
+    v2.19.3-A — Restringido a los cuatro roles que intervienen en el circuito:
+    dirección, coordinación, profesor (solo lo que él solicitó) y psicología.
+
+    Antes dependía de get_current_user, así que SECRETARÍA —que no tiene la
+    pantalla en el menú ni en el router, pero sí un token válido— podía leer
+    por API el motivo por el que un menor fue derivado a Psicología. El filtro
+    de datos sensibles de más abajo (notas_atencion, diagnostico) no la cubría:
+    `motivo` y `recomendacion_profesor` se devuelven a todos los roles.
+
+    Lo que cada rol ve NO cambia: el profesor sigue viendo solo los casos que
+    él solicitó, el lente de división se sigue aplicando igual, y las notas
+    internas y el diagnóstico siguen reservados a psicología/dirección.
 
     v2.19.2: aplica el lente de división. El nivel de un caso se deriva del
     ESTUDIANTE → curso → grado, nunca de quién lo creó: un profesor de primaria
@@ -8350,41 +8466,78 @@ async def enviar_mensaje(request: Request, db: Session = Depends(get_db), curren
     
     return JSONResponse({'message': 'Mensaje enviado', 'id': mensaje.id}, status_code=201)
 
+# v2.19.3-A — Roles que pueden ser DESTINO de una difusión masiva.
+# Lista blanca explícita: 'superadmin' queda fuera a propósito (no pertenece a
+# ningún colegio y no participa de la mensajería interna del centro).
+ROLES_DESTINO_MASIVO = {'direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'}
+
+
 @app.post("/api/mensajes/masivo")
-async def enviar_mensaje_masivo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Enviar mensaje a todos los usuarios de un rol"""
+async def enviar_mensaje_masivo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+    """Enviar mensaje a todos los usuarios de un rol.
+
+    v2.19.3-A — Restringido a Dirección y Coordinación.
+
+    Antes dependía de get_current_user, así que CUALQUIER usuario autenticado
+    podía difundir a todo el colegio: un profesor o secretaría podía escribirle
+    de una sola vez a todos los profesores o a toda la dirección. La difusión
+    masiva es una facultad de conducción, no de uso diario.
+
+    La mensajería individual sigue abierta a todos los roles vía
+    POST /api/mensajes, con el directorio de GET /api/usuarios/directorio.
+
+    v2.19.3-A — El rol destino se valida contra una lista blanca, y asunto y
+    contenido se sanitizan con las MISMAS reglas del mensaje individual (antes
+    entraban crudos a la base: era el único endpoint de texto sin bleach).
+    """
     data = await request.json()
-    
+
     if not data.get('asunto') or not data.get('contenido'):
         return JSONResponse({'error': 'Asunto y contenido son requeridos'}, status_code=400)
-    
+
     if not data.get('rol'):
         return JSONResponse({'error': 'Rol es requerido'}, status_code=400)
-    
-    rol = data['rol']
+
+    rol = str(data['rol']).strip().lower()
+    if rol not in ROLES_DESTINO_MASIVO:
+        return JSONResponse(
+            {'error': f'Rol destino inválido. Valores permitidos: {sorted(ROLES_DESTINO_MASIVO)}'},
+            status_code=400
+        )
+
+    # Mismas reglas que POST /api/mensajes: sin tags en el asunto, formato
+    # básico permitido en el cuerpo, y los mismos límites de longitud.
+    import bleach
+    asunto_limpio = bleach.clean(data['asunto'], tags=[], strip=True)[:200]
+    contenido_limpio = bleach.clean(data['contenido'], tags=['b','i','u','br','p'], strip=True)[:5000]
+
     usuarios_destino = tenant_filter(db.query(Usuario), Usuario, current_user).filter_by(role=rol, activo=True).all()
-    
+
     if not usuarios_destino:
         return JSONResponse({'error': f'No hay usuarios con el rol {rol}'}, status_code=404)
-    
+
     mensajes_enviados = 0
     for usuario in usuarios_destino:
         if usuario.id != current_user.id:  # No enviarse a sí mismo
             mensaje = Mensaje(
                 remitente_id=current_user.id,
                 destinatario_id=usuario.id,
-                asunto=data['asunto'],
-                contenido=data['contenido'],
+                asunto=asunto_limpio,
+                contenido=contenido_limpio,
                 colegio_id=current_user.colegio_id
             )
             db.add(mensaje)
             mensajes_enviados += 1
-    
+
     db.commit()
-    
+
     return JSONResponse({
         'message': f'Mensaje enviado a {mensajes_enviados} usuarios',
-        'count': mensajes_enviados
+        'count': mensajes_enviados,
+        # v2.19.3-A: el frontend leía `enviados` y el backend solo mandaba
+        # `count`, así que el aviso siempre decía "enviado a 0 usuarios".
+        # Se agrega `enviados` sin quitar `count` (retrocompatible).
+        'enviados': mensajes_enviados,
     }, status_code=201)
 
 @app.post("/api/mensajes/{id}/leer")
@@ -9088,7 +9241,12 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
     Devuelve formato compatible con el frontend existente.
     """
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
-    
+
+    # v2.19.3-A: un profesor solo consulta boletines de sus cursos asignados.
+    _guard = guard_profesor_curso(db, current_user, estudiante.curso_id, que='ese boletín')
+    if _guard:
+        return _guard
+
     # Asistencia (sin cambios — el modelo Asistencia no fue afectado)
     asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(estudiante_id=id).all()
     presentes = sum(1 for a in asistencias if a.estado == 'presente')
@@ -9235,6 +9393,12 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
     from boletin_padres import generar_boletin_padres
 
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+
+    # v2.19.3-A: un profesor solo imprime boletines de sus cursos asignados.
+    _guard = guard_profesor_curso(db, current_user, estudiante.curso_id, que='ese boletín')
+    if _guard:
+        return _guard
+
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
@@ -9927,6 +10091,12 @@ async def boletin_primaria_estudiante_json(
                                   MINIMO_APROBATORIO_PRIMARIA)
 
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+
+    # v2.19.3-A: un profesor solo consulta boletines de sus cursos asignados.
+    _guard = guard_profesor_curso(db, current_user, estudiante.curso_id, que='ese boletín')
+    if _guard:
+        return _guard
+
     curso = estudiante.curso
     if not curso:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
@@ -10045,6 +10215,12 @@ async def boletin_primaria_estudiante_pdf(
 ):
     """Informe de Aprendizaje (primaria) de UN estudiante, sobre plantilla oficial."""
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+
+    # v2.19.3-A: un profesor solo imprime boletines de sus cursos asignados.
+    _guard = guard_profesor_curso(db, current_user, estudiante.curso_id, que='ese boletín')
+    if _guard:
+        return _guard
+
     curso = estudiante.curso
     if not curso:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
@@ -10081,6 +10257,12 @@ async def boletin_primaria_curso_pdf(
     from pypdf import PdfWriter, PdfReader
 
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+
+    # v2.19.3-A: un profesor solo imprime el lote de sus cursos asignados.
+    _guard = guard_profesor_curso(db, current_user, curso.id, que='los boletines de ese curso')
+    if _guard:
+        return _guard
+
     if _es_curso_secundaria(db, curso.id):
         return JSONResponse({'error': 'Este boletín es solo para primaria.'}, status_code=400)
 
@@ -10137,8 +10319,18 @@ async def generar_boletin_minerd_v2(
     v2.13.9: validaciones tempranas + mensajes específicos de error.
     """
     from boletin_minerd_secundaria import generar_boletin_secundaria_minerd
-    
+
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+
+    # v2.19.3-A: un profesor solo imprime boletines de sus cursos asignados.
+    # Este endpoint sí lo usa el profesor desde /academico (TabBoletin y la
+    # ficha del estudiante), pero siempre sobre un curso que eligió en un
+    # selector alimentado por /api/cursos — que para él ya viene filtrado a sus
+    # asignaciones activas. El flujo legítimo no cambia.
+    _guard = guard_profesor_curso(db, current_user, estudiante.curso_id, que='ese boletín')
+    if _guard:
+        return _guard
+
     curso = estudiante.curso
     if not curso:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
@@ -11375,11 +11567,31 @@ async def ejecutar_promocion(request: Request, db: Session = Depends(get_db), cu
     errores = []
     
     for est_id in estudiantes_promover:
-        estudiante = db.get(Estudiante, est_id)
-        if not estudiante:
+        # v2.19.3-A — SEGURIDAD MULTI-TENANT.
+        #
+        # Antes esto era `db.get(Estudiante, est_id)`: cargaba por clave
+        # primaria sin mirar el colegio. Un director podía mandar en el body
+        # IDs de estudiantes de OTRO colegio y el bucle los promovía, los movía
+        # a un curso propio o los desactivaba (`activo = False`) — y además
+        # devolvía su `nombre_completo` dentro de `errores`, filtrando datos de
+        # menores ajenos.
+        #
+        # Ahora el estudiante se resuelve DENTRO del tenant. Un ID de otro
+        # colegio queda indistinguible de un ID inexistente: mismo mensaje
+        # genérico, sin nombre ni ningún otro dato del estudiante ajeno.
+        try:
+            est_id_int = int(est_id)
+        except (TypeError, ValueError):
             errores.append(f'Estudiante {est_id} no encontrado')
             continue
-        
+
+        estudiante = tenant_filter(
+            db.query(Estudiante), Estudiante, current_user
+        ).filter(Estudiante.id == est_id_int).first()
+        if not estudiante:
+            errores.append(f'Estudiante {est_id_int} no encontrado')
+            continue
+
         if not estudiante.curso or not estudiante.curso.grado:
             errores.append(f'{estudiante.nombre_completo}: Sin curso/grado asignado')
             continue

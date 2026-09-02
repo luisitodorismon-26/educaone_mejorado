@@ -380,7 +380,30 @@ class RolesRequired:
             db.info['current_user'] = None
             raise HTTPException(status_code=401, detail='Token inválido o expirado')
         user = _attach_token_context(user, payload)
-        
+
+        # v2.19.3-A — Colegio desactivado.
+        #
+        # get_current_user ya cortaba la sesión de un usuario cuyo colegio fue
+        # desactivado por Superadmin, pero RolesRequired no lo hacía. El
+        # resultado era que el interruptor quedaba a medias: un director de un
+        # colegio dado de baja seguía operando hasta 8 horas (lo que dura su
+        # token) en TODO endpoint protegido por rol — usuarios, reportes,
+        # boletines, PDFs — porque esos no pasan por get_current_user.
+        #
+        # Misma regla, mismo mensaje y mismo status que get_current_user:
+        # superadmin queda exento (no pertenece a ningún colegio); cualquier
+        # otro usuario necesita un colegio existente y activo.
+        if user.role != 'superadmin':
+            from sqlalchemy import text
+            colegio_activo = db.execute(
+                text('SELECT activo FROM colegios WHERE id = :id'),
+                {'id': user.colegio_id}
+            ).scalar() if user.colegio_id else None
+            if not colegio_activo:
+                current_user_ctx.set(None)
+                db.info['current_user'] = None
+                raise HTTPException(status_code=403, detail='El colegio está desactivado')
+
         # Validar token_version (logout / cambio de password invalida sesión)
         token_ver = payload.get('token_version', 0)
         if token_ver != (user.token_version or 0):

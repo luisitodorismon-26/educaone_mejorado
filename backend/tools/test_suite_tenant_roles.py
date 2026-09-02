@@ -1844,6 +1844,233 @@ with client:
         assert login.status_code == 200 and login.json().get('token'), \
             f"username editado debe seguir autenticando: {login.status_code} {login.text}"
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN S — v2.19.3-A (seguridad y comunicación)
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== S. v2.19.3-A — SEGURIDAD Y COMUNICACIÓN ==={RESET}")
+
+    @test("S1. Promoción NO toca ni revela estudiantes de otro colegio")
+    def t():
+        # Estado de B ANTES: nombre y curso del estudiante del otro colegio.
+        ests_b = client.get('/api/estudiantes', headers=auth(DIR_B_TOKEN)).json()
+        est_b = next((e for e in ests_b if e['id'] == B['est']), None)
+        assert est_b is not None, 'setup: el estudiante de B debe existir'
+        nombre_b = est_b['nombre_completo']
+        curso_b_antes = est_b['curso_id']
+
+        # Director A intenta promover a un estudiante del colegio B.
+        r = client.post('/api/promocion/ejecutar',
+                        json={'estudiantes': [B['est']]},
+                        headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, r.text
+        body = r.json()
+
+        # 1. No se promovió nada.
+        assert body['promocionados'] == 0, \
+            f"no debe promover estudiantes de otro colegio: {body}"
+
+        # 2. No se filtra el nombre del menor ajeno en los errores.
+        errores_txt = ' '.join(body.get('errores', []))
+        assert nombre_b not in errores_txt, \
+            f"el nombre del estudiante de otro colegio se filtró en errores: {errores_txt!r}"
+
+        # 3. El estudiante de B sigue intacto: activo y en su curso original.
+        ests_b2 = client.get('/api/estudiantes', headers=auth(DIR_B_TOKEN)).json()
+        est_b2 = next((e for e in ests_b2 if e['id'] == B['est']), None)
+        assert est_b2 is not None, \
+            'el estudiante de B fue desactivado por una promoción de otro colegio'
+        assert est_b2['curso_id'] == curso_b_antes, \
+            'el estudiante de B fue movido de curso por otro colegio'
+
+    @test("S2. Colegio desactivado también corta endpoints con RolesRequired")
+    def t():
+        # Colegio propio para no afectar al resto de la suite.
+        r = client.post('/api/superadmin/colegios', json={
+            'nombre': 'Colegio S2', 'codigo': 'S2',
+            'admin_username': 'dir_s2', 'admin_password': 'AdminS2!clave',
+            'admin_nombre': 'Dir', 'admin_apellido': 'S2',
+        }, headers=auth(SA_TOKEN))
+        assert r.status_code in (200, 201), r.text
+        cid = r.json()['id']
+        tok = _login_prueba(json={'username': 'dir_s2', 'password': 'AdminS2!clave'}).json()['token']
+
+        # Con el colegio activo, /api/usuarios (RolesRequired) responde normal.
+        assert client.get('/api/usuarios', headers=auth(tok)).status_code == 200, \
+            'setup: con el colegio activo el director debe poder listar usuarios'
+
+        r = client.put(f'/api/superadmin/colegios/{cid}', json={'activo': False},
+                       headers=auth(SA_TOKEN))
+        assert r.status_code == 200, r.text
+
+        # get_current_user ya cortaba (M17). Lo nuevo: RolesRequired también.
+        assert client.get('/api/auth/me', headers=auth(tok)).status_code == 401
+        r = client.get('/api/usuarios', headers=auth(tok))
+        assert r.status_code == 403, \
+            f'endpoint con RolesRequired debe rechazar colegio desactivado, dio {r.status_code}'
+
+    @test("S3. Profesor NO puede enviar mensaje masivo")
+    def t():
+        r = client.post('/api/mensajes/masivo', json={
+            'rol': 'profesor', 'asunto': 'Prueba S3', 'contenido': 'Cuerpo S3'
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 403, \
+            f'profesor no debe poder difundir a todo el colegio, dio {r.status_code}: {r.text}'
+
+    @test("S3b. Secretaría NO puede enviar mensaje masivo")
+    def t():
+        r = client.post('/api/mensajes/masivo', json={
+            'rol': 'profesor', 'asunto': 'Prueba S3b', 'contenido': 'Cuerpo S3b'
+        }, headers=auth(SEC_A_TOKEN))
+        assert r.status_code == 403, \
+            f'secretaría no debe poder difundir, dio {r.status_code}: {r.text}'
+
+    @test("S4. Dirección y Coordinación SÍ pueden enviar mensaje masivo")
+    def t():
+        r = client.post('/api/mensajes/masivo', json={
+            'rol': 'profesor', 'asunto': 'Aviso S4 dirección', 'contenido': 'Cuerpo S4'
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 201, f'dirección debe poder difundir: {r.text}'
+        assert r.json().get('enviados', 0) >= 1, \
+            f"la respuesta debe traer 'enviados' con el conteo real: {r.json()}"
+        assert r.json().get('count') == r.json().get('enviados'), \
+            "'count' y 'enviados' deben coincidir (retrocompatibilidad)"
+
+        coord_token = _login_prueba(json={
+            'username': f'coord_{A["sufijo"]}', 'password': 'coordinador123'
+        }).json()['token']
+        r = client.post('/api/mensajes/masivo', json={
+            'rol': 'profesor', 'asunto': 'Aviso S4 coordinación', 'contenido': 'Cuerpo S4c'
+        }, headers=auth(coord_token))
+        assert r.status_code == 201, f'coordinación debe poder difundir: {r.text}'
+
+    @test("S5. El mensaje masivo se sanitiza igual que el individual")
+    def t():
+        asunto = 'Sanitiza S5 <script>alert(1)</script>'
+        r = client.post('/api/mensajes/masivo', json={
+            'rol': 'profesor',
+            'asunto': asunto,
+            'contenido': '<script>alert("xss")</script><b>negrita</b> texto',
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 201, r.text
+
+        recibidos = client.get('/api/mensajes', headers=auth(PROF_A_TOKEN)).json()
+        msg = next((m for m in recibidos
+                    if m['tipo'] == 'recibido' and 'Sanitiza S5' in (m.get('asunto') or '')), None)
+        assert msg is not None, 'el profesor debe haber recibido el mensaje masivo'
+        assert '<script>' not in (msg.get('asunto') or ''), \
+            f"asunto sin sanitizar: {msg.get('asunto')!r}"
+        assert '<script>' not in (msg.get('contenido') or ''), \
+            f"contenido sin sanitizar: {msg.get('contenido')!r}"
+        assert 'negrita' in (msg.get('contenido') or ''), \
+            'las etiquetas permitidas (b/i/u/br/p) no deben perder el texto'
+
+    @test("S5b. El rol destino del masivo se valida contra lista blanca")
+    def t():
+        r = client.post('/api/mensajes/masivo', json={
+            'rol': 'rol_inventado', 'asunto': 'S5b', 'contenido': 'x'
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 400, \
+            f'un rol destino inválido debe dar 400, dio {r.status_code}: {r.text}'
+
+    @test("S6. El directorio no expone usuarios de otro colegio")
+    def t():
+        r = client.get('/api/usuarios/directorio', headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 200, \
+            f'todo rol autenticado debe poder leer el directorio: {r.status_code} {r.text}'
+        ids = {u['id'] for u in r.json()}
+        assert B['prof'] not in ids, 'el directorio filtró un usuario del colegio B'
+        assert A['prof'] not in ids, 'el directorio no debe incluirse a uno mismo'
+        assert A['coord'] in ids, 'el directorio debe traer a los compañeros del colegio'
+
+    @test("S7. El directorio no expone información administrativa")
+    def t():
+        r = client.get('/api/usuarios/directorio', headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 200, r.text
+        filas = r.json()
+        assert filas, 'setup: el directorio no debería venir vacío'
+        permitidas = {'id', 'nombre_completo', 'role'}
+        for u in filas:
+            extra = set(u.keys()) - permitidas
+            assert not extra, f'el directorio expone campos de más: {sorted(extra)}'
+        # Verificación explícita de los campos sensibles que sí trae /api/usuarios.
+        crudo = r.text
+        for prohibido in ('email', 'telefono', 'username',
+                          'must_change_password', 'last_login', 'nivel_asignado'):
+            assert f'"{prohibido}"' not in crudo, \
+                f'el directorio no debe incluir {prohibido}'
+
+    @test("S8. Secretaría NO puede leer casos de Psicología por API")
+    def t():
+        r = client.get('/api/psicologia/casos', headers=auth(SEC_A_TOKEN))
+        assert r.status_code == 403, \
+            f'secretaría no debe leer casos de psicología, dio {r.status_code}'
+
+    @test("S8b. Los roles del circuito de Psicología siguen entrando")
+    def t():
+        for nombre, tok in (('dirección', DIR_A_TOKEN), ('profesor', PROF_A_TOKEN)):
+            r = client.get('/api/psicologia/casos', headers=auth(tok))
+            assert r.status_code == 200, \
+                f'{nombre} debe seguir accediendo a psicología, dio {r.status_code}'
+
+    @test("S9. Profesor NO obtiene boletín de un estudiante que no tiene asignado")
+    def t():
+        # Segundo curso del colegio A, SIN asignación para PROF_A.
+        grados = client.get('/api/grados', headers=auth(DIR_A_TOKEN)).json()
+        tandas = client.get('/api/tandas', headers=auth(DIR_A_TOKEN)).json()
+        r = client.post('/api/cursos', json={
+            'nombre': 'Z', 'grado_id': grados[0]['id'], 'tanda_id': tandas[0]['id']
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code in (200, 201), r.text
+        curso_ajeno = r.json()['id']
+
+        r = client.post('/api/estudiantes', json={
+            'nombre': 'NoAsignado', 'apellido': 'S9',
+            'curso_id': curso_ajeno, 'no_lista': 1, 'matricula': 'M-S9'
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code in (200, 201), r.text
+        est_ajeno = r.json()['id']
+
+        # Mismo colegio, pero fuera de las asignaciones del profesor.
+        # Los SIETE endpoints documentales que protege guard_profesor_curso.
+        for ruta in (f'/api/boletines/estudiante/{est_ajeno}',
+                     f'/api/boletines/estudiante/{est_ajeno}/pdf',
+                     f'/api/boletines/estudiante/{est_ajeno}/pdf-minerd-v2',
+                     f'/api/boletines-primaria/estudiante/{est_ajeno}',
+                     f'/api/boletines-primaria/estudiante/{est_ajeno}/pdf',
+                     f'/api/boletines-primaria/curso/{curso_ajeno}/pdf',
+                     f'/api/calificaciones-secundaria/reporte-padres/curso/{curso_ajeno}/pdf'):
+            r = client.get(ruta, headers=auth(PROF_A_TOKEN))
+            assert r.status_code == 403, \
+                f'{ruta} debe dar 403 para un profesor sin asignación, dio {r.status_code}'
+
+        # Dirección y secretaría conservan su alcance de colegio completo.
+        # En estos endpoints el ÚNICO 403 posible es el candado de profesor:
+        # el resto de los caminos de error devuelven 404. Por eso basta con
+        # comprobar que no aparece un 403.
+        for nombre, tok in (('dirección', DIR_A_TOKEN), ('secretaría', SEC_A_TOKEN)):
+            for ruta in (f'/api/boletines/estudiante/{est_ajeno}',
+                         f'/api/calificaciones-secundaria/reporte-padres/curso/{curso_ajeno}/pdf'):
+                r = client.get(ruta, headers=auth(tok))
+                assert r.status_code != 403, \
+                    (f'{nombre} no debe verse afectada por el candado de profesor '
+                     f'en {ruta} (dio {r.status_code})')
+
+    @test("S10. Profesor SÍ obtiene el boletín de un estudiante de su curso")
+    def t():
+        # A['est'] está en A['curso'], donde PROF_A tiene asignación activa.
+        # El único 403 posible en estos endpoints es guard_profesor_curso, así
+        # que "no bloqueado por autorización" == "no dio 403". El PDF puede
+        # devolver 404/400 por falta de notas o de año escolar: eso no es un
+        # problema de permisos y no debe hacer fallar este test.
+        for ruta in (f'/api/boletines/estudiante/{A["est"]}',
+                     f'/api/boletines/estudiante/{A["est"]}/pdf-minerd-v2',
+                     f'/api/calificaciones-secundaria/reporte-padres/curso/{A["curso"]}/pdf'):
+            r = client.get(ruta, headers=auth(PROF_A_TOKEN))
+            assert r.status_code != 403, \
+                (f'{ruta}: el profesor asignado NO debe ser bloqueado '
+                 f'(dio {r.status_code}: {r.text[:200]})')
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL
