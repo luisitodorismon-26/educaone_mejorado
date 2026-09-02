@@ -2032,27 +2032,40 @@ with client:
         est_ajeno = r.json()['id']
 
         # Mismo colegio, pero fuera de las asignaciones del profesor.
+        # Los SIETE endpoints documentales que protege guard_profesor_curso.
         for ruta in (f'/api/boletines/estudiante/{est_ajeno}',
                      f'/api/boletines/estudiante/{est_ajeno}/pdf',
                      f'/api/boletines/estudiante/{est_ajeno}/pdf-minerd-v2',
                      f'/api/boletines-primaria/estudiante/{est_ajeno}',
                      f'/api/boletines-primaria/estudiante/{est_ajeno}/pdf',
-                     f'/api/boletines-primaria/curso/{curso_ajeno}/pdf'):
+                     f'/api/boletines-primaria/curso/{curso_ajeno}/pdf',
+                     f'/api/calificaciones-secundaria/reporte-padres/curso/{curso_ajeno}/pdf'):
             r = client.get(ruta, headers=auth(PROF_A_TOKEN))
             assert r.status_code == 403, \
                 f'{ruta} debe dar 403 para un profesor sin asignación, dio {r.status_code}'
 
         # Dirección y secretaría conservan su alcance de colegio completo.
+        # En estos endpoints el ÚNICO 403 posible es el candado de profesor:
+        # el resto de los caminos de error devuelven 404. Por eso basta con
+        # comprobar que no aparece un 403.
         for nombre, tok in (('dirección', DIR_A_TOKEN), ('secretaría', SEC_A_TOKEN)):
-            r = client.get(f'/api/boletines/estudiante/{est_ajeno}', headers=auth(tok))
-            assert r.status_code != 403, \
-                f'{nombre} no debe verse afectada por el candado de profesor'
+            for ruta in (f'/api/boletines/estudiante/{est_ajeno}',
+                         f'/api/calificaciones-secundaria/reporte-padres/curso/{curso_ajeno}/pdf'):
+                r = client.get(ruta, headers=auth(tok))
+                assert r.status_code != 403, \
+                    (f'{nombre} no debe verse afectada por el candado de profesor '
+                     f'en {ruta} (dio {r.status_code})')
 
     @test("S10. Profesor SÍ obtiene el boletín de un estudiante de su curso")
     def t():
         # A['est'] está en A['curso'], donde PROF_A tiene asignación activa.
+        # El único 403 posible en estos endpoints es guard_profesor_curso, así
+        # que "no bloqueado por autorización" == "no dio 403". El PDF puede
+        # devolver 404/400 por falta de notas o de año escolar: eso no es un
+        # problema de permisos y no debe hacer fallar este test.
         for ruta in (f'/api/boletines/estudiante/{A["est"]}',
-                     f'/api/boletines/estudiante/{A["est"]}/pdf-minerd-v2'):
+                     f'/api/boletines/estudiante/{A["est"]}/pdf-minerd-v2',
+                     f'/api/calificaciones-secundaria/reporte-padres/curso/{A["curso"]}/pdf'):
             r = client.get(ruta, headers=auth(PROF_A_TOKEN))
             assert r.status_code != 403, \
                 (f'{ruta}: el profesor asignado NO debe ser bloqueado '
