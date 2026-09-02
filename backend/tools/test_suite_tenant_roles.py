@@ -2071,6 +2071,109 @@ with client:
                 (f'{ruta}: el profesor asignado NO debe ser bloqueado '
                  f'(dio {r.status_code}: {r.text[:200]})')
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN U — v2.19.3-B (identidad de curso en los filtros de Reportes)
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== U. v2.19.3-B — FILTROS DE REPORTES ==={RESET}")
+
+    @test("U1. GET /api/reportes expone estudiante_curso_id con el curso real")
+    def t():
+        r = client.post('/api/reportes', json={
+            'estudiante_id': A['est'],
+            'titulo': 'Reporte U1',
+            'descripcion': 'Situación de prueba U1',
+            'tipo': 'conducta',
+            'gravedad': 'leve',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, f'el profesor asignado debe poder reportar: {r.text}'
+        rep_id = r.json()['id']
+
+        reportes = client.get('/api/reportes', headers=auth(DIR_A_TOKEN)).json()
+        rep = next((x for x in reportes if x['id'] == rep_id), None)
+        assert rep is not None, 'Dirección debe ver el reporte de su colegio'
+
+        # El campo nuevo existe y trae la IDENTIDAD del curso del estudiante.
+        assert 'estudiante_curso_id' in rep, \
+            "la respuesta debe incluir 'estudiante_curso_id'"
+        assert rep['estudiante_curso_id'] == A['curso'], \
+            (f"estudiante_curso_id debe ser el curso_id real del estudiante "
+             f"({A['curso']}), vino {rep['estudiante_curso_id']!r}")
+
+    @test("U2. estudiante_curso (nombre para mostrar) sigue existiendo")
+    def t():
+        # No-regresión: el modal de detalle y el mensaje de WhatsApp a los
+        # padres siguen usando el nombre completo del curso.
+        reportes = client.get('/api/reportes', headers=auth(DIR_A_TOKEN)).json()
+        assert reportes, 'setup: debería haber al menos un reporte'
+        rep = reportes[0]
+        assert 'estudiante_curso' in rep, \
+            "'estudiante_curso' no debe desaparecer: lo usan el detalle y WhatsApp"
+        assert rep['estudiante_curso'], 'estudiante_curso no debería venir vacío'
+        # Y es un NOMBRE, no un número: es justamente por eso que no sirve
+        # como identidad y se agregó estudiante_curso_id.
+        assert isinstance(rep['estudiante_curso'], str), \
+            'estudiante_curso debe seguir siendo el nombre para mostrar'
+
+    @test("U3. El curso expuesto permite filtrar de verdad (ID contra ID)")
+    def t():
+        # Reproduce lo que hace ReportesPage: quedarse con los reportes cuyo
+        # estudiante_curso_id coincide con el curso elegido. Antes del arreglo
+        # el frontend comparaba el nombre completo contra Curso.nombre (solo la
+        # sección) y el resultado era SIEMPRE vacío.
+        reportes = client.get('/api/reportes', headers=auth(DIR_A_TOKEN)).json()
+        del_curso = [x for x in reportes if x.get('estudiante_curso_id') == A['curso']]
+        assert del_curso, \
+            'filtrar por el curso del estudiante no puede devolver una lista vacía'
+
+        # Y el nombre NO sirve como identidad: es la causa raíz del bug.
+        cursos = client.get('/api/cursos', headers=auth(DIR_A_TOKEN)).json()
+        curso = next(c for c in cursos if c['id'] == A['curso'])
+        assert curso['nombre'] != del_curso[0]['estudiante_curso'], \
+            ('Curso.nombre debería ser solo la sección y distinto del nombre '
+             'completo: si dejaran de diferir, el bug original sería invisible')
+
+    @test("U4. Separación por tenant intacta en /api/reportes")
+    def t():
+        reportes_a = client.get('/api/reportes', headers=auth(DIR_A_TOKEN)).json()
+        ids_a = {x['id'] for x in reportes_a}
+        cursos_a = {x.get('estudiante_curso_id') for x in reportes_a}
+        assert ids_a, 'setup: colegio A debe tener reportes'
+
+        reportes_b = client.get('/api/reportes', headers=auth(DIR_B_TOKEN)).json()
+        ids_b = {x['id'] for x in reportes_b}
+        assert not (ids_a & ids_b), \
+            'el colegio B no debe ver ningún reporte del colegio A'
+        # El campo nuevo tampoco puede filtrar cursos de otro colegio.
+        for x in reportes_b:
+            assert x.get('estudiante_curso_id') not in cursos_a, \
+                'estudiante_curso_id expuso un curso del otro colegio'
+
+    @test("U5. El alcance por rol de /api/reportes no cambió")
+    def t():
+        reportes_dir = client.get('/api/reportes', headers=auth(DIR_A_TOKEN)).json()
+        ids_dir = {x['id'] for x in reportes_dir}
+
+        # Profesor: ve el reporte que él creó sobre un estudiante de su curso.
+        reportes_prof = client.get('/api/reportes', headers=auth(PROF_A_TOKEN)).json()
+        ids_prof = {x['id'] for x in reportes_prof}
+        assert ids_prof, 'el profesor debe ver los reportes que él levantó'
+        assert ids_prof <= ids_dir, \
+            'el profesor nunca debe ver más reportes que Dirección'
+        for x in reportes_prof:
+            assert 'estudiante_curso_id' in x, \
+                'el campo nuevo debe estar también para el profesor'
+
+        # Profesor del OTRO colegio: nada.
+        reportes_prof_b = client.get('/api/reportes', headers=auth(PROF_B_TOKEN)).json()
+        assert not ({x['id'] for x in reportes_prof_b} & ids_dir), \
+            'el profesor del colegio B no debe ver reportes del colegio A'
+
+        # Secretaría de A: conserva su lectura de colegio (comportamiento previo).
+        r = client.get('/api/reportes', headers=auth(SEC_A_TOKEN))
+        assert r.status_code == 200, \
+            f'secretaría debe seguir leyendo reportes: {r.status_code}'
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL
