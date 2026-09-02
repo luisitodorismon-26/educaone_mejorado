@@ -102,8 +102,48 @@ self.addEventListener('push', (event) => {
     renotify: prioridad === 'urgente'
   };
 
-  event.waitUntil(self.registration.showNotification(titulo, opciones));
+  // v2.19.3-C — Además de la notificación del sistema, avisar a las ventanas
+  // de EducaOne que estén abiertas para que refresquen su interfaz al
+  // instante, sin esperar al polling de 30 s y sin exigir F5.
+  //
+  // showNotification se mantiene SIEMPRE: el contrato userVisibleOnly de la
+  // suscripción obliga a mostrar algo por cada push. Si la persona ya está
+  // mirando la app verá las dos cosas —la notificación y la interfaz ya
+  // actualizada—, que es la decisión tomada a favor de la fiabilidad.
+  //
+  // El postMessage no lleva contenido del mensaje: es solo una señal de
+  // "hay algo nuevo, volvé a consultar". Los datos los pide el frontend con
+  // el token del usuario, así que este canal no puede filtrar nada.
+  event.waitUntil(
+    Promise.all([
+      self.registration.showNotification(titulo, opciones),
+      avisarAVentanasAbiertas({
+        tipo: 'educaone:refrescar',
+        notificacion_id: datos.notificacion_id || null,
+        link: link
+      })
+    ])
+  );
 });
+
+/**
+ * Envía una señal a todas las ventanas de EducaOne abiertas.
+ * Nunca rechaza: un fallo acá no debe impedir que se muestre la notificación.
+ */
+function avisarAVentanasAbiertas(payload) {
+  return self.clients
+    .matchAll({ type: 'window', includeUncontrolled: true })
+    .then((clientes) => {
+      clientes.forEach((cliente) => {
+        try {
+          cliente.postMessage(payload);
+        } catch (e) {
+          /* una ventana que ya se cerró no debe romper al resto */
+        }
+      });
+    })
+    .catch(() => {});
+}
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();

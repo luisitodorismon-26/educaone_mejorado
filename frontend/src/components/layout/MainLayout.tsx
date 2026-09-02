@@ -4,6 +4,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { LanguageSelector } from '../../i18n';
 import api from '../../services/api';
+import { useRefrescoEnVivo } from '../../hooks/useRefrescoEnVivo';
 import {
   LayoutDashboard,
   BookOpen,
@@ -161,6 +162,12 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
       // Silenciar error
     }
   };
+
+  // v2.19.3-C: la campana se actualiza al instante cuando llega un Web Push,
+  // y también al volver la pestaña a visible o recuperar el foco. El
+  // setInterval de 30 s de arriba se mantiene como fallback para cuando no hay
+  // Push disponible.
+  useRefrescoEnVivo(loadNotificaciones);
 
   const marcarNotifLeida = async (id: number) => {
     try { await api.put(`/notificaciones/${id}/leer`); loadNotificaciones(); } catch {}

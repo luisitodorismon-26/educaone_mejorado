@@ -8443,8 +8443,26 @@ async def get_mensajes(request: Request, db: Session = Depends(get_db), current_
     
     return todos
 
+# v2.19.3-C — Texto que ve el destinatario en la PANTALLA BLOQUEADA.
+#
+# El cuerpo es fijo y genérico a propósito: nunca lleva el asunto, ni el
+# contenido del mensaje, ni ningún dato de estudiantes. Lo único identificable
+# es el nombre de quien escribe, que es personal del centro, no un menor.
+#
+# push_service._payload() construye el push a partir de la fila de
+# Notificacion, así que este mismo texto es el que llega al dispositivo: no
+# hay dos fuentes que puedan divergir.
+CUERPO_NOTIF_MENSAJE = 'Tienes un nuevo mensaje. Toca para verlo.'
+
+
+def _titulo_notif_mensaje(remitente) -> str:
+    """'💬 Nuevo mensaje de Fulano', acotado al String(200) de la columna."""
+    nombre = (getattr(remitente, 'nombre_completo', None) or '').strip()
+    return f'💬 Nuevo mensaje de {nombre[:150]}' if nombre else '💬 Nuevo mensaje en EducaOne'
+
+
 @app.post("/api/mensajes")
-async def enviar_mensaje(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def enviar_mensaje(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Enviar un nuevo mensaje"""
     data = await request.json()
     
@@ -8476,7 +8494,32 @@ async def enviar_mensaje(request: Request, db: Session = Depends(get_db), curren
     )
     db.add(mensaje)
     db.commit()
-    
+
+    # v2.19.3-C — Un mensaje interno ahora se comporta como cualquier otro
+    # evento del sistema: Mensaje + Notificacion + Web Push.
+    #
+    # Antes solo se creaba la fila `Mensaje`, así que el destinatario únicamente
+    # se enteraba cuando el polling de 30 s de MainLayout le movía el contador,
+    # o al recargar la página. Con la app abierta en /comunicacion no se enteraba
+    # nunca sin F5.
+    #
+    # Va DESPUÉS del commit, igual que reportes y psicología: el mensaje ya está
+    # guardado pase lo que pase acá, y notify() nunca lanza excepción.
+    _notifs = notify(
+        db,
+        colegio_id=current_user.colegio_id,
+        usuario_ids=[destinatario.id],
+        excluir_usuario_id=current_user.id,
+        titulo=_titulo_notif_mensaje(current_user),
+        mensaje=CUERPO_NOTIF_MENSAJE,
+        tipo='mensaje',
+        prioridad='normal',
+        link='/comunicacion',
+        evento_key=f'mensaje:{mensaje.id}:recibido',
+    )
+    db.commit()
+    despachar_push(background_tasks, _notifs)
+
     return JSONResponse({'message': 'Mensaje enviado', 'id': mensaje.id}, status_code=201)
 
 # v2.19.3-A — Roles que pueden ser DESTINO de una difusión masiva.
@@ -8486,7 +8529,7 @@ ROLES_DESTINO_MASIVO = {'direccion', 'coordinador', 'profesor', 'psicologia', 's
 
 
 @app.post("/api/mensajes/masivo")
-async def enviar_mensaje_masivo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def enviar_mensaje_masivo(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
     """Enviar mensaje a todos los usuarios de un rol.
 
     v2.19.3-A — Restringido a Dirección y Coordinación.
@@ -8530,6 +8573,9 @@ async def enviar_mensaje_masivo(request: Request, db: Session = Depends(get_db),
         return JSONResponse({'error': f'No hay usuarios con el rol {rol}'}, status_code=404)
 
     mensajes_enviados = 0
+    # v2.19.3-C: se conservan los mensajes creados para poder notificar a cada
+    # destinatario real después del commit (antes solo se llevaba el conteo).
+    mensajes_creados = []
     for usuario in usuarios_destino:
         if usuario.id != current_user.id:  # No enviarse a sí mismo
             mensaje = Mensaje(
@@ -8540,9 +8586,34 @@ async def enviar_mensaje_masivo(request: Request, db: Session = Depends(get_db),
                 colegio_id=current_user.colegio_id
             )
             db.add(mensaje)
+            mensajes_creados.append((usuario.id, mensaje))
             mensajes_enviados += 1
 
     db.commit()
+
+    # v2.19.3-C — Misma notificación que el mensaje individual, para cada
+    # destinatario REAL de la difusión.
+    #
+    # Una sola llamada a notify() con todos los usuario_ids, no una por
+    # destinatario: resolver_destinatarios ya acota al colegio y el índice
+    # (usuario_id, evento_key) deduplica. Como cada persona aparece una única
+    # vez en la difusión, un evento_key compartido —derivado del id del primer
+    # mensaje, que es único de esta difusión— es correcto y evita N consultas.
+    if mensajes_creados:
+        _notifs = notify(
+            db,
+            colegio_id=current_user.colegio_id,
+            usuario_ids=[uid for uid, _ in mensajes_creados],
+            excluir_usuario_id=current_user.id,
+            titulo=_titulo_notif_mensaje(current_user),
+            mensaje=CUERPO_NOTIF_MENSAJE,
+            tipo='mensaje',
+            prioridad='normal',
+            link='/comunicacion',
+            evento_key=f'mensaje_masivo:{mensajes_creados[0][1].id}',
+        )
+        db.commit()
+        despachar_push(background_tasks, _notifs)
 
     return JSONResponse({
         'message': f'Mensaje enviado a {mensajes_enviados} usuarios',
