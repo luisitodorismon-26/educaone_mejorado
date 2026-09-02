@@ -25,7 +25,10 @@ interface Reporte {
   estado: string;
   estudiante: string;
   estudiante_id: number;
+  /** Nombre para mostrar: "1ro Secundaria A - Matutina". NO usar para filtrar. */
   estudiante_curso: string;
+  /** v2.19.3-B: identidad del curso. Es lo que se compara en los filtros. */
+  estudiante_curso_id?: number;
   reportado_por: string;
   reportado_por_id?: number;
   fecha: string;
@@ -96,6 +99,8 @@ export const ReportesPage = () => {
   // Filtros
   const [filtroEstado, setFiltroEstado] = useState('');
   const [filtroCurso, setFiltroCurso] = useState(0);
+  // v2.19.3-B: filtro por quien levantó el reporte, pedido por Dirección.
+  const [filtroReportador, setFiltroReportador] = useState(0);
 
   const canCreate = user?.role === 'profesor' || user?.role === 'coordinador';
   const canRespond = user?.role === 'direccion' || user?.role === 'coordinador' || user?.role === 'psicologia';
@@ -299,12 +304,34 @@ export const ReportesPage = () => {
     loadData();
   };
 
+  // v2.19.3-B: opciones del filtro por reportador, deducidas de los propios
+  // reportes ya cargados. NO se llama a /api/usuarios: ese endpoint es
+  // exclusivo de Dirección y para el resto de los roles devolvería 403.
+  // Ventaja adicional: la lista solo muestra a quienes realmente levantaron
+  // algún reporte, en vez del personal completo del colegio.
+  const reportadores = Array.from(
+    reportes.reduce((acc, r) => {
+      if (r.reportado_por_id && !acc.has(r.reportado_por_id)) {
+        acc.set(r.reportado_por_id, r.reportado_por || `Usuario ${r.reportado_por_id}`);
+      }
+      return acc;
+    }, new Map<number, string>())
+  ).sort((a, b) => a[1].localeCompare(b[1], 'es'));
+
   const reportesFiltrados = reportes.filter(r => {
     if (activeTab === 'conducta' && r.tipo !== 'conducta') return false;
     if (activeTab === 'academico' && r.tipo !== 'academico') return false;
     if (activeTab === 'asistencia' && r.tipo !== 'asistencia') return false;
     if (filtroEstado && r.estado !== filtroEstado) return false;
-    if (filtroCurso && r.estudiante_curso !== cursos.find(c => c.id === filtroCurso)?.nombre) return false;
+    // v2.19.3-B: se compara ID contra ID.
+    //
+    // Antes: r.estudiante_curso !== cursos.find(c => c.id === filtroCurso)?.nombre
+    // Eso enfrentaba "1ro Secundaria A - Matutina" (nombre_completo, que es lo
+    // que manda el backend) contra "A" (Curso.nombre, que es solo la sección).
+    // Nunca coincidían, así que elegir cualquier curso vaciaba la lista entera
+    // aunque hubiera reportes. El nombre no es identidad; el ID sí.
+    if (filtroCurso && r.estudiante_curso_id !== filtroCurso) return false;
+    if (filtroReportador && r.reportado_por_id !== filtroReportador) return false;
     return true;
   });
 
@@ -440,6 +467,22 @@ export const ReportesPage = () => {
               ))}
             </select>
           </div>
+          {/* v2.19.3-B: filtro por reportador. Solo se dibuja si hay más de un
+              reportador distinto — con uno solo la opción no aporta nada. */}
+          {reportadores.length > 1 && (
+            <div className="flex items-center gap-2">
+              <select
+                value={filtroReportador}
+                onChange={e => setFiltroReportador(Number(e.target.value))}
+                className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-sm"
+              >
+                <option value={0}>Todos los reportadores</option>
+                {reportadores.map(([id, nombre]) => (
+                  <option key={id} value={id}>{nombre}</option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
         {/* Lista de reportes */}

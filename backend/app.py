@@ -7807,6 +7807,19 @@ async def get_reportes(request: Request, db: Session = Depends(get_db), current_
             'estudiante': r.estudiante.nombre_completo if r.estudiante else None,
             'estudiante_id': r.estudiante_id,
             'estudiante_curso': r.estudiante.curso.nombre_completo if r.estudiante and r.estudiante.curso else None,
+            # v2.19.3-B — IDENTIDAD del curso, para filtrar.
+            #
+            # `estudiante_curso` es el nombre para MOSTRAR ("1ro Secundaria A -
+            # Matutina") y se mantiene intacto: lo consumen el modal de detalle
+            # y el mensaje de WhatsApp a los padres.
+            #
+            # Para decidir si un reporte pertenece a un curso hace falta el ID.
+            # El frontend comparaba `estudiante_curso` contra `Curso.nombre`,
+            # que es SOLO la sección ("A"), así que la comparación nunca era
+            # verdadera y el filtro por curso devolvía siempre una lista vacía.
+            # Un nombre no es identidad: si mañana se renombra una tanda o un
+            # grado, comparar textos vuelve a romperse. El ID no.
+            'estudiante_curso_id': r.estudiante.curso_id if r.estudiante else None,
             'reportado_por': r.reportador.nombre_completo if r.reportador else None,
             'reportado_por_id': r.reportado_por,
             'fecha': r.fecha.isoformat() if r.fecha else None,
