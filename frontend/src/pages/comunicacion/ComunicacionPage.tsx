@@ -56,6 +56,12 @@ export const ComunicacionPage = () => {
   const [titulo, setTitulo] = useState('');
   const [imagen, setImagen] = useState('');
 
+  // v2.19.3-A: la difusión masiva quedó reservada a Dirección y Coordinación
+  // en el backend. Se oculta también acá para que el resto de los roles no vea
+  // una opción que la API va a rechazar con 403. La mensajería individual
+  // sigue disponible para todos, vía /usuarios/directorio.
+  const canMasivo = user?.role === 'direccion' || user?.role === 'coordinador';
+
   useEffect(() => {
     cargarDatos();
   }, []);
@@ -66,7 +72,12 @@ export const ComunicacionPage = () => {
       const [mensajesRes, comunicadosRes, usuariosRes] = await Promise.all([
         api.get('/mensajes').catch(() => ({ data: [] })),
         api.get('/comunicados').catch(() => ({ data: [] })),
-        api.get('/usuarios').catch(() => ({ data: [] }))
+        // v2.19.3-A: antes se pedía /usuarios, que es exclusivo de Dirección.
+        // Para el resto de los roles devolvía 403, el .catch() lo silenciaba y
+        // el desplegable de destinatarios quedaba vacío: un profesor no podía
+        // enviar ningún mensaje individual. /usuarios/directorio devuelve solo
+        // id, nombre_completo y role de los activos del mismo colegio.
+        api.get('/usuarios/directorio').catch(() => ({ data: [] }))
       ]);
       setMensajes(Array.isArray(mensajesRes.data) ? mensajesRes.data : []);
       setComunicados(Array.isArray(comunicadosRes.data) ? comunicadosRes.data : []);
@@ -95,12 +106,16 @@ export const ComunicacionPage = () => {
       return;
     }
 
-    if (tipoDestinatario === 'individual' && !destinatarioId) {
+    // v2.19.3-A: sin permiso de difusión masiva, el único modo posible es el
+    // individual (la opción ni siquiera se dibuja).
+    const modoIndividual = tipoDestinatario === 'individual' || !canMasivo;
+
+    if (modoIndividual && !destinatarioId) {
       setError('Seleccione un destinatario');
       return;
     }
 
-    if (tipoDestinatario === 'rol' && !rolDestino) {
+    if (!modoIndividual && !rolDestino) {
       setError('Seleccione un rol de destino');
       return;
     }
@@ -109,7 +124,7 @@ export const ComunicacionPage = () => {
     setError('');
 
     try {
-      if (tipoDestinatario === 'individual') {
+      if (modoIndividual) {
         await api.post('/mensajes', {
           destinatario_id: destinatarioId,
           asunto,
@@ -122,7 +137,12 @@ export const ComunicacionPage = () => {
           asunto,
           contenido
         });
-        setSuccess(`Mensaje enviado a ${res.data.enviados || 0} usuarios`);
+        // v2.19.3-A: el backend siempre respondió `count`; acá se leía
+        // `enviados`, así que el aviso decía "enviado a 0 usuarios" incluso
+        // cuando el envío había funcionado. Ahora el backend manda ambas y
+        // esto acepta cualquiera de las dos.
+        const enviados = res.data?.enviados ?? res.data?.count ?? 0;
+        setSuccess(`Mensaje enviado a ${enviados} usuarios`);
       }
       
       setShowModal(false);
@@ -284,7 +304,7 @@ export const ComunicacionPage = () => {
   };
 
   const canComunicado = user?.role === 'direccion' || user?.role === 'coordinador';
-  
+
   // Filtrar mensajes
   const mensajesRecibidos = mensajes.filter(m => m.tipo === 'recibido');
   const mensajesEnviados = mensajes.filter(m => m.tipo === 'enviado');
@@ -609,29 +629,33 @@ export const ComunicacionPage = () => {
               {/* Nuevo mensaje */}
               {modalType === 'mensaje' && (
                 <div className="space-y-4">
-                  {/* Tipo de destinatario */}
-                  <div className="flex gap-4">
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="radio"
-                        checked={tipoDestinatario === 'individual'}
-                        onChange={() => setTipoDestinatario('individual')}
-                        className="w-4 h-4"
-                      />
-                      <span>Usuario específico</span>
-                    </label>
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="radio"
-                        checked={tipoDestinatario === 'rol'}
-                        onChange={() => setTipoDestinatario('rol')}
-                        className="w-4 h-4"
-                      />
-                      <span>Todos de un rol</span>
-                    </label>
-                  </div>
+                  {/* Tipo de destinatario. v2.19.3-A: la opción "Todos de un
+                      rol" solo se ofrece a Dirección y Coordinación, que son
+                      los únicos que el backend acepta para difusión masiva. */}
+                  {canMasivo && (
+                    <div className="flex gap-4">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="radio"
+                          checked={tipoDestinatario === 'individual'}
+                          onChange={() => setTipoDestinatario('individual')}
+                          className="w-4 h-4"
+                        />
+                        <span>Usuario específico</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="radio"
+                          checked={tipoDestinatario === 'rol'}
+                          onChange={() => setTipoDestinatario('rol')}
+                          className="w-4 h-4"
+                        />
+                        <span>Todos de un rol</span>
+                      </label>
+                    </div>
+                  )}
 
-                  {tipoDestinatario === 'individual' ? (
+                  {(tipoDestinatario === 'individual' || !canMasivo) ? (
                     <select
                       value={destinatarioId}
                       onChange={e => setDestinatarioId(Number(e.target.value))}
