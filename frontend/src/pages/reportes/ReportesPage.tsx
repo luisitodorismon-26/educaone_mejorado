@@ -14,6 +14,7 @@ import {
   MessageSquare
 } from 'lucide-react';
 import { Modal, Button, Select, Input, Alert } from '../../components/ui';
+import { exportarCSV } from '../../utils/exportarCSV';
 
 interface Reporte {
   id: number;
@@ -102,7 +103,15 @@ export const ReportesPage = () => {
   // v2.19.3-B: filtro por quien levantó el reporte, pedido por Dirección.
   const [filtroReportador, setFiltroReportador] = useState(0);
 
-  const canCreate = user?.role === 'profesor' || user?.role === 'coordinador';
+  // v2.19.4: Dirección también puede levantar un reporte.
+  //
+  // El backend (POST /api/reportes) siempre lo permitió: valida módulo, tenant,
+  // nivel y —solo para el rol profesor— la asignación al curso. Era la interfaz
+  // la que no le ofrecía el botón, así que un director que presenciaba un
+  // incidente no tenía forma de registrarlo sin pedirle la sesión a otra
+  // persona. No se toca el backend porque no hace falta.
+  const canCreate = user?.role === 'profesor' || user?.role === 'coordinador'
+    || user?.role === 'direccion';
   const canRespond = user?.role === 'direccion' || user?.role === 'coordinador' || user?.role === 'psicologia';
   const canSendToParents = user?.role === 'direccion' || user?.role === 'coordinador';
 
@@ -335,6 +344,37 @@ export const ReportesPage = () => {
     return true;
   });
 
+  // v2.19.4: exporta lo que se está viendo, con los filtros ya aplicados.
+  // Sin backend: los datos ya están en memoria y el usuario ya está autorizado
+  // a verlos, así que exportarlos no amplía el acceso de nadie.
+  const handleExportar = () => {
+    const ok = exportarCSV(
+      reportesFiltrados,
+      [
+        { label: 'N° Reporte', valor: r => r.numero_reporte || r.id },
+        { label: 'Fecha', valor: r => r.fecha ? new Date(r.fecha).toLocaleDateString('es-DO') : '' },
+        { label: 'Estudiante', valor: r => r.estudiante },
+        { label: 'Curso', valor: r => r.estudiante_curso },
+        { label: 'Tipo', valor: r => r.tipo },
+        { label: 'Gravedad', valor: r => r.gravedad },
+        { label: 'Estado', valor: r => r.estado },
+        { label: 'Título', valor: r => r.titulo },
+        { label: 'Descripción', valor: r => r.descripcion },
+        { label: 'Reportado por', valor: r => r.reportado_por },
+        { label: 'Acciones del centro', valor: r => r.acciones_centro || '' },
+        { label: 'Acciones en el hogar', valor: r => r.acciones_hogar || '' },
+        { label: 'Respondido por', valor: r => r.respondido_por || '' },
+        { label: 'Enviado a padres', valor: r => r.enviado_padres ? 'Sí' : 'No' },
+        { label: 'Firmado por padre', valor: r => r.confirmado_padre ? 'Sí' : 'No' },
+      ],
+      `reportes_${activeTab}_${new Date().toISOString().slice(0, 10)}`
+    );
+    if (!ok) {
+      setMessage({ type: 'error', text: 'No hay reportes para exportar con los filtros actuales.' });
+      setTimeout(() => setMessage(null), 4000);
+    }
+  };
+
   // Estadísticas
   const stats = {
     total: reportes.length,
@@ -380,7 +420,13 @@ export const ReportesPage = () => {
               Nuevo Reporte
             </Button>
           )}
-          <button className="flex items-center px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-50">
+          {/* v2.19.4: este botón existía sin onClick — se veía y no hacía nada.
+              Ahora exporta exactamente lo que hay en pantalla, respetando los
+              filtros de pestaña, estado, curso y reportador. */}
+          <button
+            onClick={handleExportar}
+            className="flex items-center px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-medium text-slate-600 hover:bg-slate-50"
+          >
             <Download size={16} className="mr-2" /> Exportar
           </button>
         </div>

@@ -105,7 +105,7 @@ export const AppRouter = () => {
         } />
         
         <Route path="/reportes" element={
-          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor', 'secretaria']}><MainLayout><ReportesPage /></MainLayout></ProtectedRoute>
+          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria']}><MainLayout><ReportesPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/psicologia" element={
@@ -151,11 +151,11 @@ export const AppRouter = () => {
         } />
         
         <Route path="/estadisticas" element={
-          <ProtectedRoute roles={['direccion', 'coordinador']}><MainLayout><EstadisticasPage /></MainLayout></ProtectedRoute>
+          <ProtectedRoute roles={['direccion', 'coordinador', 'psicologia']}><MainLayout><EstadisticasPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/whatsapp" element={
-          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><WhatsAppPage /></MainLayout></ProtectedRoute>
+          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor', 'psicologia']}><MainLayout><WhatsAppPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/evaluaciones" element={

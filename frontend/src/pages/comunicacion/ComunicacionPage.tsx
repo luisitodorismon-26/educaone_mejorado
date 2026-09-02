@@ -338,10 +338,13 @@ export const ComunicacionPage = () => {
 
   return (
     <div className="p-4 space-y-4">
-      {/* Header */}
-      <div className="flex justify-between items-center">
+      {/* Header. v2.19.4: sin `flex-wrap` los dos botones ("Nuevo Mensaje" y
+          "Publicar Comunicado") suman ~340 px y desbordaban la pantalla a 360
+          y 390 px. Ahora bajan de línea y los botones también envuelven entre
+          sí en las pantallas más angostas. */}
+      <div className="flex flex-wrap justify-between items-center gap-3">
         <h1 className="text-2xl font-bold">💬 Comunicación</h1>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <button 
             onClick={() => { 
               setModalType('mensaje'); 

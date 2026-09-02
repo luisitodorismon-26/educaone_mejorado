@@ -263,7 +263,7 @@ export const EstadisticasPage = () => {
           <div className="p-4 border-b">
             <h3 className="font-bold text-gray-800">Rendimiento por Curso</h3>
           </div>
-          <div className="max-h-96 overflow-y-auto">
+          <div className="max-h-96 overflow-y-auto overflow-x-auto">
             {estadisticasCursos.length > 0 ? (
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 sticky top-0">
@@ -315,7 +315,7 @@ export const EstadisticasPage = () => {
           <div className="p-4 border-b">
             <h3 className="font-bold text-gray-800">Rendimiento por Asignatura</h3>
           </div>
-          <div className="max-h-96 overflow-y-auto">
+          <div className="max-h-96 overflow-y-auto overflow-x-auto">
             {estadisticasAsignaturas.length > 0 ? (
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 sticky top-0">
