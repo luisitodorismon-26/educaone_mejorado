@@ -2174,6 +2174,183 @@ with client:
         assert r.status_code == 200, \
             f'secretaría debe seguir leyendo reportes: {r.status_code}'
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN T — v2.19.3-C (mensajes internos con Notificacion + Push)
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== T. v2.19.3-C — MENSAJES CON NOTIFICACIÓN ==={RESET}")
+
+    # El director del colegio A es el usuario 'direccion' que crea init_db;
+    # su id no está en el dict del setup, así que se resuelve por /auth/me.
+    DIR_A_ID = client.get('/api/auth/me', headers=auth(DIR_A_TOKEN)).json()['id']
+
+    def _notifs_de_mensaje(tok):
+        """Notificaciones de mensajería de ese usuario (las que apuntan a /comunicacion)."""
+        r = client.get('/api/notificaciones?limit=100', headers=auth(tok))
+        assert r.status_code == 200, f'no se pudo leer notificaciones: {r.text}'
+        return [n for n in r.json().get('notificaciones', [])
+                if n.get('link') == '/comunicacion' and n.get('tipo') == 'mensaje']
+
+    @test("T1. Un mensaje individual crea una Notificacion para el destinatario")
+    def t():
+        antes = len(_notifs_de_mensaje(DIR_A_TOKEN))
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': DIR_A_ID,
+            'asunto': 'Asunto secreto T1',
+            'contenido': 'Contenido confidencial T1',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, f'el mensaje debe enviarse: {r.text}'
+
+        despues = _notifs_de_mensaje(DIR_A_TOKEN)
+        assert len(despues) == antes + 1, \
+            f'el destinatario debe recibir exactamente 1 notificación nueva ({antes} → {len(despues)})'
+
+    @test("T2. El remitente NO se notifica a sí mismo")
+    def t():
+        antes = len(_notifs_de_mensaje(PROF_A_TOKEN))
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': DIR_A_ID,
+            'asunto': 'Asunto T2',
+            'contenido': 'Contenido T2',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, r.text
+        despues = len(_notifs_de_mensaje(PROF_A_TOKEN))
+        assert despues == antes, \
+            f'quien envía no debe recibir notificación de su propio mensaje ({antes} → {despues})'
+
+    @test("T3. La notificación de mensaje no cruza al otro colegio")
+    def t():
+        antes_b = len(_notifs_de_mensaje(DIR_B_TOKEN))
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': DIR_A_ID,
+            'asunto': 'Asunto T3',
+            'contenido': 'Contenido T3',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, r.text
+        assert len(_notifs_de_mensaje(DIR_B_TOKEN)) == antes_b, \
+            'el colegio B no debe recibir notificaciones de mensajes del colegio A'
+
+        # Y el destinatario de otro colegio sigue siendo inalcanzable.
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': B['prof'],
+            'asunto': 'Cross-tenant T3',
+            'contenido': 'No debería llegar',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 404, \
+            f'no se puede escribir a un usuario de otro colegio, dio {r.status_code}'
+
+    @test("T4. El título lleva el nombre del remitente")
+    def t():
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': DIR_A_ID,
+            'asunto': 'Asunto T4',
+            'contenido': 'Contenido T4',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, r.text
+
+        notif = _notifs_de_mensaje(DIR_A_TOKEN)[0]
+        titulo = notif.get('titulo') or ''
+        assert 'Nuevo mensaje' in titulo, f'título inesperado: {titulo!r}'
+
+        # Se compara contra el nombre REAL del remitente, no contra una cadena
+        # adivinada: así el test sigue valiendo si cambian los datos del setup.
+        yo = client.get('/api/auth/me', headers=auth(PROF_A_TOKEN)).json()
+        assert yo['nombre_completo'] in titulo, \
+            (f"el título debe identificar a quien escribe "
+             f"({yo['nombre_completo']!r}), vino {titulo!r}")
+
+    @test("T5. Ni el asunto ni el contenido llegan a la pantalla bloqueada")
+    def t():
+        secreto_asunto = 'ASUNTOCONFIDENCIALT5'
+        secreto_cuerpo = 'CONTENIDOCONFIDENCIALT5'
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': DIR_A_ID,
+            'asunto': secreto_asunto,
+            'contenido': secreto_cuerpo,
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, r.text
+
+        notif = _notifs_de_mensaje(DIR_A_TOKEN)[0]
+        texto = f"{notif.get('titulo') or ''} {notif.get('mensaje') or ''}"
+        assert secreto_asunto not in texto, \
+            f'el asunto no debe viajar en la notificación: {texto!r}'
+        assert secreto_cuerpo not in texto, \
+            f'el contenido no debe viajar en la notificación: {texto!r}'
+        assert 'Tienes un nuevo mensaje' in (notif.get('mensaje') or ''), \
+            f'el cuerpo debe ser el texto genérico, vino {notif.get("mensaje")!r}'
+
+    @test("T6. La notificación enlaza a /comunicacion")
+    def t():
+        notif = _notifs_de_mensaje(DIR_A_TOKEN)[0]
+        assert notif.get('link') == '/comunicacion', \
+            f"link debe ser '/comunicacion', vino {notif.get('link')!r}"
+        assert notif.get('tipo') == 'mensaje', \
+            f"tipo debe ser 'mensaje', vino {notif.get('tipo')!r}"
+
+    @test("T7. Un mensaje genera UNA sola notificación (dedup por evento_key)")
+    def t():
+        antes = len(_notifs_de_mensaje(DIR_A_TOKEN))
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': DIR_A_ID,
+            'asunto': 'Asunto T7',
+            'contenido': 'Contenido T7',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, r.text
+        despues = len(_notifs_de_mensaje(DIR_A_TOKEN))
+        assert despues == antes + 1, \
+            f'un mensaje = una notificación, no {despues - antes}'
+
+    @test("T8. El masivo notifica a cada destinatario real y no al emisor")
+    def t():
+        antes_prof = len(_notifs_de_mensaje(PROF_A_TOKEN))
+        antes_dir = len(_notifs_de_mensaje(DIR_A_TOKEN))
+
+        r = client.post('/api/mensajes/masivo', json={
+            'rol': 'profesor',
+            'asunto': 'Difusión T8',
+            'contenido': 'Cuerpo de la difusión T8',
+        }, headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 201, r.text
+        enviados = r.json().get('enviados', 0)
+        assert enviados >= 1, f'la difusión debe alcanzar al menos un profesor: {r.json()}'
+
+        # Cada destinatario real recibe exactamente una notificación.
+        despues_prof = len(_notifs_de_mensaje(PROF_A_TOKEN))
+        assert despues_prof == antes_prof + 1, \
+            f'el profesor destinatario debe recibir 1 notificación ({antes_prof} → {despues_prof})'
+
+        # El emisor no se notifica a sí mismo.
+        assert len(_notifs_de_mensaje(DIR_A_TOKEN)) == antes_dir, \
+            'quien difunde no debe recibir su propia notificación'
+
+        # Y nunca sale del colegio.
+        assert not [n for n in _notifs_de_mensaje(PROF_B_TOKEN)
+                    if 'Difusión T8' in (n.get('titulo') or '')], \
+            'la difusión del colegio A no puede notificar al colegio B'
+
+    @test("T9. No-regresión: el mensaje se sigue guardando y entregando")
+    def t():
+        r = client.post('/api/mensajes', json={
+            'destinatario_id': DIR_A_ID,
+            'asunto': 'Asunto T9 visible',
+            'contenido': 'Contenido T9 visible',
+        }, headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 201, r.text
+        mid = r.json()['id']
+
+        # El destinatario lo ve en su bandeja, con asunto y contenido completos:
+        # la notificación es genérica, el mensaje NO.
+        recibidos = client.get('/api/mensajes', headers=auth(DIR_A_TOKEN)).json()
+        msg = next((m for m in recibidos if m['id'] == mid and m['tipo'] == 'recibido'), None)
+        assert msg is not None, 'el mensaje debe llegar a la bandeja del destinatario'
+        assert msg['asunto'] == 'Asunto T9 visible'
+        assert 'Contenido T9 visible' in msg['contenido']
+
+        # Y el contador de no leídos lo cuenta.
+        no_leidos = client.get('/api/mensajes/no-leidos', headers=auth(DIR_A_TOKEN)).json()
+        assert no_leidos.get('count', 0) >= 1, \
+            f'el contador de no leídos debe reflejarlo: {no_leidos}'
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL

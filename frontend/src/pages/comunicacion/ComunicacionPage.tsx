@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
+import { useRefrescoEnVivo } from '../../hooks/useRefrescoEnVivo';
 
 interface Usuario {
   id: number;
@@ -66,8 +67,17 @@ export const ComunicacionPage = () => {
     cargarDatos();
   }, []);
 
-  const cargarDatos = async () => {
-    setLoading(true);
+  // v2.19.3-C: con /comunicacion abierta, un mensaje entrante aparece solo.
+  // Antes esta pantalla solo consultaba al montar, así que el mensaje era
+  // literalmente invisible hasta que la persona apretaba F5.
+  useRefrescoEnVivo(() => cargarDatos(true));
+
+  // v2.19.3-C: `silencioso` evita el spinner de página completa cuando la
+  // recarga la dispara un evento en segundo plano (Push, foco, visibilidad).
+  // Sin esto, un mensaje entrante haría desaparecer la bandeja que la persona
+  // está leyendo y la reemplazaría por un spinner.
+  const cargarDatos = async (silencioso = false) => {
+    if (!silencioso) setLoading(true);
     try {
       const [mensajesRes, comunicadosRes, usuariosRes] = await Promise.all([
         api.get('/mensajes').catch(() => ({ data: [] })),
