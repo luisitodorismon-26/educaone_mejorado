@@ -2351,6 +2351,139 @@ with client:
         assert no_leidos.get('count', 0) >= 1, \
             f'el contador de no leídos debe reflejarlo: {no_leidos}'
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN V — v2.19.5 (nivel correcto en el borrador del Registro Escolar)
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== V. v2.19.5 — BORRADOR DEL REGISTRO ESCOLAR ==={RESET}")
+
+    # El borrador de secundaria llevaba copiada la guarda del de primaria y
+    # exigía nivel 'primaria' dentro del endpoint de secundaria: rechazaba con
+    # 400 justo los cursos que debe atender, y el mensaje se contradecía solo
+    # ("use el registro de secundaria" estando ya en él). En producción eso
+    # dejaba sin borrador a TODOS los cursos de secundaria.
+    #
+    # El curso de la sección A ya es de secundaria (los grados que crea init_db
+    # son todos de secundaria); acá agregamos uno de primaria para poder probar
+    # los dos lados de la guarda.
+    _r = client.post('/api/grados', json={
+        'nombre': '1ro Primaria V', 'nivel': 'primaria', 'orden': 120,
+    }, headers=auth(DIR_A_TOKEN))
+    assert _r.status_code in (200, 201), f'setup V: crear grado primaria: {_r.text}'
+    V_GRADO_PRI = _r.json()['id']
+    _r = client.post('/api/cursos', json={
+        'grado_id': V_GRADO_PRI, 'tanda_id': A['tanda'], 'nombre': 'V',
+    }, headers=auth(DIR_A_TOKEN))
+    assert _r.status_code in (200, 201), f'setup V: crear curso primaria: {_r.text}'
+    V_CURSO_PRI = _r.json()['id']
+
+    # Marca inequívoca del rechazo por NIVEL, para no confundirlo con los
+    # rechazos legítimos por datos incompletos o por permisos.
+    def _rechazado_por_nivel(resp):
+        if resp.status_code != 400:
+            return False
+        return 'solo para cursos de' in (resp.text or '').lower()
+
+    @test("V1. Curso de SECUNDARIA: el borrador de secundaria ya no lo rechaza por nivel")
+    def t():
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert not _rechazado_por_nivel(r), \
+            (f'un curso de secundaria no puede ser rechazado por nivel en SU '
+             f'propio borrador: {r.status_code} {r.text[:200]}')
+        # Y de hecho genera el PDF: el borrador es tolerante a datos incompletos
+        # (este curso no tiene calificaciones ni horarios cargados).
+        assert r.status_code == 200, \
+            f'el borrador de secundaria debe generarse: {r.status_code} {r.text[:200]}'
+        assert 'pdf' in r.headers.get('content-type', ''), \
+            f"esperaba un PDF, vino {r.headers.get('content-type')!r}"
+        assert r.content[:4] == b'%PDF', 'el cuerpo debe ser un PDF real'
+
+    @test("V2. Curso de PRIMARIA: el borrador de secundaria lo rechaza con 400")
+    def t():
+        r = client.get(f'/api/registros/secundaria/{V_CURSO_PRI}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 400, \
+            f'un curso de primaria no puede sacar el borrador de secundaria: {r.status_code}'
+        assert 'SECUNDARIA' in r.text, \
+            f'el mensaje debe decir que este registro es solo de secundaria: {r.text[:200]}'
+        assert 'pdf' not in r.headers.get('content-type', ''), \
+            'no debe devolver el documento equivocado'
+
+    @test("V3. El borrador de PRIMARIA sigue aceptando primaria (no-regresión)")
+    def t():
+        r = client.get(f'/api/registros/primaria/{V_CURSO_PRI}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, \
+            f'el borrador de primaria no debe haberse tocado: {r.status_code} {r.text[:200]}'
+        assert r.content[:4] == b'%PDF', 'el borrador de primaria debe seguir siendo un PDF'
+
+    @test("V4. El borrador de PRIMARIA sigue rechazando secundaria (no-regresión)")
+    def t():
+        r = client.get(f'/api/registros/primaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 400, \
+            f'un curso de secundaria no debe sacar el borrador de primaria: {r.status_code}'
+        assert 'PRIMARIA' in r.text, f'el mensaje de primaria no cambió: {r.text[:200]}'
+
+    @test("V5. El validador oficial y force=true no cambiaron")
+    def t():
+        # El arreglo toca SOLO el borrador. El registro oficial debe seguir
+        # bloqueando por datos incompletos, y force=true debe seguir sin
+        # saltarse los errores (solo omite advertencias).
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 400, \
+            f'el oficial debe seguir exigiendo datos completos: {r.status_code}'
+        cuerpo = r.json()
+        assert cuerpo.get('detalle'), 'debe seguir listando qué falta'
+
+        r_force = client.get(f'/api/registros/secundaria/{A["curso"]}?force=true',
+                             headers=auth(DIR_A_TOKEN))
+        assert r_force.status_code == 400, \
+            f'force=true no puede saltarse los ERRORES de datos: {r_force.status_code}'
+        assert 'pdf' not in r_force.headers.get('content-type', ''), \
+            'force=true no debe generar un registro oficial incompleto'
+
+    @test("V6. Aislamiento por tenant intacto en los borradores")
+    def t():
+        # El director del colegio B no puede sacar el borrador de un curso de A,
+        # ni por el endpoint de secundaria ni por el de primaria.
+        for nivel, curso_id in (('secundaria', A['curso']), ('primaria', V_CURSO_PRI)):
+            r = client.get(f'/api/registros/{nivel}/{curso_id}/preview-pdf',
+                           headers=auth(DIR_B_TOKEN))
+            assert r.status_code in (403, 404), \
+                (f'B no debe alcanzar el curso {curso_id} de A por {nivel}: '
+                 f'{r.status_code} {r.text[:150]}')
+            assert 'pdf' not in r.headers.get('content-type', ''), \
+                f'B recibió un PDF de un curso del colegio A ({nivel})'
+
+    @test("V7. Alcance por rol intacto en el borrador de secundaria")
+    def t():
+        # Profesor CON asignación en el curso: pasa la guarda de rol y la de
+        # nivel (es justo el caso que el bug rompía para todo secundaria).
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(PROF_A_TOKEN))
+        assert r.status_code == 200, \
+            f'el profesor asignado debe poder ver el borrador: {r.status_code} {r.text[:200]}'
+
+        # Profesor del colegio B: no tiene asignación ahí; nunca 200.
+        r_b = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                         headers=auth(PROF_B_TOKEN))
+        assert r_b.status_code in (403, 404), \
+            f'el profesor de B no debe ver el borrador de A: {r_b.status_code}'
+
+        # Secretaría no está en los roles del endpoint.
+        r_s = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                         headers=auth(SEC_A_TOKEN))
+        assert r_s.status_code == 403, \
+            f'secretaría no debe entrar al borrador: {r_s.status_code}'
+
+        # Sin token: 401/403, nunca un PDF.
+        r_anon = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf')
+        assert r_anon.status_code in (401, 403), \
+            f'sin autenticar no puede salir un registro: {r_anon.status_code}'
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL
