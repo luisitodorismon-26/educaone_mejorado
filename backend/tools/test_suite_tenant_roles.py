@@ -2580,6 +2580,221 @@ with client:
         assert con_sello == total, \
             f'el endpoint debe entregar el sello en las {total} páginas, vino en {con_sello}'
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN X — v2.19.7 (los datos que YA existen llegan al Registro)
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== X. v2.19.7 — DATOS EN VIVO EN EL REGISTRO ==={RESET}")
+
+    # Se siembra el MISMO escenario que tiene el colegio en producción:
+    # el año escolar declara un rango (2024-09-01 → 2025-06-30) que NO cubre
+    # las fechas en las que realmente se tomó asistencia. Con eso, la rejilla
+    # de días se construía solo con los días esperados del año escolar y las
+    # marcas reales caían fuera: la hoja salía vacía teniendo cientos de
+    # registros. Y las notas de secundaria viven en CalificacionSecundaria,
+    # que el Registro ni siquiera consultaba.
+    from datetime import date as _date
+    from database import SessionLocal as _SL
+    from models import (Asistencia as _Asist, CalificacionSecundaria as _CS,
+                        Horario as _Hor, AnoEscolar as _Ano, Estudiante as _Est,
+                        Usuario as _Usr)
+
+    X_FECHAS = {  # fecha → estado, uno por cada código del registro
+        _date(2026, 7, 15): 'presente',
+        _date(2026, 8, 5): 'ausente',
+        _date(2026, 8, 12): 'tardanza',
+        _date(2026, 9, 2): 'excusa',
+    }
+    X_COMPETENCIAS = [(1, 65, 60, 65, 60), (2, 67, 78, 68, 89),
+                      (3, 56, 50, 71, 95), (4, 66, 63, 56, 94)]
+
+    _db = _SL()
+    try:
+        A_COLEGIO_ID = _db.query(_Usr).filter_by(username='direccion').first().colegio_id
+        _ano = _db.query(_Ano).filter_by(colegio_id=A_COLEGIO_ID, activo=True).first()
+        assert _ano is not None, 'setup X: hace falta un año escolar activo'
+        _ano.fecha_inicio = _date(2024, 9, 1)
+        _ano.fecha_fin = _date(2025, 6, 30)
+
+        # Horario de la asignatura: sin él no hay días esperados y el flujo
+        # caería al modo legacy, que no es el que falla en producción.
+        _db.add(_Hor(colegio_id=A_COLEGIO_ID, profesor_id=A['prof'], curso_id=A['curso'],
+                     asignatura_id=A['asig'], dia='Miércoles', hora_inicio='08:15',
+                     hora_fin='09:00', tipo_bloque='clase', activo=True))
+
+        X_EST = A['est']
+        for _f, _estado in X_FECHAS.items():
+            _db.add(_Asist(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST,
+                           curso_id=A['curso'], asignatura_id=A['asig'],
+                           fecha=_f, estado=_estado))
+
+        for _num, _p1, _p2, _p3, _p4 in X_COMPETENCIAS:
+            _db.add(_CS(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST,
+                        asignatura_id=A['asig'], ano_escolar_id=_ano.id,
+                        competencia_numero=_num, p1=_p1, p2=_p2, p3=_p3, p4=_p4))
+
+        # Segundo estudiante: 4 competencias pero SOLO P1 → PC1 sí, CF no.
+        _r = client.post('/api/estudiantes', json={
+            'nombre': 'Parcial', 'apellido': 'Equis', 'sexo': 'F',
+            'fecha_nacimiento': '2011-05-05', 'curso_id': A['curso'],
+            'no_lista': 30, 'matricula': 'X-PARCIAL',
+        }, headers=auth(DIR_A_TOKEN))
+        assert _r.status_code in (200, 201), f'setup X: crear estudiante: {_r.text}'
+        X_EST_PARCIAL = _r.json()['id']
+        for _num, _p1, _, _, _ in X_COMPETENCIAS:
+            _db.add(_CS(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST_PARCIAL,
+                        asignatura_id=A['asig'], ano_escolar_id=_ano.id,
+                        competencia_numero=_num, p1=_p1))
+
+        # Tercer estudiante: una sola competencia → nada calculable.
+        _r = client.post('/api/estudiantes', json={
+            'nombre': 'Incompleto', 'apellido': 'Equis', 'sexo': 'M',
+            'fecha_nacimiento': '2011-06-06', 'curso_id': A['curso'],
+            'no_lista': 31, 'matricula': 'X-INCOMPLETO',
+        }, headers=auth(DIR_A_TOKEN))
+        assert _r.status_code in (200, 201), f'setup X: crear estudiante: {_r.text}'
+        X_EST_INCOMPLETO = _r.json()['id']
+        _db.add(_CS(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST_INCOMPLETO,
+                    asignatura_id=A['asig'], ano_escolar_id=_ano.id,
+                    competencia_numero=1, p1=90, p2=90, p3=90, p4=90))
+        _db.commit()
+    finally:
+        _db.close()
+
+    def _datos_asignatura():
+        """asignaturas_data tal como lo arma el Registro, con la sesión real."""
+        import app as _app
+        _s = _SL()
+        try:
+            _u = _s.query(_Usr).filter_by(username='direccion').first()
+            _ests = _s.query(_Est).filter_by(curso_id=A['curso'], activo=True).order_by(
+                _Est.no_lista).all()
+            _data = _app._cargar_datos_asignaturas_secundaria(_s, _u, A['curso'], 1, _ests)
+            _orden = {e.id: i for i, e in enumerate(_ests)}
+            return _data, _orden
+        finally:
+            _s.close()
+
+    @test("X1. La asistencia real (P/A/T/E) llega a su día y mes del Registro")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next((k for k in data if 'atem' in k), None)
+        assert clave, f'no se resolvió Matemática en el registro: {list(data)[:4]}'
+        matriz = data[clave].get('asistencia_matriz') or []
+        assert matriz, 'la matriz de asistencia no puede venir vacía habiendo registros'
+
+        fila_idx = orden[A['est']]
+        encontrados = {}
+        for mes in matriz:
+            dias = mes['dias']
+            fila = next((f for f in mes['filas'] if f['estudiante_id'] == A['est']), None)
+            if not fila:
+                continue
+            for i, dia in enumerate(dias):
+                if fila['valores'][i]:
+                    encontrados[(mes['mes_num'], dia)] = fila['valores'][i]
+
+        esperado = {(f.month, f.day): {'presente': 'P', 'ausente': 'A',
+                                       'tardanza': 'T', 'excusa': 'E'}[e]
+                    for f, e in X_FECHAS.items()}
+        for clave_fecha, codigo in esperado.items():
+            assert clave_fecha in encontrados, \
+                (f'la marca del {clave_fecha[1]}/{clave_fecha[0]} no llegó a la hoja. '
+                 f'Días con marca: {sorted(encontrados)}')
+            assert encontrados[clave_fecha] == codigo, \
+                f'{clave_fecha}: se esperaba {codigo} y llegó {encontrados[clave_fecha]!r}'
+        assert fila_idx >= 0
+
+    @test("X2. Las fechas fuera del rango del año escolar NO se pierden")
+    def t():
+        # Es exactamente el caso de producción: el año escolar declara
+        # 2024-2025 y la asistencia se tomó en 2026. Antes de v2.19.7 la
+        # rejilla no tenía ni julio ni agosto y septiembre no tenía el día 2.
+        data, _ = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        matriz = data[clave]['asistencia_matriz']
+        meses_con_marca = {m['mes_num'] for m in matriz
+                           for f in m['filas'] for v in f['valores'] if v}
+        assert {7, 8, 9} <= meses_con_marca, \
+            f'faltan meses con marcas; llegaron {sorted(meses_con_marca)}'
+        sept = next(m for m in matriz if m['mes_num'] == 9)
+        assert 2 in sept['dias'], \
+            f"el día 2 de septiembre tiene registro y no está en la rejilla: {sept['dias']}"
+
+    @test("X3. Las notas de CalificacionSecundaria producen PC y CF en el Registro")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        califs = data[clave]['calificaciones']
+        fila = califs.get(orden[A['est']])
+        assert fila is not None, 'el estudiante con notas debe tener fila de calificaciones'
+        # Mismos números que calcula el boletín con estas competencias.
+        assert fila['pc1'] == 63.5, f"PC1 esperado 63.5, vino {fila['pc1']}"
+        assert fila['pc2'] == 62.8, f"PC2 esperado 62.8, vino {fila['pc2']}"
+        assert fila['pc3'] == 65.0, f"PC3 esperado 65.0, vino {fila['pc3']}"
+        assert fila['pc4'] == 84.5, f"PC4 esperado 84.5, vino {fila['pc4']}"
+        assert fila['cf'] == 69, f"CF esperado 69, vino {fila['cf']}"
+
+    @test("X4. Un estudiante incompleto NO recibe un promedio inventado")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        califs = data[clave]['calificaciones']
+
+        parcial = califs.get(orden[X_EST_PARCIAL])
+        assert parcial is not None, 'el estudiante con P1 debe tener fila'
+        assert parcial['pc1'] == 63.5, f"con las 4 competencias en P1 debe salir PC1: {parcial}"
+        for campo in ('pc2', 'pc3', 'pc4', 'cf'):
+            assert parcial[campo] is None, \
+                f'{campo} debe quedar vacío sin datos, vino {parcial[campo]!r}'
+
+        incompleto = califs.get(orden[X_EST_INCOMPLETO])
+        if incompleto is not None:
+            for campo in ('pc1', 'pc2', 'pc3', 'pc4', 'cf'):
+                assert incompleto[campo] is None, \
+                    (f'con UNA sola competencia no se puede calcular {campo}; '
+                     f"vino {incompleto[campo]!r}")
+
+    @test("X5. RP se deja vacío mientras no haya regla confirmada")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        fila = data[clave]['calificaciones'][orden[A['est']]]
+        for campo in ('rp1', 'rp2', 'rp3', 'rp4'):
+            assert fila[campo] is None, \
+                f'{campo} no debe inventarse desde las competencias: {fila[campo]!r}'
+
+    @test("X6. Sin cédula real, la casilla de cédula y la de RNE quedan vacías")
+    def t():
+        # La matrícula identifica al estudiante DENTRO del colegio; la cédula y
+        # el RNE son documentos externos que EducaOne no guarda. Antes la
+        # matrícula se copiaba a las dos casillas y el registro terminaba
+        # afirmando documentos que nadie había cargado.
+        from pypdf import PdfReader
+        import io as _io
+
+        _s = _SL()
+        try:
+            sin_doc = _s.query(_Est).filter_by(id=X_EST_INCOMPLETO).first()
+            assert not (getattr(sin_doc, 'cedula', None) or ''), 'setup: debe estar sin cédula'
+            matricula = sin_doc.matricula
+        finally:
+            _s.close()
+        assert matricula, 'setup: el estudiante debe tener matrícula'
+
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, f'{r.status_code} {r.text[:200]}'
+        assert r.content[:4] == b'%PDF'
+
+        # Página 11 = "Datos generales del estudiante". Sus únicas casillas de
+        # identificación son Cédula/Pasaporte y RNE: si la matrícula aparece
+        # ahí, es que se coló en una de las dos.
+        texto = PdfReader(_io.BytesIO(r.content)).pages[10].extract_text() or ''
+        assert matricula not in texto, \
+            (f'la matrícula {matricula!r} no debe imprimirse en la casilla de '
+             f'cédula ni en la de RNE del Registro')
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL

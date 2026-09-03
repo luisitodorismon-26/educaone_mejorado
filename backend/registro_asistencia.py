@@ -190,14 +190,41 @@ def build_asistencia_registro(
                 from datetime import date
                 fechas_esperadas_por_mes[mes_num].append(date(year, mes_num, dia))
 
+    # v2.19.7: TODO día con asistencia registrada tiene que tener su columna.
+    #
+    # La rejilla se armaba solo con los días esperados por horario dentro del
+    # rango del año escolar. Cuando ese rango NO cubre las fechas realmente
+    # capturadas —que es el caso del colegio en producción: año escolar
+    # 2024-09-01→2025-06-30 y asistencia tomada en 2026-07..09— los registros
+    # caían fuera de la rejilla y la hoja salía vacía pese a existir cientos de
+    # marcas. El respaldo de "modo legacy" de arriba no ayudaba: solo se activa
+    # si la rejilla queda COMPLETAMENTE vacía, y acá tenía diez meses (los del
+    # año escolar) que simplemente no intersecaban con ningún registro.
+    #
+    # Acá se añaden únicamente los días que YA tienen registro y que no estaban
+    # en la rejilla. No se inventa ninguna marca: un día agregado se llena solo
+    # con lo que haya en la base, y los días esperados sin registro siguen
+    # apareciendo vacíos como hasta ahora.
+    anio_real_por_mes_dia = {}
+    for r in registros:
+        anio_real_por_mes_dia.setdefault((r.fecha.month, r.fecha.day), r.fecha.year)
+
+    for (mes_num, dia), anio in anio_real_por_mes_dia.items():
+        lista = fechas_esperadas_por_mes.setdefault(mes_num, [])
+        if dia not in {f.day for f in lista}:
+            from datetime import date
+            lista.append(date(anio, mes_num, dia))
+
     meses_presentes = sorted(fechas_esperadas_por_mes.keys(), key=_orden_mes)
     dias_trabajados_cfg = ano.get_dias_trabajados() if ano else {}
 
     resultado = []
     for mes_num in meses_presentes:
-        fechas_mes = sorted(fechas_esperadas_por_mes.get(mes_num, []))
-        dias = [f.day for f in fechas_mes]
-        dias_unicos = list(dict.fromkeys(dias))
+        fechas_mes = fechas_esperadas_por_mes.get(mes_num, [])
+        # v2.19.7: se ordena por NÚMERO de día, no por fecha completa. Al poder
+        # convivir días de años distintos en un mismo mes (ver arriba), ordenar
+        # por fecha dejaría las columnas fuera de secuencia en la hoja MINERD.
+        dias_unicos = sorted({f.day for f in fechas_mes})
         dias_con_registro = sorted(por_mes.get(mes_num, {}).keys())
         cfg_mes = dias_trabajados_cfg.get(MES_CLAVE_CORTA.get(mes_num, ''), 0) if dias_trabajados_cfg else 0
 
