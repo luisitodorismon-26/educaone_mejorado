@@ -2484,6 +2484,102 @@ with client:
         assert r_anon.status_code in (401, 403), \
             f'sin autenticar no puede salir un registro: {r_anon.status_code}'
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN W — v2.19.6 (rendimiento del borrador, sin cambiar el documento)
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== W. v2.19.6 — SELLO BORRADOR EN UNA PASADA ==={RESET}")
+
+    # v2.19.6 dejó de generar el PDF y volver a recorrerlo para sellarlo: el
+    # sello se estampa durante la única pasada de generación, como Form XObject
+    # reutilizado. Lo que NO puede cambiar es el documento: mismo número de
+    # páginas, sello en todas, y el registro OFICIAL sin sello alguno.
+
+    def _pdf_registro(marca):
+        from registro_escolar import generar_registro_desde_sistema
+        colegio_info = {
+            'nombre': 'Centro W', 'regional': '15', 'distrito': '15-05',
+            'direccion': '', 'telefono': '', 'email': '', 'director': '',
+            'codigo_centro': '08-01-0123', 'codigo_cartografia': '',
+            'sector': '', 'zona': '', 'jornada': '', 'coordinador': 'Titular W',
+        }
+        curso_info = {'grado': '1ro Secundaria', 'seccion': 'A', 'tanda': 'Matutina'}
+        estudiantes = [{
+            'id': 1, 'no_lista': 1, 'nombre': 'Estudiante W', 'sexo': 'F',
+            'fecha_nacimiento': None, 'cedula': '', 'matricula': 'W001',
+            'lugar_nacimiento': '', 'nacionalidad': '', 'direccion': '',
+            'condicion_entrada': 'nuevo',
+        }]
+        asignaturas_data = {'Matemática': {
+            'docente': 'Prof W', 'asistencias': {}, 'asistencia_matriz': [],
+            'calificaciones': {},
+        }}
+        return generar_registro_desde_sistema(
+            colegio_info, curso_info, '2025-2026', estudiantes,
+            asignaturas_data, 1, marca_borrador=marca)
+
+    def _paginas_con_sello(pdf_bytes):
+        """Cuenta páginas cuyo contenido referencia el XObject del sello."""
+        from pypdf import PdfReader
+        from registro_borrador import NOMBRE_XOBJECT
+        import io as _io
+        lector = PdfReader(_io.BytesIO(pdf_bytes))
+        total = 0
+        for pagina in lector.pages:
+            recursos = pagina.get('/Resources')
+            if recursos is None:
+                continue
+            xobjs = recursos.get_object().get('/XObject')
+            if xobjs is not None and NOMBRE_XOBJECT in xobjs.get_object():
+                total += 1
+        return total, len(lector.pages)
+
+    @test("W1. El borrador lleva el sello en TODAS las páginas")
+    def t():
+        pdf = _pdf_registro(True)
+        assert pdf[:4] == b'%PDF', 'debe ser un PDF válido'
+        con_sello, total = _paginas_con_sello(pdf)
+        assert total > 100, f'el registro de 1ro secundaria tiene 170 páginas, vinieron {total}'
+        assert con_sello == total, \
+            f'el sello debe estar en las {total} páginas, está en {con_sello}'
+
+    @test("W2. El registro OFICIAL no lleva sello, y tiene las mismas páginas")
+    def t():
+        oficial = _pdf_registro(False)
+        borrador = _pdf_registro(True)
+        assert oficial[:4] == b'%PDF'
+        con_sello_of, total_of = _paginas_con_sello(oficial)
+        con_sello_bo, total_bo = _paginas_con_sello(borrador)
+        assert con_sello_of == 0, \
+            f'el registro oficial NO puede llevar sello (lo lleva en {con_sello_of} páginas)'
+        assert total_of == total_bo, \
+            f'sellar no puede cambiar el número de páginas: {total_of} vs {total_bo}'
+
+    @test("W3. aplicar_marca_borrador sigue sellando todas las páginas")
+    def t():
+        # Sigue en uso para el borrador de PRIMARIA, que arma el PDF por otro
+        # camino. Se verifica sobre el registro oficial ya generado.
+        from registro_borrador import aplicar_marca_borrador
+        oficial = _pdf_registro(False)
+        sellado = aplicar_marca_borrador(oficial)
+        assert sellado[:4] == b'%PDF'
+        con_sello, total = _paginas_con_sello(sellado)
+        _, total_original = _paginas_con_sello(oficial)
+        assert total == total_original, 'no puede cambiar el número de páginas'
+        assert con_sello == total, \
+            f'el sello debe estar en las {total} páginas, está en {con_sello}'
+
+    @test("W4. El borrador de secundaria del endpoint sigue siendo un PDF sellado")
+    def t():
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, f'{r.status_code} {r.text[:200]}'
+        assert r.content[:4] == b'%PDF'
+        con_sello, total = _paginas_con_sello(r.content)
+        assert total > 100, f'esperaba el registro completo, vinieron {total} páginas'
+        assert con_sello == total, \
+            f'el endpoint debe entregar el sello en las {total} páginas, vino en {con_sello}'
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL

@@ -22,6 +22,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import mm
 from pypdf import PdfReader, PdfWriter
+from registro_borrador import crear_xobject_borrador, estampar_borrador
 
 # ============================================================================
 # CONSTANTES
@@ -1046,6 +1047,7 @@ def generar_registro_escolar(
     promocion_data: Optional[List[Dict]] = None,
     estadisticas_data: Optional[Dict] = None,
     template_dir: Optional[str] = None,
+    marca_borrador: bool = False,
 ) -> bytes:
     """
     Genera el registro escolar completo para un grado.
@@ -1061,6 +1063,9 @@ def generar_registro_escolar(
         promocion_data: Lista de estudiantes con notas finales para promoción
         estadisticas_data: Dict con estadísticas de fin de año
         template_dir: Directorio donde están los PDFs template (override)
+        marca_borrador: v2.19.6 — estampa el sello BORRADOR durante ESTA misma
+            pasada. Por defecto False: el registro OFICIAL sale exactamente
+            igual que antes, sin sello y sin un solo objeto extra.
     
     Returns:
         bytes del PDF generado
@@ -1351,7 +1356,13 @@ def generar_registro_escolar(
     # MERGE: Template + Overlays
     # ========================================
     writer = PdfWriter()
-    
+
+    # v2.19.6: el sello BORRADOR se estampa acá, en la MISMA pasada. Antes se
+    # generaba el PDF entero, se serializaba, se volvía a parsear y se recorrían
+    # las 170 páginas otra vez solo para sellarlas. El sello se construye una
+    # vez por geometría de página (en la práctica, una sola vez).
+    refs_borrador = {}
+
     for pg_idx in range(total_pages):
         template_page = template_reader.pages[pg_idx]
         
@@ -1361,7 +1372,17 @@ def generar_registro_escolar(
                 overlay_page = overlay_reader.pages[0]
                 template_page.merge_page(overlay_page)
         
-        writer.add_page(template_page)
+        pagina = writer.add_page(template_page)
+
+        if marca_borrador:
+            # Después del merge del contenido, para que el sello quede ENCIMA
+            # (mismo orden visual que la pasada separada que había antes).
+            ancho = float(pagina.mediabox.width)
+            alto = float(pagina.mediabox.height)
+            clave = (round(ancho, 2), round(alto, 2))
+            if clave not in refs_borrador:
+                refs_borrador[clave] = crear_xobject_borrador(writer, ancho, alto)
+            estampar_borrador(writer, pagina, refs_borrador[clave])
     
     # Escribir resultado
     output = io.BytesIO()
@@ -1588,7 +1609,8 @@ def _calcular_edad(fecha_nacimiento) -> int:
 # TEST: Generar un registro de prueba
 # ============================================================================
 
-def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudiantes, asignaturas_data, grado_numero):
+def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudiantes,
+                                   asignaturas_data, grado_numero, marca_borrador=False):
     """
     Wrapper que traduce datos de app.py al formato del generador de registro.
     
@@ -1597,6 +1619,9 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         'asistencias': {idx_est: {idx_mes: {dia: char}}},
         'calificaciones': {idx_est: {'p1':val, 'rp1':val, ..., 'cf':val}}
     }
+
+    marca_borrador: v2.19.6 — sella BORRADOR en la misma pasada de generación.
+    Los llamadores del registro OFICIAL no lo pasan y su PDF no cambia.
     """
     anios = str(ano_escolar).split('-')
     anio_inicio = anios[0][-2:] if len(anios) > 0 else ""
@@ -1756,6 +1781,7 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         asistencia_data=asistencia_data if asistencia_data else None,
         calificaciones_data=calificaciones_data if calificaciones_data else None,
         promocion_data=promocion_data if any(p for p in promocion_data) else None,
+        marca_borrador=marca_borrador,
     )
 
 if __name__ == "__main__":
