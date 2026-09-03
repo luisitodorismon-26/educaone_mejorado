@@ -2795,6 +2795,228 @@ with client:
             (f'la matrícula {matricula!r} no debe imprimirse en la casilla de '
              f'cédula ni en la de RNE del Registro')
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN Y — v2.19.7 (2): detalle por COMPETENCIA en el spread
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== Y. v2.19.7 — DETALLE POR COMPETENCIA ==={RESET}")
+
+    # El spread de calificaciones tiene CUATRO bloques P1/RP1..P4/RP4 —uno por
+    # competencia— y además el bloque resumen. Antes solo se llenaba el resumen
+    # (y con el PC del período escrito dentro del bloque de la competencia 1),
+    # así que los cuatro bloques de detalle salían vacíos teniendo el dato.
+    #
+    # Los valores son DISTINTOS en cada competencia y período a propósito: si
+    # hubiera un cruce de bloques o de columnas, el número aparecería en la
+    # celda equivocada y el test lo detecta.
+    Y_NOTAS = {
+        1: {'p1': 65, 'p2': 60, 'p3': 65, 'p4': 60},
+        2: {'p1': 67, 'p2': 78, 'p3': 68, 'p4': 89},
+        3: {'p1': 56, 'p2': 50, 'p3': 71, 'p4': 95},
+        4: {'p1': 66, 'p2': 63, 'p3': 56, 'p4': 94},
+    }
+    Y_RP = (3, 'rp2', 72)   # una sola recuperación: competencia 3, período 2
+
+    _r = client.post('/api/estudiantes', json={
+        'nombre': 'Detalle', 'apellido': 'Ye', 'sexo': 'F',
+        'fecha_nacimiento': '2011-07-07', 'curso_id': A['curso'],
+        'no_lista': 33, 'matricula': 'Y-DETALLE',
+    }, headers=auth(DIR_A_TOKEN))
+    assert _r.status_code in (200, 201), f'setup Y: crear estudiante: {_r.text}'
+    Y_EST = _r.json()['id']
+
+    _db = _SL()
+    try:
+        _ano_y = _db.query(_Ano).filter_by(colegio_id=A_COLEGIO_ID, activo=True).first()
+        for _num, _notas in Y_NOTAS.items():
+            _fila = _CS(colegio_id=A_COLEGIO_ID, estudiante_id=Y_EST,
+                        asignatura_id=A['asig'], ano_escolar_id=_ano_y.id,
+                        competencia_numero=_num, **_notas)
+            if _num == Y_RP[0]:
+                setattr(_fila, Y_RP[1], Y_RP[2])
+            _db.add(_fila)
+        _db.commit()
+    finally:
+        _db.close()
+
+    def _celdas_del_spread():
+        """Genera el borrador y devuelve, por página del spread de la
+        asignatura, la lista de (x, texto) de la FILA de Y_EST."""
+        from pypdf import PdfReader
+        from registro_escolar import (GRADO_CONFIG, ASIGNATURAS_CICLO_1,
+                                      CALIF_SPREAD, _y as _plumber_a_pdf)
+        import io as _io
+
+        _s = _SL()
+        try:
+            orden = [e.id for e in _s.query(_Est).filter_by(
+                curso_id=A['curso'], activo=True).order_by(_Est.no_lista).all()]
+        finally:
+            _s.close()
+        fila = orden.index(Y_EST)
+        assert fila < 40, f'el estudiante de prueba quedó en la fila {fila}, fuera de la tabla'
+
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, f'{r.status_code} {r.text[:200]}'
+        lector = PdfReader(_io.BytesIO(r.content))
+
+        cfg = GRADO_CONFIG[1]
+        a_idx = ASIGNATURAS_CICLO_1.index('Matemática')
+        pg_izq = cfg['calificaciones_inicio'] - 1 + a_idx * cfg['calificaciones_pgs_por_asignatura']
+
+        # Y de la fila, en coordenadas del PDF (igual que el generador).
+        y_fila = _plumber_a_pdf(CALIF_SPREAD['centro_fila1_plumber']
+                                + 8 * 0.35) - fila * CALIF_SPREAD['row_height']
+
+        paginas = {}
+        for lado, pg in (('izq', pg_izq), ('der', pg_izq + 1)):
+            capturado = []
+
+            def visitante(texto, cm, tm, fuente, tam, _c=capturado):
+                limpio = (texto or '').strip()
+                if limpio:
+                    _c.append((round(tm[4], 1), round(tm[5], 1), limpio))
+
+            lector.pages[pg].extract_text(visitor_text=visitante)
+            paginas[lado] = [(x, t) for x, y, t in capturado
+                             if abs(y - y_fila) < 3 and x > 0]
+        return paginas
+
+    def _valor_en(celdas, x_centro, tolerancia=6.0):
+        """Texto dibujado centrado en x_centro, o None si la celda está vacía.
+
+        El visitor devuelve el borde IZQUIERDO del texto; como se dibuja
+        centrado, se busca el que caiga más cerca del centro de la columna.
+        """
+        candidatos = [(abs(x + len(t) * 2.3 - x_centro), t) for x, t in celdas]
+        candidatos = [(d, t) for d, t in candidatos if d < tolerancia]
+        if not candidatos:
+            return None
+        return min(candidatos)[1]
+
+    Y_CELDAS = _celdas_del_spread()
+
+    def _bloque(lado, num_comp):
+        return CALIF_SPREAD_TEST[lado][num_comp], Y_CELDAS[lado]
+
+    from registro_escolar import CALIF_SPREAD as CALIF_SPREAD_TEST
+
+    @test("Y1. Competencia 1: P1/P2/P3/P4 en SUS celdas del bloque 1")
+    def t():
+        cols, celdas = _bloque('izq', 1)
+        for periodo, esperado in (('p1', '65'), ('p2', '60'), ('p3', '65'), ('p4', '60')):
+            visto = _valor_en(celdas, cols[periodo])
+            assert visto == esperado, \
+                (f'competencia 1 {periodo.upper()}: se esperaba {esperado} en x={cols[periodo]}, '
+                 f'vino {visto!r}. Celdas de la fila: {sorted(celdas)}')
+
+    @test("Y2. Competencia 2: P1/P2/P3/P4 en SUS celdas del bloque 2")
+    def t():
+        cols, celdas = _bloque('izq', 2)
+        for periodo, esperado in (('p1', '67'), ('p2', '78'), ('p3', '68'), ('p4', '89')):
+            visto = _valor_en(celdas, cols[periodo])
+            assert visto == esperado, \
+                f'competencia 2 {periodo.upper()}: se esperaba {esperado}, vino {visto!r}'
+
+    @test("Y3. Competencias 3 y 4 en la página derecha, sin cruzarse")
+    def t():
+        cols3, celdas = _bloque('der', 3)
+        for periodo, esperado in (('p1', '56'), ('p2', '50'), ('p3', '71'), ('p4', '95')):
+            visto = _valor_en(celdas, cols3[periodo])
+            assert visto == esperado, \
+                f'competencia 3 {periodo.upper()}: se esperaba {esperado}, vino {visto!r}'
+        cols4, _ = _bloque('der', 4)
+        for periodo, esperado in (('p1', '66'), ('p2', '63'), ('p3', '56'), ('p4', '94')):
+            visto = _valor_en(celdas, cols4[periodo])
+            assert visto == esperado, \
+                f'competencia 4 {periodo.upper()}: se esperaba {esperado}, vino {visto!r}'
+
+    @test("Y4. La RP aparece SOLO en su competencia y su período")
+    def t():
+        num_rp, celda_rp, valor_rp = Y_RP
+        cols, celdas = _bloque('der', num_rp)
+        visto = _valor_en(celdas, cols[celda_rp])
+        assert visto == str(valor_rp), \
+            f'la recuperación debe estar en competencia {num_rp} {celda_rp.upper()}, vino {visto!r}'
+
+        # Todas las demás casillas RP del spread quedan vacías: no se inventa.
+        for lado in ('izq', 'der'):
+            for comp, columnas in CALIF_SPREAD_TEST[lado].items():
+                for columna, x in columnas.items():
+                    if not columna.startswith('rp'):
+                        continue
+                    if lado == 'der' and comp == num_rp and columna == celda_rp:
+                        continue
+                    otro = _valor_en(Y_CELDAS[lado], x)
+                    assert otro is None, \
+                        (f'{lado} competencia {comp} {columna.upper()} debía quedar '
+                         f'vacía y trae {otro!r}')
+
+    @test("Y5. El resumen conserva PC1-PC4 y CF, con el formato del boletín")
+    def t():
+        # PC = promedio de las 4 competencias en el período. La RP de la
+        # competencia 3 en P2 sube ese período: valor_periodo = max(P, RP).
+        #   PC1 = (65+67+56+66)/4 = 63.5
+        #   PC2 = (60+78+72+63)/4 = 68.25 -> 68.2
+        #   PC3 = (65+68+71+56)/4 = 65.0
+        #   PC4 = (60+89+95+94)/4 = 84.5
+        #   CF  = (63.5+68.2+65.0+84.5)/4 = 70.3 -> 70
+        resumen = CALIF_SPREAD_TEST['resumen']
+        celdas = Y_CELDAS['der']
+        for clave, esperado in (('pc1', '63.5'), ('pc2', '68.2'),
+                                ('pc3', '65'), ('pc4', '84.5'), ('cf', '70')):
+            visto = _valor_en(celdas, resumen[clave])
+            assert visto == esperado, \
+                (f'{clave.upper()}: se esperaba {esperado!r} y vino {visto!r}. '
+                 f'La regla es la del boletín: entero si es CF o si el valor es '
+                 f'redondo, 1 decimal si no.')
+
+    @test("Y6. Sin las 4 competencias, los bloques de detalle quedan vacíos")
+    def t():
+        # X_EST_INCOMPLETO tiene UNA sola competencia: su bloque 1 se llena y
+        # los otros tres quedan en blanco. Nunca se copia el mismo valor a los
+        # cuatro bloques ni se inventa un promedio.
+        from pypdf import PdfReader
+        from registro_escolar import (GRADO_CONFIG, ASIGNATURAS_CICLO_1,
+                                      CALIF_SPREAD, _y as _plumber_a_pdf)
+        import io as _io
+        _s = _SL()
+        try:
+            orden = [e.id for e in _s.query(_Est).filter_by(
+                curso_id=A['curso'], activo=True).order_by(_Est.no_lista).all()]
+        finally:
+            _s.close()
+        fila = orden.index(X_EST_INCOMPLETO)
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200
+        lector = PdfReader(_io.BytesIO(r.content))
+        cfg = GRADO_CONFIG[1]
+        a_idx = ASIGNATURAS_CICLO_1.index('Matemática')
+        pg_der = cfg['calificaciones_inicio'] + a_idx * cfg['calificaciones_pgs_por_asignatura']
+        y_fila = _plumber_a_pdf(CALIF_SPREAD['centro_fila1_plumber']
+                                + 8 * 0.35) - fila * CALIF_SPREAD['row_height']
+        capturado = []
+
+        def visitante(texto, cm, tm, fuente, tam, _c=capturado):
+            limpio = (texto or '').strip()
+            if limpio:
+                _c.append((round(tm[4], 1), round(tm[5], 1), limpio))
+
+        lector.pages[pg_der].extract_text(visitor_text=visitante)
+        celdas = [(x, t) for x, y, t in capturado if abs(y - y_fila) < 3 and x > 0]
+        for comp in (3, 4):
+            for columna, x in CALIF_SPREAD['der'][comp].items():
+                visto = _valor_en(celdas, x)
+                assert visto is None, \
+                    (f'un estudiante con una sola competencia no puede tener nada '
+                     f'en competencia {comp} {columna.upper()}; vino {visto!r}')
+        for clave in ('pc1', 'pc2', 'pc3', 'pc4', 'cf'):
+            visto = _valor_en(celdas, CALIF_SPREAD['resumen'][clave])
+            assert visto is None, \
+                f'{clave.upper()} no puede calcularse con una sola competencia; vino {visto!r}'
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL

@@ -14396,12 +14396,32 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
                         _ano_registro.id if _ano_registro else None,
                         competencias=comps,
                     )
+                    # v2.19.7 (2): las competencias NO se colapsan antes de
+                    # llegar al generador. El spread del Registro tiene CUATRO
+                    # bloques de detalle P1/RP1..P4/RP4 —uno por competencia— y
+                    # además el bloque resumen. Antes solo se enviaban los
+                    # promedios, así que los cuatro bloques de detalle salían
+                    # vacíos teniendo el dato cargado.
+                    detalle = {}
+                    for _c in comps:
+                        num = _c.competencia_numero
+                        if not num:
+                            continue
+                        detalle[num] = {
+                            'p1': _c.p1, 'rp1': _c.rp1,
+                            'p2': _c.p2, 'rp2': _c.rp2,
+                            'p3': _c.p3, 'rp3': _c.rp3,
+                            'p4': _c.p4, 'rp4': _c.rp4,
+                        }
+
                     calificaciones[idx] = {
-                        # RP se deja vacío a propósito: en secundaria la
-                        # recuperación existe por COMPETENCIA y por período,
-                        # y la casilla del Registro es una sola por período.
-                        # Sin una regla confirmada por Dirección, escribir algo
-                        # ahí sería inventar. Ver v2.19.7 en el PR.
+                        # Notas por competencia y período, tal como están en la
+                        # base. Un valor NULL queda NULL: no se inventa nada.
+                        'competencias': detalle,
+                        # Los rpN de primer nivel pertenecen al modelo legacy
+                        # `Calificacion` (una recuperación por período, sin
+                        # competencia). En secundaria la recuperación vive
+                        # DENTRO de cada competencia, en `competencias[n]`.
                         'rp1': None, 'rp2': None, 'rp3': None, 'rp4': None,
                         'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
                         'cf': cf,
