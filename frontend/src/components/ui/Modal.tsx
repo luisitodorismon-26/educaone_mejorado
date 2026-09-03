@@ -69,9 +69,15 @@ export const Modal = ({ isOpen, onClose, title, children, size = 'md', footer }:
             {children}
           </div>
           
-          {/* Footer */}
+          {/* Footer.
+              v2.19.4: `flex-wrap` para que los botones bajen de línea en vez de
+              comprimirse. El modal de detalle de un reporte llega a tener cuatro
+              (Cerrar, Imprimir PDF, Marcar firmado, Resolver reporte) y a 360 px
+              quedaban aplastados: "Resolver reporte" —la acción principal de
+              Dirección— era prácticamente intocable. `justify-end` se conserva,
+              así que en escritorio no cambia nada. */}
           {footer && (
-            <div className="flex justify-end gap-2 px-6 py-4 border-t border-gray-200 bg-gray-50 rounded-b-xl">
+            <div className="flex flex-wrap justify-end gap-2 px-4 sm:px-6 py-4 border-t border-gray-200 bg-gray-50 rounded-b-xl">
               {footer}
             </div>
           )}

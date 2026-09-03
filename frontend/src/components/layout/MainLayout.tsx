@@ -650,7 +650,14 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
               {showNotifPanel && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setShowNotifPanel(false)}></div>
-                  <div className="absolute right-0 top-12 w-80 max-h-[400px] bg-white rounded-xl shadow-xl border z-50 overflow-hidden">
+                  {/* v2.19.4: el panel medía 320 px fijos y colgaba del borde
+                      derecho de la campana, que está a ~64 px del borde de la
+                      pantalla. A 360 px su lado izquierdo caía en −24 px y el
+                      contenido quedaba cortado fuera de la vista.
+                      Ahora nunca excede el ancho disponible: en pantallas
+                      chicas ocupa el viewport menos un margen, y a partir de
+                      `sm` recupera los 320 px de siempre. */}
+                  <div className="absolute right-0 top-12 w-[calc(100vw-2rem)] max-w-[20rem] sm:w-80 max-h-[400px] bg-white rounded-xl shadow-xl border z-50 overflow-hidden">
                     <div className="p-3 border-b bg-gray-50 flex items-center justify-between">
                       <h3 className="font-bold text-sm text-gray-800">Notificaciones</h3>
                       {notifNoLeidas > 0 && (
