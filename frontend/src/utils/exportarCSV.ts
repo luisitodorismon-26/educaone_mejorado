@@ -19,10 +19,55 @@ export interface ColumnaCSV<T> {
   valor: (fila: T) => unknown;
 }
 
-/** Escapa un valor según RFC 4180: comillas dobles duplicadas y todo entrecomillado. */
-function celda(valor: unknown): string {
+/**
+ * Caracteres con los que Excel y LibreOffice deciden que una celda es una
+ * FÓRMULA en vez de texto.
+ */
+const INICIOS_DE_FORMULA = new Set(['=', '+', '-', '@']);
+
+/**
+ * Neutraliza la inyección de fórmulas (CSV / Formula Injection).
+ *
+ * El contenido de estos CSV lo escriben las personas del colegio: el título y
+ * la descripción de un reporte de conducta son texto libre. Si alguien guarda
+ * un reporte titulado `=SUM(A1:A2)` —o algo mucho peor, como una fórmula que
+ * llama a un comando externo— y Dirección abre el archivo exportado, la hoja
+ * de cálculo lo EJECUTA. El riesgo no está en EducaOne sino en Excel, y por
+ * eso hay que desactivarlo en el archivo, no en la pantalla.
+ *
+ * Se antepone un apóstrofo, que es la marca estándar de "esto es texto" en
+ * Excel y LibreOffice. El apóstrofo no se ve al abrir la hoja: la celda
+ * muestra el valor original tal cual.
+ *
+ * Se mira el primer carácter SIGNIFICATIVO, no el primero a secas: las hojas
+ * de cálculo ignoran los espacios iniciales al decidir si algo es una fórmula,
+ * así que `   =SUM(A1:A2)` se ejecuta igual que `=SUM(A1:A2)`. El regex
+ * también descarta tabuladores, saltos de línea y espacios duros.
+ *
+ * Nota deliberada: un valor como `-5` también queda como texto. En estos
+ * exportes ninguna columna es un número negativo (son fechas, nombres, cursos
+ * y texto libre), así que preferimos proteger de más antes que de menos.
+ */
+export function neutralizarFormulaCSV(texto: string): string {
+  const primerSignificativo = texto.replace(/^[\s﻿ ]+/, '').charAt(0);
+  if (!primerSignificativo) return texto;
+  return INICIOS_DE_FORMULA.has(primerSignificativo) ? `'${texto}` : texto;
+}
+
+/**
+ * Convierte un valor en una celda CSV segura.
+ *
+ * Orden de las operaciones: primero se neutraliza la fórmula y después se
+ * escapan las comillas. Al ir todo entre comillas dobles, las comas y los
+ * saltos de línea del contenido quedan dentro del campo sin romper la
+ * estructura del archivo (RFC 4180).
+ *
+ * Exportada aparte de `exportarCSV` para poder verificarla sin DOM.
+ */
+export function celdaCSV(valor: unknown): string {
   if (valor === null || valor === undefined) return '""';
-  return `"${String(valor).replace(/"/g, '""')}"`;
+  const texto = neutralizarFormulaCSV(String(valor));
+  return `"${texto.replace(/"/g, '""')}"`;
 }
 
 /**
@@ -41,9 +86,9 @@ export function exportarCSV<T>(
 ): boolean {
   if (!filas.length) return false;
 
-  const encabezados = columnas.map((c) => celda(c.label)).join(',');
+  const encabezados = columnas.map((c) => celdaCSV(c.label)).join(',');
   const cuerpo = filas.map((fila) =>
-    columnas.map((c) => celda(c.valor(fila))).join(',')
+    columnas.map((c) => celdaCSV(c.valor(fila))).join(',')
   );
   const csv = [encabezados, ...cuerpo].join('\n');
 
