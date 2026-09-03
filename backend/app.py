@@ -13976,11 +13976,16 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
         if not _tiene_reg:
             return JSONResponse({'error': 'Solo puedes ver el borrador de tus cursos asignados'}, status_code=403)
 
-    # v2.17: este flujo es EXCLUSIVO de primaria — un curso de secundaria
-    # generaría el documento equivocado (su registro es otro template).
-    if _canon_nivel(grado.nivel) != 'primaria':
-        return JSONResponse({'error': 'Este registro es solo para cursos de PRIMARIA. '
-                                      'Para secundaria usa su propio registro.'}, status_code=400)
+    # v2.19.5: esta guarda estaba copiada tal cual del borrador de primaria y
+    # exigía nivel 'primaria' DENTRO del endpoint de secundaria, así que
+    # rechazaba justo los cursos que debe atender: ningún curso de secundaria
+    # podía sacar su borrador, y el mensaje además se contradecía a sí mismo
+    # ("use el registro de secundaria" estando ya en él). El nivel correcto
+    # para este flujo es secundaria; primaria (e inicial) siguen rechazados,
+    # porque su registro usa otro template y saldría el documento equivocado.
+    if _canon_nivel(grado.nivel) != 'secundaria':
+        return JSONResponse({'error': 'Este registro es solo para cursos de SECUNDARIA. '
+                                      'Para primaria usa su propio registro.'}, status_code=400)
     
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()

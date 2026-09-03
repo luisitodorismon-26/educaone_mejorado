@@ -650,14 +650,20 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
               {showNotifPanel && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setShowNotifPanel(false)}></div>
-                  {/* v2.19.4: el panel medía 320 px fijos y colgaba del borde
-                      derecho de la campana, que está a ~64 px del borde de la
-                      pantalla. A 360 px su lado izquierdo caía en −24 px y el
-                      contenido quedaba cortado fuera de la vista.
-                      Ahora nunca excede el ancho disponible: en pantallas
-                      chicas ocupa el viewport menos un margen, y a partir de
-                      `sm` recupera los 320 px de siempre. */}
-                  <div className="absolute right-0 top-12 w-[calc(100vw-2rem)] max-w-[20rem] sm:w-80 max-h-[400px] bg-white rounded-xl shadow-xl border z-50 overflow-hidden">
+                  {/* v2.19.5: el panel cuelga del borde derecho de la campana,
+                      que NO está pegada al borde de la pantalla (hay ~64 px de
+                      controles a su derecha). Por eso limitar el ancho no
+                      alcanzaba: a 360 px el panel seguía empezando en −24 px y
+                      se perdían los primeros caracteres de cada notificación.
+                      v2.19.4 acotó el ancho pero mantuvo el anclaje al botón,
+                      así que el recorte seguía ahí.
+                      Ahora, en móvil, el panel se ancla al VIEWPORT y no al
+                      botón: `fixed` con `left-2 right-2` deja 8 px de margen a
+                      cada lado, sea cual sea la posición de la campana. Desde
+                      `sm` (640 px) vuelve exactamente al comportamiento de
+                      siempre —`absolute right-0 top-12 w-80`—, así que
+                      escritorio y tablet no cambian en nada. */}
+                  <div className="fixed left-2 right-2 top-16 w-auto sm:absolute sm:left-auto sm:right-0 sm:top-12 sm:w-80 max-h-[400px] bg-white rounded-xl shadow-xl border z-50 overflow-hidden">
                     <div className="p-3 border-b bg-gray-50 flex items-center justify-between">
                       <h3 className="font-bold text-sm text-gray-800">Notificaciones</h3>
                       {notifNoLeidas > 0 && (
