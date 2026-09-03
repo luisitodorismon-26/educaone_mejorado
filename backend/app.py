@@ -14414,15 +14414,34 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
                             'p4': _c.p4, 'rp4': _c.rp4,
                         }
 
+                    # v2.19.7 (3): el bloque "Promedio de Competencias
+                    # Específicas" del template rotula sus columnas
+                    # "PC1: Competencia 1" … "PC4: Competencia 4", así que cada
+                    # columna es el promedio FINAL de esa competencia a lo largo
+                    # de P1-P4 — no el promedio de las cuatro competencias en un
+                    # período. Se usa el método del propio modelo, que aplica
+                    # valor_periodo() (max(P, RP)) y devuelve None si falta
+                    # algún período.
+                    promedios_competencia = {
+                        _c.competencia_numero: _c.calcular_promedio_competencia()
+                        for _c in comps if _c.competencia_numero
+                    }
+
                     calificaciones[idx] = {
                         # Notas por competencia y período, tal como están en la
                         # base. Un valor NULL queda NULL: no se inventa nada.
                         'competencias': detalle,
+                        # Lo que va al bloque resumen del Registro.
+                        'promedios_competencia': promedios_competencia,
                         # Los rpN de primer nivel pertenecen al modelo legacy
                         # `Calificacion` (una recuperación por período, sin
                         # competencia). En secundaria la recuperación vive
                         # DENTRO de cada competencia, en `competencias[n]`.
                         'rp1': None, 'rp2': None, 'rp3': None, 'rp4': None,
+                        # pc1..pc4 son los promedios POR PERÍODO. El Registro ya
+                        # no los imprime (ver promedios_competencia), pero son
+                        # la base del CF oficial y los consume el boletín, así
+                        # que se conservan.
                         'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
                         'cf': cf,
                     }

@@ -2953,26 +2953,57 @@ with client:
                         (f'{lado} competencia {comp} {columna.upper()} debía quedar '
                          f'vacía y trae {otro!r}')
 
-    @test("Y5. El resumen conserva PC1-PC4 y CF, con el formato del boletín")
+    @test("Y5. El resumen es el promedio POR COMPETENCIA, no por período")
     def t():
-        # PC = promedio de las 4 competencias en el período. La RP de la
-        # competencia 3 en P2 sube ese período: valor_periodo = max(P, RP).
-        #   PC1 = (65+67+56+66)/4 = 63.5
-        #   PC2 = (60+78+72+63)/4 = 68.25 -> 68.2
-        #   PC3 = (65+68+71+56)/4 = 65.0
-        #   PC4 = (60+89+95+94)/4 = 84.5
-        #   CF  = (63.5+68.2+65.0+84.5)/4 = 70.3 -> 70
+        # El template rotula estas columnas "PC1: Competencia 1" …
+        # "PC4: Competencia 4": cada una es el promedio FINAL de esa
+        # competencia a lo largo de P1-P4.
+        #
+        #   C1: 65, 60, 65, 60                 -> 62.5
+        #   C2: 67, 78, 68, 89                 -> 75.5
+        #   C3: 56, max(50,72)=72, 71, 95      -> 73.5   (valor_periodo con RP)
+        #   C4: 66, 63, 56, 94                 -> 69.75 -> 69.8
+        #
+        # El otro eje —promedio de las 4 competencias en cada período— da
+        # números completamente distintos (63.5 / 68.2 / 65 / 84.5). Se
+        # comprueban los dos lados: que estén los correctos Y que NO estén
+        # los del eje equivocado.
+        POR_COMPETENCIA = {'pc1': '62.5', 'pc2': '75.5', 'pc3': '73.5', 'pc4': '69.8'}
+        POR_PERIODO = {'pc1': '63.5', 'pc2': '68.2', 'pc3': '65', 'pc4': '84.5'}
+
         resumen = CALIF_SPREAD_TEST['resumen']
         celdas = Y_CELDAS['der']
-        for clave, esperado in (('pc1', '63.5'), ('pc2', '68.2'),
-                                ('pc3', '65'), ('pc4', '84.5'), ('cf', '70')):
+        for clave, esperado in POR_COMPETENCIA.items():
             visto = _valor_en(celdas, resumen[clave])
             assert visto == esperado, \
-                (f'{clave.upper()}: se esperaba {esperado!r} y vino {visto!r}. '
-                 f'La regla es la del boletín: entero si es CF o si el valor es '
-                 f'redondo, 1 decimal si no.')
+                (f'{clave.upper()} debe ser el promedio de la Competencia '
+                 f'{clave[-1]} ({esperado}); vino {visto!r}. '
+                 f'Si vino {POR_PERIODO[clave]!r} se está usando el eje de '
+                 f'PERÍODO en vez del de COMPETENCIA.')
+            assert visto != POR_PERIODO[clave], \
+                f'{clave.upper()} trae el promedio del período, no el de la competencia'
 
-    @test("Y6. Sin las 4 competencias, los bloques de detalle quedan vacíos")
+    @test("Y5b. CF entero redondeado, y el PC conserva su decimal")
+    def t():
+        resumen = CALIF_SPREAD_TEST['resumen']
+        celdas = Y_CELDAS['der']
+
+        # CF = promedio de los PC, redondeado a entero (regla del boletín).
+        #   (62.5 + 75.5 + 73.5 + 69.75) / 4 = 70.3125 -> 70
+        cf = _valor_en(celdas, resumen['cf'])
+        assert cf == '70', f'la calificación final debe ser 70 entero, vino {cf!r}'
+        assert '.' not in (cf or ''), f'la calificación final no lleva decimal: {cf!r}'
+
+        # Un PC con decimal lo conserva…
+        assert _valor_en(celdas, resumen['pc1']) == '62.5', 'el PC debe conservar su decimal'
+        # …y uno redondo se escribe sin ".0" (regla de _fmt_nota).
+        from registro_escolar import _fmt_nota
+        assert _fmt_nota(65.0) == '65', f'65.0 debe mostrarse como 65, vino {_fmt_nota(65.0)!r}'
+        assert _fmt_nota(62.5) == '62.5'
+        assert _fmt_nota(69.5, ints_only=True) == '70', 'CF: 69.5 debe redondear a 70'
+        assert _fmt_nota(None) == ''
+
+    @test("Y6. Competencias ausentes: bloques vacíos, PC solo donde hay dato")
     def t():
         # X_EST_INCOMPLETO tiene UNA sola competencia: su bloque 1 se llena y
         # los otros tres quedan en blanco. Nunca se copia el mismo valor a los
@@ -3012,10 +3043,20 @@ with client:
                 assert visto is None, \
                     (f'un estudiante con una sola competencia no puede tener nada '
                      f'en competencia {comp} {columna.upper()}; vino {visto!r}')
-        for clave in ('pc1', 'pc2', 'pc3', 'pc4', 'cf'):
+        # v2.19.7 (3): con el eje POR COMPETENCIA, este estudiante SÍ tiene un
+        # promedio legítimo en PC1 —su competencia 1 tiene los cuatro períodos
+        # cargados (90 en todos)—, y nada en PC2/PC3/PC4, que no existen. Eso
+        # no es un invento: es exactamente lo que hay en la base. Lo que sigue
+        # sin poder calcularse es la calificación final, que exige las cuatro.
+        assert _valor_en(celdas, CALIF_SPREAD['resumen']['pc1']) == '90', \
+            'la competencia 1 tiene sus cuatro períodos: su promedio es 90'
+        for clave in ('pc2', 'pc3', 'pc4'):
             visto = _valor_en(celdas, CALIF_SPREAD['resumen'][clave])
             assert visto is None, \
-                f'{clave.upper()} no puede calcularse con una sola competencia; vino {visto!r}'
+                f'{clave.upper()} corresponde a una competencia que no existe; vino {visto!r}'
+        cf = _valor_en(celdas, CALIF_SPREAD['resumen']['cf'])
+        assert cf is None, \
+            f'la calificación final exige las cuatro competencias; vino {cf!r}'
 
 
 # ─────────────────────────────────────────────────────────────────

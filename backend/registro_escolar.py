@@ -423,8 +423,16 @@ CALIF_SPREAD = {
             "p3": 373.9, "rp3": 399.6, "p4": 425.2, "rp4": 450.8},
     },
     # Bloque "Promedio de Competencias Específicas" + Calificación final.
-    # Coordenadas sin cambios respecto de v2.19.7 (revisadas visualmente).
-    "resumen": {"pc1": 480, "pc2": 502, "pc3": 525, "pc4": 547, "cf": 564.5},
+    #
+    # v2.19.7 (3): centros RE-MEDIDOS sobre las líneas verticales del template
+    # —463.7 | 486.1 | 508.5 | 530.9 | 553.3 | 575.8, idénticas en las tres
+    # asignaturas y los tres grados comprobados—. Los valores anteriores
+    # (480, 502, 525, 547) caían unos 5 puntos a la derecha del centro de su
+    # casilla. El de la Calificación final ya estaba bien.
+    #
+    # Cada columna es el promedio FINAL de UNA competencia: el template las
+    # rotula "PC1: Competencia 1" … "PC4: Competencia 4".
+    "resumen": {"pc1": 474.9, "pc2": 497.3, "pc3": 519.7, "pc4": 542.1, "cf": 564.6},
 }
 
 # --- ASISTENCIA (Pgs 17+) ---
@@ -1292,10 +1300,16 @@ def generar_registro_escolar(
                 has_data2 = _dibujar_detalle(c_cal2, CALIF_SPREAD['der'])
 
                 # Bloque "Promedio de Competencias Específicas" + Calificación
-                # final. Las coordenadas y el contenido de este bloque NO se
-                # tocan en v2.19.7: se revisaron visualmente y quedaron
-                # aprobados. Lo único que cambia es el formato del número
-                # (ver _fmt_nota): antes se truncaba con int().
+                # final.
+                #
+                # v2.19.7 (3): la columna PCn es el promedio FINAL de la
+                # COMPETENCIA n a lo largo de P1-P4 —así lo rotula el template:
+                # "PC1: Competencia 1" … "PC4: Competencia 4"—. Antes se
+                # imprimía el promedio de las cuatro competencias en cada
+                # PERÍODO, que es otro número. El valor sale de
+                # CalificacionSecundaria.calcular_promedio_competencia(), que ya
+                # aplica valor_periodo() = max(P, RP) y devuelve None si falta
+                # algún período.
                 resumen = CALIF_SPREAD['resumen']
                 for est_idx, est_data in asig_califs.items():
                     if not isinstance(est_data, dict):
@@ -1306,10 +1320,12 @@ def generar_registro_escolar(
 
                     y = row_start_y - (ei * row_spacing)
 
-                    for clave in ('pc1', 'pc2', 'pc3', 'pc4'):
-                        texto = _fmt_nota(est_data.get(clave))
+                    promedios = est_data.get('promedios_competencia') or {}
+                    for num_comp in (1, 2, 3, 4):
+                        valor = promedios.get(num_comp, promedios.get(str(num_comp)))
+                        texto = _fmt_nota(valor)
                         if texto:
-                            _draw_text(c_cal2, resumen[clave], y, texto,
+                            _draw_text(c_cal2, resumen[f'pc{num_comp}'], y, texto,
                                        size=FONT_SIZE_NOTA, center=True)
                             has_data2 = True
 
