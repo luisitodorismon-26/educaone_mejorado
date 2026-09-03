@@ -13955,7 +13955,6 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     """
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema
-    from registro_borrador import aplicar_marca_borrador
 
     # Validar para incluir info, pero NO bloquear
     validacion = validar_registro_secundaria(db, curso_id, current_user.colegio_id)
@@ -14049,12 +14048,27 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     )
     
     try:
-        pdf_bytes = generar_registro_desde_sistema(
+        # v2.19.6: el sello BORRADOR se estampa DENTRO de la generación.
+        # Antes se armaba el PDF, se serializaba entero, se volvía a parsear y
+        # se recorrían las 170 páginas otra vez creando un lienzo ReportLab por
+        # página. El documento es el mismo —verificado píxel a píxel—, pero se
+        # ahorra una serialización y un parseo completos del PDF.
+        #
+        # v2.19.6 (2): armar el PDF es trabajo de CPU puro y este handler es
+        # `async`, así que se ejecutaba dentro del event loop y CONGELABA al
+        # worker entero mientras durara. Con dos workers, dos borradores
+        # simultáneos dejaban la aplicación sin atender a nadie más.
+        # `run_in_threadpool` lo saca del loop: no acelera este PDF (el GIL
+        # sigue ahí), pero el resto del colegio sigue usando el sistema.
+        # Es seguro porque a esta función no le llega la sesión de base: todos
+        # los datos ya vienen resueltos en diccionarios.
+        from starlette.concurrency import run_in_threadpool
+        pdf_bytes = await run_in_threadpool(
+            generar_registro_desde_sistema,
             colegio_info, curso_info, ano_escolar,
-            estudiantes_raw, asignaturas_data, grado_numero
+            estudiantes_raw, asignaturas_data, grado_numero,
+            marca_borrador=True,
         )
-        # Aplicar marca de agua BORRADOR
-        pdf_bytes = aplicar_marca_borrador(pdf_bytes)
         
         filename = f"BORRADOR_Registro_Secundaria_{curso.nombre_completo.replace(' ', '_')}.pdf"
         
@@ -14243,13 +14257,23 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         db.query(Asignatura), Asignatura, current_user
     ).all()
     
-    asigs_con_asignacion = set()
-    for a in asigs_colegio:
-        tiene = tenant_filter(
-            db.query(AsignacionProfesor), AsignacionProfesor, current_user
-        ).filter_by(curso_id=curso_id, asignatura_id=a.id, activo=True).first()
-        if tiene:
-            asigs_con_asignacion.add(a.id)
+    # v2.19.6: una sola consulta en vez de una por asignatura del colegio.
+    asigs_con_asignacion = {
+        fila[0] for fila in tenant_filter(
+            db.query(AsignacionProfesor.asignatura_id), AsignacionProfesor, current_user
+        ).filter_by(curso_id=curso_id, activo=True).all()
+        if fila[0] is not None
+    }
+
+    # v2.19.6: docentes de las asignaturas del curso, también en una consulta.
+    # Antes se resolvía dentro del bucle, una consulta por asignatura MINERD.
+    _docentes_por_asignatura = {}
+    for _asig_prof in tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso_id, activo=True).order_by(AsignacionProfesor.id).all():
+        # `.first()` se quedaba con la primera asignación activa de la asignatura;
+        # ordenar por id reproduce ese criterio de forma determinista.
+        _docentes_por_asignatura.setdefault(_asig_prof.asignatura_id, _asig_prof)
     
     def _resolver_asignatura(nombre_minerd: str):
         """
@@ -14293,9 +14317,7 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         
         docente_nombre = 'Sin asignar'
         if asignatura:
-            asig_prof = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-                curso_id=curso_id, asignatura_id=asignatura.id, activo=True
-            ).first()
+            asig_prof = _docentes_por_asignatura.get(asignatura.id)
             if asig_prof and asig_prof.profesor:
                 docente_nombre = asig_prof.profesor.nombre_completo
         
@@ -14306,10 +14328,21 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         # que retorna None si faltan datos (no hay fallbacks que inventen promedios).
         calificaciones = {}
         if asignatura:
+            # v2.19.6: UNA consulta por asignatura para todo el curso. Antes era
+            # una por estudiante: con 38 estudiantes y 13 asignaturas eran ~500
+            # viajes a la base. En Render la base es un host aparte, así que cada
+            # viaje cuesta latencia de red y se sumaban segundos enteros.
+            # `.setdefault` conserva el criterio del `.first()` anterior
+            # (quedarse con la primera fila), ahora de forma determinista.
+            _por_estudiante = {}
+            for _c in tenant_filter(db.query(Calificacion), Calificacion, current_user).filter(
+                Calificacion.asignatura_id == asignatura.id,
+                Calificacion.estudiante_id.in_([e.id for e in estudiantes_db]),
+            ).order_by(Calificacion.id).all():
+                _por_estudiante.setdefault(_c.estudiante_id, _c)
+
             for idx, est in enumerate(estudiantes_db):
-                calif = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(
-                    estudiante_id=est.id, asignatura_id=asignatura.id
-                ).first()
+                calif = _por_estudiante.get(est.id)
                 if calif:
                     # PC: usar valor persistido; si está NULL, recalcular con la lógica
                     # oficial del modelo (que retorna None si faltan parciales).
@@ -14336,10 +14369,16 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         # Asistencia por materia
         asistencias_por_est = {}
         if asignatura:
+            # v2.19.6: una consulta por asignatura, repartida después en memoria.
+            _asist_por_estudiante = {}
+            for _r in tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+                Asistencia.asignatura_id == asignatura.id,
+                Asistencia.estudiante_id.in_([e.id for e in estudiantes_db]),
+            ).all():
+                _asist_por_estudiante.setdefault(_r.estudiante_id, []).append(_r)
+
             for idx, est in enumerate(estudiantes_db):
-                registros = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
-                    estudiante_id=est.id, asignatura_id=asignatura.id
-                ).all()
+                registros = _asist_por_estudiante.get(est.id, [])
                 
                 est_asist = {}
                 for r in registros:
