@@ -2580,6 +2580,484 @@ with client:
         assert con_sello == total, \
             f'el endpoint debe entregar el sello en las {total} páginas, vino en {con_sello}'
 
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN X — v2.19.7 (los datos que YA existen llegan al Registro)
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== X. v2.19.7 — DATOS EN VIVO EN EL REGISTRO ==={RESET}")
+
+    # Se siembra el MISMO escenario que tiene el colegio en producción:
+    # el año escolar declara un rango (2024-09-01 → 2025-06-30) que NO cubre
+    # las fechas en las que realmente se tomó asistencia. Con eso, la rejilla
+    # de días se construía solo con los días esperados del año escolar y las
+    # marcas reales caían fuera: la hoja salía vacía teniendo cientos de
+    # registros. Y las notas de secundaria viven en CalificacionSecundaria,
+    # que el Registro ni siquiera consultaba.
+    from datetime import date as _date
+    from database import SessionLocal as _SL
+    from models import (Asistencia as _Asist, CalificacionSecundaria as _CS,
+                        Horario as _Hor, AnoEscolar as _Ano, Estudiante as _Est,
+                        Usuario as _Usr)
+
+    X_FECHAS = {  # fecha → estado, uno por cada código del registro
+        _date(2026, 7, 15): 'presente',
+        _date(2026, 8, 5): 'ausente',
+        _date(2026, 8, 12): 'tardanza',
+        _date(2026, 9, 2): 'excusa',
+    }
+    X_COMPETENCIAS = [(1, 65, 60, 65, 60), (2, 67, 78, 68, 89),
+                      (3, 56, 50, 71, 95), (4, 66, 63, 56, 94)]
+
+    _db = _SL()
+    try:
+        A_COLEGIO_ID = _db.query(_Usr).filter_by(username='direccion').first().colegio_id
+        _ano = _db.query(_Ano).filter_by(colegio_id=A_COLEGIO_ID, activo=True).first()
+        assert _ano is not None, 'setup X: hace falta un año escolar activo'
+        _ano.fecha_inicio = _date(2024, 9, 1)
+        _ano.fecha_fin = _date(2025, 6, 30)
+
+        # Horario de la asignatura: sin él no hay días esperados y el flujo
+        # caería al modo legacy, que no es el que falla en producción.
+        _db.add(_Hor(colegio_id=A_COLEGIO_ID, profesor_id=A['prof'], curso_id=A['curso'],
+                     asignatura_id=A['asig'], dia='Miércoles', hora_inicio='08:15',
+                     hora_fin='09:00', tipo_bloque='clase', activo=True))
+
+        X_EST = A['est']
+        for _f, _estado in X_FECHAS.items():
+            _db.add(_Asist(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST,
+                           curso_id=A['curso'], asignatura_id=A['asig'],
+                           fecha=_f, estado=_estado))
+
+        for _num, _p1, _p2, _p3, _p4 in X_COMPETENCIAS:
+            _db.add(_CS(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST,
+                        asignatura_id=A['asig'], ano_escolar_id=_ano.id,
+                        competencia_numero=_num, p1=_p1, p2=_p2, p3=_p3, p4=_p4))
+
+        # Segundo estudiante: 4 competencias pero SOLO P1 → PC1 sí, CF no.
+        _r = client.post('/api/estudiantes', json={
+            'nombre': 'Parcial', 'apellido': 'Equis', 'sexo': 'F',
+            'fecha_nacimiento': '2011-05-05', 'curso_id': A['curso'],
+            'no_lista': 30, 'matricula': 'X-PARCIAL',
+        }, headers=auth(DIR_A_TOKEN))
+        assert _r.status_code in (200, 201), f'setup X: crear estudiante: {_r.text}'
+        X_EST_PARCIAL = _r.json()['id']
+        for _num, _p1, _, _, _ in X_COMPETENCIAS:
+            _db.add(_CS(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST_PARCIAL,
+                        asignatura_id=A['asig'], ano_escolar_id=_ano.id,
+                        competencia_numero=_num, p1=_p1))
+
+        # Tercer estudiante: una sola competencia → nada calculable.
+        _r = client.post('/api/estudiantes', json={
+            'nombre': 'Incompleto', 'apellido': 'Equis', 'sexo': 'M',
+            'fecha_nacimiento': '2011-06-06', 'curso_id': A['curso'],
+            'no_lista': 31, 'matricula': 'X-INCOMPLETO',
+        }, headers=auth(DIR_A_TOKEN))
+        assert _r.status_code in (200, 201), f'setup X: crear estudiante: {_r.text}'
+        X_EST_INCOMPLETO = _r.json()['id']
+        _db.add(_CS(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST_INCOMPLETO,
+                    asignatura_id=A['asig'], ano_escolar_id=_ano.id,
+                    competencia_numero=1, p1=90, p2=90, p3=90, p4=90))
+        _db.commit()
+    finally:
+        _db.close()
+
+    def _datos_asignatura():
+        """asignaturas_data tal como lo arma el Registro, con la sesión real."""
+        import app as _app
+        _s = _SL()
+        try:
+            _u = _s.query(_Usr).filter_by(username='direccion').first()
+            _ests = _s.query(_Est).filter_by(curso_id=A['curso'], activo=True).order_by(
+                _Est.no_lista).all()
+            _data = _app._cargar_datos_asignaturas_secundaria(_s, _u, A['curso'], 1, _ests)
+            _orden = {e.id: i for i, e in enumerate(_ests)}
+            return _data, _orden
+        finally:
+            _s.close()
+
+    @test("X1. La asistencia real (P/A/T/E) llega a su día y mes del Registro")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next((k for k in data if 'atem' in k), None)
+        assert clave, f'no se resolvió Matemática en el registro: {list(data)[:4]}'
+        matriz = data[clave].get('asistencia_matriz') or []
+        assert matriz, 'la matriz de asistencia no puede venir vacía habiendo registros'
+
+        fila_idx = orden[A['est']]
+        encontrados = {}
+        for mes in matriz:
+            dias = mes['dias']
+            fila = next((f for f in mes['filas'] if f['estudiante_id'] == A['est']), None)
+            if not fila:
+                continue
+            for i, dia in enumerate(dias):
+                if fila['valores'][i]:
+                    encontrados[(mes['mes_num'], dia)] = fila['valores'][i]
+
+        esperado = {(f.month, f.day): {'presente': 'P', 'ausente': 'A',
+                                       'tardanza': 'T', 'excusa': 'E'}[e]
+                    for f, e in X_FECHAS.items()}
+        for clave_fecha, codigo in esperado.items():
+            assert clave_fecha in encontrados, \
+                (f'la marca del {clave_fecha[1]}/{clave_fecha[0]} no llegó a la hoja. '
+                 f'Días con marca: {sorted(encontrados)}')
+            assert encontrados[clave_fecha] == codigo, \
+                f'{clave_fecha}: se esperaba {codigo} y llegó {encontrados[clave_fecha]!r}'
+        assert fila_idx >= 0
+
+    @test("X2. Las fechas fuera del rango del año escolar NO se pierden")
+    def t():
+        # Es exactamente el caso de producción: el año escolar declara
+        # 2024-2025 y la asistencia se tomó en 2026. Antes de v2.19.7 la
+        # rejilla no tenía ni julio ni agosto y septiembre no tenía el día 2.
+        data, _ = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        matriz = data[clave]['asistencia_matriz']
+        meses_con_marca = {m['mes_num'] for m in matriz
+                           for f in m['filas'] for v in f['valores'] if v}
+        assert {7, 8, 9} <= meses_con_marca, \
+            f'faltan meses con marcas; llegaron {sorted(meses_con_marca)}'
+        sept = next(m for m in matriz if m['mes_num'] == 9)
+        assert 2 in sept['dias'], \
+            f"el día 2 de septiembre tiene registro y no está en la rejilla: {sept['dias']}"
+
+    @test("X3. Las notas de CalificacionSecundaria producen PC y CF en el Registro")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        califs = data[clave]['calificaciones']
+        fila = califs.get(orden[A['est']])
+        assert fila is not None, 'el estudiante con notas debe tener fila de calificaciones'
+        # Mismos números que calcula el boletín con estas competencias.
+        assert fila['pc1'] == 63.5, f"PC1 esperado 63.5, vino {fila['pc1']}"
+        assert fila['pc2'] == 62.8, f"PC2 esperado 62.8, vino {fila['pc2']}"
+        assert fila['pc3'] == 65.0, f"PC3 esperado 65.0, vino {fila['pc3']}"
+        assert fila['pc4'] == 84.5, f"PC4 esperado 84.5, vino {fila['pc4']}"
+        assert fila['cf'] == 69, f"CF esperado 69, vino {fila['cf']}"
+
+    @test("X4. Un estudiante incompleto NO recibe un promedio inventado")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        califs = data[clave]['calificaciones']
+
+        parcial = califs.get(orden[X_EST_PARCIAL])
+        assert parcial is not None, 'el estudiante con P1 debe tener fila'
+        assert parcial['pc1'] == 63.5, f"con las 4 competencias en P1 debe salir PC1: {parcial}"
+        for campo in ('pc2', 'pc3', 'pc4', 'cf'):
+            assert parcial[campo] is None, \
+                f'{campo} debe quedar vacío sin datos, vino {parcial[campo]!r}'
+
+        incompleto = califs.get(orden[X_EST_INCOMPLETO])
+        if incompleto is not None:
+            for campo in ('pc1', 'pc2', 'pc3', 'pc4', 'cf'):
+                assert incompleto[campo] is None, \
+                    (f'con UNA sola competencia no se puede calcular {campo}; '
+                     f"vino {incompleto[campo]!r}")
+
+    @test("X5. RP se deja vacío mientras no haya regla confirmada")
+    def t():
+        data, orden = _datos_asignatura()
+        clave = next(k for k in data if 'atem' in k)
+        fila = data[clave]['calificaciones'][orden[A['est']]]
+        for campo in ('rp1', 'rp2', 'rp3', 'rp4'):
+            assert fila[campo] is None, \
+                f'{campo} no debe inventarse desde las competencias: {fila[campo]!r}'
+
+    @test("X6. Sin cédula real, la casilla de cédula y la de RNE quedan vacías")
+    def t():
+        # La matrícula identifica al estudiante DENTRO del colegio; la cédula y
+        # el RNE son documentos externos que EducaOne no guarda. Antes la
+        # matrícula se copiaba a las dos casillas y el registro terminaba
+        # afirmando documentos que nadie había cargado.
+        from pypdf import PdfReader
+        import io as _io
+
+        _s = _SL()
+        try:
+            sin_doc = _s.query(_Est).filter_by(id=X_EST_INCOMPLETO).first()
+            assert not (getattr(sin_doc, 'cedula', None) or ''), 'setup: debe estar sin cédula'
+            matricula = sin_doc.matricula
+        finally:
+            _s.close()
+        assert matricula, 'setup: el estudiante debe tener matrícula'
+
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, f'{r.status_code} {r.text[:200]}'
+        assert r.content[:4] == b'%PDF'
+
+        # Página 11 = "Datos generales del estudiante". Sus únicas casillas de
+        # identificación son Cédula/Pasaporte y RNE: si la matrícula aparece
+        # ahí, es que se coló en una de las dos.
+        texto = PdfReader(_io.BytesIO(r.content)).pages[10].extract_text() or ''
+        assert matricula not in texto, \
+            (f'la matrícula {matricula!r} no debe imprimirse en la casilla de '
+             f'cédula ni en la de RNE del Registro')
+
+    # ─────────────────────────────────────────────────────────────
+    # SECCIÓN Y — v2.19.7 (2): detalle por COMPETENCIA en el spread
+    # ─────────────────────────────────────────────────────────────
+
+    print(f"{BOLD}\n=== Y. v2.19.7 — DETALLE POR COMPETENCIA ==={RESET}")
+
+    # El spread de calificaciones tiene CUATRO bloques P1/RP1..P4/RP4 —uno por
+    # competencia— y además el bloque resumen. Antes solo se llenaba el resumen
+    # (y con el PC del período escrito dentro del bloque de la competencia 1),
+    # así que los cuatro bloques de detalle salían vacíos teniendo el dato.
+    #
+    # Los valores son DISTINTOS en cada competencia y período a propósito: si
+    # hubiera un cruce de bloques o de columnas, el número aparecería en la
+    # celda equivocada y el test lo detecta.
+    Y_NOTAS = {
+        1: {'p1': 65, 'p2': 60, 'p3': 65, 'p4': 60},
+        2: {'p1': 67, 'p2': 78, 'p3': 68, 'p4': 89},
+        3: {'p1': 56, 'p2': 50, 'p3': 71, 'p4': 95},
+        4: {'p1': 66, 'p2': 63, 'p3': 56, 'p4': 94},
+    }
+    Y_RP = (3, 'rp2', 72)   # una sola recuperación: competencia 3, período 2
+
+    _r = client.post('/api/estudiantes', json={
+        'nombre': 'Detalle', 'apellido': 'Ye', 'sexo': 'F',
+        'fecha_nacimiento': '2011-07-07', 'curso_id': A['curso'],
+        'no_lista': 33, 'matricula': 'Y-DETALLE',
+    }, headers=auth(DIR_A_TOKEN))
+    assert _r.status_code in (200, 201), f'setup Y: crear estudiante: {_r.text}'
+    Y_EST = _r.json()['id']
+
+    _db = _SL()
+    try:
+        _ano_y = _db.query(_Ano).filter_by(colegio_id=A_COLEGIO_ID, activo=True).first()
+        for _num, _notas in Y_NOTAS.items():
+            _fila = _CS(colegio_id=A_COLEGIO_ID, estudiante_id=Y_EST,
+                        asignatura_id=A['asig'], ano_escolar_id=_ano_y.id,
+                        competencia_numero=_num, **_notas)
+            if _num == Y_RP[0]:
+                setattr(_fila, Y_RP[1], Y_RP[2])
+            _db.add(_fila)
+        _db.commit()
+    finally:
+        _db.close()
+
+    def _celdas_del_spread():
+        """Genera el borrador y devuelve, por página del spread de la
+        asignatura, la lista de (x, texto) de la FILA de Y_EST."""
+        from pypdf import PdfReader
+        from registro_escolar import (GRADO_CONFIG, ASIGNATURAS_CICLO_1,
+                                      CALIF_SPREAD, _y as _plumber_a_pdf)
+        import io as _io
+
+        _s = _SL()
+        try:
+            orden = [e.id for e in _s.query(_Est).filter_by(
+                curso_id=A['curso'], activo=True).order_by(_Est.no_lista).all()]
+        finally:
+            _s.close()
+        fila = orden.index(Y_EST)
+        assert fila < 40, f'el estudiante de prueba quedó en la fila {fila}, fuera de la tabla'
+
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200, f'{r.status_code} {r.text[:200]}'
+        lector = PdfReader(_io.BytesIO(r.content))
+
+        cfg = GRADO_CONFIG[1]
+        a_idx = ASIGNATURAS_CICLO_1.index('Matemática')
+        pg_izq = cfg['calificaciones_inicio'] - 1 + a_idx * cfg['calificaciones_pgs_por_asignatura']
+
+        # Y de la fila, en coordenadas del PDF (igual que el generador).
+        y_fila = _plumber_a_pdf(CALIF_SPREAD['centro_fila1_plumber']
+                                + 8 * 0.35) - fila * CALIF_SPREAD['row_height']
+
+        paginas = {}
+        for lado, pg in (('izq', pg_izq), ('der', pg_izq + 1)):
+            capturado = []
+
+            def visitante(texto, cm, tm, fuente, tam, _c=capturado):
+                limpio = (texto or '').strip()
+                if limpio:
+                    _c.append((round(tm[4], 1), round(tm[5], 1), limpio))
+
+            lector.pages[pg].extract_text(visitor_text=visitante)
+            paginas[lado] = [(x, t) for x, y, t in capturado
+                             if abs(y - y_fila) < 3 and x > 0]
+        return paginas
+
+    def _valor_en(celdas, x_centro, tolerancia=6.0):
+        """Texto dibujado centrado en x_centro, o None si la celda está vacía.
+
+        El visitor devuelve el borde IZQUIERDO del texto; como se dibuja
+        centrado, se busca el que caiga más cerca del centro de la columna.
+        """
+        candidatos = [(abs(x + len(t) * 2.3 - x_centro), t) for x, t in celdas]
+        candidatos = [(d, t) for d, t in candidatos if d < tolerancia]
+        if not candidatos:
+            return None
+        return min(candidatos)[1]
+
+    Y_CELDAS = _celdas_del_spread()
+
+    def _bloque(lado, num_comp):
+        return CALIF_SPREAD_TEST[lado][num_comp], Y_CELDAS[lado]
+
+    from registro_escolar import CALIF_SPREAD as CALIF_SPREAD_TEST
+
+    @test("Y1. Competencia 1: P1/P2/P3/P4 en SUS celdas del bloque 1")
+    def t():
+        cols, celdas = _bloque('izq', 1)
+        for periodo, esperado in (('p1', '65'), ('p2', '60'), ('p3', '65'), ('p4', '60')):
+            visto = _valor_en(celdas, cols[periodo])
+            assert visto == esperado, \
+                (f'competencia 1 {periodo.upper()}: se esperaba {esperado} en x={cols[periodo]}, '
+                 f'vino {visto!r}. Celdas de la fila: {sorted(celdas)}')
+
+    @test("Y2. Competencia 2: P1/P2/P3/P4 en SUS celdas del bloque 2")
+    def t():
+        cols, celdas = _bloque('izq', 2)
+        for periodo, esperado in (('p1', '67'), ('p2', '78'), ('p3', '68'), ('p4', '89')):
+            visto = _valor_en(celdas, cols[periodo])
+            assert visto == esperado, \
+                f'competencia 2 {periodo.upper()}: se esperaba {esperado}, vino {visto!r}'
+
+    @test("Y3. Competencias 3 y 4 en la página derecha, sin cruzarse")
+    def t():
+        cols3, celdas = _bloque('der', 3)
+        for periodo, esperado in (('p1', '56'), ('p2', '50'), ('p3', '71'), ('p4', '95')):
+            visto = _valor_en(celdas, cols3[periodo])
+            assert visto == esperado, \
+                f'competencia 3 {periodo.upper()}: se esperaba {esperado}, vino {visto!r}'
+        cols4, _ = _bloque('der', 4)
+        for periodo, esperado in (('p1', '66'), ('p2', '63'), ('p3', '56'), ('p4', '94')):
+            visto = _valor_en(celdas, cols4[periodo])
+            assert visto == esperado, \
+                f'competencia 4 {periodo.upper()}: se esperaba {esperado}, vino {visto!r}'
+
+    @test("Y4. La RP aparece SOLO en su competencia y su período")
+    def t():
+        num_rp, celda_rp, valor_rp = Y_RP
+        cols, celdas = _bloque('der', num_rp)
+        visto = _valor_en(celdas, cols[celda_rp])
+        assert visto == str(valor_rp), \
+            f'la recuperación debe estar en competencia {num_rp} {celda_rp.upper()}, vino {visto!r}'
+
+        # Todas las demás casillas RP del spread quedan vacías: no se inventa.
+        for lado in ('izq', 'der'):
+            for comp, columnas in CALIF_SPREAD_TEST[lado].items():
+                for columna, x in columnas.items():
+                    if not columna.startswith('rp'):
+                        continue
+                    if lado == 'der' and comp == num_rp and columna == celda_rp:
+                        continue
+                    otro = _valor_en(Y_CELDAS[lado], x)
+                    assert otro is None, \
+                        (f'{lado} competencia {comp} {columna.upper()} debía quedar '
+                         f'vacía y trae {otro!r}')
+
+    @test("Y5. El resumen es el promedio POR COMPETENCIA, no por período")
+    def t():
+        # El template rotula estas columnas "PC1: Competencia 1" …
+        # "PC4: Competencia 4": cada una es el promedio FINAL de esa
+        # competencia a lo largo de P1-P4.
+        #
+        #   C1: 65, 60, 65, 60                 -> 62.5
+        #   C2: 67, 78, 68, 89                 -> 75.5
+        #   C3: 56, max(50,72)=72, 71, 95      -> 73.5   (valor_periodo con RP)
+        #   C4: 66, 63, 56, 94                 -> 69.75 -> 69.8
+        #
+        # El otro eje —promedio de las 4 competencias en cada período— da
+        # números completamente distintos (63.5 / 68.2 / 65 / 84.5). Se
+        # comprueban los dos lados: que estén los correctos Y que NO estén
+        # los del eje equivocado.
+        POR_COMPETENCIA = {'pc1': '62.5', 'pc2': '75.5', 'pc3': '73.5', 'pc4': '69.8'}
+        POR_PERIODO = {'pc1': '63.5', 'pc2': '68.2', 'pc3': '65', 'pc4': '84.5'}
+
+        resumen = CALIF_SPREAD_TEST['resumen']
+        celdas = Y_CELDAS['der']
+        for clave, esperado in POR_COMPETENCIA.items():
+            visto = _valor_en(celdas, resumen[clave])
+            assert visto == esperado, \
+                (f'{clave.upper()} debe ser el promedio de la Competencia '
+                 f'{clave[-1]} ({esperado}); vino {visto!r}. '
+                 f'Si vino {POR_PERIODO[clave]!r} se está usando el eje de '
+                 f'PERÍODO en vez del de COMPETENCIA.')
+            assert visto != POR_PERIODO[clave], \
+                f'{clave.upper()} trae el promedio del período, no el de la competencia'
+
+    @test("Y5b. CF entero redondeado, y el PC conserva su decimal")
+    def t():
+        resumen = CALIF_SPREAD_TEST['resumen']
+        celdas = Y_CELDAS['der']
+
+        # CF = promedio de los PC, redondeado a entero (regla del boletín).
+        #   (62.5 + 75.5 + 73.5 + 69.75) / 4 = 70.3125 -> 70
+        cf = _valor_en(celdas, resumen['cf'])
+        assert cf == '70', f'la calificación final debe ser 70 entero, vino {cf!r}'
+        assert '.' not in (cf or ''), f'la calificación final no lleva decimal: {cf!r}'
+
+        # Un PC con decimal lo conserva…
+        assert _valor_en(celdas, resumen['pc1']) == '62.5', 'el PC debe conservar su decimal'
+        # …y uno redondo se escribe sin ".0" (regla de _fmt_nota).
+        from registro_escolar import _fmt_nota
+        assert _fmt_nota(65.0) == '65', f'65.0 debe mostrarse como 65, vino {_fmt_nota(65.0)!r}'
+        assert _fmt_nota(62.5) == '62.5'
+        assert _fmt_nota(69.5, ints_only=True) == '70', 'CF: 69.5 debe redondear a 70'
+        assert _fmt_nota(None) == ''
+
+    @test("Y6. Competencias ausentes: bloques vacíos, PC solo donde hay dato")
+    def t():
+        # X_EST_INCOMPLETO tiene UNA sola competencia: su bloque 1 se llena y
+        # los otros tres quedan en blanco. Nunca se copia el mismo valor a los
+        # cuatro bloques ni se inventa un promedio.
+        from pypdf import PdfReader
+        from registro_escolar import (GRADO_CONFIG, ASIGNATURAS_CICLO_1,
+                                      CALIF_SPREAD, _y as _plumber_a_pdf)
+        import io as _io
+        _s = _SL()
+        try:
+            orden = [e.id for e in _s.query(_Est).filter_by(
+                curso_id=A['curso'], activo=True).order_by(_Est.no_lista).all()]
+        finally:
+            _s.close()
+        fila = orden.index(X_EST_INCOMPLETO)
+        r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                       headers=auth(DIR_A_TOKEN))
+        assert r.status_code == 200
+        lector = PdfReader(_io.BytesIO(r.content))
+        cfg = GRADO_CONFIG[1]
+        a_idx = ASIGNATURAS_CICLO_1.index('Matemática')
+        pg_der = cfg['calificaciones_inicio'] + a_idx * cfg['calificaciones_pgs_por_asignatura']
+        y_fila = _plumber_a_pdf(CALIF_SPREAD['centro_fila1_plumber']
+                                + 8 * 0.35) - fila * CALIF_SPREAD['row_height']
+        capturado = []
+
+        def visitante(texto, cm, tm, fuente, tam, _c=capturado):
+            limpio = (texto or '').strip()
+            if limpio:
+                _c.append((round(tm[4], 1), round(tm[5], 1), limpio))
+
+        lector.pages[pg_der].extract_text(visitor_text=visitante)
+        celdas = [(x, t) for x, y, t in capturado if abs(y - y_fila) < 3 and x > 0]
+        for comp in (3, 4):
+            for columna, x in CALIF_SPREAD['der'][comp].items():
+                visto = _valor_en(celdas, x)
+                assert visto is None, \
+                    (f'un estudiante con una sola competencia no puede tener nada '
+                     f'en competencia {comp} {columna.upper()}; vino {visto!r}')
+        # v2.19.7 (3): con el eje POR COMPETENCIA, este estudiante SÍ tiene un
+        # promedio legítimo en PC1 —su competencia 1 tiene los cuatro períodos
+        # cargados (90 en todos)—, y nada en PC2/PC3/PC4, que no existen. Eso
+        # no es un invento: es exactamente lo que hay en la base. Lo que sigue
+        # sin poder calcularse es la calificación final, que exige las cuatro.
+        assert _valor_en(celdas, CALIF_SPREAD['resumen']['pc1']) == '90', \
+            'la competencia 1 tiene sus cuatro períodos: su promedio es 90'
+        for clave in ('pc2', 'pc3', 'pc4'):
+            visto = _valor_en(celdas, CALIF_SPREAD['resumen'][clave])
+            assert visto is None, \
+                f'{clave.upper()} corresponde a una competencia que no existe; vino {visto!r}'
+        cf = _valor_en(celdas, CALIF_SPREAD['resumen']['cf'])
+        assert cf is None, \
+            f'la calificación final exige las cuatro competencias; vino {cf!r}'
+
 
 # ─────────────────────────────────────────────────────────────────
 # REPORTE FINAL

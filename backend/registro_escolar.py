@@ -23,6 +23,11 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import mm
 from pypdf import PdfReader, PdfWriter
 from registro_borrador import crear_xobject_borrador, estampar_borrador
+# v2.19.7: el formato de las notas es el MISMO que ya usa el boletín oficial de
+# secundaria — "entero si es CF, 1 decimal si es PC/competencia". Se importa en
+# vez de reescribirlo para que no puedan divergir. `boletin_minerd_secundaria`
+# no importa este módulo, así que no hay ciclo.
+from boletin_minerd_secundaria import _fmt_nota
 
 # ============================================================================
 # CONSTANTES
@@ -331,20 +336,33 @@ ESTUDIANTES_TABLE = {
     "primera_fila_y_plumber": 180.2,  # top of first row
     "row_height": 14.15,               # approx spacing
     "total_filas": 40,
+    # v2.19.7 — CENTROS RE-MEDIDOS SOBRE EL TEMPLATE.
+    #
+    # Las líneas verticales reales de la tabla (pág. 11) son:
+    #   36.4 | 59.2 | 82.0 | 106.5 | 131.0 | 155.5 | 181.7 | 210.4 | 239.0
+    #        | 318.6 | 398.3 | 575.5
+    # o sea ONCE columnas: Femenino, Masculino, Día, Mes, Año, Libro, Folio,
+    # Edad, Cédula/Pasaporte, RNE, Lugar donde reside. NO hay columna de "No."
+    # ni de nombre: al estudiante lo identifica su posición de fila, igual que
+    # en el resto del cuaderno.
+    #
+    # La versión anterior daba por hecha una columna "numero" al principio, y
+    # eso corría TODO un lugar a la derecha: el sexo se marcaba en la casilla
+    # del día de nacimiento, el día en la del mes, la cédula en la del RNE...
+    # Los comentarios ya traían los límites correctos; los centros no.
     "columnas": {
         # col_name: (x_center, width) - x_center para centrar texto
-        "numero": {"x": 42, "w": 18},        # 36.4 - 59.2
-        "femenino": {"x": 67, "w": 18},       # 59.2 - 82.0 (marcar X)
-        "masculino": {"x": 90, "w": 18},      # 82.0 - 106.5 (marcar X)
-        "dia": {"x": 116, "w": 20},           # 106.5 - 131.0
-        "mes": {"x": 141, "w": 20},           # 131.0 - 155.5
-        "anio": {"x": 166, "w": 22},          # 155.5 - 181.7
-        "libro": {"x": 194, "w": 24},         # 181.7 - 210.4
-        "folio": {"x": 222, "w": 24},         # 210.4 - 239.0
-        "edad": {"x": 256, "w": 14},          # ~239 - ~275
-        "cedula": {"x": 340, "w": 75},        # 318.6 - 398.3 (o RNE)
-        "rne": {"x": 420, "w": 40},           # 398.3 - ~440
-        "lugar_residencia": {"x": 510, "w": 130},  # 398.3 - 575.5
+        "femenino": {"x": 47.8, "w": 22},          # 36.4 - 59.2  (marcar X)
+        "masculino": {"x": 70.6, "w": 22},         # 59.2 - 82.0  (marcar X)
+        "dia": {"x": 94.2, "w": 24},               # 82.0 - 106.5
+        "mes": {"x": 118.7, "w": 24},              # 106.5 - 131.0
+        "anio": {"x": 143.2, "w": 24},             # 131.0 - 155.5
+        "libro": {"x": 168.6, "w": 25},            # 155.5 - 181.7
+        "folio": {"x": 196.0, "w": 28},            # 181.7 - 210.4
+        "edad": {"x": 224.7, "w": 28},             # 210.4 - 239.0
+        "cedula": {"x": 278.8, "w": 76},           # 239.0 - 318.6
+        "rne": {"x": 358.4, "w": 76},              # 318.6 - 398.3
+        "lugar_residencia": {"x": 486.9, "w": 172},  # 398.3 - 575.5
     },
 }
 
@@ -352,16 +370,69 @@ ESTUDIANTES_TABLE = {
 # Misma estructura de tabla pero con columnas diferentes
 # V-lines similares, columnas: No | Correo | Promovido | Repitente | Reingreso
 CONDICION_TABLE = {
-    "primera_fila_y_plumber": 180.2,
+    # v2.19.7: la primera fila de esta página empieza en 177.2, no en 180.2
+    # (medido sobre el template). Con el valor anterior la línea base caía
+    # justo en el borde entre la fila 1 y la 2.
+    "primera_fila_y_plumber": 177.2,
     "row_height": 14.15,
     "total_filas": 40,
+    # Verticales reales: 34.9 | 351.5 | 427.0 | 502.7 | 578.4
+    # → Correo electrónico | Promovido | Repitente | Reingreso. Tampoco hay
+    # columna de "No." acá.
     "columnas": {
-        "numero": {"x": 42, "w": 18},
-        "correo": {"x": 200, "w": 200},
-        "promovido": {"x": 410, "w": 40},     # X mark
-        "repitente": {"x": 470, "w": 40},     # X mark
-        "reingreso": {"x": 530, "w": 40},     # X mark
+        "correo": {"x": 40, "w": 300},        # 34.9 - 351.5 (texto a la izquierda)
+        "promovido": {"x": 389.3, "w": 70},   # 351.5 - 427.0 (marcar X)
+        "repitente": {"x": 464.9, "w": 70},   # 427.0 - 502.7 (marcar X)
+        "reingreso": {"x": 540.6, "w": 70},   # 502.7 - 578.4 (marcar X)
     },
+}
+
+# --- CALIFICACIONES: SPREAD DE DOS PÁGINAS POR ASIGNATURA (v2.19.7) ---
+#
+# Medido sobre las cabeceras P1/RP1/P2/RP2/P3/RP3/P4/RP4 del template. La
+# geometría es IDÉNTICA en todas las asignaturas y en los seis grados de
+# secundaria (verificado en 1ro, 4to y 6to, sobre tres asignaturas cada uno),
+# así que estos centros valen para todo el registro y no para una página suelta.
+#
+# Cada página lleva DOS bloques de ocho columnas. En orden de lectura:
+#   página izquierda  → bloque 1 (competencia 1) y bloque 2 (competencia 2)
+#   página derecha    → bloque 3 (competencia 3) y bloque 4 (competencia 4)
+#
+# El template rotula esos bloques con los códigos de competencia específica del
+# MINERD —para Inglés: CE-LEI1 / CE-LEI2+CE-LEI3 / CE-LEI4+CE-LEI7 /
+# CE-LEI5+CE-LEI6—, es decir agrupa siete competencias específicas en cuatro
+# bloques evaluables. EducaOne numera las competencias 1-4
+# (CalificacionSecundaria.competencia_numero), que es exactamente la numeración
+# que usa el propio bloque resumen del template ("PC1: Competencia 1" …
+# "PC4: Competencia 4"). Por eso el mapeo es posicional: bloque n ← competencia n.
+CALIF_SPREAD = {
+    # Filas: los números 1-40 vienen pre-impresos en el template; el centro de
+    # la fila 1 está en 187.80 y la separación es 14.17 (medido).
+    "centro_fila1_plumber": 187.80,
+    "row_height": 14.17,
+    "izq": {
+        1: {"p1": 73.1, "rp1": 105.5, "p2": 137.9, "rp2": 170.4,
+            "p3": 202.8, "rp3": 235.3, "p4": 267.7, "rp4": 300.1},
+        2: {"p1": 332.7, "rp1": 365.1, "p2": 397.5, "rp2": 430.0,
+            "p3": 462.4, "rp3": 494.9, "p4": 527.3, "rp4": 559.7},
+    },
+    "der": {
+        3: {"p1": 66.2, "rp1": 91.8, "p2": 117.4, "rp2": 143.1,
+            "p3": 168.7, "rp3": 194.4, "p4": 220.0, "rp4": 245.6},
+        4: {"p1": 271.4, "rp1": 297.0, "p2": 322.6, "rp2": 348.3,
+            "p3": 373.9, "rp3": 399.6, "p4": 425.2, "rp4": 450.8},
+    },
+    # Bloque "Promedio de Competencias Específicas" + Calificación final.
+    #
+    # v2.19.7 (3): centros RE-MEDIDOS sobre las líneas verticales del template
+    # —463.7 | 486.1 | 508.5 | 530.9 | 553.3 | 575.8, idénticas en las tres
+    # asignaturas y los tres grados comprobados—. Los valores anteriores
+    # (480, 502, 525, 547) caían unos 5 puntos a la derecha del centro de su
+    # casilla. El de la Calificación final ya estaba bien.
+    #
+    # Cada columna es el promedio FINAL de UNA competencia: el template las
+    # rotula "PC1: Competencia 1" … "PC4: Competencia 4".
+    "resumen": {"pc1": 474.9, "pc2": 497.3, "pc3": 519.7, "pc4": 542.1, "cf": 564.6},
 }
 
 # --- ASISTENCIA (Pgs 17+) ---
@@ -633,10 +704,9 @@ def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
         
         cols = table["columnas"]
         
-        # Número
-        _draw_text(c, cols["numero"]["x"], y,
-                   str(est.get("numero", i + 1)),
-                   size=FONT_SIZE_TABLA, center=True)
+        # v2.19.7: el template no tiene columna de "No." en esta página; el
+        # número de lista que se dibujaba acá caía dentro de la casilla de
+        # Femenino y parecía una marca de sexo.
         
         # Sexo (marcar X en columna correspondiente)
         sexo = est.get("sexo", "").upper()
@@ -715,10 +785,7 @@ def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict]):
         
         cols = table["columnas"]
         
-        # Número
-        _draw_text(c, cols["numero"]["x"], y,
-                   str(est.get("numero", i + 1)),
-                   size=FONT_SIZE_TABLA, center=True)
+        # v2.19.7: sin columna de "No." en el template (ver CONDICION_TABLE).
         
         # Correo electrónico (con marca de retiro si aplica)
         es_retirado = bool(est.get("retirado")) or str(est.get("condicion", "")).lower() == "retirado"
@@ -731,7 +798,7 @@ def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict]):
                 marca_ret = "[RETIRADO]"
             correo = f"{marca_ret} {correo}".strip()
         if correo:
-            _draw_text(c, cols["correo"]["x"] - 80, y,
+            _draw_text(c, cols["correo"]["x"], y,
                        correo, size=FONT_SIZE_TABLA_NOMBRE,
                        max_width=cols["correo"]["w"])
         
@@ -1174,115 +1241,101 @@ def generar_registro_escolar(
             if pg_izq >= total_pages:
                 break
             
-            # Página izquierda — P1 y P2
-            buf = io.BytesIO()
-            c_cal = canvas.Canvas(buf, pagesize=letter)
-            has_data = False
-            
-            # === Página IZQUIERDA: PC1, RP1, PC2, RP2 (Competencia 1) ===
-            # Geometría medida del template MINERD pag 131 (1ro Sec):
-            #   h-lines de filas de notas: 180.72, 194.89, 209.06, ...  (alto = 14.17)
-            #   centro vertical fila 1 = (180.72 + 194.89) / 2 = 187.80
-            # ReportLab dibuja desde la baseline: para centrar visualmente un texto de
-            # FONT_SIZE_NOTA puntos en una celda, la baseline debe caer ~0.35 * font
-            # por debajo del centro geométrico de la celda.
-            CENTRO_FILA1_PLUMBER = 187.80
-            ROW_HEIGHT = 14.17
-            row_start_y = _y(CENTRO_FILA1_PLUMBER + FONT_SIZE_NOTA * 0.35)
-            row_spacing = ROW_HEIGHT
-            # Columnas (x_centro) CE-LE1 medidas: P1=73, RP1=105, P2=138, RP2=170
-            COL_P1   = 73
-            COL_RP1  = 105
-            COL_P2   = 138
-            COL_RP2  = 170
-            
-            for est_idx, est_data in asig_califs.items():
-                if not isinstance(est_data, dict):
-                    continue
-                ei = int(est_idx) if isinstance(est_idx, str) else est_idx
-                if ei >= 40:
-                    continue
-                
-                y = row_start_y - (ei * row_spacing)
-                
-                # MINERD: la página IZQUIERDA muestra el consolidado del período (PC) y su recuperación (RP).
-                # PC SOLO aparece cuando los 4 parciales del período están completos
-                # (lógica garantizada por Calificacion.calcular_pc en el modelo).
-                pc1 = est_data.get('pc1')
-                if pc1 is not None:
-                    _draw_text(c_cal, COL_P1, y, str(int(pc1)), size=FONT_SIZE_NOTA, center=True)
-                    has_data = True
-                
-                rp1 = est_data.get('rp1')
-                if rp1 is not None:
-                    _draw_text(c_cal, COL_RP1, y, str(int(rp1)), size=FONT_SIZE_NOTA, center=True)
-                
-                pc2 = est_data.get('pc2')
-                if pc2 is not None:
-                    _draw_text(c_cal, COL_P2, y, str(int(pc2)), size=FONT_SIZE_NOTA, center=True)
-                    has_data = True
-                
-                rp2 = est_data.get('rp2')
-                if rp2 is not None:
-                    _draw_text(c_cal, COL_RP2, y, str(int(rp2)), size=FONT_SIZE_NOTA, center=True)
-            
-            if has_data:
-                c_cal.showPage()
-                c_cal.save()
-                buf.seek(0)
-                overlays[pg_izq] = buf
-            
-            # Página derecha (pag 132): bloque "Promedio de Competencias Específicas"
-            # MINERD: las columnas centrales de la pag derecha son P1/RP1/P2/RP2/P3/RP3/P4/RP4
-            # de OTRAS competencias específicas (CE-LEF4 y CE-LEF5). NO son los parciales
-            # del consolidado del período. Esas columnas se dejan VACÍAS — el modelo de
-            # secundaria del SGE solo lleva 4 períodos (pc1-pc4) y no rompe los indicadores
-            # por competencia específica individual.
-            if pg_der and pg_der < total_pages:
-                buf2 = io.BytesIO()
-                c_cal2 = canvas.Canvas(buf2, pagesize=letter)
-                has_data2 = False
-                
+            # === SPREAD DE CALIFICACIONES (v2.19.7) ===
+            #
+            # El spread MINERD tiene CUATRO bloques de detalle P1/RP1..P4/RP4
+            # —uno por competencia— repartidos dos por página, más el bloque
+            # resumen en la página derecha. Antes solo se dibujaba el resumen y
+            # se escribía el PC del período dentro del bloque de detalle de la
+            # competencia 1: los cuatro bloques quedaban vacíos o con el número
+            # equivocado. La nota de cada competencia y período ya viene en
+            # est_data['competencias'][n], sin colapsar.
+            row_start_y = _y(CALIF_SPREAD['centro_fila1_plumber'] + FONT_SIZE_NOTA * 0.35)
+            row_spacing = CALIF_SPREAD['row_height']
+
+            def _dibujar_detalle(lienzo, columnas_por_competencia):
+                """Dibuja los bloques de detalle de una página del spread.
+
+                Devuelve True si escribió al menos un valor. Una celda sin dato
+                se deja en blanco: nunca se rellena con cero ni con promedios.
+                """
+                escribio = False
                 for est_idx, est_data in asig_califs.items():
                     if not isinstance(est_data, dict):
                         continue
                     ei = int(est_idx) if isinstance(est_idx, str) else est_idx
                     if ei >= 40:
                         continue
-                    
+                    detalle = est_data.get('competencias') or {}
+                    if not detalle:
+                        continue
                     y = row_start_y - (ei * row_spacing)
-                    
-                    # Bloque "Promedio de Competencias Específicas" (columna gris derecha)
-                    # Coordenadas medidas del PDF MINERD pag 132:
-                    # PC1=480, PC2=502, PC3=525, PC4=547, CF=564.5
-                    # Cada PC se imprime individualmente cuando el período está completo.
-                    pc1 = est_data.get('pc1')
-                    if pc1 is not None:
-                        _draw_text(c_cal2, 480, y, str(int(pc1)), size=FONT_SIZE_NOTA, center=True)
+                    for num_comp, columnas in columnas_por_competencia.items():
+                        notas = detalle.get(num_comp) or detalle.get(str(num_comp))
+                        if not notas:
+                            continue
+                        for celda, x in columnas.items():
+                            texto = _fmt_nota(notas.get(celda))
+                            if texto:
+                                _draw_text(lienzo, x, y, texto,
+                                           size=FONT_SIZE_NOTA, center=True)
+                                escribio = True
+                return escribio
+
+            # --- Página IZQUIERDA: competencias 1 y 2 ---
+            buf = io.BytesIO()
+            c_cal = canvas.Canvas(buf, pagesize=letter)
+            has_data = _dibujar_detalle(c_cal, CALIF_SPREAD['izq'])
+
+            if has_data:
+                c_cal.showPage()
+                c_cal.save()
+                buf.seek(0)
+                overlays[pg_izq] = buf
+
+            # --- Página DERECHA: competencias 3 y 4 + resumen ---
+            if pg_der and pg_der < total_pages:
+                buf2 = io.BytesIO()
+                c_cal2 = canvas.Canvas(buf2, pagesize=letter)
+                has_data2 = _dibujar_detalle(c_cal2, CALIF_SPREAD['der'])
+
+                # Bloque "Promedio de Competencias Específicas" + Calificación
+                # final.
+                #
+                # v2.19.7 (3): la columna PCn es el promedio FINAL de la
+                # COMPETENCIA n a lo largo de P1-P4 —así lo rotula el template:
+                # "PC1: Competencia 1" … "PC4: Competencia 4"—. Antes se
+                # imprimía el promedio de las cuatro competencias en cada
+                # PERÍODO, que es otro número. El valor sale de
+                # CalificacionSecundaria.calcular_promedio_competencia(), que ya
+                # aplica valor_periodo() = max(P, RP) y devuelve None si falta
+                # algún período.
+                resumen = CALIF_SPREAD['resumen']
+                for est_idx, est_data in asig_califs.items():
+                    if not isinstance(est_data, dict):
+                        continue
+                    ei = int(est_idx) if isinstance(est_idx, str) else est_idx
+                    if ei >= 40:
+                        continue
+
+                    y = row_start_y - (ei * row_spacing)
+
+                    promedios = est_data.get('promedios_competencia') or {}
+                    for num_comp in (1, 2, 3, 4):
+                        valor = promedios.get(num_comp, promedios.get(str(num_comp)))
+                        texto = _fmt_nota(valor)
+                        if texto:
+                            _draw_text(c_cal2, resumen[f'pc{num_comp}'], y, texto,
+                                       size=FONT_SIZE_NOTA, center=True)
+                            has_data2 = True
+
+                    # La calificación final es entera (regla del boletín).
+                    texto_cf = _fmt_nota(est_data.get('cf'), ints_only=True)
+                    if texto_cf:
+                        _draw_text(c_cal2, resumen['cf'], y, texto_cf,
+                                   size=FONT_SIZE_NOTA, center=True)
                         has_data2 = True
-                    
-                    pc2 = est_data.get('pc2')
-                    if pc2 is not None:
-                        _draw_text(c_cal2, 502, y, str(int(pc2)), size=FONT_SIZE_NOTA, center=True)
-                        has_data2 = True
-                    
-                    pc3 = est_data.get('pc3')
-                    if pc3 is not None:
-                        _draw_text(c_cal2, 525, y, str(int(pc3)), size=FONT_SIZE_NOTA, center=True)
-                        has_data2 = True
-                    
-                    pc4 = est_data.get('pc4')
-                    if pc4 is not None:
-                        _draw_text(c_cal2, 547, y, str(int(pc4)), size=FONT_SIZE_NOTA, center=True)
-                        has_data2 = True
-                    
-                    # Calificación Final — solo cuando los 4 PC están completos
-                    # (lógica del modelo Calificacion.calcular_cf en models.py).
-                    cf = est_data.get('cf')
-                    if cf is not None:
-                        _draw_text(c_cal2, 564.5, y, str(int(cf)), size=FONT_SIZE_NOTA, center=True)
-                        has_data2 = True
-                
+
                 if has_data2:
                     c_cal2.showPage()
                     c_cal2.save()
@@ -1665,7 +1718,14 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
             "anio_nac": str(fn.year) if fn else '',
             "edad": str((date.today() - fn).days // 365) if fn else '',
             "cedula": est.get('cedula', ''),
-            "rne": est.get('matricula', ''),
+            # v2.19.7: el RNE es el Registro Nacional del Estudiante, un número
+            # que asigna el MINERD. EducaOne no lo guarda: no existe columna
+            # `rne` en Estudiante. Acá se imprimía la MATRÍCULA interna del
+            # colegio en esa casilla, con lo que el registro afirmaba un dato
+            # nacional que nadie había cargado. Si algún día el modelo tiene
+            # `rne`, este `est.get('rne')` lo toma solo; mientras tanto la
+            # casilla va vacía, que es la verdad.
+            "rne": est.get('rne', '') or '',
             "lugar_residencia": est.get('direccion', ''),
             "correo": est.get('email', '') or '',
             "condicion": est.get('condicion_entrada', 'nuevo'),
@@ -1712,10 +1772,28 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
                 if est_list:
                     meses_list.append({
                         "nombre_mes": mes_data.get("mes", ""),
-                        "docente": data.get('docente', '') if not meses_list else '',
+                        "docente": "",
                         "asistencias": est_list,
                         "dias_labels": dias_mes,
+                        # marca interna para priorizar los meses con captura real
+                        "_tiene_marcas": any(v for f in est_list for v in f["dias"]),
                     })
+            # v2.19.7: la hoja MINERD tiene 10 huecos de mes por asignatura
+            # (5 páginas x 2). Cuando el año escolar y las fechas realmente
+            # capturadas no coinciden, la matriz puede traer más de 10 meses y
+            # los últimos se perderían — justo los que tienen asistencia. Se
+            # ponen delante los meses CON captura, conservando entre ellos el
+            # orden del año escolar (agosto→julio). No se altera ningún dato:
+            # solo se decide qué meses ocupan los huecos disponibles.
+            meses_list = (
+                [m for m in meses_list if m.get("_tiene_marcas")]
+                + [m for m in meses_list if not m.get("_tiene_marcas")]
+            )
+            for m in meses_list:
+                m.pop("_tiene_marcas", None)
+            if meses_list:
+                # El template imprime el docente una sola vez, en el primer mes.
+                meses_list[0]["docente"] = data.get('docente', '')
         else:
             meses_legacy = sorted({mes_idx for est_raw in raw.values() for mes_idx in est_raw.keys()})
             for mes_idx in meses_legacy:

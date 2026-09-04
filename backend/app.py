@@ -5099,7 +5099,8 @@ def _es_curso_secundaria(db, curso_id: int) -> bool:
     return grado and (grado.nivel or '').lower() == 'secundaria'
 
 
-def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: int, con_exacto: bool = False):
+def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: int, con_exacto: bool = False,
+                            competencias=None):
     """Calcular CF del área de secundaria según MINERD oficial.
     
     Fórmula MINERD: CF = AVG(PC1, PC2, PC3, PC4) redondeado a entero.
@@ -5109,10 +5110,16 @@ def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: 
     pero seguimos la fórmula oficial del boletín.
     
     Devuelve (cf, literal) o (None, None) si no están las 4 competencias completas.
+
+    v2.19.7: `competencias` permite pasar las filas YA cargadas. El Registro
+    Escolar necesita el CF de un curso entero y consultarlas de a un estudiante
+    serían cientos de viajes a la base. La fórmula es exactamente la misma: lo
+    único que cambia es de dónde salen las filas.
     """
-    competencias = db.query(CalificacionSecundaria).filter_by(
-        estudiante_id=estudiante_id, asignatura_id=asignatura_id, ano_escolar_id=ano_id
-    ).all()
+    if competencias is None:
+        competencias = db.query(CalificacionSecundaria).filter_by(
+            estudiante_id=estudiante_id, asignatura_id=asignatura_id, ano_escolar_id=ano_id
+        ).all()
     if len(competencias) < 4:
         return (None, None, None) if con_exacto else (None, None)
     
@@ -14035,7 +14042,11 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
         'nombre': e.nombre_completo,
         'sexo': e.sexo or '',
         'fecha_nacimiento': e.fecha_nacimiento,
-        'cedula': getattr(e, 'cedula', '') or e.matricula or '',
+        # v2.19.7: la cédula es la cédula, y punto. Antes caía a la matrícula
+        # cuando el estudiante no tenía documento, así que el mismo número
+        # terminaba impreso en la casilla de CÉDULA y en la de RNE del registro
+        # MINERD. Sin cédula real, la casilla va vacía.
+        'cedula': (getattr(e, 'cedula', None) or '').strip(),
         'matricula': e.matricula or '',
         'lugar_nacimiento': getattr(e, 'lugar_nacimiento', '') or '',
         'nacionalidad': getattr(e, 'nacionalidad', '') or '',
@@ -14181,7 +14192,11 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
         'nombre': e.nombre_completo,
         'sexo': e.sexo or '',
         'fecha_nacimiento': e.fecha_nacimiento,
-        'cedula': getattr(e, 'cedula', '') or e.matricula or '',
+        # v2.19.7: la cédula es la cédula, y punto. Antes caía a la matrícula
+        # cuando el estudiante no tenía documento, así que el mismo número
+        # terminaba impreso en la casilla de CÉDULA y en la de RNE del registro
+        # MINERD. Sin cédula real, la casilla va vacía.
+        'cedula': (getattr(e, 'cedula', None) or '').strip(),
         'matricula': e.matricula or '',
         'lugar_nacimiento': getattr(e, 'lugar_nacimiento', '') or '',
         'nacionalidad': getattr(e, 'nacionalidad', '') or '',
@@ -14257,6 +14272,13 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         db.query(Asignatura), Asignatura, current_user
     ).all()
     
+    # v2.19.7: año escolar activo del colegio. Las notas de secundaria viven en
+    # CalificacionSecundaria, que SÍ está acotada por año, y el CF oficial lo
+    # exige. Se resuelve una sola vez para todo el curso.
+    _ano_registro = tenant_filter(
+        db.query(AnoEscolar), AnoEscolar, current_user
+    ).filter_by(activo=True).first()
+
     # v2.19.6: una sola consulta en vez de una por asignatura del colegio.
     asigs_con_asignacion = {
         fila[0] for fila in tenant_filter(
@@ -14341,7 +14363,90 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
             ).order_by(Calificacion.id).all():
                 _por_estudiante.setdefault(_c.estudiante_id, _c)
 
+            # v2.19.7: la secundaria REAL no escribe en `Calificacion` sino en
+            # `CalificacionSecundaria`, una fila por competencia (1-4). El
+            # Registro leía solo la tabla legacy —vacía en producción— y por eso
+            # las páginas de notas salían en blanco aunque el profesor tuviera
+            # todo cargado. Acá se leen las competencias del curso en UNA
+            # consulta y se calculan PC y CF con las MISMAS funciones que ya usa
+            # el boletín: CalificacionSecundaria.calcular_pc_periodo y
+            # _calcular_cf_secundaria. No hay fórmula nueva.
+            _competencias_por_est = {}
+            if _ano_registro is not None:
+                for _cs in tenant_filter(
+                    db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
+                ).filter(
+                    CalificacionSecundaria.asignatura_id == asignatura.id,
+                    CalificacionSecundaria.ano_escolar_id == _ano_registro.id,
+                    CalificacionSecundaria.estudiante_id.in_([e.id for e in estudiantes_db]),
+                ).all():
+                    _competencias_por_est.setdefault(_cs.estudiante_id, []).append(_cs)
+
             for idx, est in enumerate(estudiantes_db):
+                comps = _competencias_por_est.get(est.id)
+                if comps:
+                    # PC del período = promedio de las 4 competencias. Devuelve
+                    # None si falta alguna: un estudiante incompleto queda en
+                    # blanco, nunca con un promedio inventado.
+                    pc1, pc2, pc3, pc4 = (
+                        CalificacionSecundaria.calcular_pc_periodo(comps, p) for p in (1, 2, 3, 4)
+                    )
+                    cf, _literal = _calcular_cf_secundaria(
+                        db, est.id, asignatura.id,
+                        _ano_registro.id if _ano_registro else None,
+                        competencias=comps,
+                    )
+                    # v2.19.7 (2): las competencias NO se colapsan antes de
+                    # llegar al generador. El spread del Registro tiene CUATRO
+                    # bloques de detalle P1/RP1..P4/RP4 —uno por competencia— y
+                    # además el bloque resumen. Antes solo se enviaban los
+                    # promedios, así que los cuatro bloques de detalle salían
+                    # vacíos teniendo el dato cargado.
+                    detalle = {}
+                    for _c in comps:
+                        num = _c.competencia_numero
+                        if not num:
+                            continue
+                        detalle[num] = {
+                            'p1': _c.p1, 'rp1': _c.rp1,
+                            'p2': _c.p2, 'rp2': _c.rp2,
+                            'p3': _c.p3, 'rp3': _c.rp3,
+                            'p4': _c.p4, 'rp4': _c.rp4,
+                        }
+
+                    # v2.19.7 (3): el bloque "Promedio de Competencias
+                    # Específicas" del template rotula sus columnas
+                    # "PC1: Competencia 1" … "PC4: Competencia 4", así que cada
+                    # columna es el promedio FINAL de esa competencia a lo largo
+                    # de P1-P4 — no el promedio de las cuatro competencias en un
+                    # período. Se usa el método del propio modelo, que aplica
+                    # valor_periodo() (max(P, RP)) y devuelve None si falta
+                    # algún período.
+                    promedios_competencia = {
+                        _c.competencia_numero: _c.calcular_promedio_competencia()
+                        for _c in comps if _c.competencia_numero
+                    }
+
+                    calificaciones[idx] = {
+                        # Notas por competencia y período, tal como están en la
+                        # base. Un valor NULL queda NULL: no se inventa nada.
+                        'competencias': detalle,
+                        # Lo que va al bloque resumen del Registro.
+                        'promedios_competencia': promedios_competencia,
+                        # Los rpN de primer nivel pertenecen al modelo legacy
+                        # `Calificacion` (una recuperación por período, sin
+                        # competencia). En secundaria la recuperación vive
+                        # DENTRO de cada competencia, en `competencias[n]`.
+                        'rp1': None, 'rp2': None, 'rp3': None, 'rp4': None,
+                        # pc1..pc4 son los promedios POR PERÍODO. El Registro ya
+                        # no los imprime (ver promedios_competencia), pero son
+                        # la base del CF oficial y los consume el boletín, así
+                        # que se conservan.
+                        'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
+                        'cf': cf,
+                    }
+                    continue
+
                 calif = _por_estudiante.get(est.id)
                 if calif:
                     # PC: usar valor persistido; si está NULL, recalcular con la lógica
@@ -14484,7 +14589,11 @@ async def generar_registro_escolar(curso_id, db: Session = Depends(get_db), curr
         'nombre': e.nombre_completo,
         'sexo': e.sexo or '',
         'fecha_nacimiento': e.fecha_nacimiento,
-        'cedula': getattr(e, 'cedula', '') or e.matricula or '',
+        # v2.19.7: la cédula es la cédula, y punto. Antes caía a la matrícula
+        # cuando el estudiante no tenía documento, así que el mismo número
+        # terminaba impreso en la casilla de CÉDULA y en la de RNE del registro
+        # MINERD. Sin cédula real, la casilla va vacía.
+        'cedula': (getattr(e, 'cedula', None) or '').strip(),
         'matricula': e.matricula or '',
         'lugar_nacimiento': e.lugar_nacimiento or '',
         'nacionalidad': e.nacionalidad or '',
