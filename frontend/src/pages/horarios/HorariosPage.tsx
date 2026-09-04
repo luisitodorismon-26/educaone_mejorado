@@ -157,6 +157,13 @@ export const HorariosPage = () => {
       : (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null);
   const nivelLabel = nivelActivo ? (nivelActivo === 'primaria' ? 'Primaria' : 'Secundaria') : null;
 
+  // v2.19.8: administrar horarios por CURSO y RECREOS exige un contexto de nivel
+  // concreto. Dirección en "Todos" (sin lente) NO puede: no elegimos un recreo
+  // específico de forma arbitraria — se pide elegir Primaria o Secundaria en el
+  // switch existente del header. El profesor queda EXENTO: su horario personal
+  // se muestra completo aunque cruce niveles.
+  const requiereNivel = user?.role !== 'profesor' && !nivelActivo;
+
   useEffect(() => { loadInicial(); }, []);
   useEffect(() => { 
     if (vistaActual === 'profesor' && profesorId) loadHorariosProfesor();
@@ -424,12 +431,12 @@ export const HorariosPage = () => {
           </h1>
         </div>
         <div className="flex items-center gap-3">
-          {canEdit && (
+          {canEdit && !requiereNivel && (
             <Button onClick={() => openRecreoModal()} variant="secondary" icon={<Coffee size={16} />}>
               Gestionar Recreos
             </Button>
           )}
-          {canEdit && profesorId > 0 && vistaActual === 'profesor' && (
+          {canEdit && !requiereNivel && profesorId > 0 && vistaActual === 'profesor' && (
             <Button onClick={() => setShowModal(true)} icon={<Plus size={16} />}>
               Agregar Bloque
             </Button>
@@ -444,8 +451,22 @@ export const HorariosPage = () => {
         <Alert variant={message.type} onClose={() => setMessage(null)}>{message.text}</Alert>
       )}
 
+      {/* v2.19.8: sin contexto de nivel concreto no se administra por curso ni
+          recreos — se reutiliza el switch Primaria/Secundaria del header. */}
+      {requiereNivel && (
+        <div className="bg-white rounded-xl border border-slate-200 p-12 text-center">
+          <Clock size={48} className="mx-auto text-slate-300 mb-4" />
+          <h3 className="text-lg font-semibold text-slate-600">
+            Selecciona Primaria o Secundaria para administrar horarios y recreos por nivel
+          </h3>
+          <p className="text-sm text-slate-400 mt-2">
+            Usa el selector de división en la parte superior de la pantalla.
+          </p>
+        </div>
+      )}
+
       {/* Recreos configurados */}
-      {canEdit && recreos.length > 0 && (
+      {canEdit && !requiereNivel && recreos.length > 0 && (
         <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
           <h4 className="font-medium text-amber-800 mb-2 flex items-center gap-2">
             <Coffee size={16} /> Recreos Configurados
@@ -475,6 +496,7 @@ export const HorariosPage = () => {
       )}
 
       {/* Filtros */}
+      {!requiereNivel && (
       <div className="bg-white p-4 rounded-xl border border-slate-200 flex flex-wrap items-center gap-4">
         <div className="flex bg-slate-100 rounded-lg p-1">
           <button
@@ -536,9 +558,10 @@ export const HorariosPage = () => {
           </select>
         )}
       </div>
+      )}
 
       {/* Tabla de horario */}
-      {((vistaActual === 'profesor' && profesorId > 0) || (vistaActual === 'curso' && cursoId > 0)) && HORAS.length > 0 && (
+      {!requiereNivel && ((vistaActual === 'profesor' && profesorId > 0) || (vistaActual === 'curso' && cursoId > 0)) && HORAS.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="p-4 border-b border-slate-100 flex justify-between items-center">
             <h3 className="font-bold text-slate-800">
@@ -643,7 +666,7 @@ export const HorariosPage = () => {
       )}
 
       {/* Mensaje inicial */}
-      {((vistaActual === 'profesor' && profesorId === 0) || (vistaActual === 'curso' && cursoId === 0)) && !loading && (
+      {!requiereNivel && ((vistaActual === 'profesor' && profesorId === 0) || (vistaActual === 'curso' && cursoId === 0)) && !loading && (
         <div className="bg-white rounded-xl border border-slate-200 p-12 text-center">
           <Clock size={48} className="mx-auto text-slate-300 mb-4" />
           <h3 className="text-lg font-semibold text-slate-600">

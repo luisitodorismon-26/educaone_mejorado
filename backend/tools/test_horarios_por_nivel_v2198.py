@@ -192,9 +192,9 @@ with client:
             'hora_inicio': '10:20', 'hora_fin': '10:40'}, headers=auth(DIR_A, 'secundaria'))
         assert r1.status_code == 201 and r2.status_code == 201, (r1.text, r2.text)
         assert r1.json()['nivel'] == 'primaria' and r2.json()['nivel'] == 'secundaria'
-        # Sin lente ("Todos") se ven ambos.
-        todos = horas(recreos(DIR_A, None, A['matutina']))
-        assert ('09:30', '10:00') in todos and ('10:20', '10:40') in todos, todos
+        # Cada específico aparece bajo SU lente.
+        assert horas(recreos(DIR_A, 'primaria', A['matutina'])) == [('09:30', '10:00')]
+        assert horas(recreos(DIR_A, 'secundaria', A['matutina'])) == [('10:20', '10:40')]
 
     @test("B — Dirección en Primaria SOLO obtiene el recreo de Primaria de esa tanda")
     def _():
@@ -222,6 +222,28 @@ with client:
         assert r.status_code == 201, r.text
         assert horas(recreos(DIR_A, 'primaria', A['vespertina'])) == [('15:45', '16:00')], 'específico no ganó'
         assert horas(recreos(DIR_A, 'secundaria', A['vespertina'])) == [('15:00', '15:30')], 'secundaria perdió el fallback'
+
+    # ══════════════════════════════════════ M — contexto "Todos" no aplica un específico
+    @test("M — Primaria 09:30 + Secundaria 10:20 + contexto Todos: NO se aplica ninguno como si fuera el general")
+    def _():
+        # Matutina NO tiene recreo legacy: en "Todos" (dirección administrando) no
+        # debe salir NINGÚN específico. Antes la grilla podía tomar uno arbitrario.
+        h = horas(recreos(DIR_A, None, A['matutina']))
+        assert h == [], f'"Todos" filtró un recreo específico como general: {h}'
+        assert ('09:30', '10:00') not in h and ('10:20', '10:40') not in h
+
+    @test("M — En Todos, una tanda con legacy + específico devuelve SOLO el legacy (nunca el específico suelto)")
+    def _():
+        h = horas(recreos(DIR_A, None, A['vespertina']))
+        assert h == [('15:00', '15:30')], f'esperaba solo el legacy, obtuvo {h}'
+        assert ('15:45', '16:00') not in h, 'un recreo específico se coló en "Todos"'
+
+    @test("M — El profesor NO se ve afectado: sin X-Nivel sigue viendo TODOS los recreos del colegio")
+    def _():
+        tok = login('prof_mix_a', 'Temporal2026x')
+        h = horas(recreos(tok, None))
+        for esperado in (('09:30', '10:00'), ('10:20', '10:40'), ('15:00', '15:30'), ('15:45', '16:00')):
+            assert esperado in h, f'al profesor se le ocultó {esperado}: {h}'
 
     # ══════════════════════════════════════ F / G (cursos por nivel)
     @test("F — Dirección en Primaria solo ve cursos de Primaria")

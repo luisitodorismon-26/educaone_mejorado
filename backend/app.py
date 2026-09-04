@@ -2593,11 +2593,16 @@ def _norm_nivel_recreo(raw):
 async def get_recreos(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Obtener los recreos, aplicando el lente de nivel efectivo.
 
-    v2.19.8: dirección/coordinación ven los recreos de SU división (con fallback
-    al recreo legacy nivel=NULL si esa división aún no tiene uno propio). Sin
-    lente ('Todos') se devuelven todos, como siempre. El profesor no usa este
-    endpoint para su horario personal, así que su vista completa no se ve
-    afectada.
+    v2.19.8:
+      - Con lente concreto (dirección en Primaria/Secundaria, o coordinación con
+        división fija): los recreos de ESA división, con fallback al legacy
+        nivel=NULL de la tanda si esa división aún no tiene uno propio.
+      - Sin lente ('Todos') y rol de gestión (no profesor): SOLO los recreos
+        legacy (nivel=NULL). No se elige arbitrariamente un recreo específico de
+        Primaria o Secundaria; la UI pide elegir división. Los legacy quedan
+        intactos y visibles.
+      - Profesor: SIEMPRE todos (su horario personal es completo aunque cruce
+        niveles). Este endpoint no recorta su vista.
     """
     tanda_id = request.query_params.get('tanda_id')
     q = tenant_filter(db.query(Recreo), Recreo, current_user).filter_by(activo=True)
@@ -2605,7 +2610,12 @@ async def get_recreos(request: Request, db: Session = Depends(get_db), current_u
         q = q.filter_by(tanda_id=tanda_id)
     recreos = q.all()
 
-    recreos = _recreos_efectivos(recreos, nivel_efectivo(current_user, request))
+    _niv = nivel_efectivo(current_user, request)
+    if _niv is None and getattr(current_user, 'role', None) != 'profesor':
+        # 'Todos' administrando: nunca un específico suelto, solo el legacy.
+        recreos = [r for r in recreos if _canon_nivel_division(r.nivel) is None]
+    else:
+        recreos = _recreos_efectivos(recreos, _niv)
 
     return [{
         'id': r.id,
