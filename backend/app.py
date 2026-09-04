@@ -488,6 +488,25 @@ async def lifespan(app):
                     f"✅ Migración: agregadas {len(pendientes_notif)} columnas a notificaciones"
                 )
 
+        # === 6c. Recreos: columna nivel (v2.19.8 — horarios por nivel) ===
+        # Evolución ADITIVA y reversible: una columna nullable, sin DEFAULT y sin
+        # backfill. Los recreos legacy quedan con nivel = NULL a propósito y
+        # siguen funcionando como fallback (ver Recreo.nivel en models.py y
+        # _recreos_efectivos()). Reversible con `ALTER TABLE recreos DROP COLUMN
+        # nivel` en Postgres. La verificación post-migración de más abajo exige
+        # que esta columna exista físicamente, así que este ALTER no es opcional.
+        if 'recreos' in inspector.get_table_names():
+            recreo_cols = {c['name'] for c in inspector.get_columns('recreos')}
+            if 'nivel' not in recreo_cols:
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text("ALTER TABLE recreos ADD COLUMN nivel VARCHAR(20)"))
+                        conn.commit()
+                        logger.info("✅ Migración: columna nivel agregada a recreos")
+                    except Exception as e:
+                        logger.warning(f"No se pudo agregar recreos.nivel: {e}")
+                        raise
+
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
         # Acelera queries frecuentes:
@@ -2559,48 +2578,83 @@ async def delete_tanda(id, request: Request, db: Session = Depends(get_db), curr
 
 # ============== RECREOS ==============
 
+def _norm_nivel_recreo(raw):
+    """Normaliza el nivel recibido para un Recreo. '' / None / 'todos' -> None
+    (recreo legacy). Cualquier otro valor fuera de primaria/secundaria -> 400."""
+    low = (raw or '').strip().lower()
+    if low in ('', 'todos'):
+        return None
+    if low in NIVELES_DIVISION:
+        return low
+    raise HTTPException(status_code=400, detail=f"nivel inválido: {raw!r}. Válidos: primaria, secundaria o vacío (legacy).")
+
+
 @app.get("/api/recreos")
 async def get_recreos(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Obtener todos los recreos"""
+    """Obtener los recreos, aplicando el lente de nivel efectivo.
+
+    v2.19.8: dirección/coordinación ven los recreos de SU división (con fallback
+    al recreo legacy nivel=NULL si esa división aún no tiene uno propio). Sin
+    lente ('Todos') se devuelven todos, como siempre. El profesor no usa este
+    endpoint para su horario personal, así que su vista completa no se ve
+    afectada.
+    """
     tanda_id = request.query_params.get('tanda_id')
+    q = tenant_filter(db.query(Recreo), Recreo, current_user).filter_by(activo=True)
     if tanda_id:
-        recreos = tenant_filter(db.query(Recreo), Recreo, current_user).filter_by(tanda_id=tanda_id, activo=True).all()
-    else:
-        recreos = tenant_filter(db.query(Recreo), Recreo, current_user).filter_by(activo=True).all()
-    
+        q = q.filter_by(tanda_id=tanda_id)
+    recreos = q.all()
+
+    recreos = _recreos_efectivos(recreos, nivel_efectivo(current_user, request))
+
     return [{
         'id': r.id,
         'tanda_id': r.tanda_id,
         'tanda': r.tanda.nombre if r.tanda else None,
         'nombre': r.nombre,
         'hora_inicio': r.hora_inicio,
-        'hora_fin': r.hora_fin
+        'hora_fin': r.hora_fin,
+        'nivel': r.nivel,  # None = legacy (aplica a la tanda entera)
     } for r in recreos]
 
 @app.post("/api/recreos")
 async def crear_recreo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Crear un nuevo recreo"""
+    """Crear un nuevo recreo.
+
+    El nivel se toma del body si viene explícito; si no, del contexto de nivel
+    efectivo (X-Nivel para dirección). Así un recreo creado desde 'Horarios —
+    Primaria' queda marcado 'primaria' sin que el usuario tenga que elegirlo.
+    Sin contexto de nivel, queda NULL (legacy) — no se rompe nada.
+    """
     data = await request.json()
     tanda = get_tenant_or_404(db, Tanda, data.get('tanda_id'), current_user, name='tanda')
+    if 'nivel' in data:
+        nivel = _norm_nivel_recreo(data.get('nivel'))
+    else:
+        nivel = nivel_efectivo(current_user, request)  # None si dirección está en 'Todos'
     recreo = Recreo(
         tanda_id=tanda.id,
         colegio_id=current_user.colegio_id,
         nombre=data.get('nombre', 'Recreo'),
         hora_inicio=data['hora_inicio'],
-        hora_fin=data['hora_fin']
+        hora_fin=data['hora_fin'],
+        nivel=nivel,
     )
     db.add(recreo)
     db.commit()
-    return JSONResponse({'message': 'Recreo creado', 'id': recreo.id}, status_code=201)
+    return JSONResponse({'message': 'Recreo creado', 'id': recreo.id, 'nivel': recreo.nivel}, status_code=201)
 
 @app.put("/api/recreos/{id}")
 async def update_recreo(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Actualizar recreo"""
+    """Actualizar recreo. `nivel` solo cambia si viene explícito en el body
+    (para no re-etiquetar recreos legacy sin querer)."""
     recreo = get_tenant_or_404(db, Recreo, id, current_user, name='recreo')
     data = await request.json()
     recreo.nombre = data.get('nombre', recreo.nombre)
     recreo.hora_inicio = data.get('hora_inicio', recreo.hora_inicio)
     recreo.hora_fin = data.get('hora_fin', recreo.hora_fin)
+    if 'nivel' in data:
+        recreo.nivel = _norm_nivel_recreo(data.get('nivel'))
     db.commit()
     return {'message': 'Recreo actualizado'}
 
@@ -2866,6 +2920,52 @@ def cursos_ids_de_nivel(db, current_user, nivel):
              .join(Grado, Curso.grado_id == Grado.id)
              .with_entities(Curso.id, Grado.nivel).all())
     return {cid for cid, gniv in filas if _canon_nivel(gniv) == nivel}
+
+
+def _canon_nivel_division(raw):
+    """Nivel de división canónico ('primaria'|'secundaria') o None.
+
+    A diferencia de _canon_nivel() (que fuerza 'secundaria' por defecto y sirve
+    para grados/estudiantes), aquí un valor vacío o desconocido es None: un
+    Recreo con nivel = NULL es LEGACY, no 'secundaria'.
+    """
+    low = (raw or '').strip().lower()
+    if low.startswith('prim'):
+        return 'primaria'
+    if low.startswith('sec'):
+        return 'secundaria'
+    return None
+
+
+def _recreos_efectivos(recreos, nivel):
+    """Aplica el lente de nivel a una lista de Recreo, con fallback legacy.
+
+    Contrato (v2.19.8):
+      - nivel None  (lente 'Todos' / dirección sin switch): se devuelve la lista
+        entera sin tocar — comportamiento histórico.
+      - nivel 'primaria'/'secundaria': POR TANDA,
+          * si existe al menos un recreo con ESE nivel -> se usan solo esos;
+          * si no hay ninguno específico para ese nivel -> se cae al legacy
+            (nivel = NULL) de la misma tanda.
+        Un recreo del OTRO nivel nunca entra cuando el lente está activo.
+
+    Así Matutina puede tener 09:30–10:00 para primaria y 10:20–10:40 para
+    secundaria a la vez, y un colegio que aún no configuró nada sigue viendo su
+    recreo legacy en ambos niveles.
+    """
+    if not nivel:
+        return list(recreos)
+    por_tanda = {}
+    for r in recreos:
+        por_tanda.setdefault(r.tanda_id, []).append(r)
+    salida = []
+    for grupo in por_tanda.values():
+        especificos = [r for r in grupo if _canon_nivel_division(r.nivel) == nivel]
+        if especificos:
+            salida.extend(especificos)
+        else:
+            salida.extend(r for r in grupo if _canon_nivel_division(r.nivel) is None)
+    return salida
 
 
 def validar_nivel_escritura(db, current_user, curso_id=None, estudiante_id=None):
@@ -4394,15 +4494,53 @@ async def delete_asignacion(id, request: Request, db: Session = Depends(get_db),
 
 # ============== HORARIOS ==============
 
+def _guardia_nivel_lectura_curso(db, current_user, curso_id):
+    """v2.19.8: candado de LECTURA por división para Horarios.
+
+    Espejo de validar_nivel_escritura(), pero para GET: un usuario con división
+    FIJA (coordinador/secretaría/psicología con nivel_asignado) no puede
+    consultar el horario de un curso del OTRO nivel, ni llamando a la API
+    directo. Dirección y profesor quedan exentos — a dirección la rige el
+    switch (solo un lente de vista) y al profesor sus asignaciones (puede
+    cruzar niveles). Devuelve un JSONResponse 403 si viola la división; None si
+    todo bien.
+    """
+    rol = getattr(current_user, 'role', None)
+    if rol in ('direccion', 'profesor', 'superadmin'):
+        return None
+    nv = (getattr(current_user, 'nivel_asignado', None) or '').strip().lower()
+    if nv not in NIVELES_DIVISION:
+        return None  # sin división fija = comportamiento de siempre
+    _cids = cursos_ids_de_nivel(db, current_user, nv) or set()
+    if int(curso_id) not in _cids:
+        return JSONResponse({
+            'error': f'Tu división es {nv}: no puedes ver horarios del otro nivel.'
+        }, status_code=403)
+    return None
+
+
 @app.get("/api/horarios")
 async def get_horarios(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    # v2.19.8: la lista institucional respeta el lente de nivel. Bajo
+    # 'Horarios — Primaria' solo salen los bloques de clase de cursos de
+    # primaria; los bloques sin curso (libre/recreo del profesor) se conservan
+    # siempre porque pertenecen al profesor, no a un nivel.
     horarios = tenant_filter(db.query(Horario), Horario, current_user).all()
+    _niv = nivel_efectivo(current_user, request)
+    if _niv is not None:
+        _cids = cursos_ids_de_nivel(db, current_user, _niv) or set()
+        horarios = [h for h in horarios if h.curso_id is None or h.curso_id in _cids]
     return [h.to_dict() for h in horarios]
 
 @app.get("/api/horarios/profesor/{id}")
 async def get_horarios_profesor(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     # Validar que el profesor pertenezca al mismo colegio (404 si no)
     get_tenant_or_404(db, Usuario, id, current_user, name='profesor')
+    # v2.19.8: NO se filtra por nivel a propósito. El horario personal del
+    # profesor es su vista completa — un profesor de inglés que da 5to Primaria
+    # y 1ro Secundaria debe ver AMBAS clases. La separación por nivel es para la
+    # gestión institucional (dirección/coordinación), no para ocultarle clases
+    # válidas al profesor.
     horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(profesor_id=id).order_by(Horario.dia, Horario.hora_inicio).all()
     return [h.to_dict() for h in horarios]
 
@@ -4410,6 +4548,10 @@ async def get_horarios_profesor(id, request: Request, db: Session = Depends(get_
 async def get_horarios_curso(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     # Validar que el curso pertenezca al mismo colegio (404 si no)
     get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    # v2.19.8: un coordinador con división fija no cruza al otro nivel.
+    _g = _guardia_nivel_lectura_curso(db, current_user, id)
+    if _g is not None:
+        return _g
     horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(curso_id=id).order_by(Horario.dia, Horario.hora_inicio).all()
     return [h.to_dict() for h in horarios]
 

@@ -365,7 +365,21 @@ class Recreo(Base):
     hora_inicio = Column(String(5), nullable=False)
     hora_fin = Column(String(5), nullable=False)
     activo = Column(Boolean, default=True)
-    
+    # v2.19.8: división del recreo dentro de la tanda.
+    # 'primaria' | 'secundaria' | NULL.
+    #   - NULL  = recreo LEGACY: aplica a la tanda entera y sirve de FALLBACK
+    #             cuando un nivel todavía no tiene su recreo específico. Nunca
+    #             se transforma ni se adivina: los datos previos a v2.19.8
+    #             conservan NULL a propósito.
+    #   - primaria/secundaria = recreo específico. Si una tanda tiene al menos
+    #             uno para un nivel, ESE gana y el legacy deja de aplicar a ese
+    #             nivel (el legacy sigue vigente para el nivel que aún no tenga
+    #             recreo propio). El nivel se deriva del contexto (X-Nivel /
+    #             nivel_asignado) al crearlo, igual que en el resto del sistema:
+    #             NO se agrega `nivel` a Horario porque allí se deriva de
+    #             Horario -> Curso -> Grado -> nivel.
+    nivel = Column(String(20), nullable=True)
+
     tanda = relationship('Tanda', backref='recreos')
 
 class BloqueHorario(Base):

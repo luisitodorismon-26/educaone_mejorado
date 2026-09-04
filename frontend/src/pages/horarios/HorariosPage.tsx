@@ -26,6 +26,8 @@ interface Recreo {
   nombre: string;
   hora_inicio: string;
   hora_fin: string;
+  // v2.19.8: 'primaria' | 'secundaria' | null (null = legacy, aplica a la tanda entera)
+  nivel?: 'primaria' | 'secundaria' | null;
 }
 
 interface Tanda {
@@ -132,10 +134,28 @@ export const HorariosPage = () => {
     tanda_id: 0,
     nombre: 'Recreo',
     hora_inicio: '10:00',
-    hora_fin: '10:30'
+    hora_fin: '10:30',
+    nivel: '' as '' | 'primaria' | 'secundaria'
   });
 
   const canEdit = user?.role === 'direccion';
+
+  // v2.19.8: nivel efectivo del contexto (misma regla que el resto de EducaOne).
+  // - nivel_asignado fijo (coordinación) manda siempre;
+  // - dirección usa el switch del header, persistido en localStorage.
+  // El backend es la autoridad; acá solo se refleja en la UI.
+  const nivelFijo: 'primaria' | 'secundaria' | null =
+    ((user as any)?.nivel_asignado === 'primaria' || (user as any)?.nivel_asignado === 'secundaria')
+      ? (user as any).nivel_asignado
+      : null;
+  const nivelVista = typeof window !== 'undefined'
+    ? localStorage.getItem('educaone_nivel_vista')
+    : null;
+  const nivelActivo: 'primaria' | 'secundaria' | null =
+    nivelFijo
+      ? nivelFijo
+      : (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null);
+  const nivelLabel = nivelActivo ? (nivelActivo === 'primaria' ? 'Primaria' : 'Secundaria') : null;
 
   useEffect(() => { loadInicial(); }, []);
   useEffect(() => { 
@@ -278,7 +298,7 @@ export const HorariosPage = () => {
       const r = await api.get('/recreos');
       setRecreos(r.data);
       setShowRecreoModal(false);
-      setRecreoForm({ id: 0, tanda_id: 0, nombre: 'Recreo', hora_inicio: '10:00', hora_fin: '10:30' });
+      setRecreoForm({ id: 0, tanda_id: 0, nombre: 'Recreo', hora_inicio: '10:00', hora_fin: '10:30', nivel: nivelActivo || '' });
       setMessage({ type: 'success', text: 'Recreo guardado' });
     } catch (e) {
       setMessage({ type: 'error', text: 'Error al guardar recreo' });
@@ -304,10 +324,20 @@ export const HorariosPage = () => {
         tanda_id: recreo.tanda_id,
         nombre: recreo.nombre,
         hora_inicio: recreo.hora_inicio,
-        hora_fin: recreo.hora_fin
+        hora_fin: recreo.hora_fin,
+        nivel: (recreo.nivel === 'primaria' || recreo.nivel === 'secundaria') ? recreo.nivel : ''
       });
     } else {
-      setRecreoForm({ id: 0, tanda_id: tandaId || (tandas[0]?.id || 0), nombre: 'Recreo', hora_inicio: '10:00', hora_fin: '10:30' });
+      // Nuevo recreo: hereda el nivel del contexto activo (Primaria/Secundaria).
+      // En "Todos" queda '' = recreo general (legacy), sin romper nada.
+      setRecreoForm({
+        id: 0,
+        tanda_id: tandaId || (tandas[0]?.id || 0),
+        nombre: 'Recreo',
+        hora_inicio: '10:00',
+        hora_fin: '10:30',
+        nivel: nivelActivo || ''
+      });
     }
     setShowRecreoModal(true);
   };
@@ -389,7 +419,9 @@ export const HorariosPage = () => {
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-2">
           <Clock className="text-slate-400" size={24} />
-          <h1 className="text-2xl font-bold text-slate-800">Horarios</h1>
+          <h1 className="text-2xl font-bold text-slate-800">
+            Horarios{nivelLabel ? <span className="text-slate-400 font-semibold"> — {nivelLabel}</span> : null}
+          </h1>
         </div>
         <div className="flex items-center gap-3">
           {canEdit && (
@@ -422,6 +454,13 @@ export const HorariosPage = () => {
             {recreos.map(r => (
               <div key={r.id} className="flex items-center gap-2 px-3 py-1 bg-white rounded-full border border-amber-200 text-sm">
                 <span className="text-amber-700">{r.tanda}: {r.nombre}</span>
+                <span className={`text-[10px] font-bold uppercase px-1.5 py-0.5 rounded ${
+                  r.nivel === 'primaria' ? 'bg-blue-100 text-blue-700'
+                  : r.nivel === 'secundaria' ? 'bg-purple-100 text-purple-700'
+                  : 'bg-slate-100 text-slate-500'
+                }`}>
+                  {r.nivel === 'primaria' ? 'Primaria' : r.nivel === 'secundaria' ? 'Secundaria' : 'General'}
+                </span>
                 <span className="text-amber-600">{formatHora(r.hora_inicio)} - {formatHora(r.hora_fin)}</span>
                 <button onClick={() => openRecreoModal(r)} className="text-blue-500 hover:text-blue-700">
                   <Settings size={14} />
@@ -717,6 +756,21 @@ export const HorariosPage = () => {
             options={tandas.map(t => ({ value: t.id, label: t.nombre }))}
             placeholder="Seleccionar tanda"
           />
+          <Select
+            label="Nivel"
+            value={recreoForm.nivel}
+            onChange={e => setRecreoForm({ ...recreoForm, nivel: e.target.value as '' | 'primaria' | 'secundaria' })}
+            options={[
+              { value: '', label: 'General (toda la tanda)' },
+              { value: 'primaria', label: 'Primaria' },
+              { value: 'secundaria', label: 'Secundaria' },
+            ]}
+          />
+          <p className="text-xs text-slate-500 -mt-2">
+            Un recreo por nivel permite, en la misma tanda, un descanso distinto para
+            Primaria y para Secundaria. "General" se usa como respaldo mientras un
+            nivel no tenga el suyo.
+          </p>
           <Input
             label="Nombre"
             value={recreoForm.nombre}
