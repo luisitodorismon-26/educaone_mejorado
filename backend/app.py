@@ -4634,6 +4634,67 @@ def _validar_hora(valor: str, campo: str):
     return f"{h:02d}:{mi:02d}"
 
 
+def _conflicto_clase(db, *, colegio_id, dia, hora_inicio, hora_fin,
+                     profesor_id=None, curso_id=None, excluir_id=None):
+    """v2.19.8.1 — Prevención de horarios imposibles por error humano.
+
+    Devuelve un JSONResponse 409 (mensaje claro) si el bloque dia/hora se
+    SOLAPA con otra clase ACTIVA del MISMO colegio, ya sea:
+      - del mismo PROFESOR (no puede estar en dos aulas a la vez — no importa si
+        una clase es Primaria y otra Secundaria), o
+      - del mismo CURSO (el grupo no puede tener dos clases simultáneas, aunque
+        las den profesores distintos).
+    Devuelve None si no hay conflicto.
+
+    Solo aplica a tipo_bloque='clase'. NO agrega ninguna restricción por nivel:
+    un profesor puede seguir dando varias clases de Primaria y de Secundaria el
+    mismo día mientras no se pisen en el tiempo.
+
+    Solapamiento de intervalos:
+        nuevo_inicio < existente_fin  AND  nuevo_fin > existente_inicio
+    Las horas se guardan como 'HH:MM' con cero a la izquierda (_validar_hora),
+    así que el orden lexicográfico coincide con el cronológico.
+
+    El filtro colegio_id garantiza que un horario de OTRO colegio nunca cuenta
+    como conflicto. Al editar (PUT) se pasa excluir_id para no chocar consigo
+    mismo.
+    """
+    base = db.query(Horario).filter(
+        Horario.colegio_id == colegio_id,
+        Horario.tipo_bloque == 'clase',
+        Horario.activo == True,  # noqa: E712  (una clase inactiva/histórica no bloquea)
+        Horario.dia == dia,
+        Horario.hora_inicio < hora_fin,
+        Horario.hora_fin > hora_inicio,
+    )
+    if excluir_id is not None:
+        base = base.filter(Horario.id != excluir_id)
+
+    if profesor_id is not None:
+        choque = base.filter(Horario.profesor_id == profesor_id).order_by(Horario.hora_inicio).first()
+        if choque is not None:
+            _curso_txt = ''
+            try:
+                if choque.curso is not None and choque.curso.colegio_id == colegio_id:
+                    _curso_txt = f' en {choque.curso.nombre_completo}'
+            except Exception:
+                _curso_txt = ''
+            return JSONResponse({
+                'error': (f'Conflicto de horario: este profesor ya tiene una clase{_curso_txt} '
+                          f'el {dia} de {choque.hora_inicio} a {choque.hora_fin}.')
+            }, status_code=409)
+
+    if curso_id is not None:
+        choque = base.filter(Horario.curso_id == curso_id).order_by(Horario.hora_inicio).first()
+        if choque is not None:
+            return JSONResponse({
+                'error': (f'Conflicto de horario: este curso ya tiene otra clase '
+                          f'el {dia} de {choque.hora_inicio} a {choque.hora_fin}.')
+            }, status_code=409)
+
+    return None
+
+
 @app.post("/api/horarios")
 async def crear_horario(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Crear horario. Valida que curso, asignatura y profesor pertenezcan al colegio del caller."""
@@ -4675,7 +4736,16 @@ async def crear_horario(request: Request, background_tasks: BackgroundTasks, db:
         assert_nivel_curso_activo(db, current_user, curso.id)
         curso_id = curso.id
         asignatura_id = asignatura.id
-    
+
+        # v2.19.8.1 — no permitir clases superpuestas (mismo profesor o mismo curso).
+        _conf = _conflicto_clase(
+            db, colegio_id=current_user.colegio_id, dia=dia,
+            hora_inicio=hora_inicio, hora_fin=hora_fin,
+            profesor_id=profesor.id, curso_id=curso_id,
+        )
+        if _conf is not None:
+            return _conf
+
     horario = Horario(
         profesor_id=profesor.id,
         colegio_id=current_user.colegio_id,
@@ -4770,7 +4840,20 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
         horario.hora_fin = _validar_hora(data['hora_fin'], 'hora_fin')
     if horario.hora_inicio >= horario.hora_fin:
         return JSONResponse({'error': 'hora_fin debe ser mayor que hora_inicio'}, status_code=400)
-    
+
+    # v2.19.8.1 — mismas validaciones de solapamiento que al crear, excluyendo
+    # el propio horario (editar sin cambiar la hora NO choca consigo mismo).
+    if horario.tipo_bloque == 'clase':
+        _conf = _conflicto_clase(
+            db, colegio_id=current_user.colegio_id, dia=horario.dia,
+            hora_inicio=horario.hora_inicio, hora_fin=horario.hora_fin,
+            profesor_id=horario.profesor_id, curso_id=horario.curso_id,
+            excluir_id=horario.id,
+        )
+        if _conf is not None:
+            db.rollback()  # descartar los cambios pendientes: nada existente se toca
+            return _conf
+
     _aula_antes = horario.aula
     if 'aula' in data:
         horario.aula = data['aula'] or None
