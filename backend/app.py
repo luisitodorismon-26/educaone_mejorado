@@ -4546,12 +4546,30 @@ async def get_horarios(request: Request, db: Session = Depends(get_db), current_
 async def get_horarios_profesor(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     # Validar que el profesor pertenezca al mismo colegio (404 si no)
     get_tenant_or_404(db, Usuario, id, current_user, name='profesor')
-    # v2.19.8: NO se filtra por nivel a propósito. El horario personal del
-    # profesor es su vista completa — un profesor de inglés que da 5to Primaria
-    # y 1ro Secundaria debe ver AMBAS clases. La separación por nivel es para la
-    # gestión institucional (dirección/coordinación), no para ocultarle clases
-    # válidas al profesor.
-    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(profesor_id=id).order_by(Horario.dia, Horario.hora_inicio).all()
+
+    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(
+        profesor_id=id).order_by(Horario.dia, Horario.hora_inicio).all()
+
+    # v2.19.8 (ajuste de auditoría): este endpoint tiene DOS consumidores.
+    #
+    # 1) EL PROPIO PROFESOR viendo su horario personal → vista COMPLETA. Un
+    #    profesor de inglés que da 5to Primaria y 1ro Secundaria debe ver AMBAS
+    #    clases; X-Nivel no recorta nada. (nivel_efectivo ya devuelve None para
+    #    el rol 'profesor', pero lo dejamos explícito.)
+    #
+    # 2) DIRECCIÓN/COORDINACIÓN usando la vista "Por Profesor" de HorariosPage →
+    #    es gestión institucional, así que se recorta al nivel efectivo, igual
+    #    que GET /api/horarios: se derivan los cursos del nivel
+    #    (Horario.curso_id → Curso → Grado → nivel) con cursos_ids_de_nivel(); los
+    #    bloques sin curso (libre/recreo del profesor) se conservan siempre
+    #    porque no pertenecen a un nivel. Para un coordinador con nivel_asignado
+    #    fijo, nivel_efectivo() ignora X-Nivel, así que no puede cruzar de nivel.
+    if getattr(current_user, 'role', None) != 'profesor':
+        _niv = nivel_efectivo(current_user, request)
+        if _niv is not None:
+            _cids = cursos_ids_de_nivel(db, current_user, _niv) or set()
+            horarios = [h for h in horarios if h.curso_id is None or h.curso_id in _cids]
+
     return [h.to_dict() for h in horarios]
 
 @app.get("/api/horarios/curso/{id}")

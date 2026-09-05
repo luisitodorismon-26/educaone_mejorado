@@ -302,6 +302,63 @@ with client:
         mine = client.get('/api/horarios/profesor/%d' % A['prof'], headers=auth(tok, 'primaria')).json()
         assert any(h['id'] == A['h_sec'] for h in mine), 'a un profesor de primaria se le ocultó su clase de secundaria'
 
+    # ══════════════════════════════════════ N — GET /horarios/profesor/{id}
+    # bajo lente institucional (ajuste de auditoría sobre 919bcd44).
+    #
+    # Bloque LIBRE del profesor mixto (curso_id = None): debe sobrevivir a
+    # cualquier lente porque no pertenece a un nivel.
+    _r_libre = client.post('/api/horarios', json={
+        'profesor_id': A['prof'], 'dia': 'Viernes', 'hora_inicio': '11:00',
+        'hora_fin': '11:45', 'tipo_bloque': 'libre'}, headers=auth(DIR_A))
+    assert _r_libre.status_code == 201, _r_libre.text
+    A['h_libre'] = _r_libre.json()['id']
+
+    def prof_ids(tok, nivel=None):
+        r = client.get(f'/api/horarios/profesor/{A["prof"]}', headers=auth(tok, nivel))
+        assert r.status_code == 200, r.text
+        return {h['id'] for h in r.json()}
+
+    @test("N1 — Dirección + X-Nivel=primaria: /horarios/profesor/{mixto} trae la clase de Primaria, NO la de Secundaria")
+    def _():
+        ids = prof_ids(DIR_A, 'primaria')
+        assert A['h_prim'] in ids, f'falta la clase de Primaria: {ids}'
+        assert A['h_sec'] not in ids, f'FUGA: apareció la clase de Secundaria: {ids}'
+
+    @test("N2 — Dirección + X-Nivel=secundaria: trae Secundaria, NO Primaria")
+    def _():
+        ids = prof_ids(DIR_A, 'secundaria')
+        assert A['h_sec'] in ids and A['h_prim'] not in ids, ids
+
+    @test("N3 — Coordinador FIJO Primaria + X-Nivel=secundaria: solo la clase de Primaria")
+    def _():
+        tok = login('coord_prim_a', 'Temporal2026x')
+        for nivel in (None, 'secundaria', 'primaria'):
+            ids = prof_ids(tok, nivel)
+            assert A['h_prim'] in ids, f'X-Nivel={nivel}: perdió Primaria -> {ids}'
+            assert A['h_sec'] not in ids, f'X-Nivel={nivel}: FUGA de Secundaria -> {ids}'
+
+    @test("N4 — Coordinador FIJO Secundaria + X-Nivel=primaria: solo la clase de Secundaria")
+    def _():
+        tok = login('coord_sec_a', 'Temporal2026x')
+        for nivel in (None, 'primaria', 'secundaria'):
+            ids = prof_ids(tok, nivel)
+            assert A['h_sec'] in ids and A['h_prim'] not in ids, f'X-Nivel={nivel} -> {ids}'
+
+    @test("N5 — El PROPIO profesor mixto sigue viendo AMBAS clases (None / primaria / secundaria)")
+    def _():
+        tok = login('prof_mix_a', 'Temporal2026x')
+        for nivel in (None, 'primaria', 'secundaria'):
+            ids = prof_ids(tok, nivel)
+            assert {A['h_prim'], A['h_sec']}.issubset(ids), f'X-Nivel={nivel}: se le recortó el horario -> {ids}'
+
+    @test("N6 — El bloque libre (curso_id=None) permanece visible bajo el lente institucional")
+    def _():
+        for nivel in ('primaria', 'secundaria'):
+            assert A['h_libre'] in prof_ids(DIR_A, nivel), f'el bloque libre desapareció con lente {nivel}'
+        # y el profesor también lo ve siempre
+        tok = login('prof_mix_a', 'Temporal2026x')
+        assert A['h_libre'] in prof_ids(tok, 'primaria')
+
     # ══════════════════════════════════════ K (multi-tenant)
     @test("K — Aislamiento multi-tenant: Dirección B no ve horarios ni recreos de A")
     def _():
@@ -317,7 +374,13 @@ with client:
     # ══════════════════════════════════════ L (nada existente cambia)
     @test("L — Los horarios existentes NO cambiaron ni se eliminaron tras toda la operación de recreos")
     def _():
-        assert snap_horarios(DIR_A, A['prof']) == SNAP_A, 'un horario existente cambió'
+        # Intención de L: ninguna fila PREEXISTENTE se modificó ni se borró. Se
+        # comprueba que cada fila del snapshot inicial siga presente EXACTAMENTE
+        # igual. (El bloque libre que crea N6 es una fila NUEVA — L nunca
+        # prohibió agregar, solo alterar/eliminar lo existente.)
+        actuales = set(snap_horarios(DIR_A, A['prof']))
+        assert set(SNAP_A).issubset(actuales), \
+            f'un horario existente cambió o desapareció: faltan {set(SNAP_A) - actuales}'
         d = SessionLocal()
         try:
             for hid in (A['h_prim'], A['h_sec'], Bc['h_prim'], Bc['h_sec']):
