@@ -148,6 +148,105 @@ def estampar_borrador(writer: PdfWriter, page, xobject_ref) -> None:
     page[NameObject("/Contents")] = contenidos
 
 
+# ============================================================================
+# v2.19.9 — OVERLAYS DE DATOS COMO FORM XOBJECT
+# ============================================================================
+# Misma técnica que el sello BORRADOR de arriba, generalizada para los overlays
+# de DATOS del Registro Escolar de Secundaria. Hasta v2.19.8 cada overlay de
+# datos se fusionaba con `pypdf.Page.merge_page()`, que descomprime y re-parsea
+# el content-stream del template página por página: el 73 % del tiempo de
+# generación se iba ahí (auditoría v2.19.9). Con Form XObject el content-stream
+# del template NO se toca: la página solo gana una referencia
+# `/EODataOverlayN Do` encadenada a su `/Contents`.
+#
+# El overlay que entra acá es el PDF de una página que ya produce
+# `registro_escolar._create_overlay_page` (ReportLab). No se rasteriza nada.
+
+def crear_xobject_desde_overlay(writer: PdfWriter, overlay_page):
+    """
+    Registra `overlay_page` (PageObject de un PDF ReportLab de UNA página) como
+    Form XObject dentro de `writer` y devuelve su referencia.
+
+    Clona las `/Resources` del overlay al writer (`.clone(writer)`), igual que
+    `crear_xobject_borrador`: así las fuentes (Helvetica / Helvetica-Bold) viajan
+    dentro del XObject y el visor las encuentra al ejecutar el `Do`.
+    """
+    mb = overlay_page.mediabox
+
+    xobj = DecodedStreamObject()
+    xobj.set_data(overlay_page.get_contents().get_data())
+    xobj[NameObject("/Type")] = NameObject("/XObject")
+    xobj[NameObject("/Subtype")] = NameObject("/Form")
+    xobj[NameObject("/FormType")] = NumberObject(1)
+    xobj[NameObject("/BBox")] = ArrayObject([
+        FloatObject(float(mb.left)), FloatObject(float(mb.bottom)),
+        FloatObject(float(mb.right)), FloatObject(float(mb.top)),
+    ])
+
+    recursos = overlay_page.get("/Resources")
+    if recursos is not None:
+        xobj[NameObject("/Resources")] = recursos.get_object().clone(writer)
+
+    return writer._add_object(xobj)
+
+
+def nombre_xobject_libre(page, base: str = "/EODataOverlay") -> str:
+    """
+    Devuelve `base` + N (empezando en 1) tal que `baseN` NO exista ya en
+    `page/Resources/XObject`. Evita pisar un XObject del template MINERD (que
+    usa `/Fm0`../Fm7`) o un `/EODataOverlay1` que hubiera quedado de otra pasada.
+    """
+    usados = set()
+    recursos = page.get("/Resources")
+    if recursos is not None:
+        xo = recursos.get_object().get("/XObject")
+        if xo is not None:
+            usados = {str(k) for k in xo.get_object().keys()}
+    i = 1
+    while f"{base}{i}" in usados:
+        i += 1
+    return f"{base}{i}"
+
+
+def estampar_xobject(writer: PdfWriter, page, xobject_ref, nombre: str) -> None:
+    """
+    Estampa `xobject_ref` sobre `page` (que ya debe pertenecer a `writer`) bajo
+    `nombre` (p. ej. '/EODataOverlay1'). Igual que `estampar_borrador` pero con
+    el nombre parametrizado: NO usa `merge_page`, encadena al `/Contents` como
+    ARRAY con el contenido ORIGINAL intacto en el medio y `q`/`Q` aislando el
+    estado gráfico.
+
+    Llamar ANTES de `estampar_borrador` para que el orden de dibujo quede
+    TEMPLATE -> DATOS -> BORRADOR.
+    """
+    recursos = page.get("/Resources")
+    if recursos is None:
+        recursos = DictionaryObject()
+        page[NameObject("/Resources")] = recursos
+    recursos = recursos.get_object()
+
+    xobjects = recursos.get("/XObject")
+    if xobjects is None:
+        xobjects = DictionaryObject()
+        recursos[NameObject("/XObject")] = xobjects
+    xobjects.get_object()[NameObject(nombre)] = xobject_ref
+
+    apertura = DecodedStreamObject()
+    apertura.set_data(b"q\n")
+    cierre = DecodedStreamObject()
+    cierre.set_data(b"Q\nq\n" + nombre.encode("ascii") + b" Do\nQ\n")
+
+    contenidos = ArrayObject([writer._add_object(apertura)])
+    actual = page.get("/Contents")
+    if actual is not None:
+        if isinstance(actual.get_object(), ArrayObject):
+            contenidos.extend(actual)
+        else:
+            contenidos.append(actual)
+    contenidos.append(writer._add_object(cierre))
+    page[NameObject("/Contents")] = contenidos
+
+
 def aplicar_marca_borrador(pdf_bytes: bytes) -> bytes:
     """
     Aplica marca de agua 'BORRADOR' a todas las páginas de un PDF.
