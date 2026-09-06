@@ -1244,10 +1244,22 @@ class EvaluacionExtraSecundaria(Base):
         if cf_esp is not None and cf_esp >= 70:
             return ('aprobado_especial', cf_esp)
         
-        # Reprobó todas las fases, o aún no se cargaron las pendientes
-        # La "nota efectiva" en este caso es la última calculada (la peor)
-        # para mostrar en el boletín. Si nada se cargó aún, usar CF.
-        nota_a_mostrar = (cf_esp or cf_extra or cf_comp or self.cf_original)
+        # Reprobó todas las fases, o aún no se cargaron las pendientes.
+        # La "nota efectiva" es la última fase EFECTIVAMENTE calculada (la más
+        # avanzada de la cascada). v2.20.0-A2:
+        #   - se usa `is not None` en vez de `or`: un resultado académico
+        #     legítimo de 0 ya NO se salta (antes `0 or X` devolvía X).
+        #   - si aún no hay ninguna evaluación extra, la nota mostrada es la
+        #     CF OFICIAL entera (cf_redondeado), NO la CF exacta decimal
+        #     (ej. 68.975 → 69, nunca 68.975). cf_original se conserva intacto.
+        if cf_esp is not None:
+            nota_a_mostrar = cf_esp
+        elif cf_extra is not None:
+            nota_a_mostrar = cf_extra
+        elif cf_comp is not None:
+            nota_a_mostrar = cf_comp
+        else:
+            nota_a_mostrar = cf_redondeado
         return ('reprobado', nota_a_mostrar)
     
     def fase_pendiente(self):

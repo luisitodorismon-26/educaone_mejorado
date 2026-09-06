@@ -352,6 +352,52 @@ def _():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# v2.20.0-A2 — nota_final SIEMPRE entera + resultados cero no se saltan
+# calcular_condicion_final(): nota_a_mostrar usa `is not None` (no `or`) y,
+# cuando aún no hay ninguna evaluación extra, muestra la CF OFICIAL entera
+# (cf_redondeado), nunca la CF exacta decimal. cf_original NO se toca.
+# ══════════════════════════════════════════════════════════════════════════
+@check("§A2-A cf=68.975 sin evaluaciones extra → cf_original==68.975, nota_final==69, fase_pendiente=='completiva'")
+def _():
+    e = _recalc(_ev(cf=68.975))
+    assert e.cf_original == 68.975, f"cf_original mutó a {e.cf_original}"
+    assert e.nota_final == 69, f"nota_final={e.nota_final!r} (esperado 69, no el decimal 68.975)"
+    assert e.fase_pendiente() == 'completiva', f"fase={e.fase_pendiente()!r}"
+
+@check("§A2-B cf=59.175 sin evaluaciones extra → nota_final==59 (CF oficial entera, no 59.175)")
+def _():
+    e = _recalc(_ev(cf=59.175))
+    assert e.nota_final == 59, f"nota_final={e.nota_final!r} (esperado 59)"
+
+@check("§A2-C cf=0, cec=50, ceex=50, ce=0 → especial_final==0 y nota_final==0 (NO 35: el `or` ya no salta el 0)")
+def _():
+    e = _recalc(_ev(cf=0, cec=50, ceex=50, ce=0))
+    assert e.especial_final == 0, f"especial_final={e.especial_final!r} (esperado 0)"
+    assert e.nota_final == 0, f"nota_final={e.nota_final!r} (esperado 0, NO 35)"
+
+@check("§A2-D extraordinaria_final==0 y especial aún None → nota_final==0")
+def _():
+    e = _recalc(_ev(cf=0, cec=0, ceex=0, ce=None))
+    assert e.especial_final is None, f"especial_final={e.especial_final!r} (esperado None)"
+    assert e.extraordinaria_final == 0, f"extraordinaria_final={e.extraordinaria_final!r} (esperado 0)"
+    assert e.nota_final == 0, f"nota_final={e.nota_final!r} (esperado 0)"
+
+@check("§A2-E completiva_final==0 y fases posteriores None → nota_final==0")
+def _():
+    e = _recalc(_ev(cf=0, cec=0, ceex=None, ce=None))
+    assert e.extraordinaria_final is None and e.especial_final is None
+    assert e.completiva_final == 0, f"completiva_final={e.completiva_final!r} (esperado 0)"
+    assert e.nota_final == 0, f"nota_final={e.nota_final!r} (esperado 0)"
+
+@check("§A2-F cf=69.5 aprobado normal → nota_final==70, condicion_final=='aprobado_normal', fase_pendiente()==None")
+def _():
+    e = _recalc(_ev(cf=69.5))
+    assert e.nota_final == 70, f"nota_final={e.nota_final!r}"
+    assert e.condicion_final == 'aprobado_normal', f"condicion_final={e.condicion_final!r}"
+    assert e.fase_pendiente() is None, f"fase={e.fase_pendiente()!r}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # PARTE 2 — ENDPOINTS (RBAC / tenant / cascada / backfill)
 # ══════════════════════════════════════════════════════════════════════════
 print(f"{B}\n=== PARTE 2: ENDPOINTS ==={X}")
@@ -790,7 +836,7 @@ for (v, py, prod, aca, py_ok, prod_ok) in TABLA_BANKERS:
           f"{c1}{'sí' if py_ok else 'NO':>15}{X} | {c2}{'sí' if prod_ok else 'NO':>14}{X}")
 
 print(f"\n{B}{'=' * 74}{X}")
-print(f"{B}  RESUMEN v2.20.0-A1{X}")
+print(f"{B}  RESUMEN v2.20.0-A2{X}")
 print(f"{B}{'=' * 74}{X}")
 print(f"  [INV] invariantes         : {G}{len(inv_ok)} OK{X} / {R}{len(inv_fail)} FALLAN{X}")
 print(f"  [CAR] caracteriz./diferido : {G}{len(car_ok)} coinciden{X} / {Y}{len(car_bug)} pendiente{X}")
@@ -823,5 +869,5 @@ print(f"{G}✓ SEGURIDAD: sge.db del repo intacto (no leído ni escrito por la s
 # Las caracterizaciones [CAR] son bugs DIFERIDOS a propósito (documentados).
 if inv_fail or errores:
     sys.exit(1)
-print(f"\n{G}{B}✔ v2.20.0-A1: {len(inv_ok)} invariantes verdes. "
+print(f"\n{G}{B}✔ v2.20.0-A2: {len(inv_ok)} invariantes verdes. "
       f"{len(car_bug)} caracterización(es) diferida(s) a propósito.{X}\n")
