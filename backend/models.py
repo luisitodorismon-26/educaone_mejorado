@@ -17,6 +17,7 @@ def _now_dr():
     return datetime.now(timezone(timedelta(hours=-4))).replace(tzinfo=None)
 
 from database import Base
+from reglas_academicas import redondear_calificacion_final, ponderar_y_redondear
 
 # ============== COLEGIO (MULTI-TENANT) ==============
 
@@ -1188,23 +1189,36 @@ class EvaluacionExtraSecundaria(Base):
     asignatura = relationship('Asignatura', backref='evaluaciones_extra')
     
     def calcular_completiva_final(self):
-        """50% C.F. + 50% C.E.C. redondeado entero (fórmula MINERD oficial)."""
+        """50% C.F. + 50% C.E.C. → entero con REDONDEO ACADÉMICO (.5 sube).
+
+        v2.20.0-A1: la ponderación se calcula sobre la CF EXACTA (cf_original);
+        solo el resultado final se redondea, con redondeo académico (.5 sube).
+        v2.20.0-A3: la ponderación 50/50 se hace ENTERAMENTE en Decimal desde
+        los operandos (ver ponderar_y_redondear), evitando que un artefacto
+        float como 69.49999999999999 tumbe un resultado exacto de 69.5.
+        No cambia la fórmula ni usa la CF oficial como base.
+        """
         if self.cf_original is None or self.cec is None:
             return None
-        return round(0.5 * self.cf_original + 0.5 * self.cec, 0)
-    
+        return ponderar_y_redondear(self.cf_original, "0.5", self.cec, "0.5")
+
     def calcular_extraordinaria_final(self):
-        """30% C.F. + 70% C.E.EX redondeado entero."""
+        """30% C.F. + 70% C.E.EX → entero con redondeo académico (.5 sube).
+        Ponderación sobre la CF EXACTA.
+        v2.20.0-A3: la ponderación 30/70 se hace ENTERAMENTE en Decimal desde
+        los operandos (ver ponderar_y_redondear). Ej.: CF=17, CEEX=92 →
+        0.3·17 + 0.7·92 = 5.1 + 64.4 = 69.5 → 70 (antes float daba 69)."""
         if self.cf_original is None or self.ceex is None:
             return None
-        return round(0.3 * self.cf_original + 0.7 * self.ceex, 0)
-    
+        return ponderar_y_redondear(self.cf_original, "0.3", self.ceex, "0.7")
+
     def calcular_especial_final(self):
-        """C.F. (redondeado) + C.E. — suma simple sin ponderación.
-        La tabla oficial MINERD usa el CF redondeado en la Especial (64+10=74)."""
+        """C.F. OFICIAL + C.E. — suma complementaria sin ponderación.
+        v2.20.0-A1: la base es la CF OFICIAL = redondear_calificacion_final(cf_original)
+        (ej. cf_exacta 68.5 → base 69, no 68). No cambia la naturaleza de C.E."""
         if self.cf_original is None or self.ce is None:
             return None
-        return round(self.cf_original, 0) + self.ce
+        return redondear_calificacion_final(self.cf_original) + self.ce
     
     def calcular_condicion_final(self):
         """Cascada oficial MINERD para determinar condición final.
@@ -1215,8 +1229,9 @@ class EvaluacionExtraSecundaria(Base):
         if self.cf_original is None:
             return (None, None)
         
-        # El corte de 70 y la nota mostrada usan el CF redondeado (boletín oficial)
-        cf_redondeado = round(self.cf_original, 0)
+        # El corte de 70 y la nota mostrada usan la CF OFICIAL (redondeo académico
+        # .5-sube). v2.20.0-A1: antes usaba round() (half-to-even).
+        cf_redondeado = redondear_calificacion_final(self.cf_original)
         if cf_redondeado >= 70:
             return ('aprobado_normal', cf_redondeado)
         
@@ -1235,10 +1250,22 @@ class EvaluacionExtraSecundaria(Base):
         if cf_esp is not None and cf_esp >= 70:
             return ('aprobado_especial', cf_esp)
         
-        # Reprobó todas las fases, o aún no se cargaron las pendientes
-        # La "nota efectiva" en este caso es la última calculada (la peor)
-        # para mostrar en el boletín. Si nada se cargó aún, usar CF.
-        nota_a_mostrar = (cf_esp or cf_extra or cf_comp or self.cf_original)
+        # Reprobó todas las fases, o aún no se cargaron las pendientes.
+        # La "nota efectiva" es la última fase EFECTIVAMENTE calculada (la más
+        # avanzada de la cascada). v2.20.0-A2:
+        #   - se usa `is not None` en vez de `or`: un resultado académico
+        #     legítimo de 0 ya NO se salta (antes `0 or X` devolvía X).
+        #   - si aún no hay ninguna evaluación extra, la nota mostrada es la
+        #     CF OFICIAL entera (cf_redondeado), NO la CF exacta decimal
+        #     (ej. 68.975 → 69, nunca 68.975). cf_original se conserva intacto.
+        if cf_esp is not None:
+            nota_a_mostrar = cf_esp
+        elif cf_extra is not None:
+            nota_a_mostrar = cf_extra
+        elif cf_comp is not None:
+            nota_a_mostrar = cf_comp
+        else:
+            nota_a_mostrar = cf_redondeado
         return ('reprobado', nota_a_mostrar)
     
     def fase_pendiente(self):
@@ -1249,7 +1276,11 @@ class EvaluacionExtraSecundaria(Base):
         """
         if self.cf_original is None:
             return None  # aún no termina el año
-        if self.cf_original >= 70:
+        # v2.20.0-A1: la decisión de "aprobó normal" usa la CF OFICIAL redondeada
+        # (.5 sube), NO el promedio exacto. Antes `self.cf_original >= 70` dejaba
+        # a un 69.5–69.99 (CF oficial 70) marcado como "completiva pendiente",
+        # contradiciendo a calcular_condicion_final() y al endpoint POST.
+        if redondear_calificacion_final(self.cf_original) >= 70:
             return None  # aprobó normal, no necesita nada
         
         if self.cec is None:

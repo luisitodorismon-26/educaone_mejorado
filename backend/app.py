@@ -43,6 +43,7 @@ from security import validate_password
 load_dotenv()
 
 from database import engine, SessionLocal, get_db, Base
+from reglas_academicas import redondear_calificacion_final
 from models import (
     Colegio, ConfiguracionColegio, AnoEscolar, Grado, Tanda, Recreo,
     Asignatura, Curso, Estudiante, AsignacionProfesor, Horario, Calificacion,
@@ -5384,10 +5385,11 @@ def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: 
             return (None, None, None) if con_exacto else (None, None)  # falta alguna competencia en ese período
         pcs.append(pc)
     
-    # CF = promedio de los 4 PC. El oficial usa el valor SIN redondear para
-    # los porcentajes de completiva/extraordinaria, y el redondeado para mostrar.
+    # CF = promedio de los 4 PC. El valor EXACTO (cf_exacto) NO se toca: lo usan
+    # los porcentajes de completiva/extraordinaria. La CF visible/oficial usa
+    # redondeo académico (.5 sube) — v2.20.0-A1, antes round() (half-to-even).
     cf_exacto = sum(pcs) / 4
-    cf = round(cf_exacto, 0)
+    cf = redondear_calificacion_final(cf_exacto)
     
     # Literal MINERD
     if cf >= 90: literal = 'A'
@@ -6100,10 +6102,12 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
             'error': 'No hay CF calculado para este estudiante en esta asignatura. Primero deben estar las 4 competencias completas.'
         }, status_code=400)
     
-    # No tiene sentido cargar completiva si aprobó normal (corte con CF redondeado)
-    if round(ev.cf_original, 0) >= 70:
+    # No tiene sentido cargar completiva si aprobó normal. El corte usa la CF
+    # OFICIAL (redondeo académico .5-sube) — v2.20.0-A1, antes round().
+    cf_oficial = redondear_calificacion_final(ev.cf_original)
+    if cf_oficial >= 70:
         return JSONResponse({
-            'error': f'El estudiante aprobó el año normal (CF={ev.cf_original}). No necesita {tipo}.'
+            'error': f'El estudiante aprobó el año normal (CF={cf_oficial}). No necesita {tipo}.'
         }, status_code=400)
     
     # Cascada: permitir la fase pendiente O corregir la ÚLTIMA fase ya cargada
@@ -6134,7 +6138,8 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
     # (puntos que se SUMAN al CF, ej: 5, 10), no una nota de examen 0-100.
     # La suma CF + CE no puede pasar de 100.
     if tipo == 'especial':
-        cf_red = round(ev.cf_original, 0)
+        # Mismo CF OFICIAL que usa calcular_especial_final() como base.
+        cf_red = redondear_calificacion_final(ev.cf_original)
         max_ce = 100 - cf_red
         if nota_f > max_ce:
             return JSONResponse({
@@ -6172,16 +6177,20 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
 
 @app.get("/api/calificaciones-secundaria/pendientes-evaluacion-extra")
 async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depends(get_db),
-                                             current_user: Usuario = Depends(get_current_user)):
+                                             current_user: Usuario = Depends(
+                                                 RolesRequired('direccion', 'coordinador', 'profesor'))):
     """Lista de estudiantes que necesitan evaluación extra agrupados por tipo.
-    
+
     Query params (opcionales):
         curso_id: filtrar por curso
         asignatura_id: filtrar por asignatura
         tipo: completiva | extraordinaria | especial
-    
+
+    v2.20.0-A1: RBAC explícito — solo dirección / coordinación / profesor
+    (secretaría y otros roles autenticados quedan fuera; antes cualquier
+    usuario autenticado obtenía la lista del colegio).
     Dirección/coordinación: ven todo el colegio.
-    Profesor: solo de sus cursos asignados.
+    Profesor: solo de sus cursos/asignaturas con asignación ACTIVA.
     """
     # v2.15 AUDITORÍA: las evaluaciones extra son EXCLUSIVAS de secundaria.
     # Bajo el lente de primaria (coordinador de primaria o switch de dirección)
@@ -6267,21 +6276,41 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
         except (ValueError, TypeError):
             return JSONResponse({'error': 'curso_id inválido'}, status_code=400)
     
-    # Profesor: solo cursos donde está asignado
+    # Profesor: solo cursos/asignaturas con asignación ACTIVA. v2.20.0-A1: antes
+    # faltaba `activo=True` y `tenant_filter` — una asignación desactivada seguía
+    # autorizando la lectura de esos pendientes.
+    # v2.20.0-A4: la autorización es por PAREJA EXACTA (curso_id, asignatura_id).
+    # Antes se separaba en set(cursos) y set(asignaturas) y se filtraba
+    # `curso IN cursos AND asignatura IN asignaturas` — un producto cartesiano que
+    # autorizaba parejas nunca asignadas (con (C1,MAT) y (C2,CIE) dejaba ver
+    # también (C1,CIE) y (C2,MAT)).
     if current_user.role == 'profesor':
-        asigs = db.query(AsignacionProfesor.curso_id, AsignacionProfesor.asignatura_id).filter_by(
-            profesor_id=current_user.id
+        asigs = tenant_filter(
+            db.query(AsignacionProfesor), AsignacionProfesor, current_user
+        ).filter_by(
+            profesor_id=current_user.id, activo=True
+        ).with_entities(
+            AsignacionProfesor.curso_id, AsignacionProfesor.asignatura_id
         ).all()
-        if not asigs:
+        pares_activos = {(a[0], a[1]) for a in asigs}
+        if not pares_activos:
             return {'pendientes': []}
-        cursos_prof = {a[0] for a in asigs}
-        asig_prof = {a[1] for a in asigs}
-        est_ids_prof = [e.id for e in db.query(Estudiante).filter(
-            Estudiante.curso_id.in_(cursos_prof),
-            Estudiante.colegio_id == current_user.colegio_id,
-        ).all()]
-        q = q.filter(EvaluacionExtraSecundaria.estudiante_id.in_(est_ids_prof))
-        q = q.filter(EvaluacionExtraSecundaria.asignatura_id.in_(asig_prof))
+        # ids de estudiantes por curso asignado (una sola consulta por curso)
+        est_por_curso = {}
+        for cid in {c for (c, _a) in pares_activos}:
+            est_por_curso[cid] = [e.id for e in db.query(Estudiante).filter(
+                Estudiante.curso_id == cid,
+                Estudiante.colegio_id == current_user.colegio_id,
+            ).all()]
+        # OR de condiciones AND por pareja: (estudiante ∈ curso_i) Y (asignatura == asig_i)
+        condiciones_pareja = [
+            and_(
+                EvaluacionExtraSecundaria.estudiante_id.in_(est_por_curso.get(cid, [])),
+                EvaluacionExtraSecundaria.asignatura_id == aid,
+            )
+            for (cid, aid) in pares_activos
+        ]
+        q = q.filter(or_(*condiciones_pareja))
     
     pendientes = []
     for ev in q.all():
