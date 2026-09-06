@@ -481,9 +481,35 @@ ASISTENCIA_TABLE = {
     "mes_der_dia_spacing": 11.49,
 }
 
-# --- CALIFICACIONES COMPLETIVAS (Pgs 150+) ---
-# V-lines: 37.5, 54.4, 98.4, 137.9, 177.6, 217.3, 257.0, 296.7, 336.3, 376.0, 415.7, 455.4, 495.1, 534.8, 574.5
-# Columnas: No | CF | [Completiva: CF 50%, CEC 50%, CCF, CF] | [Extraordinaria: 30%, CEX, CF, EEX, CEEX, EXF] | [Especiales: CF, CE, A, R]
+# --- CALIFICACIONES COMPLETIVAS / EXTRAORDINARIAS / ESPECIALES (Pgs 150+) ---
+# v2.20.1-B2: los x-center se DERIVAN de las v-lines oficiales del template,
+# (left + right) / 2, en vez de valores aproximados a mano. Los nombres de
+# columna representan EXACTAMENTE el encabezado oficial MINERD, en orden:
+#   No | C.F. |
+#   COMPLETIVA:      50% C.F. | C.E.C | 50% C.E.C | C.C.F
+#   EXTRAORDINARIA:  30% C.F. | C.E.EX | 70% C.E.EX | C.EX.F
+#   ESPECIALES:      C.F. | C.E
+#   SITUACIÓN FINAL EN LA ASIGNATURA:  A | R
+_COMPLETIVA_VLINES = [
+    37.5, 54.4, 98.4, 137.9, 177.6, 217.3, 257.0, 296.7,
+    336.3, 376.0, 415.7, 455.4, 495.1, 534.8, 574.5,
+]
+_COMPLETIVA_COLS_ORDER = [
+    "numero",         # 37.5 - 54.4   (ya impreso en el template)
+    "cf",             # 54.4 - 98.4   C.F. oficial (entera)
+    "comp_cf_50",     # 98.4 - 137.9  50% C.F. (de la CF EXACTA)
+    "comp_cec",       # 137.9 - 177.6 C.E.C (nota examen completivo)
+    "comp_cec_50",    # 177.6 - 217.3 50% C.E.C
+    "comp_ccf",       # 217.3 - 257.0 C.C.F (completiva_final, almacenada)
+    "extra_cf_30",    # 257.0 - 296.7 30% C.F. (de la CF EXACTA)
+    "extra_ceex",     # 296.7 - 336.3 C.E.EX
+    "extra_ceex_70",  # 336.3 - 376.0 70% C.E.EX
+    "extra_final",    # 376.0 - 415.7 C.EX.F (extraordinaria_final, almacenada)
+    "espec_cf",       # 415.7 - 455.4 C.F. oficial (bloque especial)
+    "espec_ce",       # 455.4 - 495.1 C.E.
+    "situacion_a",    # 495.1 - 534.8 A (aprobado) — nota_final
+    "situacion_r",    # 534.8 - 574.5 R (reprobado) — nota_final
+]
 COMPLETIVA_TABLE = {
     "primera_fila_y_plumber": 179.6,
     "row_height": 14.2,
@@ -491,20 +517,13 @@ COMPLETIVA_TABLE = {
     "docente_x": 100,
     "docente_y_plumber": 73,
     "columnas": {
-        "numero": {"x": 43, "w": 14},
-        "cf_original": {"x": 73, "w": 38},         # 54.4 - 98.4
-        "comp_cf_50": {"x": 116, "w": 36},          # 98.4 - 137.9
-        "comp_cec_50": {"x": 156, "w": 36},         # 137.9 - 177.6
-        "comp_ccf": {"x": 196, "w": 36},            # 177.6 - 217.3
-        "comp_cf": {"x": 235, "w": 36},             # 217.3 - 257.0
-        "extra_30": {"x": 275, "w": 36},            # 257.0 - 296.7
-        "extra_c": {"x": 315, "w": 36},             # 296.7 - 336.3
-        "extra_70_c": {"x": 354, "w": 36},          # 336.3 - 376.0
-        "extra_cf": {"x": 394, "w": 36},            # 376.0 - 415.7
-        "espec_cf": {"x": 434, "w": 36},            # 415.7 - 455.4
-        "espec_ce": {"x": 473, "w": 36},            # 455.4 - 495.1
-        "espec_a": {"x": 513, "w": 36},             # 495.1 - 534.8
-        "espec_r": {"x": 553, "w": 36},             # 534.8 - 574.5
+        name: {
+            "x": round((_COMPLETIVA_VLINES[i] + _COMPLETIVA_VLINES[i + 1]) / 2, 2),
+            "left": _COMPLETIVA_VLINES[i],
+            "right": _COMPLETIVA_VLINES[i + 1],
+            "w": round(_COMPLETIVA_VLINES[i + 1] - _COMPLETIVA_VLINES[i], 2),
+        }
+        for i, name in enumerate(_COMPLETIVA_COLS_ORDER)
     },
 }
 
@@ -905,55 +924,150 @@ def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = Fa
                        f"{est['porcentaje']:.0f}", size=FONT_SIZE_ASISTENCIA, center=True)
 
 
+def _fila_completiva(cd: Optional[Dict]) -> Optional[Dict]:
+    """v2.20.1-B2: traduce la entrada de calificaciones de UN estudiante/asignatura
+    a las 13 columnas oficiales de la página Completiva/Extraordinaria/Especial.
+
+    Fuente ÚNICA de la cascada: el dict serializado `evaluacion_extra` (de
+    EvaluacionExtraSecundaria). Las notas FINALES se toman almacenadas, NO se
+    recalculan. Los porcentajes intermedios se calculan desde la CF EXACTA
+    (`ev.cf_original` / `cf_exacto`), como el Boletín MINERD en producción.
+
+    Devuelve un dict con solo las columnas que tienen dato, o None si la fila
+    no aporta nada (ni CF ni evaluación extra).
+    """
+    if not cd:
+        return None
+    cf = cd.get('cf')                 # CF OFICIAL (entera, v2.20.0)
+    cf_exacto = cd.get('cf_exacto')   # CF EXACTA interna (para %)
+    ev = cd.get('evaluacion_extra')   # dict serializado o None
+
+    if cf is None and not ev:
+        return None
+
+    cf_oficial = int(round(cf)) if cf is not None else None
+
+    # Base EXACTA para los porcentajes: preferir cf_original de la evaluación
+    # extra (es el valor exacto cacheado), luego cf_exacto, luego la CF oficial.
+    if ev is not None and ev.get('cf_original') is not None:
+        base_pct = ev['cf_original']
+    elif cf_exacto is not None:
+        base_pct = cf_exacto
+    else:
+        base_pct = cf
+
+    reprobo_ano = cf_oficial is not None and cf_oficial < 70
+    fila: Dict = {}
+
+    # --- C.F. oficial ---
+    if cf_oficial is not None:
+        fila['cf'] = cf_oficial
+
+    # --- COMPLETIVA ---
+    if reprobo_ano and base_pct is not None:
+        fila['comp_cf_50'] = round(base_pct * 0.5, 1)
+    if ev is not None and ev.get('cec') is not None:
+        fila['comp_cec'] = ev['cec']
+        fila['comp_cec_50'] = round(ev['cec'] * 0.5, 1)
+    if ev is not None and ev.get('completiva_final') is not None:
+        fila['comp_ccf'] = ev['completiva_final']
+
+    # --- EXTRAORDINARIA (se "inicia" al no aprobar completiva o al cargar CEEX) ---
+    extra_iniciada = ev is not None and (
+        ev.get('ceex') is not None
+        or ev.get('fase_pendiente') == 'extraordinaria'
+        or (ev.get('completiva_final') is not None and ev['completiva_final'] < 70)
+    )
+    if extra_iniciada and base_pct is not None:
+        fila['extra_cf_30'] = round(base_pct * 0.3, 1)
+    if ev is not None and ev.get('ceex') is not None:
+        fila['extra_ceex'] = ev['ceex']
+        fila['extra_ceex_70'] = round(ev['ceex'] * 0.7, 1)
+    if ev is not None and ev.get('extraordinaria_final') is not None:
+        fila['extra_final'] = ev['extraordinaria_final']
+
+    # --- ESPECIAL (se "inicia" al no aprobar extraordinaria o al cargar CE) ---
+    espec_iniciada = ev is not None and (
+        ev.get('ce') is not None
+        or ev.get('fase_pendiente') == 'especial'
+        or (ev.get('extraordinaria_final') is not None and ev['extraordinaria_final'] < 70)
+    )
+    if espec_iniciada and cf_oficial is not None:
+        fila['espec_cf'] = cf_oficial
+    if ev is not None and ev.get('ce') is not None:
+        fila['espec_ce'] = ev['ce']
+
+    # --- SITUACIÓN FINAL EN LA ASIGNATURA (A / R) ---
+    # Regla B2: NO marcar A ni R mientras haya una fase pendiente. La columna
+    # afirma un resultado FINAL; un estado provisional 'reprobado' no lo es.
+    a = r = None
+    if ev is not None:
+        fp = ev.get('fase_pendiente')
+        if fp in ('completiva', 'extraordinaria', 'especial'):
+            a = r = None
+        else:
+            cond = ev.get('condicion_final') or ''
+            nf = ev.get('nota_final')
+            if cond.startswith('aprobado_'):
+                a = nf
+            elif cond == 'reprobado':
+                r = nf
+    else:
+        # Sin evaluación extra: solo cuenta la CF normal.
+        if cf_oficial is not None and cf_oficial >= 70:
+            a = cf_oficial
+        # cf_oficial < 70 y sin ev => pendiente de Completiva => A/R vacío.
+
+    if a is not None:
+        fila['situacion_a'] = a
+    if r is not None:
+        fila['situacion_r'] = r
+
+    return fila or None
+
+
 def draw_completiva(c: canvas.Canvas, datos: Dict):
     """
-    Dibuja calificaciones completivas/extraordinarias (1 pg por asignatura).
+    Dibuja calificaciones completivas / extraordinarias / especiales
+    (1 página por asignatura). v2.20.1-B2.
+
     datos: {
         "docente": str,
-        "calificaciones": [
-            {  # por estudiante (hasta 40)
-                "cf_original": float,
-                "comp_cf_50": float,
-                "comp_cec_50": float,
-                "comp_ccf": float,
-                "comp_cf": float,
-                "extra_30": float,
-                "extra_c": float,
-                "extra_70_c": float,
-                "extra_cf": float,
-                "espec_cf": float,
-                "espec_ce": float,
-                "espec_a": str,  # "A" = Aprobado
-                "espec_r": str,  # "R" = Reprobado
-            }
-        ]
+        "calificaciones": [ <fila> | None, ... ]   # índice = fila del estudiante
     }
+    donde <fila> es lo que devuelve `_fila_completiva`: subconjunto de
+      cf, comp_cf_50, comp_cec, comp_cec_50, comp_ccf,
+      extra_cf_30, extra_ceex, extra_ceex_70, extra_final,
+      espec_cf, espec_ce, situacion_a, situacion_r
+    Un valor 0 es válido y SE dibuja (se usa `is not None`, nunca `if valor`).
     """
     table = COMPLETIVA_TABLE
-    
+
     # Docente
     if datos.get("docente"):
         _draw_text(c, table["docente_x"], _y(table["docente_y_plumber"]),
                    datos["docente"], size=FONT_SIZE_NOTA, max_width=250)
-    
+
     for i, est in enumerate(datos.get("calificaciones", [])[:40]):
         if not est:
             continue
-        
+
         row_y_plumber = table["primera_fila_y_plumber"] + (i * table["row_height"])
         y = _y(row_y_plumber + table["row_height"] - 3)
-        
+
         for col_name, col_info in table["columnas"].items():
             if col_name == "numero":
-                continue  # El número ya está impreso
-            
+                continue  # El número ya está impreso en el template
+
             valor = est.get(col_name)
-            if valor is not None and valor != "":
-                text = str(valor)
-                if isinstance(valor, float):
-                    text = f"{valor:.0f}" if valor == int(valor) else f"{valor:.1f}"
-                _draw_text(c, col_info["x"], y, text,
-                           size=FONT_SIZE_NOTA, center=True)
+            if valor is None:
+                continue  # 0 SÍ se dibuja; None no
+
+            texto = _fmt_nota(valor)  # entero si ~entero, si no 1 decimal (igual que el Boletín)
+            if texto == "":
+                continue
+            _draw_text(c, col_info["x"], y, texto,
+                       size=FONT_SIZE_NOTA, center=True)
 
 
 def draw_promocion_izq(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: List[str]):
@@ -1851,7 +1965,33 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         califs = asignaturas_data[asig_nombre].get('calificaciones', {})
         if califs:
             calificaciones_data[asig_idx] = califs
-    
+
+    # === TRADUCIR COMPLETIVA / EXTRAORDINARIA / ESPECIAL (v2.20.1-B2) ===
+    # Una entrada por asignatura, con una lista alineada al orden de estudiantes
+    # del Registro. Fuente única de la cascada: `evaluacion_extra` ya serializado
+    # en asignaturas_data[...]['calificaciones'][idx]. Si ninguna fila aporta
+    # dato (ni CF ni evaluación extra), la asignatura NO entra y su página queda
+    # idéntica al template.
+    completiva_data = {}
+    for asig_nombre in asigs_minerd:
+        if asig_nombre not in asignaturas_data:
+            continue
+        data_asig = asignaturas_data[asig_nombre]
+        califs = data_asig.get('calificaciones', {}) or {}
+        filas = []
+        tiene_algo = False
+        for i in range(num_est):
+            fila = _fila_completiva(califs.get(i))
+            filas.append(fila)
+            if fila:
+                tiene_algo = True
+        if tiene_algo:
+            asig_key = asig_nombre.lower().replace(" ", "_").replace("-", "_")
+            completiva_data[asig_key] = {
+                "docente": data_asig.get('docente', ''),
+                "calificaciones": filas,
+            }
+
     # === TRADUCIR PROMOCION ===
     promocion_data = []
     for idx in range(num_est):
@@ -1872,6 +2012,7 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         estudiantes=estudiantes_nuevo,
         asistencia_data=asistencia_data if asistencia_data else None,
         calificaciones_data=calificaciones_data if calificaciones_data else None,
+        completiva_data=completiva_data if completiva_data else None,
         promocion_data=promocion_data if any(p for p in promocion_data) else None,
         marca_borrador=marca_borrador,
     )
