@@ -31,6 +31,11 @@ from registro_borrador import (
 # vez de reescribirlo para que no puedan divergir. `boletin_minerd_secundaria`
 # no importa este módulo, así que no hay ciclo.
 from boletin_minerd_secundaria import _fmt_nota
+# v2.20.1-B2.1: la CF OFICIAL visible se redondea con el criterio académico
+# (.5 SIEMPRE sube — Decimal + ROUND_HALF_UP), NUNCA con round() (half-to-even).
+# Es el MISMO helper que v2.20.0 usa en el modelo y el endpoint; se importa para
+# no poder divergir. reglas_academicas no importa este módulo (no hay ciclo).
+from reglas_academicas import redondear_calificacion_final
 
 # ============================================================================
 # CONSTANTES
@@ -945,7 +950,9 @@ def _fila_completiva(cd: Optional[Dict]) -> Optional[Dict]:
     if cf is None and not ev:
         return None
 
-    cf_oficial = int(round(cf)) if cf is not None else None
+    # CF OFICIAL: redondeo académico (.5 sube), no round() builtin. La ruta
+    # moderna ya entrega `cf` entero, pero el fallback legacy puede traer decimal.
+    cf_oficial = redondear_calificacion_final(cf) if cf is not None else None
 
     # Base EXACTA para los porcentajes: preferir cf_original de la evaluación
     # extra (es el valor exacto cacheado), luego cf_exacto, luego la CF oficial.
@@ -1484,17 +1491,20 @@ def generar_registro_escolar(
                 buf = _create_overlay_page(draw_completiva, asig_comp)
                 overlays[pg_idx] = buf
             
-            # Salida optativa (solo 4to-6to)
-            salida_opt_paginas = config.get("completiva_salida_optativa", [])
-            if salida_opt_paginas:
-                asig_key = "salida_optativa"
-                asig_comp = completiva_data.get(asig_key, {})
-                if asig_comp:
-                    for pg_num in salida_opt_paginas:
-                        pg_idx = pg_num - 1
-                        if pg_idx < total_pages:
-                            buf = _create_overlay_page(draw_completiva, asig_comp)
-                            overlays[pg_idx] = buf
+            # Salida optativa (solo 4to-6to) — DESACTIVADO en v2.20.1-B2.1.
+            # Las seis páginas 211/212/214/217/219/221 son bloques de Salida
+            # Optativa intercalados con distintas áreas del template. EducaOne
+            # modela hoy UNA sola asignatura genérica "Salida Optativa" y NO hay
+            # un mapeo inequívoco asignatura real → página específica; replicar
+            # la misma nota en las seis crearía información académica falsa.
+            # Por eso NO se estampa ningún overlay de completiva_data genérico
+            # sobre esas páginas: quedan idénticas al template.
+            # TODO futuro: mapear la Salida Optativa real por área/página y
+            # entonces reactivar este bloque con datos por página (no replicados).
+            #
+            # salida_opt_paginas = config.get("completiva_salida_optativa", [])
+            # if salida_opt_paginas and completiva_data.get("salida_optativa"):
+            #     ...  # requiere mapping por página, aún inexistente
         else:
             # Fallback: calcular por offset
             comp_inicio = config["completiva_inicio"] - 1
@@ -1972,9 +1982,21 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
     # en asignaturas_data[...]['calificaciones'][idx]. Si ninguna fila aporta
     # dato (ni CF ni evaluación extra), la asignatura NO entra y su página queda
     # idéntica al template.
+    #
+    # v2.20.1-B2.1 — SALIDA OPTATIVA: en el template de ciclo 2 hay SEIS páginas
+    # (211,212,214,217,219,221) que son bloques de Salida Optativa intercalados
+    # con distintas áreas. EducaOne modela hoy UNA sola asignatura genérica
+    # "Salida Optativa"; NO existe todavía un mapeo inequívoco asignatura real →
+    # página específica. Estampar la misma nota en las seis páginas produciría
+    # información académica falsa, así que la Salida Optativa se EXCLUYE de la
+    # integración: sus seis páginas quedan sin overlay de notas extra.
+    # TODO futuro: mapear la Salida Optativa real por área/página antes de activarla.
+    _EXCLUIR_COMPLETIVA = {"Salida Optativa"}
     completiva_data = {}
     for asig_nombre in asigs_minerd:
         if asig_nombre not in asignaturas_data:
+            continue
+        if asig_nombre in _EXCLUIR_COMPLETIVA:
             continue
         data_asig = asignaturas_data[asig_nombre]
         califs = data_asig.get('calificaciones', {}) or {}

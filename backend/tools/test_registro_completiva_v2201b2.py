@@ -232,6 +232,49 @@ def _():
     assert _fmt_nota(0) == "0"  # se dibuja, no se salta
 
 
+@test("§B2.1-CF CF oficial usa redondeo académico (.5 SUBE), no round() builtin: 68.5→69, 69.5→70, 70.5→71")
+def _():
+    from reglas_academicas import redondear_calificacion_final as _rac
+    # oráculo académico (NO Python round(); round(68.5)=68, round(70.5)=70 con half-to-even)
+    for v, esperado in ((68.5, 69), (69.5, 70), (70.5, 71)):
+        assert _rac(v) == esperado, (v, _rac(v))
+        f = _fila_completiva(mk_cd(cf=v, cf_exacto=v, ev=None))
+        assert f["cf"] == esperado, (v, f["cf"])
+    # 68.5 in ('espec_cf') también redondea académico
+    ev = mk_ev(cf_original=68.5, cec=None, ce=None, fase_pendiente="completiva",
+               condicion_final="reprobado", nota_final=69)
+    f = _fila_completiva(mk_cd(cf=68.5, cf_exacto=68.5, ev=ev))
+    assert f["cf"] == 69
+
+
+@test("§B2.1-CF-2 cf=69.5 sin ev → C.F.=70 y A=70 (aprobado normal, NO pendiente Completiva)")
+def _():
+    f = _fila_completiva(mk_cd(cf=69.5, cf_exacto=69.5, ev=None))
+    assert f["cf"] == 70, f
+    assert f.get("situacion_a") == 70, f
+    assert "situacion_r" not in f
+    assert "comp_cf_50" not in f  # 70 >= 70 -> no reprobó el año
+
+
+@test("§B2.1-CF-3 cf=68.5 sin ev → C.F.=69, comp_cf_50 desde la BASE EXACTA (68.5·0.5), A/R vacío")
+def _():
+    f = _fila_completiva(mk_cd(cf=68.5, cf_exacto=68.5, ev=None))
+    assert f["cf"] == 69, f
+    # el % se calcula sobre la base exacta 68.5, no sobre la CF oficial 69
+    assert f["comp_cf_50"] == round(68.5 * 0.5, 1), f["comp_cf_50"]
+    assert f["comp_cf_50"] != round(69 * 0.5, 1) or 68.5 * 0.5 == 69 * 0.5  # 34.25 vs 34.5
+    assert "situacion_a" not in f and "situacion_r" not in f, f
+
+
+@test("§23-b _fila_completiva NO usa round() builtin para la CF oficial (usa redondear_calificacion_final)")
+def _():
+    import inspect
+    src = inspect.getsource(_fila_completiva)
+    # no debe existir 'round(cf)' ni 'int(round(' aplicado a la CF oficial
+    assert "int(round(cf))" not in src, src
+    assert "redondear_calificacion_final(cf)" in src, src
+
+
 @test("§25 A/R NUNCA se llena mientras fase_pendiente != None (aunque condicion_final diga 'reprobado')")
 def _():
     for fp in ("completiva", "extraordinaria", "especial"):
@@ -404,15 +447,40 @@ def _():
     assert _page_has_data_overlay(rd, 224), "pg 224 (FIHR completiva) sin overlay"
 
 
-@test("§16 Salida Optativa (ciclo 2): dibuja en sus páginas existentes 211,212,214,217,219,221")
+@test("§16 [B2.1] Salida Optativa genérica NO se replica: pgs 211/212/214/217/219/221 SIN overlay de notas extra")
 def _():
+    # Asignatura genérica "Salida Optativa" con datos de cascada: NO debe estamparse
+    # en ninguna de las seis páginas de Salida Optativa (no hay mapeo inequívoco).
     ev = mk_ev(cf_original=50.0, cec=90, completiva_final=70,
                condicion_final="aprobado_completiva", nota_final=70, fase_pendiente=None)
-    califs = {"Salida Optativa": {0: _cd_full(50, 50.0, ev)}}
+    califs = {"Salida Optativa": {0: _cd_full(50, 50.0, ev)},
+              # una asignatura BASE con datos, para probar que el ciclo 2 sí funciona
+              "Matemática": {0: _cd_full(55, 55.0, mk_ev(
+                  cf_original=55.0, cec=85, completiva_final=70,
+                  condicion_final="aprobado_completiva", nota_final=70, fase_pendiente=None))}}
     pdf = _gen(5, califs)
     rd = PdfReader(io.BytesIO(pdf))
     for pg in (211, 212, 214, 217, 219, 221):
-        assert _page_has_data_overlay(rd, pg), f"Salida Optativa pg {pg} sin overlay"
+        assert not _page_has_data_overlay(rd, pg), \
+            f"Salida Optativa pg {pg} recibió overlay genérico replicado (B2.1 lo prohíbe)"
+    # la asignatura BASE Matemática (pg 216 en ciclo 2) SÍ debe tener overlay
+    assert _page_has_data_overlay(rd, 216), "pg 216 (Matemática, base ciclo 2) sin overlay"
+
+
+@test("§16-b [B2.1] páginas BASE de ciclo 2 siguen funcionando (210..224) con datos de cascada")
+def _():
+    ev = mk_ev(cf_original=48.0, cec=80, completiva_final=64,
+               ceex=None, condicion_final="reprobado", nota_final=64, fase_pendiente="extraordinaria")
+    califs = {a: {0: _cd_full(48, 48.0, ev)} for a in
+             ("Lengua Española", "Lenguas Extranjeras - Inglés", "Lenguas Extranjeras - Francés",
+              "Matemática", "Ciencias Sociales", "Ciencias de la Naturaleza",
+              "Educación Artística", "Educación Física", "Formación Integral Humana y Religiosa")}
+    pdf = _gen(6, califs)
+    rd = PdfReader(io.BytesIO(pdf))
+    for pg in (210, 213, 215, 216, 218, 220, 222, 223, 224):
+        assert _page_has_data_overlay(rd, pg), f"página base ciclo 2 pg {pg} sin overlay"
+    for pg in (211, 212, 214, 217, 219, 221):
+        assert not _page_has_data_overlay(rd, pg), f"Salida Optativa pg {pg} con overlay indebido"
 
 
 @test("§17 página SIN datos (asignatura sin CF ni ev para nadie) permanece SIN overlay de datos")
@@ -665,7 +733,7 @@ def _():
 # RESUMEN
 # ═══════════════════════════════════════════════════════════════════════════
 print(f"\n{B}{'=' * 66}{X}")
-print(f"{B}  RESUMEN v2.20.1-B2{X}")
+print(f"{B}  RESUMEN v2.20.1-B2.1{X}")
 print(f"{B}{'=' * 66}{X}")
 print(f"  {G}{_ok} PASARON{X} / {R}{len(_fail)} FALLARON{X}  (de {_total})")
 for n, e in _fail:
