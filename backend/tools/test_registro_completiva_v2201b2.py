@@ -352,6 +352,59 @@ def _():
     assert n_check >= 12, f"solo se verificaron {n_check} celdas"
 
 
+@test("§B2.1.1 nombre del docente: arranca tras el recuadro DOCENTE, baseline alineada, no lo toca, respeta max_width")
+def _():
+    # Template real (idéntico en los 6 grados): label 'DOCENTE' ocupa
+    #   x ≈ 64.2 .. 105.1 ;  y_top ≈ 72.9 .. 81.7  ->  baseline PDF ≈ 710.3
+    #   línea de la grilla justo debajo: y_top 87.8  ->  PDF y ≈ 704.2
+    LABEL_RIGHT_X = 105.1
+    LABEL_BASELINE_PDF = 710.3
+    GRID_LINE_PDF = 704.2
+    T = COMPLETIVA_TABLE
+    baseline_pdf = 792 - T["docente_y_plumber"]
+    # 1) baseline del nombre alineada con la del label (± 3 pt) y por ENCIMA de la grilla
+    assert abs(baseline_pdf - LABEL_BASELINE_PDF) <= 3.0, (baseline_pdf, LABEL_BASELINE_PDF)
+    assert baseline_pdf > GRID_LINE_PDF, (baseline_pdf, GRID_LINE_PDF)
+    # 2) el nombre arranca DESPUÉS del recuadro, con separación visual (>= 15 pt)
+    assert T["docente_x"] >= LABEL_RIGHT_X + 15, (T["docente_x"], LABEL_RIGHT_X)
+
+    for nombre in ("Luis Dorismon", "Roxanna Montero"):
+        buf = _create_overlay_page(draw_completiva, {"docente": nombre, "calificaciones": [{"cf": 64}]})
+        pg = PdfReader(buf).pages[0]
+        hits = []
+
+        def vis(t, cm, tm, fd, fs):
+            s = (t or "").strip()
+            if s:
+                hits.append((round(float(tm[4]), 2), round(float(tm[5]), 2), s))
+        pg.extract_text(visitor_text=vis)
+        doc = [h for h in hits if h[2] != "64"]
+        assert doc, f"no se dibujó el docente {nombre!r}"
+        left_x = min(h[0] for h in doc)
+        y = doc[0][1]
+        rendered = " ".join(h[2] for h in doc)
+        width = stringWidth(rendered, "Helvetica", 8)
+        assert left_x >= LABEL_RIGHT_X, f"{nombre!r}: left_x {left_x} pisa el label (<= {LABEL_RIGHT_X})"
+        assert left_x == T["docente_x"], (left_x, T["docente_x"])
+        assert abs(y - baseline_pdf) < 0.5, (y, baseline_pdf)
+        assert width <= 250, f"{nombre!r} excede max_width: {width}"
+
+    # 3) nombre MUY largo: se trunca por max_width y no sale del área
+    largo = "Prof. Maria de los Angeles Santana Rodriguez del Sagrado Corazon"
+    buf = _create_overlay_page(draw_completiva, {"docente": largo, "calificaciones": [{"cf": 64}]})
+    pg = PdfReader(buf).pages[0]
+    hits = []
+
+    def vis2(t, cm, tm, fd, fs):
+        s = (t or "").strip()
+        if s and s != "64":
+            hits.append((round(float(tm[4]), 2), s))
+    pg.extract_text(visitor_text=vis2)
+    rendered = " ".join(s for _x, s in hits)
+    assert stringWidth(rendered, "Helvetica", 8) <= 250, stringWidth(rendered, "Helvetica", 8)
+    assert min(x for x, _s in hits) == T["docente_x"]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PARTE 3 — PDF completo vía generar_registro_desde_sistema (sin DB)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -733,7 +786,7 @@ def _():
 # RESUMEN
 # ═══════════════════════════════════════════════════════════════════════════
 print(f"\n{B}{'=' * 66}{X}")
-print(f"{B}  RESUMEN v2.20.1-B2.1{X}")
+print(f"{B}  RESUMEN v2.20.1.1{X}")
 print(f"{B}{'=' * 66}{X}")
 print(f"  {G}{_ok} PASARON{X} / {R}{len(_fail)} FALLARON{X}  (de {_total})")
 for n, e in _fail:
