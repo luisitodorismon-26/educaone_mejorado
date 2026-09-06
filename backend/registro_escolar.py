@@ -22,7 +22,10 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import mm
 from pypdf import PdfReader, PdfWriter
-from registro_borrador import crear_xobject_borrador, estampar_borrador
+from registro_borrador import (
+    crear_xobject_borrador, estampar_borrador,
+    crear_xobject_desde_overlay, estampar_xobject, nombre_xobject_libre,
+)
 # v2.19.7: el formato de las notas es el MISMO que ya usa el boletín oficial de
 # secundaria — "entero si es CF, 1 decimal si es PC/competencia". Se importa en
 # vez de reescribirlo para que no puedan divergir. `boletin_minerd_secundaria`
@@ -1414,22 +1417,33 @@ def generar_registro_escolar(
     # generaba el PDF entero, se serializaba, se volvía a parsear y se recorrían
     # las 170 páginas otra vez solo para sellarlas. El sello se construye una
     # vez por geometría de página (en la práctica, una sola vez).
+    #
+    # v2.19.9: los overlays de DATOS también se aplican como Form XObject (misma
+    # técnica que el sello), NO con merge_page(). merge_page descomprimía y
+    # re-parseaba el content-stream del template en cada página —el 73 % del
+    # tiempo de generación (auditoría v2.19.9)—. Ahora el template no se toca:
+    # la página gana una referencia `/EODataOverlayN Do`. Orden de dibujo por
+    # página: TEMPLATE -> DATOS -> BORRADOR.
     refs_borrador = {}
 
     for pg_idx in range(total_pages):
         template_page = template_reader.pages[pg_idx]
-        
+
+        pagina = writer.add_page(template_page)
+
+        # DATOS: overlay ReportLab de esta página como Form XObject encadenado
+        # al /Contents. `pg_idx in overlays` solo es cierto para páginas con
+        # contenido real (portada, centro, estudiantes, asistencia con datos,
+        # calificaciones, promoción): las demás no reciben ningún XObject.
         if pg_idx in overlays:
             overlay_reader = PdfReader(overlays[pg_idx])
             if len(overlay_reader.pages) > 0:
-                overlay_page = overlay_reader.pages[0]
-                template_page.merge_page(overlay_page)
-        
-        pagina = writer.add_page(template_page)
+                nombre = nombre_xobject_libre(pagina, "/EODataOverlay")
+                ref = crear_xobject_desde_overlay(writer, overlay_reader.pages[0])
+                estampar_xobject(writer, pagina, ref, nombre)
 
         if marca_borrador:
-            # Después del merge del contenido, para que el sello quede ENCIMA
-            # (mismo orden visual que la pasada separada que había antes).
+            # Después de los DATOS, para que el sello quede ENCIMA de todo.
             ancho = float(pagina.mediabox.width)
             alto = float(pagina.mediabox.height)
             clave = (round(ancho, 2), round(alto, 2))
