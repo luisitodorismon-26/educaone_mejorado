@@ -17,7 +17,7 @@ def _now_dr():
     return datetime.now(timezone(timedelta(hours=-4))).replace(tzinfo=None)
 
 from database import Base
-from reglas_academicas import redondear_calificacion_final
+from reglas_academicas import redondear_calificacion_final, ponderar_y_redondear
 
 # ============== COLEGIO (MULTI-TENANT) ==============
 
@@ -1192,19 +1192,25 @@ class EvaluacionExtraSecundaria(Base):
         """50% C.F. + 50% C.E.C. → entero con REDONDEO ACADÉMICO (.5 sube).
 
         v2.20.0-A1: la ponderación se calcula sobre la CF EXACTA (cf_original);
-        solo el resultado final se redondea, ahora con
-        redondear_calificacion_final() en vez de round() (half-to-even).
+        solo el resultado final se redondea, con redondeo académico (.5 sube).
+        v2.20.0-A3: la ponderación 50/50 se hace ENTERAMENTE en Decimal desde
+        los operandos (ver ponderar_y_redondear), evitando que un artefacto
+        float como 69.49999999999999 tumbe un resultado exacto de 69.5.
+        No cambia la fórmula ni usa la CF oficial como base.
         """
         if self.cf_original is None or self.cec is None:
             return None
-        return redondear_calificacion_final(0.5 * self.cf_original + 0.5 * self.cec)
+        return ponderar_y_redondear(self.cf_original, "0.5", self.cec, "0.5")
 
     def calcular_extraordinaria_final(self):
         """30% C.F. + 70% C.E.EX → entero con redondeo académico (.5 sube).
-        Ponderación sobre la CF EXACTA; solo se cambia el redondeo final."""
+        Ponderación sobre la CF EXACTA.
+        v2.20.0-A3: la ponderación 30/70 se hace ENTERAMENTE en Decimal desde
+        los operandos (ver ponderar_y_redondear). Ej.: CF=17, CEEX=92 →
+        0.3·17 + 0.7·92 = 5.1 + 64.4 = 69.5 → 70 (antes float daba 69)."""
         if self.cf_original is None or self.ceex is None:
             return None
-        return redondear_calificacion_final(0.3 * self.cf_original + 0.7 * self.ceex)
+        return ponderar_y_redondear(self.cf_original, "0.3", self.ceex, "0.7")
 
     def calcular_especial_final(self):
         """C.F. OFICIAL + C.E. — suma complementaria sin ponderación.

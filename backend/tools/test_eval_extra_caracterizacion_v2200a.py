@@ -53,7 +53,7 @@ def _cleanup_tmpdir():
 
 
 from database import engine, SessionLocal
-from reglas_academicas import redondear_calificacion_final
+from reglas_academicas import redondear_calificacion_final, ponderar_y_redondear
 from models import (
     Base, Usuario, Grado, Curso, Asignatura, Estudiante, AnoEscolar,
     AsignacionProfesor, CalificacionSecundaria, EvaluacionExtraSecundaria,
@@ -395,6 +395,111 @@ def _():
     assert e.nota_final == 70, f"nota_final={e.nota_final!r}"
     assert e.condicion_final == 'aprobado_normal', f"condicion_final={e.condicion_final!r}"
     assert e.fase_pendiente() is None, f"fase={e.fase_pendiente()!r}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v2.20.0-A3 — PRECISIÓN DECIMAL EN LAS PONDERACIONES 50/50 y 30/70
+# La ponderación se hace ENTERAMENTE en Decimal desde los operandos
+# (ponderar_y_redondear), no en float antes de envolver en Decimal. Un
+# resultado matemático exacto de 69.5 debe subir a 70 (HALF_UP), sin que
+# un artefacto float 69.49999999999999 lo tumbe a 69.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _extra_float_viejo(cf, ceex):
+    """Ruta A2 (float primero, Decimal después) — para contraste en los tests."""
+    return redondear_calificacion_final(0.3 * cf + 0.7 * ceex)
+
+def _comp_float_viejo(cf, cec):
+    return redondear_calificacion_final(0.5 * cf + 0.5 * cec)
+
+@check("§A3-1 helper ponderar_y_redondear: 0.3·17 + 0.7·92 = 69.5 → 70 (la ruta float vieja daba 69)")
+def _():
+    assert ponderar_y_redondear(17, "0.3", 92, "0.7") == 70, ponderar_y_redondear(17, "0.3", 92, "0.7")
+    assert _extra_float_viejo(17, 92) == 69, "se esperaba que la ruta float vieja fallara con 69"
+    # exactitud de la aritmética Decimal
+    assert (Decimal("0.3") * Decimal("17") + Decimal("0.7") * Decimal("92")) == Decimal("69.5")
+
+@check("§A3-2 BLOCKER CF=17, CEEX=92 → extraordinaria_final==70, condicion=='aprobado_extraordinaria', fase_pendiente()==None")
+def _():
+    # cec se incluye porque en la cascada real un estudiante que rinde
+    # Extraordinaria ya pasó por Completiva; con cec<... la completiva queda <70
+    # y la decisión depende de la Extraordinaria (que es el objeto del blocker).
+    e = _recalc(_ev(cf=17, cec=40, ceex=92))
+    assert e.completiva_final == 29 and e.completiva_final < 70, f"completiva_final={e.completiva_final!r}"
+    assert e.extraordinaria_final == 70, f"extraordinaria_final={e.extraordinaria_final!r} (esperado 70)"
+    assert e.condicion_final == 'aprobado_extraordinaria', f"condicion_final={e.condicion_final!r}"
+    assert e.fase_pendiente() is None, f"fase={e.fase_pendiente()!r}"
+    assert e.nota_final == 70, f"nota_final={e.nota_final!r}"
+    assert e.cf_original == 17, f"cf_original mutó a {e.cf_original!r}"
+    # el resultado exacto es 0.3·17 + 0.7·92 = 69.5 (la ruta float vieja daba 69)
+    assert _extra_float_viejo(17, 92) == 69
+
+@check("§A3-3 BLOCKER CF=64.6, CEEX=71.6 → 0.3·64.6 + 0.7·71.6 = 19.38 + 50.12 = 69.5 → extraordinaria_final==70")
+def _():
+    e = _recalc(_ev(cf=64.6, cec=60, ceex=71.6))
+    assert e.completiva_final == 62 and e.completiva_final < 70, f"completiva_final={e.completiva_final!r}"
+    assert e.extraordinaria_final == 70, f"extraordinaria_final={e.extraordinaria_final!r} (esperado 70, no 69)"
+    assert e.condicion_final == 'aprobado_extraordinaria', f"condicion_final={e.condicion_final!r}"
+    assert e.fase_pendiente() is None, f"fase={e.fase_pendiente()!r}"
+    assert e.cf_original == 64.6, f"cf_original mutó a {e.cf_original!r}"
+    assert _extra_float_viejo(64.6, 71.6) == 69
+
+@check("§A3-4 NO inflar: CF=17, CEC=40, CEEX=91.9 → 0.3·17 + 0.7·91.9 = 69.43 (< 69.5) → extraordinaria_final==69, sigue reprobado")
+def _():
+    e = _recalc(_ev(cf=17, cec=40, ceex=91.9))
+    assert e.extraordinaria_final == 69, f"extraordinaria_final={e.extraordinaria_final!r} (esperado 69)"
+    assert e.condicion_final == 'reprobado', f"condicion_final={e.condicion_final!r}"
+    assert e.fase_pendiente() == 'especial', f"fase={e.fase_pendiente()!r}"
+
+@check("§A3-5 Completiva conserva 50/50 sobre CF EXACTA con redondeo HALF_UP: cf=69,cec=70 → 69.5 → 70 ; cf=68.975,cec=70.025 → 69.5 → 70")
+def _():
+    assert _recalc(_ev(cf=69, cec=70)).completiva_final == 70
+    e = _recalc(_ev(cf=68.975, cec=70.025))
+    assert (Decimal("0.5") * Decimal("68.975") + Decimal("0.5") * Decimal("70.025")) == Decimal("69.500000")
+    assert e.completiva_final == 70, f"completiva_final={e.completiva_final!r} (esperado 70 por HALF_UP)"
+    # y no usa la CF oficial como base (68.975 → base exacta, no 69)
+    e2 = _recalc(_ev(cf=63.5, cec=77))   # exacto 31.75 + 38.5 = 70.25 → 70 ; con CF pre-red 64: 71
+    assert e2.completiva_final == 70
+
+@check("§A3-6 Completiva 50/50: Decimal-desde-operandos == valor matemático exacto en toda la rejilla cf∈{0..69.9/.1}, cec∈{0..100}")
+def _():
+    cf = 0.0
+    peor = None
+    while cf <= 69.9 + 1e-9:
+        cfr = round(cf, 1)
+        for cec in range(0, 101):
+            got = ponderar_y_redondear(cfr, "0.5", cec, "0.5")
+            exact = int((Decimal(str(cfr)) * Decimal("0.5") + Decimal(str(cec)) * Decimal("0.5"))
+                        .quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            if got != exact:
+                peor = (cfr, cec, got, exact)
+        cf = round(cf + 0.1, 1)
+    assert peor is None, f"divergencia Decimal vs exacto en {peor}"
+
+@check("§A3-7 Extraordinaria 30/70: ponderar_y_redondear NUNCA queda por debajo del valor matemático exacto (no baja notas) — rejilla cf∈{0..69.9/.1}, ceex∈{0..100}")
+def _():
+    cf = 0.0
+    bajas = []
+    while cf <= 69.9 + 1e-9:
+        cfr = round(cf, 1)
+        for ceex in range(0, 101):
+            got = ponderar_y_redondear(cfr, "0.3", ceex, "0.7")
+            exact = int((Decimal(str(cfr)) * Decimal("0.3") + Decimal(str(ceex)) * Decimal("0.7"))
+                        .quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            if got < exact:
+                bajas.append((cfr, ceex, got, exact))
+        cf = round(cf + 0.1, 1)
+    assert not bajas, f"A3 quedó por debajo del exacto en {bajas[:5]}"
+
+@check("§A3-8 ponderar_y_redondear acepta int/float/Decimal indistintamente y da el mismo entero")
+def _():
+    from decimal import Decimal as D
+    r_int = ponderar_y_redondear(17, "0.3", 92, "0.7")
+    r_float = ponderar_y_redondear(17.0, "0.3", 92.0, "0.7")
+    r_dec = ponderar_y_redondear(D("17"), D("0.3"), D("92"), D("0.7"))
+    assert r_int == r_float == r_dec == 70, (r_int, r_float, r_dec)
+    assert ponderar_y_redondear(None, "0.5", 70, "0.5") is None
+    assert ponderar_y_redondear(50, "0.5", None, "0.5") is None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -836,7 +941,7 @@ for (v, py, prod, aca, py_ok, prod_ok) in TABLA_BANKERS:
           f"{c1}{'sí' if py_ok else 'NO':>15}{X} | {c2}{'sí' if prod_ok else 'NO':>14}{X}")
 
 print(f"\n{B}{'=' * 74}{X}")
-print(f"{B}  RESUMEN v2.20.0-A2{X}")
+print(f"{B}  RESUMEN v2.20.0-A3{X}")
 print(f"{B}{'=' * 74}{X}")
 print(f"  [INV] invariantes         : {G}{len(inv_ok)} OK{X} / {R}{len(inv_fail)} FALLAN{X}")
 print(f"  [CAR] caracteriz./diferido : {G}{len(car_ok)} coinciden{X} / {Y}{len(car_bug)} pendiente{X}")
@@ -869,5 +974,5 @@ print(f"{G}✓ SEGURIDAD: sge.db del repo intacto (no leído ni escrito por la s
 # Las caracterizaciones [CAR] son bugs DIFERIDOS a propósito (documentados).
 if inv_fail or errores:
     sys.exit(1)
-print(f"\n{G}{B}✔ v2.20.0-A2: {len(inv_ok)} invariantes verdes. "
+print(f"\n{G}{B}✔ v2.20.0-A3: {len(inv_ok)} invariantes verdes. "
       f"{len(car_bug)} caracterización(es) diferida(s) a propósito.{X}\n")

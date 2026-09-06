@@ -42,3 +42,38 @@ def redondear_calificacion_final(valor):
     if valor is None:
         return None
     return int(Decimal(str(valor)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def ponderar_y_redondear(valor_a, peso_a, valor_b, peso_b):
+    """
+    Pondera dos calificaciones con pesos exactos y redondea el resultado al
+    entero con el criterio académico (.5 SIEMPRE sube).
+
+    v2.20.0-A3 — PRECISIÓN DECIMAL DESDE LOS OPERANDOS
+    -------------------------------------------------
+    Toda la aritmética (multiplicación y suma) se hace en Decimal, con cada
+    operando convertido vía `Decimal(str(v))` y cada peso como Decimal exacto.
+    Así se evita el artefacto de coma flotante que ocurría al ponderar primero
+    en float y recién después envolver en Decimal:
+
+        0.3 * 17 + 0.7 * 92  →  69.49999999999999 (float)  →  69   ❌
+        Decimal("0.3")*17 + Decimal("0.7")*92  →  69.5      →  70   ✅
+
+    NO muta ninguno de los valores de entrada (en particular NO redondea ni
+    convierte a entero la CF exacta / `cf_original`).
+
+    Args:
+        valor_a, valor_b: calificaciones (int/float/Decimal/str numérico) o None.
+        peso_a, peso_b:   pesos exactos (str como "0.3" / "0.7" / "0.5", o Decimal).
+
+    Returns:
+        int redondeado (ROUND_HALF_UP), o None si algún valor es None.
+    """
+    if valor_a is None or valor_b is None:
+        return None
+    da = valor_a if isinstance(valor_a, Decimal) else Decimal(str(valor_a))
+    db = valor_b if isinstance(valor_b, Decimal) else Decimal(str(valor_b))
+    pa = peso_a if isinstance(peso_a, Decimal) else Decimal(str(peso_a))
+    pb = peso_b if isinstance(peso_b, Decimal) else Decimal(str(peso_b))
+    total = da * pa + db * pb
+    return int(total.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
