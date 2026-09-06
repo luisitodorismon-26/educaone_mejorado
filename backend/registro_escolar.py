@@ -519,8 +519,15 @@ COMPLETIVA_TABLE = {
     "primera_fila_y_plumber": 179.6,
     "row_height": 14.2,
     "total_filas": 40,
-    "docente_x": 100,
-    "docente_y_plumber": 73,
+    # v2.20.1.1 — ajuste visual del nombre del docente. El label "DOCENTE" del
+    # template ocupa x≈64.2–105.1, y_top≈72.9–81.7 (baseline PDF ≈ 710.3),
+    # idéntico en los 6 grados. Antes docente_x=100 pisaba el label y
+    # docente_y_plumber=73 (baseline PDF 719) lo dejaba ~9 pt por encima.
+    # Ahora el nombre arranca después del recuadro y su baseline coincide con
+    # la del label. No toca ninguna otra celda (row_height, primera_fila_y y
+    # las 13 columnas siguen igual).
+    "docente_x": 128,
+    "docente_y_plumber": 82,
     "columnas": {
         name: {
             "x": round((_COMPLETIVA_VLINES[i] + _COMPLETIVA_VLINES[i + 1]) / 2, 2),
