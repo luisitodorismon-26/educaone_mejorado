@@ -6279,6 +6279,11 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
     # Profesor: solo cursos/asignaturas con asignación ACTIVA. v2.20.0-A1: antes
     # faltaba `activo=True` y `tenant_filter` — una asignación desactivada seguía
     # autorizando la lectura de esos pendientes.
+    # v2.20.0-A4: la autorización es por PAREJA EXACTA (curso_id, asignatura_id).
+    # Antes se separaba en set(cursos) y set(asignaturas) y se filtraba
+    # `curso IN cursos AND asignatura IN asignaturas` — un producto cartesiano que
+    # autorizaba parejas nunca asignadas (con (C1,MAT) y (C2,CIE) dejaba ver
+    # también (C1,CIE) y (C2,MAT)).
     if current_user.role == 'profesor':
         asigs = tenant_filter(
             db.query(AsignacionProfesor), AsignacionProfesor, current_user
@@ -6287,16 +6292,25 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
         ).with_entities(
             AsignacionProfesor.curso_id, AsignacionProfesor.asignatura_id
         ).all()
-        if not asigs:
+        pares_activos = {(a[0], a[1]) for a in asigs}
+        if not pares_activos:
             return {'pendientes': []}
-        cursos_prof = {a[0] for a in asigs}
-        asig_prof = {a[1] for a in asigs}
-        est_ids_prof = [e.id for e in db.query(Estudiante).filter(
-            Estudiante.curso_id.in_(cursos_prof),
-            Estudiante.colegio_id == current_user.colegio_id,
-        ).all()]
-        q = q.filter(EvaluacionExtraSecundaria.estudiante_id.in_(est_ids_prof))
-        q = q.filter(EvaluacionExtraSecundaria.asignatura_id.in_(asig_prof))
+        # ids de estudiantes por curso asignado (una sola consulta por curso)
+        est_por_curso = {}
+        for cid in {c for (c, _a) in pares_activos}:
+            est_por_curso[cid] = [e.id for e in db.query(Estudiante).filter(
+                Estudiante.curso_id == cid,
+                Estudiante.colegio_id == current_user.colegio_id,
+            ).all()]
+        # OR de condiciones AND por pareja: (estudiante ∈ curso_i) Y (asignatura == asig_i)
+        condiciones_pareja = [
+            and_(
+                EvaluacionExtraSecundaria.estudiante_id.in_(est_por_curso.get(cid, [])),
+                EvaluacionExtraSecundaria.asignatura_id == aid,
+            )
+            for (cid, aid) in pares_activos
+        ]
+        q = q.filter(or_(*condiciones_pareja))
     
     pendientes = []
     for ev in q.all():

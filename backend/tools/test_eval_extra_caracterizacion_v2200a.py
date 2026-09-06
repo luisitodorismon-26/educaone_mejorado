@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EducaOne v2.20.0-A / A1 — RED DE SEGURIDAD + CARACTERIZACIÓN
+EducaOne v2.20.0-A .. A4 — RED DE SEGURIDAD + CARACTERIZACIÓN
 Completiva + Extraordinaria + Especial de Secundaria.
 
 Fase A  : caracterizó el comportamiento y detectó bugs.
@@ -851,6 +851,106 @@ with client:
         for p in r.json().get('pendientes', []):
             assert p['estudiante_id'] != A['est']
 
+    # ── §A4: RBAC por PAREJA EXACTA (curso_id, asignatura_id) ───────────
+    # Bug objetivo: el filtro del profesor separaba set(cursos) y
+    # set(asignaturas) y filtraba `curso IN cursos AND asignatura IN asigs`
+    # → producto cartesiano. Con asignaciones (C1,MAT) y (C2,CIE) autorizaba
+    # también (C1,CIE) y (C2,MAT).
+    def _montar_a4():
+        grados = client.get('/api/grados', headers=auth(DIR_A)).json()
+        tandas = client.get('/api/tandas', headers=auth(DIR_A)).json()
+        gs = next(g for g in grados if g['nivel'] == 'secundaria')
+        mat_tanda = next((t for t in tandas if t['nombre'] == 'Matutina'), tandas[0])
+        C1 = A['cs']                      # curso ya existente ("A")
+        C2 = client.post('/api/cursos', json={'grado_id': gs['id'], 'tanda_id': mat_tanda['id'],
+                                              'nombre': 'A4-C2'}, headers=auth(DIR_A)).json()['id']
+        MAT = A['asig']                   # "Matemática"
+        CIE = A['asig2']                  # otra asignatura
+        client.post('/api/usuarios', json={'username': 'prof_a4', 'password': 'Temporal2026x',
+            'nombre': 'ProfA4', 'apellido': 'A', 'email': 'prof_a4@x.com', 'role': 'profesor'},
+            headers=auth(DIR_A))
+        d = SessionLocal()
+        try:
+            p4 = d.query(Usuario).filter_by(username='prof_a4').first().id
+        finally:
+            d.close()
+        # SOLO estas dos parejas, ambas activas
+        client.post('/api/asignaciones', json={'profesor_id': p4, 'curso_id': C1, 'asignatura_id': MAT}, headers=auth(DIR_A))
+        client.post('/api/asignaciones', json={'profesor_id': p4, 'curso_id': C2, 'asignatura_id': CIE}, headers=auth(DIR_A))
+        est_c1 = A['est']                 # estudiante ya existente en C1
+        est_c2 = client.post('/api/estudiantes', json={'nombre': 'EstC2', 'apellido': 'A', 'sexo': 'M',
+            'fecha_nacimiento': '2010-03-03', 'curso_id': C2, 'no_lista': 1, 'matricula': 'M-A4C2'},
+            headers=auth(DIR_A)).json()['id']
+        # CF<70 en las 4 combinaciones (est, asig)
+        for (e_id, a_id) in [(est_c1, MAT), (est_c1, CIE), (est_c2, MAT), (est_c2, CIE)]:
+            _set_cf(e_id, a_id, A['ano_id'], 55.0, A['colegio_id'])
+        return dict(C1=C1, C2=C2, MAT=MAT, CIE=CIE, p4=p4, est_c1=est_c1, est_c2=est_c2)
+
+    A4 = _montar_a4()
+    PROF_A4 = login('prof_a4', 'Temporal2026x')
+
+    def _pares_vistos(resp):
+        """{(estudiante_id, asignatura_id)} de los pendientes devueltos."""
+        return {(p['estudiante_id'], p['asignatura_id']) for p in resp.json().get('pendientes', [])}
+
+    @check("§A4-1 profesor con (C1,MAT)+(C2,CIE): ve exactamente esas parejas, NO las cruzadas (C1,CIE)/(C2,MAT)")
+    def _():
+        r = get_pend(PROF_A4)
+        assert r.status_code == 200, r.text
+        vistos = _pares_vistos(r)
+        assert (A4['est_c1'], A4['MAT']) in vistos, f"C1+MAT debería ser visible; vistos={vistos}"
+        assert (A4['est_c2'], A4['CIE']) in vistos, f"C2+CIE debería ser visible; vistos={vistos}"
+        assert (A4['est_c1'], A4['CIE']) not in vistos, f"CRUCE C1+CIE visible (no autorizado); vistos={vistos}"
+        assert (A4['est_c2'], A4['MAT']) not in vistos, f"CRUCE C2+MAT visible (no autorizado); vistos={vistos}"
+
+    @check("§A4-2 query param ?curso_id=C2 no revela (C2,MAT) ni ninguna pareja no asignada")
+    def _():
+        r = get_pend(PROF_A4, curso_id=A4['C2'])
+        assert r.status_code == 200, r.text
+        vistos = _pares_vistos(r)
+        assert vistos <= {(A4['est_c2'], A4['CIE'])}, f"con ?curso_id=C2 el profesor ve {vistos}"
+
+    @check("§A4-3 query param ?asignatura_id=MAT solo devuelve (C1,MAT); ?asignatura_id=CIE solo (C2,CIE)")
+    def _():
+        r_mat = get_pend(PROF_A4, asignatura_id=A4['MAT'])
+        r_cie = get_pend(PROF_A4, asignatura_id=A4['CIE'])
+        assert r_mat.status_code == 200 and r_cie.status_code == 200
+        assert _pares_vistos(r_mat) <= {(A4['est_c1'], A4['MAT'])}, _pares_vistos(r_mat)
+        assert _pares_vistos(r_cie) <= {(A4['est_c2'], A4['CIE'])}, _pares_vistos(r_cie)
+
+    @check("§A4-4 desactivar (C2,CIE) → deja de verse; (C1,MAT) sigue visible; reactivar")
+    def _():
+        d = SessionLocal()
+        try:
+            row = d.query(AsignacionProfesor).filter_by(
+                profesor_id=A4['p4'], curso_id=A4['C2'], asignatura_id=A4['CIE']).first()
+            row.activo = False
+            d.commit()
+        finally:
+            d.close()
+        try:
+            vistos = _pares_vistos(get_pend(PROF_A4))
+            assert (A4['est_c2'], A4['CIE']) not in vistos, f"asignación inactiva sigue autorizando: {vistos}"
+            assert (A4['est_c1'], A4['MAT']) in vistos, f"la pareja activa desapareció: {vistos}"
+        finally:
+            d = SessionLocal()
+            try:
+                row = d.query(AsignacionProfesor).filter_by(
+                    profesor_id=A4['p4'], curso_id=A4['C2'], asignatura_id=A4['CIE']).first()
+                row.activo = True
+                d.commit()
+            finally:
+                d.close()
+
+    @check("§A4-5 secretaría 403 y profesor de otro colegio no ve nada de las parejas A4")
+    def _():
+        assert get_pend(SEC_A).status_code == 403
+        r = get_pend(PROF_B)
+        assert r.status_code == 200
+        vistos = _pares_vistos(r)
+        ids_a4 = {A4['est_c1'], A4['est_c2']}
+        assert not any(e in ids_a4 for (e, _a) in vistos), f"PROF_B ve estudiantes de A4: {vistos}"
+
     # ── §18: tenant isolation ──────────────────────────────────────────
     @check("§18 dirección B no ve pendientes con estudiantes de A")
     def _():
@@ -941,7 +1041,7 @@ for (v, py, prod, aca, py_ok, prod_ok) in TABLA_BANKERS:
           f"{c1}{'sí' if py_ok else 'NO':>15}{X} | {c2}{'sí' if prod_ok else 'NO':>14}{X}")
 
 print(f"\n{B}{'=' * 74}{X}")
-print(f"{B}  RESUMEN v2.20.0-A3{X}")
+print(f"{B}  RESUMEN v2.20.0-A4{X}")
 print(f"{B}{'=' * 74}{X}")
 print(f"  [INV] invariantes         : {G}{len(inv_ok)} OK{X} / {R}{len(inv_fail)} FALLAN{X}")
 print(f"  [CAR] caracteriz./diferido : {G}{len(car_ok)} coinciden{X} / {Y}{len(car_bug)} pendiente{X}")
@@ -974,5 +1074,5 @@ print(f"{G}✓ SEGURIDAD: sge.db del repo intacto (no leído ni escrito por la s
 # Las caracterizaciones [CAR] son bugs DIFERIDOS a propósito (documentados).
 if inv_fail or errores:
     sys.exit(1)
-print(f"\n{G}{B}✔ v2.20.0-A3: {len(inv_ok)} invariantes verdes. "
+print(f"\n{G}{B}✔ v2.20.0-A4: {len(inv_ok)} invariantes verdes. "
       f"{len(car_bug)} caracterización(es) diferida(s) a propósito.{X}\n")
