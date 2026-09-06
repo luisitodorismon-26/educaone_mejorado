@@ -14561,6 +14561,38 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         db.query(AnoEscolar), AnoEscolar, current_user
     ).filter_by(activo=True).first()
 
+    # v2.20.1-B2: TODAS las EvaluacionExtraSecundaria del curso + año activo en
+    # UNA sola consulta (fuente única de la cascada Completiva/Extraordinaria/
+    # Especial para el Registro). Lookup O(1) por (estudiante_id, asignatura_id).
+    # NO se pasan objetos ORM al generador: se serializa un dict plano más abajo.
+    _ids_est_reg = [e.id for e in estudiantes_db]
+    _extras_idx = {}
+    if _ano_registro is not None and _ids_est_reg:
+        for _ev_row in tenant_filter(
+            db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria, current_user
+        ).filter(
+            EvaluacionExtraSecundaria.ano_escolar_id == _ano_registro.id,
+            EvaluacionExtraSecundaria.estudiante_id.in_(_ids_est_reg),
+        ).all():
+            _extras_idx[(_ev_row.estudiante_id, _ev_row.asignatura_id)] = _ev_row
+
+    def _serial_ev(_ev):
+        """dict plano y serializable (sin ORM, sin sesión) para el threadpool."""
+        if _ev is None:
+            return None
+        return {
+            'cf_original': _ev.cf_original,
+            'cec': _ev.cec,
+            'completiva_final': _ev.completiva_final,
+            'ceex': _ev.ceex,
+            'extraordinaria_final': _ev.extraordinaria_final,
+            'ce': _ev.ce,
+            'especial_final': _ev.especial_final,
+            'condicion_final': _ev.condicion_final,
+            'nota_final': _ev.nota_final,
+            'fase_pendiente': _ev.fase_pendiente(),
+        }
+
     # v2.19.6: una sola consulta en vez de una por asignatura del colegio.
     asigs_con_asignacion = {
         fila[0] for fila in tenant_filter(
@@ -14673,9 +14705,10 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
                     pc1, pc2, pc3, pc4 = (
                         CalificacionSecundaria.calcular_pc_periodo(comps, p) for p in (1, 2, 3, 4)
                     )
-                    cf, _literal = _calcular_cf_secundaria(
+                    cf, _literal, cf_exacto = _calcular_cf_secundaria(
                         db, est.id, asignatura.id,
                         _ano_registro.id if _ano_registro else None,
+                        con_exacto=True,
                         competencias=comps,
                     )
                     # v2.19.7 (2): las competencias NO se colapsan antes de
@@ -14726,6 +14759,10 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
                         # que se conservan.
                         'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
                         'cf': cf,
+                        # v2.20.1-B2: CF exacta (para % de completiva/extraordinaria)
+                        # y cascada de evaluaciones extra, ya serializadas.
+                        'cf_exacto': cf_exacto,
+                        'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
                     }
                     continue
 
@@ -14751,6 +14788,11 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
                         'rp4': calif.rp4,
                         'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
                         'cf': cf,
+                        # v2.20.1-B2: el modelo legacy Calificacion no guarda CF
+                        # exacta; el % usa la misma CF. La cascada extra vive solo
+                        # en EvaluacionExtraSecundaria (puede o no existir).
+                        'cf_exacto': cf,
+                        'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
                     }
         
         # Asistencia por materia
