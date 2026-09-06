@@ -1,19 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-EducaOne v2.20.0-A — RED DE SEGURIDAD / TESTS DE CARACTERIZACIÓN
+EducaOne v2.20.0-A / A1 — RED DE SEGURIDAD + CARACTERIZACIÓN
 Completiva + Extraordinaria + Especial de Secundaria.
 
-NO modifica lógica productiva. Caracteriza el comportamiento ACTUAL de:
+Fase A  : caracterizó el comportamiento y detectó bugs.
+Fase A1 : corrige redondeo académico (helper ROUND_HALF_UP), la decisión de
+          entrada a Completiva y el RBAC del GET de pendientes. Esta suite se
+          actualizó SOLO donde el comportamiento productivo cambió legítimamente.
+
+Cubre:
+  - reglas_academicas.redondear_calificacion_final  (== ROUND_HALF_UP)
   - EvaluacionExtraSecundaria (modelo + cascada MINERD)
-  - _calcular_cf_secundaria / redondeo académico
+  - _calcular_cf_secundaria
   - POST /api/calificaciones-secundaria/evaluacion-extra
   - GET  /api/calificaciones-secundaria/pendientes-evaluacion-extra
   - RBAC + tenant isolation
 
 Categorías:
   [INV]  invariante que DEBE cumplirse (si falla → exit 1)
-  [CAR]  caracterización contra la regla académica esperada; si falla es un
-         BUG PREEXISTENTE (se reporta, NO se corrige, NO fuerza exit 1)
+  [CAR]  caracterización / bug DIFERIDO a propósito (se reporta, NO fuerza exit 1)
+
+SEGURIDAD DE DATOS: esta suite NUNCA borra sge.db ni ninguna DB del repo.
+Usa una SQLite temporal aislada, propia de este proceso, creada ANTES de
+importar database/models/app.
 
 Uso:
     cd backend
@@ -21,18 +30,30 @@ Uso:
 """
 import os
 import sys
+import atexit
+import tempfile
 from decimal import Decimal, ROUND_HALF_UP
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for ext in ['', '-shm', '-wal']:
-    p = os.path.join(_BASE, 'sge.db' + ext)
-    if os.path.exists(p):
-        os.remove(p)
-if os.path.exists(os.path.join(_BASE, 'INITIAL_CREDENTIALS.txt')):
-    os.remove(os.path.join(_BASE, 'INITIAL_CREDENTIALS.txt'))
+
+# ── DB TEMPORAL AISLADA (antes de cualquier import de database/models/app) ──
+_TMPDIR = tempfile.mkdtemp(prefix="eo_eval_extra_test_")
+_TEST_DB_PATH = os.path.join(_TMPDIR, "eval_extra_test.db")
+_TEST_DB_URL = "sqlite:///" + _TEST_DB_PATH.replace("\\", "/")
+os.environ["DATABASE_URL"] = _TEST_DB_URL
+
+
+@atexit.register
+def _cleanup_tmpdir():
+    try:
+        import shutil
+        shutil.rmtree(_TMPDIR, ignore_errors=True)
+    except Exception:
+        pass
+
 
 from database import engine, SessionLocal
+from reglas_academicas import redondear_calificacion_final
 from models import (
     Base, Usuario, Grado, Curso, Asignatura, Estudiante, AnoEscolar,
     AsignacionProfesor, CalificacionSecundaria, EvaluacionExtraSecundaria,
@@ -42,6 +63,19 @@ from fastapi.testclient import TestClient
 from app import app
 
 client = TestClient(app)
+
+# ── ASSERT DE SEGURIDAD: el test corre contra su DB temporal, no la del repo ──
+_engine_url = str(engine.url)
+_tmpdir_fs = _TMPDIR.replace("\\", "/")
+assert _tmpdir_fs in _engine_url.replace("\\", "/"), (
+    f"SEGURIDAD: el engine NO apunta al directorio temporal del test.\n"
+    f"  engine.url = {_engine_url}\n  esperado dentro de {_tmpdir_fs}"
+)
+assert "sge.db" not in _engine_url, "SEGURIDAD: el test estaría usando sge.db del repo"
+assert os.environ["DATABASE_URL"] == _TEST_DB_URL, "SEGURIDAD: DATABASE_URL fue sobrescrito"
+print(f"\033[92m✓ DB de test AISLADA:\033[0m {_engine_url}")
+_REPO_SGE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sge.db")
+_sge_mtime_inicial = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
 
 G, R, Y, B, C, X = "\033[92m", "\033[91m", "\033[93m", "\033[1m", "\033[96m", "\033[0m"
 
@@ -109,19 +143,26 @@ def _recalc(e):
 # ══════════════════════════════════════════════════════════════════════════
 print(f"{B}\n=== PARTE 1: MODELO EvaluacionExtraSecundaria ==={X}")
 
-# ---- §11: Python round() vs redondeo académico (bankers rounding) ----
+# ---- §11: Python round() (half-to-even) vs redondeo académico (HALF_UP) ----
+# Python round() NO cambia; lo que cambió (A1) es que PRODUCCIÓN ya no lo usa
+# para calificaciones finales — usa reglas_academicas.redondear_calificacion_final().
 BANKERS = [66.5, 67.5, 68.5, 69.5, 70.5, 71.5]
 TABLA_BANKERS = []
 for v in BANKERS:
-    py = round(v)                    # lo que usa producción (round builtin)
-    py0 = round(v, 0)               # round(x, 0) → float, como en models.py
-    aca = redondeo_academico(v)
-    TABLA_BANKERS.append((v, py, py0, aca, py == aca))
+    py = round(v)                              # builtin (half-to-even)
+    aca = redondeo_academico(v)                # oráculo del test (HALF_UP)
+    prod = redondear_calificacion_final(v)     # helper productivo A1
+    TABLA_BANKERS.append((v, py, prod, aca, py == aca, prod == aca))
 
-@caracteriza("§11 round() de producción == ROUND_HALF_UP académico en .5 (66.5/67.5/68.5/69.5/70.5/71.5)")
+@check("§11-a INFORMATIVO: Python round() difiere de HALF_UP en 66.5/68.5/70.5 (por eso producción ya no lo usa)")
 def _():
-    difs = [f"{v}: round()={py} vs académico={aca}" for (v, py, _p0, aca, ok) in TABLA_BANKERS if not ok]
-    assert not difs, "bankers rounding divergente → " + " | ".join(difs)
+    difs = [f"{v}: round()={py} vs HALF_UP={aca}" for (v, py, _pr, aca, ok, _o2) in TABLA_BANKERS if not ok]
+    assert difs, "se esperaba que round() divergiera (documentado); si NO diverge, revisar el oráculo"
+
+@check("§11-b redondear_calificacion_final() == ROUND_HALF_UP para 66.5/67.5/68.5/69.5/70.5/71.5")
+def _():
+    difs = [f"{v}: helper={pr} vs HALF_UP={aca}" for (v, _py, pr, aca, _o, ok) in TABLA_BANKERS if not ok]
+    assert not difs, "el helper productivo NO coincide con HALF_UP → " + " | ".join(difs)
 
 # ---- §2/§10: CF exacta vs CF oficial y decisión de aprobación normal ----
 CF_TABLA = [69.00, 69.49, 69.50, 69.51, 69.60, 69.80, 69.99, 70.00, 70.01]
@@ -148,25 +189,66 @@ def _():
              for f in FILAS_CF if not f['cond_ok']]
     assert not malas, " | ".join(malas)
 
-@caracteriza("§10-b fase_pendiente() coincide con CF oficial (CF>=70 ⇒ fase None) en toda la tabla 69.00–70.01")
+@check("§10-b [A1 corregido] fase_pendiente() coincide con la CF oficial (CF>=70 ⇒ None) en toda la tabla 69.00–70.01")
 def _():
     malas = [f"cf_original={f['cf_original']} (CF oficial {f['cf_academica']}) → fase_pendiente()={f['fase_pendiente']!r} "
              f"(esperado {f['esperado_fase']!r})" for f in FILAS_CF if not f['fase_ok']]
     assert not malas, "inconsistencia CF-oficial vs fase_pendiente → " + " || ".join(malas)
 
 # ---- §12: invariante duro CF oficial >= 70 ⇒ aprobado_normal + fase None ----
-@caracteriza("§12 invariante: CF oficial >= 70 ⇒ condicion_final=='aprobado_normal' Y fase_pendiente()==None")
+@check("§12 [A1 corregido] CF oficial >= 70 ⇒ condicion_final=='aprobado_normal' Y fase_pendiente()==None (69.5/69.6/69.8/69.99/70.0)")
 def _():
     for v in [69.5, 69.6, 69.8, 69.99, 70.0]:
         e = _recalc(_ev(cf=v))
         assert e.condicion_final == 'aprobado_normal', f"cf_original={v}: condicion_final={e.condicion_final!r}"
         assert e.fase_pendiente() is None, f"cf_original={v}: fase_pendiente()={e.fase_pendiente()!r} (CF oficial {cf_oficial(v)} ≥ 70)"
 
+# ---- §14 A/B/C: redondeo académico de la CF ----
+@check("§14-A redondear_calificacion_final(68.5) == 69")
+def _():
+    assert redondear_calificacion_final(68.5) == 69
+
+@check("§14-B redondear_calificacion_final(69.5) == 70")
+def _():
+    assert redondear_calificacion_final(69.5) == 70
+
+@check("§14-C redondear_calificacion_final(69.8) == 70")
+def _():
+    assert redondear_calificacion_final(69.8) == 70
+
+@check("§14-D/E/F fase_pendiente: 69.5→None, 69.8→None, 69.49→'completiva'")
+def _():
+    assert _recalc(_ev(cf=69.5)).fase_pendiente() is None
+    assert _recalc(_ev(cf=69.8)).fase_pendiente() is None
+    assert _recalc(_ev(cf=69.49)).fase_pendiente() == 'completiva'
+
+@check("§14-G condicion_final(69.5) == 'aprobado_normal'")
+def _():
+    assert _recalc(_ev(cf=69.5)).condicion_final == 'aprobado_normal'
+
+@check("§14-O Completiva/Extraordinaria conservan la BASE EXACTA para 50%/30% (no redondean cf_original antes)")
+def _():
+    # cf exacta 63.5: 0.5·63.5 = 31.75 (no 32); 0.3·63.5 = 19.05 (no 19.2)
+    e = _ev(cf=63.5, cec=70)   # 31.75 + 35 = 66.75 → 67 ; si redondeara CF antes: 32+35=67 (coincide) → usar otro
+    # Caso que distingue: cf 63.5, cec 77 → exacto 31.75+38.5 = 70.25 → 70 ; con CF pre-redondeada 64: 32+38.5 = 70.5 → 71
+    e2 = _ev(cf=63.5, cec=77)
+    assert e2.calcular_completiva_final() == 70, \
+        f"completiva_final={e2.calcular_completiva_final()} — ¿se redondeó cf_original antes del 50%?"
+    # extraordinaria: cf 63.5, ceex 90 → 0.3·63.5 + 0.7·90 = 19.05 + 63 = 82.05 → 82 ;
+    #                 con CF pre-redondeada 64: 19.2 + 63 = 82.2 → 82 (no distingue) — usar ceex 85:
+    #   exacto: 19.05 + 59.5 = 78.55 → 79 ; pre-redondeado: 19.2 + 59.5 = 78.7 → 79 (tampoco)
+    #   probamos cf 63.5, ceex 65: exacto 19.05 + 45.5 = 64.55 → 65 ; pre: 19.2+45.5 = 64.7 → 65
+    # La ponderación con .05 rara vez cruza un .5; basta con verificar que el número
+    # es el de la CF EXACTA y no el de una CF entera:
+    exacto = redondear_calificacion_final(0.3 * 63.5 + 0.7 * 90)
+    pre_red = redondear_calificacion_final(0.3 * 64 + 0.7 * 90)
+    assert _ev(cf=63.5, ceex=90).calcular_extraordinaria_final() == exacto
+
 # ---- §5: Completiva ----
 @check("§5-a Completiva Final = round(0.5·CF + 0.5·CEC) (fórmula actual, entera)")
 def _():
-    e = _ev(cf=63.5, cec=76)   # 31.75 + 38 = 69.75 → 70
-    assert e.calcular_completiva_final() == round(0.5*63.5 + 0.5*76, 0)
+    e = _ev(cf=63.5, cec=76)   # 31.75 + 38 = 69.75 → 70 (HALF_UP)
+    assert e.calcular_completiva_final() == redondear_calificacion_final(0.5*63.5 + 0.5*76) == 70
     e2 = _ev(cf=60.0, cec=80)  # 30 + 40 = 70
     assert e2.calcular_completiva_final() == 70
 
@@ -185,10 +267,10 @@ def _():
     assert e.fase_pendiente() == 'extraordinaria'
 
 # ---- §6: Extraordinaria ----
-@check("§6-a Extraordinaria Final = round(0.3·CF + 0.7·CEEX) (entera)")
+@check("§6-a Extraordinaria Final = redondeo académico de (0.3·CF + 0.7·CEEX)")
 def _():
     e = _ev(cf=50.0, ceex=80)   # 15 + 56 = 71
-    assert e.calcular_extraordinaria_final() == round(0.3*50.0 + 0.7*80, 0) == 71
+    assert e.calcular_extraordinaria_final() == redondear_calificacion_final(0.3*50.0 + 0.7*80) == 71
 
 @check("§6-b Extraordinaria >= 70 ⇒ aprobado_extraordinaria y FIN")
 def _():
@@ -203,10 +285,10 @@ def _():
     assert e.fase_pendiente() == 'especial'
 
 # ---- §7: Especial ----
-@check("§7-a Especial Final = round(CF) + CE (fórmula actual)")
+@check("§7-a Especial Final = CF_oficial + CE")
 def _():
     e = _ev(cf=64.0, ce=10)
-    assert e.calcular_especial_final() == round(64.0, 0) + 10 == 74
+    assert e.calcular_especial_final() == redondear_calificacion_final(64.0) + 10 == 74
 
 @check("§7-b Especial >= 70 ⇒ aprobado_especial ; < 70 ⇒ reprobado")
 def _():
@@ -216,12 +298,12 @@ def _():
     assert rp.condicion_final == 'reprobado'
     assert rp.fase_pendiente() is None
 
-@caracteriza("§7-c Especial: round(CF) usa redondeo académico (CF exacta 68.5 ⇒ base 69, no 68)")
+@check("§7-c [A1 corregido] Especial: la base usa CF oficial HALF_UP (CF exacta 68.5 ⇒ base 69, no 68)")
 def _():
-    e = _ev(cf=68.5, ce=1)   # académico: 69 + 1 = 70 (aprobado). round() banker: 68 + 1 = 69
+    e = _ev(cf=68.5, ce=1)   # 69 + 1 = 70 (aprobado). Antes: 68 + 1 = 69 (reprobado)
     esperado = redondeo_academico(68.5) + 1
-    assert e.calcular_especial_final() == esperado, \
-        f"especial_final={e.calcular_especial_final()} (round() banker) vs académico {esperado}"
+    assert e.calcular_especial_final() == esperado == 70, \
+        f"especial_final={e.calcular_especial_final()} vs académico {esperado}"
 
 # ---- §9: cascada completa, sin saltos ----
 @check("§9-1 aprobado normal (CF oficial 85)")
@@ -487,25 +569,25 @@ with client:
         assert row is not None  # ya existía por _set_cf
 
     # ── §15: aprobado normal NO entra a Completiva (corte con CF oficial) ──
-    @caracteriza("§15 cf_original=69.49 → CF oficial 69 → el endpoint PERMITE Completiva (200)")
+    @check("§15/§14-I cf_original=69.49 (CF oficial 69) → el endpoint PERMITE Completiva (200)")
     def _():
         _set_cf(A['est2'], A['asig'], A['ano_id'], 69.49, A['colegio_id'])
         r = post_extra(PROF_A, A['est2'], A['asig'], 'completiva', 50)
         assert r.status_code == 200, f"{r.status_code}: {r.text}"
 
-    @caracteriza("§15 cf_original=69.50 → CF oficial 70 → el endpoint RECHAZA Completiva (400)")
+    @check("§15/§14-H cf_original=69.50 (CF oficial 70) → el endpoint RECHAZA Completiva (400)")
     def _():
         _set_cf(A['est2'], A['asig'], A['ano_id'], 69.50, A['colegio_id'])
         r = post_extra(PROF_A, A['est2'], A['asig'], 'completiva', 50)
         assert r.status_code == 400, f"esperado 400 (aprobó normal), obtuvo {r.status_code}: {r.text}"
 
-    @caracteriza("§15 cf_original=69.80 → CF oficial 70 → el endpoint RECHAZA Completiva (400)")
+    @check("§15 cf_original=69.80 (CF oficial 70) → el endpoint RECHAZA Completiva (400)")
     def _():
         _set_cf(A['est2'], A['asig'], A['ano_id'], 69.80, A['colegio_id'])
         r = post_extra(PROF_A, A['est2'], A['asig'], 'completiva', 50)
         assert r.status_code == 400, f"esperado 400, obtuvo {r.status_code}: {r.text}"
 
-    @caracteriza("§15 cf_original=69.99 → CF oficial 70 → el endpoint RECHAZA Completiva (400)")
+    @check("§15 cf_original=69.99 (CF oficial 70) → el endpoint RECHAZA Completiva (400)")
     def _():
         _set_cf(A['est2'], A['asig'], A['ano_id'], 69.99, A['colegio_id'])
         r = post_extra(PROF_A, A['est2'], A['asig'], 'completiva', 50)
@@ -521,7 +603,7 @@ with client:
         row = _ev_row(A['est'], A['asig'], A['ano_id'])
         assert row['cec'] == 88
 
-    @caracteriza("§16-B corregir Completiva cuando YA existe Extraordinaria: limpia Extraordinaria y Especial")
+    @caracteriza("§16-B [DIFERIDO] corregir Completiva con Extraordinaria ya cargada — bloqueado (400). Política académica pendiente.")
     def _():
         _set_cf(A['est'], A['asig'], A['ano_id'], 40.0, A['colegio_id'])
         assert post_extra(PROF_A, A['est'], A['asig'], 'completiva', 30).status_code == 200      # comp 35<70
@@ -532,7 +614,7 @@ with client:
         assert row['cec'] == 95 and row['ceex'] is None and row['ce'] is None, \
             f"esperado ceex/ce limpiados; row={row}"
 
-    @caracteriza("§16-C corregir Extraordinaria cuando YA existe Especial: limpia Especial")
+    @caracteriza("§16-C [DIFERIDO] corregir Extraordinaria con Especial ya cargada — bloqueado (400). Política académica pendiente.")
     def _():
         _set_cf(A['est'], A['asig'], A['ano_id'], 40.0, A['colegio_id'])
         assert post_extra(PROF_A, A['est'], A['asig'], 'completiva', 30).status_code == 200
@@ -587,7 +669,7 @@ with client:
         for p in r.json().get('pendientes', []):
             assert p['asignatura_id'] == A['asig']
 
-    @caracteriza("§17-d profesor con asignación INACTIVA NO debe ver pendientes de ese curso/asignatura")
+    @check("§17-d [A1 corregido] §14-K profesor con asignación INACTIVA NO ve pendientes de ese curso/asignatura")
     def _():
         _set_cf(A['est'], A['asig'], A['ano_id'], 55.0, A['colegio_id'])
         r = get_pend(PROF_INACT_A)
@@ -596,10 +678,19 @@ with client:
         assert not any(p['asignatura_id'] == A['asig'] and p['estudiante_id'] == A['est'] for p in pend), \
             f"profesor con asignación INACTIVA ve pendientes: {pend}"
 
-    @caracteriza("§17-e secretaría NO debe poder acceder al módulo de evaluaciones extra (403)")
+    @check("§17-e [A1 corregido] §14-J secretaría NO accede al GET de pendientes (403)")
     def _():
         r = get_pend(SEC_A)
         assert r.status_code == 403, f"esperado 403, obtuvo {r.status_code} (body: {r.text[:120]})"
+
+    @check("§14-L profesor con asignación ACTIVA solo ve pendientes de SUS asignaciones")
+    def _():
+        _set_cf(A['est'], A['asig'], A['ano_id'], 55.0, A['colegio_id'])
+        _set_cf(A['est'], A['asig2'], A['ano_id'], 55.0, A['colegio_id'])  # asig2 NO asignada a PROF_A
+        r = get_pend(PROF_A)
+        assert r.status_code == 200
+        for p in r.json().get('pendientes', []):
+            assert p['asignatura_id'] == A['asig'], f"ve pendiente de asignatura ajena: {p}"
 
     @check("§17-f profesor de otro colegio jamás ve pendientes del colegio A")
     def _():
@@ -624,8 +715,8 @@ with client:
         r = post_extra(PROF_A, Bc['est'], Bc['asig'], 'completiva', 40)
         assert r.status_code in (403, 404), f"{r.status_code}: {r.text}"
 
-    # ── §19: GET con side-effect de escritura (backfill) ───────────────
-    @caracteriza("§19 GET /pendientes NO debería escribir; hoy hace backfill (documentado, no se corrige)")
+    # ── §19: GET con side-effect de escritura (backfill) — DIFERIDO ────
+    @caracteriza("§19 [DIFERIDO] GET /pendientes ejecuta backfill+commit — refactor separado (datos existentes pueden depender)")
     def _():
         # estudiante est2 de A con 4 competencias completas y CF<70, SIN fila EvaluacionExtra
         d = SessionLocal()
@@ -690,18 +781,19 @@ for f in FILAS_CF:
           f"{str(f['fase_pendiente']):>12} | {color}{ok}{X}")
 
 print(f"\n{B}{'=' * 74}{X}")
-print(f"{B}  TABLA §11 — Python round() vs ROUND_HALF_UP académico{X}")
+print(f"{B}  TABLA §11 — Python round() (half-to-even) vs helper A1 vs HALF_UP{X}")
 print(f"{B}{'=' * 74}{X}")
-print(f"  {'valor':>7} | {'round()':>8} | {'round(x,0)':>10} | {'académico':>9} | coincide?")
-for (v, py, py0, aca, ok) in TABLA_BANKERS:
-    color = G if ok else Y
-    print(f"  {v:>7.1f} | {py:>8} | {py0:>10} | {aca:>9} | {color}{'sí' if ok else 'NO — divergen'}{X}")
+print(f"  {'valor':>7} | {'round()':>8} | {'helper A1':>10} | {'HALF_UP':>8} | round()==HALF_UP | helper==HALF_UP")
+for (v, py, prod, aca, py_ok, prod_ok) in TABLA_BANKERS:
+    c1 = (G if py_ok else Y); c2 = (G if prod_ok else R)
+    print(f"  {v:>7.1f} | {py:>8} | {prod:>10} | {aca:>8} | "
+          f"{c1}{'sí' if py_ok else 'NO':>15}{X} | {c2}{'sí' if prod_ok else 'NO':>14}{X}")
 
 print(f"\n{B}{'=' * 74}{X}")
-print(f"{B}  RESUMEN{X}")
+print(f"{B}  RESUMEN v2.20.0-A1{X}")
 print(f"{B}{'=' * 74}{X}")
-print(f"  [INV] invariantes : {G}{len(inv_ok)} OK{X} / {R}{len(inv_fail)} FALLAN{X}")
-print(f"  [CAR] caracteriz. : {G}{len(car_ok)} coinciden{X} / {Y}{len(car_bug)} BUG CONFIRMADO{X}")
+print(f"  [INV] invariantes         : {G}{len(inv_ok)} OK{X} / {R}{len(inv_fail)} FALLAN{X}")
+print(f"  [CAR] caracteriz./diferido : {G}{len(car_ok)} coinciden{X} / {Y}{len(car_bug)} pendiente{X}")
 print(f"  errores inesperados: {len(errores)}")
 
 if inv_fail:
@@ -710,7 +802,7 @@ if inv_fail:
         print(f"{R}  ✗ {n}{X}\n      {e}")
 
 if car_bug:
-    print(f"\n{Y}{B}BUGS PREEXISTENTES CONFIRMADOS (NO se corrigen en esta fase):{X}")
+    print(f"\n{Y}{B}CARACTERIZACIONES / BUGS DIFERIDOS A PROPÓSITO (política académica o refactor aparte):{X}")
     for n, e in car_bug:
         print(f"{Y}  ✗ {n}{X}\n      {e}")
 
@@ -719,8 +811,17 @@ if errores:
     for n, e in errores:
         print(f"{R}  ! {n}{X}\n      {e}")
 
+# ── SEGURIDAD DE DATOS: confirmar que la suite NO tocó sge.db del repo ──
+if _sge_mtime_inicial is not None:
+    _now = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
+    if _now != _sge_mtime_inicial or not os.path.exists(_REPO_SGE):
+        print(f"{R}{B}✗ SEGURIDAD: sge.db del repo cambió/desapareció durante la suite{X}")
+        sys.exit(2)
+print(f"{G}✓ SEGURIDAD: sge.db del repo intacto (no leído ni escrito por la suite){X}")
+
 # exit 1 SOLO si falla un invariante o hay una excepción inesperada.
-# Las caracterizaciones que fallan son bugs preexistentes ya documentados.
+# Las caracterizaciones [CAR] son bugs DIFERIDOS a propósito (documentados).
 if inv_fail or errores:
     sys.exit(1)
-print(f"\n{G}{B}✔ Invariantes verdes. {len(car_bug)} caracterización(es) marcan bug preexistente (ver arriba).{X}\n")
+print(f"\n{G}{B}✔ v2.20.0-A1: {len(inv_ok)} invariantes verdes. "
+      f"{len(car_bug)} caracterización(es) diferida(s) a propósito.{X}\n")

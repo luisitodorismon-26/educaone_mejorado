@@ -17,6 +17,7 @@ def _now_dr():
     return datetime.now(timezone(timedelta(hours=-4))).replace(tzinfo=None)
 
 from database import Base
+from reglas_academicas import redondear_calificacion_final
 
 # ============== COLEGIO (MULTI-TENANT) ==============
 
@@ -1188,23 +1189,30 @@ class EvaluacionExtraSecundaria(Base):
     asignatura = relationship('Asignatura', backref='evaluaciones_extra')
     
     def calcular_completiva_final(self):
-        """50% C.F. + 50% C.E.C. redondeado entero (fórmula MINERD oficial)."""
+        """50% C.F. + 50% C.E.C. → entero con REDONDEO ACADÉMICO (.5 sube).
+
+        v2.20.0-A1: la ponderación se calcula sobre la CF EXACTA (cf_original);
+        solo el resultado final se redondea, ahora con
+        redondear_calificacion_final() en vez de round() (half-to-even).
+        """
         if self.cf_original is None or self.cec is None:
             return None
-        return round(0.5 * self.cf_original + 0.5 * self.cec, 0)
-    
+        return redondear_calificacion_final(0.5 * self.cf_original + 0.5 * self.cec)
+
     def calcular_extraordinaria_final(self):
-        """30% C.F. + 70% C.E.EX redondeado entero."""
+        """30% C.F. + 70% C.E.EX → entero con redondeo académico (.5 sube).
+        Ponderación sobre la CF EXACTA; solo se cambia el redondeo final."""
         if self.cf_original is None or self.ceex is None:
             return None
-        return round(0.3 * self.cf_original + 0.7 * self.ceex, 0)
-    
+        return redondear_calificacion_final(0.3 * self.cf_original + 0.7 * self.ceex)
+
     def calcular_especial_final(self):
-        """C.F. (redondeado) + C.E. — suma simple sin ponderación.
-        La tabla oficial MINERD usa el CF redondeado en la Especial (64+10=74)."""
+        """C.F. OFICIAL + C.E. — suma complementaria sin ponderación.
+        v2.20.0-A1: la base es la CF OFICIAL = redondear_calificacion_final(cf_original)
+        (ej. cf_exacta 68.5 → base 69, no 68). No cambia la naturaleza de C.E."""
         if self.cf_original is None or self.ce is None:
             return None
-        return round(self.cf_original, 0) + self.ce
+        return redondear_calificacion_final(self.cf_original) + self.ce
     
     def calcular_condicion_final(self):
         """Cascada oficial MINERD para determinar condición final.
@@ -1215,8 +1223,9 @@ class EvaluacionExtraSecundaria(Base):
         if self.cf_original is None:
             return (None, None)
         
-        # El corte de 70 y la nota mostrada usan el CF redondeado (boletín oficial)
-        cf_redondeado = round(self.cf_original, 0)
+        # El corte de 70 y la nota mostrada usan la CF OFICIAL (redondeo académico
+        # .5-sube). v2.20.0-A1: antes usaba round() (half-to-even).
+        cf_redondeado = redondear_calificacion_final(self.cf_original)
         if cf_redondeado >= 70:
             return ('aprobado_normal', cf_redondeado)
         
@@ -1249,7 +1258,11 @@ class EvaluacionExtraSecundaria(Base):
         """
         if self.cf_original is None:
             return None  # aún no termina el año
-        if self.cf_original >= 70:
+        # v2.20.0-A1: la decisión de "aprobó normal" usa la CF OFICIAL redondeada
+        # (.5 sube), NO el promedio exacto. Antes `self.cf_original >= 70` dejaba
+        # a un 69.5–69.99 (CF oficial 70) marcado como "completiva pendiente",
+        # contradiciendo a calcular_condicion_final() y al endpoint POST.
+        if redondear_calificacion_final(self.cf_original) >= 70:
             return None  # aprobó normal, no necesita nada
         
         if self.cec is None:
