@@ -508,6 +508,135 @@ async def lifespan(app):
                         logger.warning(f"No se pudo agregar recreos.nivel: {e}")
                         raise
 
+        # === 6d. Indicadores de logro: identidad INSTITUCIONAL (R2) ===
+        # El indicador pertenece a colegio+año+curso+asignatura+período, no al
+        # profesor. Tres pasos, todos idempotentes y en este orden:
+        #   (1) ADD COLUMN ano_escolar_id (aditivo, nullable, sin DEFAULT);
+        #   (2) backfill conservador de filas previas al año ACTIVO de su colegio
+        #       (si no, quedarían invisibles: el listado filtra por año);
+        #   (3) swap de la restricción única legacy por la institucional, SOLO si
+        #       no hay duplicados bajo la clave nueva.
+        # Rollback (Postgres):
+        #   DROP INDEX IF EXISTS uq_indicador_logro_institucional;
+        #   ALTER TABLE indicadores_logro ADD CONSTRAINT unique_indicador_logro
+        #     UNIQUE (profesor_id, asignatura_id, curso_id, periodo, colegio_id);
+        #   ALTER TABLE indicadores_logro DROP COLUMN ano_escolar_id;
+        if 'indicadores_logro' in inspector.get_table_names():
+            _es_pg = engine.dialect.name == 'postgresql'
+            _ind_cols = {c['name'] for c in inspector.get_columns('indicadores_logro')}
+
+            # (1) columna nueva — ADITIVA, nullable, sin backfill implícito
+            if 'ano_escolar_id' not in _ind_cols:
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            "ALTER TABLE indicadores_logro ADD COLUMN ano_escolar_id "
+                            "INTEGER REFERENCES ano_escolar(id)"
+                        ))
+                        conn.commit()
+                        logger.info("✅ Migración: columna ano_escolar_id agregada a indicadores_logro")
+                    except Exception as e:
+                        logger.warning(f"No se pudo agregar indicadores_logro.ano_escolar_id: {e}")
+                        raise
+
+            # (2) backfill conservador — solo filas con ano_escolar_id NULL.
+            # Nunca borra ni modifica `contenido`; idempotente.
+            with engine.connect() as conn:
+                try:
+                    if _es_pg:
+                        _res = conn.execute(text(
+                            "UPDATE indicadores_logro AS il SET ano_escolar_id = ae.id "
+                            "FROM ano_escolar AS ae "
+                            "WHERE il.ano_escolar_id IS NULL AND ae.activo = TRUE "
+                            "AND ae.colegio_id IS NOT DISTINCT FROM il.colegio_id"
+                        ))
+                    else:
+                        _res = conn.execute(text(
+                            "UPDATE indicadores_logro SET ano_escolar_id = ("
+                            "  SELECT ae.id FROM ano_escolar ae "
+                            "  WHERE ae.activo = 1 "
+                            "    AND ae.colegio_id IS indicadores_logro.colegio_id LIMIT 1) "
+                            "WHERE ano_escolar_id IS NULL"
+                        ))
+                    conn.commit()
+                    if _res.rowcount:
+                        logger.info(
+                            f"✅ Migración: {_res.rowcount} indicador(es) de logro "
+                            f"asociados al año escolar activo de su colegio"
+                        )
+                except Exception as e:
+                    logger.warning(f"Backfill de indicadores_logro.ano_escolar_id falló: {e}")
+                    raise
+
+            # (3) swap de restricción única — solo si no hay duplicados.
+            _idx_ind = {i.get('name') for i in inspector.get_indexes('indicadores_logro')}
+            try:
+                _idx_ind |= {u.get('name') for u in
+                             (inspector.get_unique_constraints('indicadores_logro') or [])}
+            except Exception:
+                pass
+            if 'uq_indicador_logro_institucional' not in _idx_ind:
+                with engine.connect() as conn:
+                    _dups = conn.execute(text(
+                        "SELECT COUNT(*) FROM ("
+                        "  SELECT colegio_id, ano_escolar_id, curso_id, asignatura_id, periodo "
+                        "  FROM indicadores_logro "
+                        "  GROUP BY colegio_id, ano_escolar_id, curso_id, asignatura_id, periodo "
+                        "  HAVING COUNT(*) > 1"
+                        ") d"
+                    )).scalar() or 0
+                    if _dups:
+                        # CERO PÉRDIDA DE DATOS: no se borra ni se fusiona nada.
+                        # Se conserva el estado actual y se reporta para revisión
+                        # manual; la clave legacy sigue vigente hasta resolverlo.
+                        logger.error(
+                            f"⚠️ indicadores_logro: {_dups} grupo(s) duplicados bajo la clave "
+                            f"institucional (colegio, año, curso, asignatura, período). NO se "
+                            f"cambió ninguna restricción y NO se borró ninguna fila. Resolver "
+                            f"manualmente antes de completar la migración R2."
+                        )
+                    else:
+                        try:
+                            conn.execute(text(
+                                "CREATE UNIQUE INDEX IF NOT EXISTS uq_indicador_logro_institucional "
+                                "ON indicadores_logro "
+                                "(colegio_id, ano_escolar_id, curso_id, asignatura_id, periodo)"
+                            ))
+                            conn.commit()
+                            # Retirar la clave legacy: además de permitir filas
+                            # paralelas por cambio de docente, NO contempla el año
+                            # y bloquearía crear el período del año siguiente.
+                            if _es_pg:
+                                conn.execute(text(
+                                    "ALTER TABLE indicadores_logro "
+                                    "DROP CONSTRAINT IF EXISTS unique_indicador_logro"
+                                ))
+                                conn.commit()
+                            else:
+                                # SQLite no soporta DROP CONSTRAINT. Si la clave
+                                # legacy es un índice suelto se elimina; si quedó
+                                # embebida en el CREATE TABLE solo un rebuild de
+                                # tabla la quitaría, y eso NO se improvisa: se
+                                # avisa y se deja el esquema intacto.
+                                conn.execute(text("DROP INDEX IF EXISTS unique_indicador_logro"))
+                                conn.commit()
+                                _resto = {i.get('name') for i in
+                                          inspect(engine).get_indexes('indicadores_logro')}
+                                if 'unique_indicador_logro' in _resto:
+                                    logger.warning(
+                                        "indicadores_logro: la clave legacy sigue embebida en la "
+                                        "tabla (SQLite). No se reconstruye la tabla: el año escolar "
+                                        "siguiente podría rechazar inserciones. Solo afecta a "
+                                        "instalaciones SQLite; producción usa PostgreSQL."
+                                    )
+                            logger.info(
+                                "✅ Migración: indicadores_logro usa la clave institucional "
+                                "(colegio, año, curso, asignatura, período)"
+                            )
+                        except Exception as e:
+                            logger.warning(f"No se pudo cambiar la clave de indicadores_logro: {e}")
+                            raise
+
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
         # Acelera queries frecuentes:
@@ -14576,6 +14705,20 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         ).all():
             _extras_idx[(_ev_row.estudiante_id, _ev_row.asignatura_id)] = _ev_row
 
+    # R2: TODOS los indicadores de logro del curso + año activo en UNA consulta.
+    # Índice O(1) por (asignatura_id, periodo). Es material del CURSO, no del
+    # estudiante: no hay ninguna consulta por estudiante ni por celda.
+    _indicadores_idx = {}
+    if _ano_registro is not None:
+        for _il in tenant_filter(
+            db.query(IndicadorLogro), IndicadorLogro, current_user
+        ).filter(
+            IndicadorLogro.curso_id == curso_id,
+            IndicadorLogro.ano_escolar_id == _ano_registro.id,
+        ).all():
+            if _il.contenido and str(_il.contenido).strip():
+                _indicadores_idx[(_il.asignatura_id, _il.periodo)] = str(_il.contenido).strip()
+
     def _serial_ev(_ev):
         """dict plano y serializable (sin ORM, sin sesión) para el threadpool."""
         if _ev is None:
@@ -14826,8 +14969,18 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
                 
                 asistencias_por_est[idx] = est_asist
         
+        # R2: indicadores de logro del período, ya resueltos del índice bulk.
+        # Solo texto plano: nada de ORM cruza al threadpool.
+        indicadores_asig = {}
+        if asignatura:
+            for _p in (1, 2, 3, 4):
+                _txt = _indicadores_idx.get((asignatura.id, _p))
+                if _txt:
+                    indicadores_asig[_p] = _txt
+
         asignaturas_data[asig_nombre] = {
             'docente': docente_nombre,
+            'indicadores': indicadores_asig,
             'asistencias': asistencias_por_est,
             'asistencia_matriz': build_asistencia_registro(
                 db,
@@ -15357,89 +15510,191 @@ async def api_info(request: Request, db: Session = Depends(get_db), current_user
 
 # ============== INDICADORES DE LOGRO (REGISTRO ESCOLAR) ==============
 
+INDICADOR_LOGRO_MAX_CHARS = 4000
+
+
+def _ano_registro_indicadores(db, current_user, ano_param=None):
+    """Año escolar aplicable a un indicador: el pedido por query, o el ACTIVO."""
+    if ano_param:
+        try:
+            return get_tenant_or_404(db, AnoEscolar, int(ano_param), current_user, name='año escolar')
+        except (TypeError, ValueError):
+            return None
+    return tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+
+
+def _profesor_tiene_par_activo(db, current_user, curso_id, asignatura_id) -> bool:
+    """Asignación ACTIVA para la PAREJA EXACTA (curso, asignatura)."""
+    return tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(
+        profesor_id=current_user.id, curso_id=curso_id,
+        asignatura_id=asignatura_id, activo=True,
+    ).first() is not None
+
+
+def _indicadores_lente_nivel(query, db, current_user, request):
+    """Lente de nivel de dirección/coordinación: acota a cursos de ese nivel."""
+    nivel = nivel_efectivo(current_user, request)
+    if not nivel:
+        return query
+    # Una sola consulta: (curso_id, nivel del grado) del colegio.
+    cursos_nivel = [
+        cid for cid, nv in tenant_filter(
+            db.query(Curso.id, Grado.nivel), Curso, current_user
+        ).join(Grado, Grado.id == Curso.grado_id).all()
+        if _canon_nivel(nv) == nivel
+    ]
+    if not cursos_nivel:
+        return query.filter(sa_false())
+    return query.filter(IndicadorLogro.curso_id.in_(cursos_nivel))
+
+
 @app.get("/api/indicadores-logro")
 async def get_indicadores_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Obtener indicadores de logro filtrados por curso/asignatura/periodo"""
+    """Indicadores de logro del AÑO ESCOLAR (activo por defecto).
+
+    Filtros opcionales: curso_id, asignatura_id, periodo, ano_escolar_id.
+    Profesor: solo las parejas EXACTAS (curso, asignatura) con asignación
+    ACTIVA — da igual quién escribió el indicador (continuidad institucional).
+    Dirección/coordinación: su colegio, bajo la lente de nivel vigente.
+    """
     curso_id = request.query_params.get('curso_id')
     asignatura_id = request.query_params.get('asignatura_id')
     periodo = request.query_params.get('periodo')
-    
-    query = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user)
-    if curso_id:
-        query = query.filter_by(curso_id=int(curso_id))
-    if asignatura_id:
-        query = query.filter_by(asignatura_id=int(asignatura_id))
-    if periodo:
-        query = query.filter_by(periodo=int(periodo))
-    # v2.19 continuidad institucional: el profesor asignado ve los indicadores
-    # de SU curso+asignatura, los haya creado él o el profesor anterior.
+    ano = _ano_registro_indicadores(db, current_user, request.query_params.get('ano_escolar_id'))
+    if not ano:
+        return []
+
+    query = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter(
+        IndicadorLogro.ano_escolar_id == ano.id
+    )
+    try:
+        if curso_id:
+            query = query.filter(IndicadorLogro.curso_id == int(curso_id))
+        if asignatura_id:
+            query = query.filter(IndicadorLogro.asignatura_id == int(asignatura_id))
+        if periodo:
+            query = query.filter(IndicadorLogro.periodo == int(periodo))
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'curso_id / asignatura_id / periodo inválidos'}, status_code=400)
+
+    # Profesor: parejas EXACTAS (curso, asignatura) con asignación activa.
     query = filtrar_por_asignacion_activa(query, IndicadorLogro, db, current_user)
-    
-    return [i.to_dict() for i in query.all()]
+    query = _indicadores_lente_nivel(query, db, current_user, request)
+
+    return [i.to_dict() for i in query.order_by(IndicadorLogro.periodo).all()]
 
 
 @app.post("/api/indicadores-logro")
 async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
-    """Crear o actualizar indicador de logro"""
+    """Crear o actualizar el indicador INSTITUCIONAL del período.
+
+    Identidad: colegio + año escolar + curso + asignatura + período.
+    NO se crea una fila nueva porque cambió el profesor: el docente asignado
+    hoy continúa el registro que dejó el anterior. `profesor_id` guarda al
+    autor / último editor.
+    """
     data = await request.json()
-    
+
     curso_id = data.get('curso_id')
     asignatura_id = data.get('asignatura_id')
     periodo = data.get('periodo')
-    contenido = data.get('contenido', '').strip()
-    
+    contenido = (data.get('contenido') or '').strip()
+
     if not all([curso_id, asignatura_id, periodo]):
         return JSONResponse({'error': 'curso_id, asignatura_id y periodo son requeridos'}, status_code=400)
+    try:
+        periodo = int(periodo)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'periodo inválido'}, status_code=400)
+    if periodo not in (1, 2, 3, 4):
+        return JSONResponse({'error': 'El período debe ser 1, 2, 3 o 4'}, status_code=400)
+    if len(contenido) > INDICADOR_LOGRO_MAX_CHARS:
+        return JSONResponse(
+            {'error': f'El texto supera {INDICADOR_LOGRO_MAX_CHARS} caracteres'},
+            status_code=400,
+        )
 
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     asignatura = get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
     curso_id = curso.id
     asignatura_id = asignatura.id
 
-    if current_user.role == 'profesor':
-        asignacion = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-            profesor_id=current_user.id,
-            curso_id=curso_id,
-            asignatura_id=asignatura_id,
-            activo=True,
-        ).first()
-        if not asignacion:
-            return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'}, status_code=403)
-    
-    # Buscar existente
+    if current_user.role == 'profesor' and not _profesor_tiene_par_activo(
+        db, current_user, curso_id, asignatura_id
+    ):
+        return JSONResponse(
+            {'error': 'No tiene asignación activa para este curso y asignatura'}, status_code=403
+        )
+
+    ano = _ano_registro_indicadores(db, current_user, data.get('ano_escolar_id'))
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=400)
+
+    # Upsert INSTITUCIONAL: la búsqueda NO incluye profesor_id.
     existente = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter_by(
+        ano_escolar_id=ano.id,
+        curso_id=curso_id,
+        asignatura_id=asignatura_id,
+        periodo=periodo,
+    ).first()
+
+    if existente:
+        if not contenido:
+            # Texto vacío sobre un registro existente = borrar el contenido de
+            # esa casilla, explícitamente. No se deja basura ni cadena vacía.
+            db.delete(existente)
+            db.commit()
+            return {'message': 'Indicador eliminado (texto vacío)', 'id': None, 'eliminado': True}
+        anterior = existente.to_dict()
+        existente.contenido = contenido
+        existente.profesor_id = current_user.id   # último editor
+        db.commit()
+        log_auditoria(db, 'actualizar', 'indicadores_logro', existente.id,
+                      anterior, existente.to_dict(), user=current_user, request=request)
+        return {'message': 'Indicador actualizado', 'id': existente.id}
+
+    if not contenido:
+        # Nada que guardar: no se crea una fila vacía.
+        return {'message': 'Sin contenido: no se creó ningún indicador', 'id': None}
+
+    indicador = IndicadorLogro(
+        colegio_id=current_user.colegio_id,
         profesor_id=current_user.id,
         asignatura_id=asignatura_id,
         curso_id=curso_id,
-        periodo=periodo
-    ).first()
-    
-    if existente:
-        existente.contenido = contenido
-        db.commit()
-        return {'message': 'Indicador actualizado', 'id': existente.id}
-    else:
-        indicador = IndicadorLogro(
-            colegio_id=current_user.colegio_id,
-            profesor_id=current_user.id,
-            asignatura_id=asignatura_id,
-            curso_id=curso_id,
-            periodo=periodo,
-            contenido=contenido
-        )
-        db.add(indicador)
-        db.commit()
-        return JSONResponse({'message': 'Indicador creado', 'id': indicador.id}, status_code=201)
+        ano_escolar_id=ano.id,
+        periodo=periodo,
+        contenido=contenido,
+    )
+    db.add(indicador)
+    db.commit()
+    log_auditoria(db, 'crear', 'indicadores_logro', indicador.id,
+                  None, indicador.to_dict(), user=current_user, request=request)
+    return JSONResponse({'message': 'Indicador creado', 'id': indicador.id}, status_code=201)
 
 
 @app.delete("/api/indicadores-logro/{id}")
-async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion'))):
-    """Eliminar indicador de logro. Valida tenant + ownership del profesor."""
+async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+    """Eliminar un indicador. Tenant safe (get_tenant_or_404 evita IDOR).
+
+    Profesor: solo con asignación ACTIVA sobre la pareja exacta
+    (curso, asignatura) del indicador — no por haberlo escrito él.
+    Dirección/coordinación: dentro de su colegio.
+    """
     indicador = get_tenant_or_404(db, IndicadorLogro, id, current_user, name='indicador')
-    if current_user.role == 'profesor' and indicador.profesor_id != current_user.id:
-        return JSONResponse({'error': 'No autorizado'}, status_code=403)
+    if current_user.role == 'profesor' and not _profesor_tiene_par_activo(
+        db, current_user, indicador.curso_id, indicador.asignatura_id
+    ):
+        return JSONResponse(
+            {'error': 'No tiene asignación activa para este curso y asignatura'}, status_code=403
+        )
+    previo = indicador.to_dict()
     db.delete(indicador)
     db.commit()
+    log_auditoria(db, 'eliminar', 'indicadores_logro', previo.get('id'),
+                  previo, None, user=current_user, request=request)
     return {'message': 'Indicador eliminado'}
 
 

@@ -2049,44 +2049,63 @@ class ItemCompletivo(Base):
 
 class IndicadorLogro(Base):
     """
-    Indicadores de logro por asignatura y período.
-    El profesor registra qué competencias/indicadores trabajó.
-    Se usa en el registro escolar MINERD (páginas de competencias).
-    Opcional — si no se llena, las casillas quedan vacías en el registro.
+    Indicadores de logro trabajados por asignatura y período.
+
+    Se imprime en el Registro Escolar MINERD, en la tabla
+    "ESPECIFICACIÓN CURRICULAR APLICADA POR PERÍODO", columna
+    "Indicadores de Logro" (una página por asignatura y período).
+    Opcional — si no se llena, esa casilla del template queda intacta.
+
+    R2 — IDENTIDAD INSTITUCIONAL
+    ----------------------------
+    El indicador pertenece al COLEGIO / AÑO ESCOLAR / CURSO / ASIGNATURA /
+    PERÍODO, no al profesor. `profesor_id` se conserva como AUTOR / ÚLTIMO
+    EDITOR (auditoría), pero NO define la identidad: si el profesor cambia a
+    mitad de año, el que entra continúa el MISMO registro en vez de crear uno
+    paralelo. La identidad anterior —que incluía profesor_id y no contemplaba
+    el año— permitía duplicados por cambio de docente e impedía crear el
+    período del año escolar siguiente.
     """
     __tablename__ = 'indicadores_logro'
     id = Column(Integer, primary_key=True)
     colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
+    # Autor / último editor. NO forma parte de la identidad institucional.
     profesor_id = Column(Integer, ForeignKey('usuarios.id'), nullable=False)
     asignatura_id = Column(Integer, ForeignKey('asignaturas.id'), nullable=False)
     curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False)
+    # R2: el indicador vive dentro de un año escolar concreto.
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=True, index=True)
     periodo = Column(Integer, nullable=False)  # 1-4
-    
+
     # Texto libre que el profesor escribe sobre lo que trabajó
     contenido = Column(Text)
-    
+
     fecha_creacion = Column(DateTime, default=_now_dr)
     fecha_actualizacion = Column(DateTime, default=_now_dr, onupdate=_now_dr)
-    
+
     profesor = relationship('Usuario', backref='indicadores_logro')
     asignatura = relationship('Asignatura', backref='indicadores_logro')
     curso = relationship('Curso', backref='indicadores_logro')
-    
+
     __table_args__ = (
-        UniqueConstraint('profesor_id', 'asignatura_id', 'curso_id', 'periodo', 'colegio_id',
-                         name='unique_indicador_logro'),
+        # R2: identidad INSTITUCIONAL (sin profesor_id, con año escolar).
+        UniqueConstraint('colegio_id', 'ano_escolar_id', 'curso_id', 'asignatura_id', 'periodo',
+                         name='uq_indicador_logro_institucional'),
     )
-    
+
     def to_dict(self):
         return {
             'id': self.id,
+            # profesor = autor / último editor (no identidad)
             'profesor_id': self.profesor_id,
             'profesor': self.profesor.nombre_completo if self.profesor else None,
             'asignatura_id': self.asignatura_id,
             'asignatura': self.asignatura.nombre if self.asignatura else None,
             'curso_id': self.curso_id,
+            'ano_escolar_id': self.ano_escolar_id,
             'periodo': self.periodo,
             'contenido': self.contenido,
+            'actualizado_en': self.fecha_actualizacion.isoformat() if self.fecha_actualizacion else None,
         }
 
 
