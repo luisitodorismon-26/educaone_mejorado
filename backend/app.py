@@ -539,30 +539,39 @@ async def lifespan(app):
                         logger.warning(f"No se pudo agregar indicadores_logro.ano_escolar_id: {e}")
                         raise
 
-            # (2) backfill conservador — solo filas con ano_escolar_id NULL.
-            # Nunca borra ni modifica `contenido`; idempotente.
+            # (2) backfill CONSERVADOR — solo filas con ano_escolar_id NULL.
+            # R2-hardening §4: NO se inventa historia. La única fuente admitida
+            # es el AÑO DEL PROPIO CURSO (Curso.ano_escolar_id): es un hecho
+            # estructural, no una suposición. Si el curso tampoco tiene año, la
+            # fila se DEJA EN NULL y se reporta — nunca se le asigna un año
+            # arbitrario ni se borra. Idempotente; jamás toca `contenido`.
             with engine.connect() as conn:
                 try:
-                    if _es_pg:
-                        _res = conn.execute(text(
-                            "UPDATE indicadores_logro AS il SET ano_escolar_id = ae.id "
-                            "FROM ano_escolar AS ae "
-                            "WHERE il.ano_escolar_id IS NULL AND ae.activo = TRUE "
-                            "AND ae.colegio_id IS NOT DISTINCT FROM il.colegio_id"
-                        ))
-                    else:
-                        _res = conn.execute(text(
-                            "UPDATE indicadores_logro SET ano_escolar_id = ("
-                            "  SELECT ae.id FROM ano_escolar ae "
-                            "  WHERE ae.activo = 1 "
-                            "    AND ae.colegio_id IS indicadores_logro.colegio_id LIMIT 1) "
-                            "WHERE ano_escolar_id IS NULL"
-                        ))
+                    _res = conn.execute(text(
+                        "UPDATE indicadores_logro SET ano_escolar_id = ("
+                        "  SELECT c.ano_escolar_id FROM cursos c "
+                        "  WHERE c.id = indicadores_logro.curso_id"
+                        ") "
+                        "WHERE ano_escolar_id IS NULL AND EXISTS ("
+                        "  SELECT 1 FROM cursos c WHERE c.id = indicadores_logro.curso_id "
+                        "  AND c.ano_escolar_id IS NOT NULL"
+                        ")"
+                    ))
                     conn.commit()
                     if _res.rowcount:
                         logger.info(
-                            f"✅ Migración: {_res.rowcount} indicador(es) de logro "
-                            f"asociados al año escolar activo de su colegio"
+                            f"✅ Migración: {_res.rowcount} indicador(es) de logro asociados "
+                            f"al año escolar de su curso"
+                        )
+                    _sin_ano = conn.execute(text(
+                        "SELECT COUNT(*) FROM indicadores_logro WHERE ano_escolar_id IS NULL"
+                    )).scalar() or 0
+                    if _sin_ano:
+                        logger.warning(
+                            f"⚠️ indicadores_logro: {_sin_ano} fila(s) quedaron con "
+                            f"ano_escolar_id NULL porque su curso tampoco tiene año escolar. "
+                            f"NO se les asignó un año arbitrario ni se borró ninguna. "
+                            f"Asignar el año al curso y reiniciar para completarlas."
                         )
                 except Exception as e:
                     logger.warning(f"Backfill de indicadores_logro.ano_escolar_id falló: {e}")
@@ -15534,20 +15543,65 @@ def _profesor_tiene_par_activo(db, current_user, curso_id, asignatura_id) -> boo
 
 
 def _indicadores_lente_nivel(query, db, current_user, request):
-    """Lente de nivel de dirección/coordinación: acota a cursos de ese nivel."""
+    """Lente de nivel de dirección/coordinación: acota a cursos de ese nivel.
+
+    Usa el helper institucional `cursos_ids_de_nivel`. `nivel_efectivo` ya
+    devuelve None para 'profesor', así que la lente NUNCA recorta a un docente:
+    él se rige por su asignación ACTIVA exacta, aunque cruce Primaria/Secundaria.
+    """
     nivel = nivel_efectivo(current_user, request)
     if not nivel:
         return query
-    # Una sola consulta: (curso_id, nivel del grado) del colegio.
-    cursos_nivel = [
-        cid for cid, nv in tenant_filter(
-            db.query(Curso.id, Grado.nivel), Curso, current_user
-        ).join(Grado, Grado.id == Curso.grado_id).all()
-        if _canon_nivel(nv) == nivel
-    ]
+    cursos_nivel = cursos_ids_de_nivel(db, current_user, nivel) or set()
     if not cursos_nivel:
         return query.filter(sa_false())
     return query.filter(IndicadorLogro.curso_id.in_(cursos_nivel))
+
+
+def _indicador_nivel_bloqueado(db, current_user, request, curso_id) -> bool:
+    """True si la lente de nivel del usuario le impide ESCRIBIR en ese curso.
+
+    R2-hardening: la misma regla que aplica el GET debe aplicar a POST y
+    DELETE. Un coordinador con nivel_asignado fijo no puede crear, modificar
+    ni eliminar indicadores fuera de su nivel (nivel_efectivo ignora X-Nivel
+    para él). El profesor queda exento por diseño: `nivel_efectivo` devuelve
+    None para su rol y su límite real es la asignación activa exacta.
+    """
+    nivel = nivel_efectivo(current_user, request)
+    if not nivel:
+        return False
+    return curso_id not in (cursos_ids_de_nivel(db, current_user, nivel) or set())
+
+
+def _ano_coherente_con_curso(db, current_user, curso, ano_param):
+    """Resuelve el año del indicador y valida que sea coherente con el curso.
+
+    Devuelve (ano, error_msg). Si `error_msg` no es None, NO debe escribirse nada.
+
+    - Curso con `ano_escolar_id`: el indicador DEBE ir a ese mismo año.
+    - Curso legacy sin año (caracterizado: en producción hoy 0 cursos así):
+      solo se admite el año ACTIVO. No se permite escribir arbitrariamente en
+      un año histórico de un curso cuya pertenencia no se puede verificar.
+    """
+    ano = _ano_registro_indicadores(db, current_user, ano_param)
+    if not ano:
+        return None, 'No hay año escolar activo'
+    curso_ano = getattr(curso, 'ano_escolar_id', None)
+    if curso_ano is not None:
+        if ano.id != curso_ano:
+            return None, (
+                'El año escolar del indicador no corresponde al del curso. '
+                'El curso pertenece a otro año escolar.'
+            )
+        return ano, None
+    # Curso legacy sin año: solo el activo.
+    activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not activo or ano.id != activo.id:
+        return None, (
+            'Este curso no tiene año escolar asignado; solo se pueden registrar '
+            'indicadores en el año escolar activo.'
+        )
+    return ano, None
 
 
 @app.get("/api/indicadores-logro")
@@ -15628,25 +15682,49 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
             {'error': 'No tiene asignación activa para este curso y asignatura'}, status_code=403
         )
 
-    ano = _ano_registro_indicadores(db, current_user, data.get('ano_escolar_id'))
-    if not ano:
-        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=400)
+    # R2-hardening §3: la lente de nivel también rige al ESCRIBIR.
+    if _indicador_nivel_bloqueado(db, current_user, request, curso_id):
+        return JSONResponse(
+            {'error': 'Este curso está fuera de tu nivel asignado'}, status_code=403
+        )
+
+    # R2-hardening §2: el año del indicador debe ser el del curso.
+    ano, err_ano = _ano_coherente_con_curso(db, current_user, curso, data.get('ano_escolar_id'))
+    if err_ano:
+        return JSONResponse({'error': err_ano}, status_code=400)
 
     # Upsert INSTITUCIONAL: la búsqueda NO incluye profesor_id.
-    existente = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter_by(
+    # R2-hardening §4: nunca un .first() silencioso — si la identidad
+    # institucional tuviera más de una fila (anomalía que la clave única debe
+    # impedir), NO se modifica ninguna.
+    coincidencias = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter_by(
         ano_escolar_id=ano.id,
         curso_id=curso_id,
         asignatura_id=asignatura_id,
         periodo=periodo,
-    ).first()
+    ).order_by(IndicadorLogro.id).all()
+    if len(coincidencias) > 1:
+        logger.error(
+            f"ANOMALÍA indicadores_logro: {len(coincidencias)} filas para la identidad "
+            f"institucional (colegio={current_user.colegio_id}, año={ano.id}, curso={curso_id}, "
+            f"asignatura={asignatura_id}, período={periodo}). No se modificó ninguna."
+        )
+        return JSONResponse(
+            {'error': 'Hay más de un indicador para este período. Contacte soporte técnico '
+                      'antes de continuar: no se modificó ningún dato.'},
+            status_code=409,
+        )
+    existente = coincidencias[0] if coincidencias else None
 
     if existente:
+        # R2-hardening §1: un POST vacío NUNCA borra ni vacía. La única vía de
+        # eliminación es DELETE /api/indicadores-logro/{id}.
         if not contenido:
-            # Texto vacío sobre un registro existente = borrar el contenido de
-            # esa casilla, explícitamente. No se deja basura ni cadena vacía.
-            db.delete(existente)
-            db.commit()
-            return {'message': 'Indicador eliminado (texto vacío)', 'id': None, 'eliminado': True}
+            return JSONResponse(
+                {'error': 'El contenido está vacío. Usa Eliminar si deseas borrar '
+                          'este indicador.'},
+                status_code=400,
+            )
         anterior = existente.to_dict()
         existente.contenido = contenido
         existente.profesor_id = current_user.id   # último editor
@@ -15656,7 +15734,7 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
         return {'message': 'Indicador actualizado', 'id': existente.id}
 
     if not contenido:
-        # Nada que guardar: no se crea una fila vacía.
+        # No existe y no hay texto: no-op explícito, no se crea una fila vacía.
         return {'message': 'Sin contenido: no se creó ningún indicador', 'id': None}
 
     indicador = IndicadorLogro(
@@ -15689,6 +15767,11 @@ async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(g
     ):
         return JSONResponse(
             {'error': 'No tiene asignación activa para este curso y asignatura'}, status_code=403
+        )
+    # R2-hardening §3: la lente de nivel también rige al ELIMINAR.
+    if _indicador_nivel_bloqueado(db, current_user, request, indicador.curso_id):
+        return JSONResponse(
+            {'error': 'Este curso está fuera de tu nivel asignado'}, status_code=403
         )
     previo = indicador.to_dict()
     db.delete(indicador)

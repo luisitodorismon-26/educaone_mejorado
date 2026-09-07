@@ -129,6 +129,10 @@ export const IndicadoresLogroPage = () => {
   }, [actual, periodo]);
 
   const cambioSinGuardar = (actual?.contenido || '') !== texto;
+  // R2-hardening: vaciar la casilla NO se hace con Guardar (un POST vacío ya
+  // nunca borra en el backend). La única vía es el botón Eliminar.
+  const intentaVaciar = !!actual && texto.trim().length === 0;
+  const puedeGuardar = cambioSinGuardar && !intentaVaciar && texto.trim().length > 0;
 
   // ── acciones ─────────────────────────────────────────────────────────
   const guardar = async () => {
@@ -138,6 +142,15 @@ export const IndicadoresLogroPage = () => {
     }
     if (texto.length > MAX_CHARS) {
       setMensaje({ tipo: 'error', texto: `El texto supera ${MAX_CHARS} caracteres` });
+      return;
+    }
+    if (!texto.trim()) {
+      setMensaje({
+        tipo: 'error',
+        texto: actual
+          ? 'El contenido está vacío. Usa Eliminar si deseas borrar este indicador.'
+          : 'Escribe los indicadores antes de guardar.',
+      });
       return;
     }
     setSaving(true);
@@ -311,13 +324,20 @@ export const IndicadoresLogroPage = () => {
                 </div>
               </div>
 
+              {intentaVaciar && (
+                <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  Dejar el texto en blanco no borra la casilla. Para vaciarla en el
+                  Registro Escolar usa <strong>Eliminar período</strong>.
+                </p>
+              )}
+
               <div className="flex flex-col sm:flex-row gap-2 sm:justify-end">
                 {actual && (
                   <Button variant="danger" onClick={eliminar} disabled={saving}>
                     <Trash2 size={16} className="mr-1" /> Eliminar período
                   </Button>
                 )}
-                <Button onClick={guardar} disabled={saving || !cambioSinGuardar}>
+                <Button onClick={guardar} disabled={saving || !puedeGuardar}>
                   <Save size={16} className="mr-1" />
                   {saving ? 'Guardando…' : cambioSinGuardar ? 'Guardar' : 'Guardado'}
                 </Button>

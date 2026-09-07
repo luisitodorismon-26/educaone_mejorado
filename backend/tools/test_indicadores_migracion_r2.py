@@ -89,6 +89,7 @@ def test(nombre):
 
 
 COL, ANO, CURSO, ASIG, PROF = 1, 1, 1, 1, 1
+CURSO_SIN_ANO = 2      # curso legacy sin ano_escolar_id
 CONTENIDO = "IL-1 texto histórico que NO se puede perder"
 
 # ── 1. esquema LEGACY + fila previa ──────────────────────────────────────
@@ -113,14 +114,29 @@ with engine.connect() as conn:
         "(profesor_id, asignatura_id, curso_id, periodo, colegio_id)"
     ))
     conn.execute(text("CREATE INDEX ix_indicadores_logro_colegio_id ON indicadores_logro (colegio_id)"))
-    # año escolar ACTIVO del colegio + la fila legacy
+    # año escolar ACTIVO + un curso CON año y otro SIN año (legacy)
     conn.execute(text(
         "INSERT INTO ano_escolar (id, colegio_id, nombre, activo, cerrado, periodo_activo, dias_trabajados) "
         "VALUES (:i, :c, '2025-2026', 1, 0, 1, '{}')"), {"i": ANO, "c": COL})
     conn.execute(text(
+        "INSERT INTO grados (id, colegio_id, nombre, nivel) VALUES (1, :c, '1ro Secundaria', 'secundaria')"),
+        {"c": COL})
+    conn.execute(text(
+        "INSERT INTO cursos (id, colegio_id, nombre, grado_id, ano_escolar_id) "
+        "VALUES (:k, :c, 'A', 1, :y)"), {"k": CURSO, "c": COL, "y": ANO})
+    conn.execute(text(
+        "INSERT INTO cursos (id, colegio_id, nombre, grado_id, ano_escolar_id) "
+        "VALUES (:k, :c, 'B', 1, NULL)"), {"k": CURSO_SIN_ANO, "c": COL})
+    # (1) indicador de un curso CON año -> debe heredar el año del CURSO
+    conn.execute(text(
         "INSERT INTO indicadores_logro (id, colegio_id, profesor_id, asignatura_id, curso_id, periodo, contenido) "
         "VALUES (1, :c, :p, :a, :k, 2, :t)"),
         {"c": COL, "p": PROF, "a": ASIG, "k": CURSO, "t": CONTENIDO})
+    # (2) indicador de un curso SIN año -> debe quedarse en NULL, sin inventar
+    conn.execute(text(
+        "INSERT INTO indicadores_logro (id, colegio_id, profesor_id, asignatura_id, curso_id, periodo, contenido) "
+        "VALUES (2, :c, :p, :a, :k, 3, 'sin año determinable')"),
+        {"c": COL, "p": PROF, "a": ASIG, "k": CURSO_SIN_ANO})
     conn.commit()
 
 _cols_antes = {r[1] for r in engine.connect().execute(text("PRAGMA table_info(indicadores_logro)"))}
@@ -164,14 +180,21 @@ def _():
     assert _cols_antes.issubset(_cols1), _cols_antes - _cols1
 
 
-@test("§C2 CERO PÉRDIDA: la fila legacy se conserva íntegra y queda en el año ACTIVO")
+@test("§C2 CERO PÉRDIDA: la fila legacy se conserva íntegra y hereda el año del CURSO")
 def _():
-    assert len(_filas1) == 1, _filas1
-    f = _filas1[0]
-    assert f[0] == 1 and f[1] == COL and f[2] == PROF and f[3] == ASIG and f[4] == CURSO
+    assert len(_filas1) == 2, _filas1
+    f = next(x for x in _filas1 if x[0] == 1)
+    assert f[1] == COL and f[2] == PROF and f[3] == ASIG and f[4] == CURSO
     assert f[5] == 2, "cambió el período"
     assert f[6] == CONTENIDO, "se perdió o alteró el contenido"
     assert f[7] == ANO, f"backfill incorrecto: ano_escolar_id={f[7]}"
+
+
+@test("§C2-b backfill CONSERVADOR: sin año determinable NO se inventa — queda NULL y se conserva")
+def _():
+    g = next(x for x in _filas1 if x[0] == 2)
+    assert g[6] == "sin año determinable", "se perdió o alteró el contenido"
+    assert g[7] is None, f"se inventó un año: ano_escolar_id={g[7]}"
 
 
 @test("§C3 queda la clave institucional y se retira la legacy dependiente del profesor")
@@ -210,7 +233,8 @@ def _():
             {"c": COL, "p": PROF, "a": ASIG, "k": CURSO})
         conn.commit()
         n = conn.execute(text("SELECT COUNT(*) FROM indicadores_logro")).scalar()
-    assert n == 2, n
+    # 2 filas del seed + la del año siguiente
+    assert n == 3, n
 
 
 @test("§C5 IDEMPOTENCIA: un segundo arranque no altera esquema ni datos")
@@ -222,8 +246,9 @@ def _():
     # la fila original sigue intacta (la del año 99 se agregó en §C4)
     orig = [f for f in filas2 if f[0] == 1]
     assert len(orig) == 1 and orig[0][6] == CONTENIDO and orig[0][7] == ANO, orig
-    # el backfill no reasigna lo ya asignado
-    assert all(f[7] is not None for f in filas2), filas2
+    # la fila sin año determinable sigue en NULL y con su contenido intacto
+    huerf = [f for f in filas2 if f[0] == 2]
+    assert len(huerf) == 1 and huerf[0][7] is None and huerf[0][6] == "sin año determinable", huerf
 
 
 print(f"\n{B}{'=' * 62}{X}")

@@ -106,6 +106,9 @@ COL_A, COL_B = 1, 2
 ANO_A, ANO_A_PREV, ANO_B = 1, 2, 3
 GRADO_A, GRADO_B = 1, 2
 C1, C2, C3 = 1, 2, 3                     # C1/C2 -> colegio A ; C3 -> colegio B
+C4_PRIM, C5_PREV = 4, 5                  # C4 = primaria (colegio A) ; C5 = año anterior
+GRADO_PRIM = 3
+U_COORD_SEC, U_PROF_X = 14, 15
 MAT, LEN, MAT_B = 101, 102, 201
 U_DIR_A, U_PROF_A, U_PROF_B, U_DIR_B = 10, 11, 12, 13
 PWD = "Prueba2026x"
@@ -127,9 +130,13 @@ def _seed():
         d.add(M.AnoEscolar(id=ANO_B, colegio_id=COL_B, nombre="2025-2026", activo=True, dias_trabajados="{}"))
         d.add(M.Grado(id=GRADO_A, colegio_id=COL_A, nombre="1ro Secundaria", nivel="secundaria"))
         d.add(M.Grado(id=GRADO_B, colegio_id=COL_B, nombre="1ro Secundaria", nivel="secundaria"))
-        d.add(M.Curso(id=C1, colegio_id=COL_A, nombre="A", grado_id=GRADO_A))
-        d.add(M.Curso(id=C2, colegio_id=COL_A, nombre="B", grado_id=GRADO_A))
-        d.add(M.Curso(id=C3, colegio_id=COL_B, nombre="A", grado_id=GRADO_B))
+        d.add(M.Grado(id=GRADO_PRIM, colegio_id=COL_A, nombre="4to Primaria", nivel="primaria"))
+        # Los cursos SÍ pertenecen a un año escolar (así es en producción).
+        d.add(M.Curso(id=C1, colegio_id=COL_A, nombre="A", grado_id=GRADO_A, ano_escolar_id=ANO_A))
+        d.add(M.Curso(id=C2, colegio_id=COL_A, nombre="B", grado_id=GRADO_A, ano_escolar_id=ANO_A))
+        d.add(M.Curso(id=C3, colegio_id=COL_B, nombre="A", grado_id=GRADO_B, ano_escolar_id=ANO_B))
+        d.add(M.Curso(id=C4_PRIM, colegio_id=COL_A, nombre="P", grado_id=GRADO_PRIM, ano_escolar_id=ANO_A))
+        d.add(M.Curso(id=C5_PREV, colegio_id=COL_A, nombre="C", grado_id=GRADO_A, ano_escolar_id=ANO_A_PREV))
         d.add(M.Asignatura(id=MAT, colegio_id=COL_A, nombre="Matemática"))
         d.add(M.Asignatura(id=LEN, colegio_id=COL_A, nombre="Lengua Española"))
         d.add(M.Asignatura(id=MAT_B, colegio_id=COL_B, nombre="Matemática"))
@@ -138,13 +145,22 @@ def _seed():
             (U_PROF_A, "prof_a", "profesor", COL_A),
             (U_PROF_B, "prof_b", "profesor", COL_A),
             (U_DIR_B, "dir_b", "direccion", COL_B),
+            (U_COORD_SEC, "coord_sec", "coordinador", COL_A),
+            (U_PROF_X, "prof_x", "profesor", COL_A),
         ):
             u = M.Usuario(id=uid, username=uname, nombre=uname, apellido="T", role=rol, colegio_id=col)
+            if uname == "coord_sec":
+                u.nivel_asignado = "secundaria"      # lente FIJO
             u.set_password(PWD)
             d.add(u)
         # Profesor A: asignación ACTIVA a (C1, MAT). Nada más.
         d.add(M.AsignacionProfesor(id=1, colegio_id=COL_A, profesor_id=U_PROF_A,
                                    curso_id=C1, asignatura_id=MAT, activo=True, es_titular=True))
+        # prof_x: asignación REAL cruzando niveles (secundaria C1/LEN + primaria C4/MAT)
+        d.add(M.AsignacionProfesor(id=3, colegio_id=COL_A, profesor_id=U_PROF_X,
+                                   curso_id=C1, asignatura_id=LEN, activo=True))
+        d.add(M.AsignacionProfesor(id=4, colegio_id=COL_A, profesor_id=U_PROF_X,
+                                   curso_id=C4_PRIM, asignatura_id=MAT, activo=True))
         d.commit()
     finally:
         d.close()
@@ -185,6 +201,8 @@ DIR_A = login("dir_a")
 PROF_A = login("prof_a")
 PROF_B = login("prof_b")
 DIR_B = login("dir_b")
+COORD_SEC = login("coord_sec")
+PROF_X = login("prof_x")
 print(f"{G}✓ DB de test AISLADA:{X} {_eu}")
 
 
@@ -249,23 +267,32 @@ def _():
     assert autor_antes == U_PROF_A and despues[0].profesor_id == U_PROF_B, "no se registró el último editor"
 
 
-@test("§8 misma asignatura/curso en OTRO año escolar puede tener su propio indicador")
+@test("§8 un curso de OTRO año escolar tiene su propio indicador, sin colisionar")
 def _():
-    r = post_ind(DIR_A, C1, MAT, 1, "Indicador del año anterior", ano_escolar_id=ANO_A_PREV)
+    # C5 pertenece al año anterior. El default sigue siendo el año ACTIVO, así
+    # que escribir en un año histórico exige pedirlo EXPLÍCITAMENTE.
+    r = post_ind(DIR_A, C5_PREV, MAT, 1, "Indicador del año anterior")
+    assert r.status_code == 400, "sin ano_escolar_id explícito debe rechazarse"
+    r = post_ind(DIR_A, C5_PREV, MAT, 1, "Indicador del año anterior",
+                 ano_escolar_id=ANO_A_PREV)
     assert r.status_code == 201, r.text
-    filas = _filas({"curso_id": C1, "asignatura_id": MAT, "periodo": 1})
-    assert len(filas) == 2, [f.ano_escolar_id for f in filas]
-    assert {f.ano_escolar_id for f in filas} == {ANO_A, ANO_A_PREV}
+    filas = _filas({"asignatura_id": MAT, "periodo": 1})
+    anios = {f.ano_escolar_id for f in filas}
+    assert {ANO_A, ANO_A_PREV}.issubset(anios), anios
+    assert len(_filas({"curso_id": C5_PREV, "asignatura_id": MAT, "periodo": 1})) == 1
 
 
 @test("§1 el indicador de un año NO aparece en el listado de otro año")
 def _():
     actual = get_ind(DIR_A, curso_id=C1, asignatura_id=MAT).json()          # año activo
-    previo = get_ind(DIR_A, curso_id=C1, asignatura_id=MAT, ano_escolar_id=ANO_A_PREV).json()
+    previo = get_ind(DIR_A, curso_id=C5_PREV, asignatura_id=MAT,
+                     ano_escolar_id=ANO_A_PREV).json()
     assert all(i["ano_escolar_id"] == ANO_A for i in actual), actual
     assert all(i["ano_escolar_id"] == ANO_A_PREV for i in previo), previo
     assert not any(i["contenido"] == "Indicador del año anterior" for i in actual)
     assert len(previo) == 1 and previo[0]["contenido"] == "Indicador del año anterior"
+    # el listado del año ACTIVO no muestra el curso del año anterior
+    assert get_ind(DIR_A, curso_id=C5_PREV, asignatura_id=MAT).json() == []
 
 
 @test("§2 tenant: Colegio B no lee NADA del Colegio A (ni por id directo)")
@@ -278,18 +305,33 @@ def _():
     assert _filas({"curso_id": C1, "asignatura_id": MAT, "ano_escolar_id": ANO_A, "periodo": 1}), "se borró un dato ajeno"
 
 
-@test("§9 texto vacío: no crea fila nueva; sobre una existente la elimina explícitamente")
+VACIO_MIXTO = " " + chr(10) + chr(9) + " "
+
+
+@test("§H1 POST vacío JAMÁS borra: sin fila = no-op; con fila = 400 y dato intacto")
 def _():
     # (a) vacío sobre par sin indicador -> no crea basura
     n0 = len(_filas())
     r = post_ind(DIR_A, C1, LEN, 3, "   ")
     assert r.status_code == 200 and r.json().get("id") is None, r.text
     assert len(_filas()) == n0, "se creó una fila con contenido vacío"
-    # (b) vacío sobre uno existente -> lo elimina
-    assert post_ind(DIR_A, C1, LEN, 3, "algo").status_code == 201
-    assert len(_filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 3})) == 1
-    r = post_ind(DIR_A, C1, LEN, 3, "")
-    assert r.status_code == 200 and r.json().get("eliminado") is True, r.text
+
+    # (b) vacío sobre uno EXISTENTE -> 400, y la fila queda INTACTA
+    assert post_ind(DIR_A, C1, LEN, 3, "contenido original").status_code == 201
+    antes = _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 3})
+    assert len(antes) == 1
+    id_antes, texto_antes = antes[0].id, antes[0].contenido
+    for vacio in ("", "   ", VACIO_MIXTO):
+        r = post_ind(DIR_A, C1, LEN, 3, vacio)
+        assert r.status_code == 400, f"POST vacío devolvió {r.status_code}: {r.text[:120]}"
+        assert "Eliminar" in r.json().get("error", ""), r.json()
+    despues = _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 3})
+    assert len(despues) == 1, "el POST vacío borró la fila"
+    assert despues[0].id == id_antes and despues[0].contenido == texto_antes, "se alteró el contenido"
+
+    # (c) la ÚNICA vía de borrado es DELETE explícito
+    r = client.delete(f"/api/indicadores-logro/{id_antes}", headers=auth(DIR_A))
+    assert r.status_code == 200, r.text
     assert _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 3}) == []
 
 
@@ -311,6 +353,115 @@ def _():
     from app import INDICADOR_LOGRO_MAX_CHARS as LIM
     assert post_ind(DIR_A, C1, MAT, 4, "a" * (LIM + 1)).status_code == 400
     assert post_ind(DIR_A, C1, MAT, 4, "a" * LIM).status_code == 201
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PARTE 1-b — R2 HARDENING: coherencia curso↔año, lente de nivel, duplicados
+# ═══════════════════════════════════════════════════════════════════════════
+@test("§H2 coherencia curso↔año: curso del año A + año A → OK; + año B → 400 sin escribir")
+def _():
+    n0 = len(_filas())
+    # (a) coherente: C1 pertenece a ANO_A
+    assert post_ind(DIR_A, C1, LEN, 2, "coherente", ano_escolar_id=ANO_A).status_code == 201
+    # (b) incoherente: C1 es de ANO_A, se pide ANO_A_PREV
+    r = post_ind(DIR_A, C1, LEN, 1, "año equivocado", ano_escolar_id=ANO_A_PREV)
+    assert r.status_code == 400, r.text
+    assert "año escolar" in r.json().get("error", "").lower(), r.json()
+    assert not _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 1}), "creó la fila pese al 400"
+    # (c) al revés: curso del año anterior con el año activo
+    r = post_ind(DIR_A, C5_PREV, LEN, 1, "otra vez mal", ano_escolar_id=ANO_A)
+    assert r.status_code == 400, r.text
+    assert not _filas({"curso_id": C5_PREV, "asignatura_id": LEN, "periodo": 1})
+    # nada más se creó salvo (a)
+    assert len(_filas()) == n0 + 1, "hubo escrituras inesperadas"
+
+
+@test("§H2-b una actualización con año incoherente NO modifica la fila existente")
+def _():
+    fila = _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 2})[0]
+    original = fila.contenido
+    r = post_ind(DIR_A, C1, LEN, 2, "intento de pisar", ano_escolar_id=ANO_A_PREV)
+    assert r.status_code == 400, r.text
+    assert _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 2})[0].contenido == original
+
+
+@test("§H3 lente de nivel: coordinador de secundaria NO escribe ni borra en primaria")
+def _():
+    # (a) curso de SECUNDARIA -> permitido
+    r = post_ind(COORD_SEC, C2, MAT, 1, "coord en secundaria")
+    assert r.status_code == 201, r.text
+    # (b) curso de PRIMARIA -> bloqueado, sin escribir
+    r = post_ind(COORD_SEC, C4_PRIM, MAT, 1, "coord en primaria")
+    assert r.status_code == 403, r.text
+    assert not _filas({"curso_id": C4_PRIM}), "escribió fuera de su nivel"
+    # (c) DELETE de un indicador de primaria -> bloqueado
+    assert post_ind(DIR_A, C4_PRIM, MAT, 1, "creado por dirección").status_code == 201
+    prim = _filas({"curso_id": C4_PRIM, "asignatura_id": MAT, "periodo": 1})[0]
+    r = client.delete(f"/api/indicadores-logro/{prim.id}", headers=auth(COORD_SEC))
+    assert r.status_code == 403, r.text
+    assert _filas({"curso_id": C4_PRIM, "asignatura_id": MAT, "periodo": 1}), "borró fuera de su nivel"
+    # (d) el GET tampoco se lo muestra
+    vistos = get_ind(COORD_SEC, curso_id=C4_PRIM).json()
+    assert vistos == [], vistos
+
+
+@test("§H3-b profesor con asignación REAL cross-level: permitido en ambos niveles")
+def _():
+    # prof_x tiene (C1=secundaria, LEN) y (C4=primaria, MAT) activas
+    assert post_ind(PROF_X, C1, LEN, 4, "prof_x en secundaria").status_code == 201
+    assert post_ind(PROF_X, C4_PRIM, MAT, 2, "prof_x en primaria").status_code == 201
+    # y sin la pareja exacta -> 403 (su límite real es la asignación)
+    assert post_ind(PROF_X, C1, MAT, 4, "sin pareja").status_code == 403
+    assert post_ind(PROF_X, C2, LEN, 1, "sin pareja").status_code == 403
+
+
+@test("§H4 identidad duplicada: POST devuelve 409 y NO modifica ninguna fila")
+def _():
+    # La clave única impide el duplicado por diseño. Para poder ejercitar la
+    # GUARDA de la API se reconstruye la tabla SIN esa restricción (solo en esta
+    # DB temporal), se inserta la anomalía y al final se restaura el esquema.
+    from sqlalchemy import text as _sql
+    _COLS = ("id, colegio_id, profesor_id, asignatura_id, curso_id, ano_escolar_id, "
+             "periodo, contenido, fecha_creacion, fecha_actualizacion")
+    with engine.connect() as conn:
+        conn.execute(_sql(f"CREATE TABLE il_bak AS SELECT {_COLS} FROM indicadores_logro"))
+        conn.execute(_sql("DROP TABLE indicadores_logro"))
+        conn.execute(_sql(
+            "CREATE TABLE indicadores_logro ("
+            " id INTEGER NOT NULL PRIMARY KEY, colegio_id INTEGER, profesor_id INTEGER NOT NULL,"
+            " asignatura_id INTEGER NOT NULL, curso_id INTEGER NOT NULL, ano_escolar_id INTEGER,"
+            " periodo INTEGER NOT NULL, contenido TEXT, fecha_creacion DATETIME,"
+            " fecha_actualizacion DATETIME)"))
+        conn.execute(_sql(f"INSERT INTO indicadores_logro ({_COLS}) SELECT {_COLS} FROM il_bak"))
+        conn.execute(_sql(
+            "INSERT INTO indicadores_logro (colegio_id, profesor_id, asignatura_id, curso_id,"
+            " ano_escolar_id, periodo, contenido) VALUES (:c, :p, :a, :k, :y, 1, 'fila duplicada')"),
+            {"c": COL_A, "p": U_DIR_A, "a": MAT, "k": C2, "y": ANO_A})
+        conn.commit()
+
+    antes = sorted((f.id, f.contenido) for f in
+                   _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 1}))
+    assert len(antes) == 2, antes
+    r = post_ind(DIR_A, C2, MAT, 1, "intento sobre duplicados")
+    assert r.status_code == 409, r.text
+    despues = sorted((f.id, f.contenido) for f in
+                     _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 1}))
+    assert despues == antes, "se modificó una fila pese al conflicto"
+    # restaurar el esquema original (con la clave única) y quitar la anomalía
+    with engine.connect() as conn:
+        conn.execute(_sql("DELETE FROM indicadores_logro WHERE contenido = 'fila duplicada'"))
+        conn.execute(_sql("DROP TABLE il_bak"))
+        conn.execute(_sql(f"CREATE TABLE il_bak AS SELECT {_COLS} FROM indicadores_logro"))
+        conn.execute(_sql("DROP TABLE indicadores_logro"))
+        conn.commit()
+    M.IndicadorLogro.__table__.create(bind=engine)
+    with engine.connect() as conn:
+        conn.execute(_sql(f"INSERT INTO indicadores_logro ({_COLS}) SELECT {_COLS} FROM il_bak"))
+        conn.execute(_sql("DROP TABLE il_bak"))
+        conn.commit()
+    idx = {r[1] for r in engine.connect().execute(_sql("PRAGMA index_list(indicadores_logro)"))}
+    assert any("uq_indicador_logro_institucional" in n or n.startswith("sqlite_autoindex")
+               for n in idx), f"no se restauró la clave única: {idx}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
