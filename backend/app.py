@@ -545,16 +545,23 @@ async def lifespan(app):
             # estructural, no una suposición. Si el curso tampoco tiene año, la
             # fila se DEJA EN NULL y se reporta — nunca se le asigna un año
             # arbitrario ni se borra. Idempotente; jamás toca `contenido`.
+            # R2-final-guard §2: el backfill es TENANT-SAFE. Solo completa la
+            # fila si el curso referenciado pertenece AL MISMO colegio que el
+            # indicador. Una fila históricamente corrupta que cruce tenant NO se
+            # completa en silencio: se deja en NULL y se reporta.
+            _eq_col = "IS NOT DISTINCT FROM" if _es_pg else "IS"
             with engine.connect() as conn:
                 try:
                     _res = conn.execute(text(
                         "UPDATE indicadores_logro SET ano_escolar_id = ("
                         "  SELECT c.ano_escolar_id FROM cursos c "
-                        "  WHERE c.id = indicadores_logro.curso_id"
+                        "  WHERE c.id = indicadores_logro.curso_id "
+                        f"    AND c.colegio_id {_eq_col} indicadores_logro.colegio_id"
                         ") "
                         "WHERE ano_escolar_id IS NULL AND EXISTS ("
                         "  SELECT 1 FROM cursos c WHERE c.id = indicadores_logro.curso_id "
-                        "  AND c.ano_escolar_id IS NOT NULL"
+                        "  AND c.ano_escolar_id IS NOT NULL "
+                        f"  AND c.colegio_id {_eq_col} indicadores_logro.colegio_id"
                         ")"
                     ))
                     conn.commit()
@@ -563,15 +570,27 @@ async def lifespan(app):
                             f"✅ Migración: {_res.rowcount} indicador(es) de logro asociados "
                             f"al año escolar de su curso"
                         )
+                    # Anomalía de tenant: el curso del indicador es de otro colegio.
+                    _cruzados = conn.execute(text(
+                        "SELECT COUNT(*) FROM indicadores_logro il "
+                        "JOIN cursos c ON c.id = il.curso_id "
+                        "WHERE il.ano_escolar_id IS NULL "
+                        f"  AND NOT (c.colegio_id {_eq_col} il.colegio_id)"
+                    )).scalar() or 0
+                    if _cruzados:
+                        logger.error(
+                            f"⚠️ ANOMALÍA indicadores_logro: {_cruzados} fila(s) apuntan a un "
+                            f"curso de OTRO colegio. NO se les asignó año, NO se modificaron y "
+                            f"NO se borraron. Requieren revisión manual."
+                        )
                     _sin_ano = conn.execute(text(
                         "SELECT COUNT(*) FROM indicadores_logro WHERE ano_escolar_id IS NULL"
                     )).scalar() or 0
                     if _sin_ano:
                         logger.warning(
                             f"⚠️ indicadores_logro: {_sin_ano} fila(s) quedaron con "
-                            f"ano_escolar_id NULL porque su curso tampoco tiene año escolar. "
-                            f"NO se les asignó un año arbitrario ni se borró ninguna. "
-                            f"Asignar el año al curso y reiniciar para completarlas."
+                            f"ano_escolar_id NULL (curso sin año, curso inexistente o de otro "
+                            f"colegio). NO se les asignó un año arbitrario ni se borró ninguna."
                         )
                 except Exception as e:
                     logger.warning(f"Backfill de indicadores_logro.ano_escolar_id falló: {e}")
@@ -15542,6 +15561,28 @@ def _profesor_tiene_par_activo(db, current_user, curso_id, asignatura_id) -> boo
     ).first() is not None
 
 
+def _par_curso_asignatura_valido(db, current_user, curso_id, asignatura_id) -> bool:
+    """¿(curso, asignatura) es una pareja académica REAL de este curso?
+
+    R2-final-guard: una asignatura puede pertenecer al colegio y aun así no
+    dictarse en ese curso. Sin esta comprobación, dirección/coordinación podían
+    crear un IndicadorLogro huérfano (curso válido + asignatura válida del
+    tenant, combinación inexistente).
+
+    Fuente institucional: AsignacionProfesor ACTIVA (sin filtrar por profesor).
+    Caracterizado contra producción: los pares con horario de clase (19) y los
+    que ya tienen notas (13) están TODOS contenidos en los 58 pares con
+    asignación activa — no hay ningún par académico legítimo fuera de esta
+    fuente. `ano_escolar_id` de la asignación NO se usa: 140/143 filas reales lo
+    tienen NULL y exigirlo rompería las asignaciones legacy.
+    """
+    return tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(
+        curso_id=curso_id, asignatura_id=asignatura_id, activo=True,
+    ).first() is not None
+
+
 def _indicadores_lente_nivel(query, db, current_user, request):
     """Lente de nivel de dirección/coordinación: acota a cursos de ese nivel.
 
@@ -15675,11 +15716,25 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
     curso_id = curso.id
     asignatura_id = asignatura.id
 
+    # El profesor se valida PRIMERO contra su propia asignación (403), para
+    # conservar su semántica actual: si el par ni siquiera existe, tampoco lo
+    # tiene asignado.
     if current_user.role == 'profesor' and not _profesor_tiene_par_activo(
         db, current_user, curso_id, asignatura_id
     ):
         return JSONResponse(
             {'error': 'No tiene asignación activa para este curso y asignatura'}, status_code=403
+        )
+
+    # R2-final-guard §1: la pareja (curso, asignatura) debe ser académica REAL,
+    # para TODOS los roles. Dirección/coordinación pueden escribir sobre pares
+    # válidos aunque el docente asignado sea otra persona, pero no sobre
+    # combinaciones inexistentes (indicador huérfano).
+    if not _par_curso_asignatura_valido(db, current_user, curso_id, asignatura_id):
+        return JSONResponse(
+            {'error': 'Esa asignatura no está asignada a este curso. Verifique las '
+                      'asignaciones del curso antes de registrar indicadores.'},
+            status_code=400,
         )
 
     # R2-hardening §3: la lente de nivel también rige al ESCRIBIR.

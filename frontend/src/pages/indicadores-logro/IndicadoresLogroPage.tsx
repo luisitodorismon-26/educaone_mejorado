@@ -77,22 +77,29 @@ export const IndicadoresLogroPage = () => {
     })();
   }, []);
 
-  // El profesor solo puede elegir las parejas (curso, asignatura) que tiene
-  // asignadas y activas. Dirección/coordinación ven todo su colegio.
+  // El profesor solo puede elegir los cursos donde tiene asignación activa.
+  // Dirección/coordinación ven los cursos de su colegio (ya filtrados por la
+  // lente de nivel del backend en /cursos).
   const cursosDisponibles = useMemo(() => {
     if (!esProfesor) return cursos;
     const ids = new Set(asignaciones.map((a) => a.curso_id));
     return cursos.filter((c) => ids.has(c.id));
   }, [esProfesor, cursos, asignaciones]);
 
+  // R2-final-guard: para TODOS los roles, al elegir un curso solo se ofrecen
+  // las asignaturas ACADÉMICAS de ese curso (las que tienen asignación activa),
+  // nunca el catálogo completo del colegio. Evita crear indicadores huérfanos.
+  // Es la misma fuente que valida el backend.
   const asignaturasDisponibles = useMemo(() => {
     if (!cursoId) return [];
-    if (!esProfesor) return asignaturas;
+    // `/asignaciones` ya viene acotado por rol: al profesor le devuelve solo
+    // las suyas; a dirección/coordinación, todas las del colegio. Por eso el
+    // mismo filtro sirve para ambos.
     const ids = new Set(
       asignaciones.filter((a) => a.curso_id === cursoId).map((a) => a.asignatura_id)
     );
     return asignaturas.filter((a) => ids.has(a.id));
-  }, [esProfesor, cursoId, asignaturas, asignaciones]);
+  }, [cursoId, asignaturas, asignaciones]);
 
   // ── indicadores del par seleccionado ─────────────────────────────────
   const cargarIndicadores = async () => {
@@ -244,6 +251,13 @@ export const IndicadoresLogroPage = () => {
             onChange={(e) => setAsignaturaId(e.target.value ? Number(e.target.value) : '')}
           />
         </div>
+
+        {!!cursoId && asignaturasDisponibles.length === 0 && (
+          <p className="mt-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            Este curso no tiene asignaturas con profesor asignado. Asigna primero
+            las asignaturas del curso en <strong>Asignaciones</strong>.
+          </p>
+        )}
 
         {esProfesor && cursosDisponibles.length === 0 && (
           <p className="mt-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">

@@ -90,10 +90,20 @@ def test(nombre):
 
 COL, ANO, CURSO, ASIG, PROF = 1, 1, 1, 1, 1
 CURSO_SIN_ANO = 2      # curso legacy sin ano_escolar_id
+COL_AJENO, CURSO_AJENO, ANO_AJENO = 2, 3, 2   # colegio B: curso CON año, pero ajeno
 CONTENIDO = "IL-1 texto histórico que NO se puede perder"
 
 # ── 1. esquema LEGACY + fila previa ──────────────────────────────────────
 M.Base.metadata.create_all(bind=engine)
+
+# Colegio B (para la anomalía cross-tenant) vía ORM: aplica los defaults del modelo.
+_dcol = SessionLocal()
+try:
+    _dcol.add(M.Colegio(id=COL_AJENO, nombre="Colegio B", codigo="b"))
+    _dcol.commit()
+finally:
+    _dcol.close()
+
 with engine.connect() as conn:
     conn.execute(text("DROP TABLE IF EXISTS indicadores_logro"))
     conn.execute(text(
@@ -127,6 +137,13 @@ with engine.connect() as conn:
     conn.execute(text(
         "INSERT INTO cursos (id, colegio_id, nombre, grado_id, ano_escolar_id) "
         "VALUES (:k, :c, 'B', 1, NULL)"), {"k": CURSO_SIN_ANO, "c": COL})
+    # Colegio B con su propio año y curso (para la anomalía cross-tenant)
+    conn.execute(text(
+        "INSERT INTO ano_escolar (id, colegio_id, nombre, activo, cerrado, periodo_activo, dias_trabajados) "
+        "VALUES (:i, :c, '2025-2026', 1, 0, 1, '{}')"), {"i": ANO_AJENO, "c": COL_AJENO})
+    conn.execute(text(
+        "INSERT INTO cursos (id, colegio_id, nombre, grado_id, ano_escolar_id) "
+        "VALUES (:k, :c, 'X', 1, :y)"), {"k": CURSO_AJENO, "c": COL_AJENO, "y": ANO_AJENO})
     # (1) indicador de un curso CON año -> debe heredar el año del CURSO
     conn.execute(text(
         "INSERT INTO indicadores_logro (id, colegio_id, profesor_id, asignatura_id, curso_id, periodo, contenido) "
@@ -137,6 +154,12 @@ with engine.connect() as conn:
         "INSERT INTO indicadores_logro (id, colegio_id, profesor_id, asignatura_id, curso_id, periodo, contenido) "
         "VALUES (2, :c, :p, :a, :k, 3, 'sin año determinable')"),
         {"c": COL, "p": PROF, "a": ASIG, "k": CURSO_SIN_ANO})
+    # (3) ANOMALÍA cross-tenant: indicador del colegio A apuntando a un curso
+    #     del colegio B (que SÍ tiene año). El backfill NO debe completarlo.
+    conn.execute(text(
+        "INSERT INTO indicadores_logro (id, colegio_id, profesor_id, asignatura_id, curso_id, periodo, contenido) "
+        "VALUES (3, :c, :p, :a, :k, 4, 'curso de otro colegio')"),
+        {"c": COL, "p": PROF, "a": ASIG, "k": CURSO_AJENO})
     conn.commit()
 
 _cols_antes = {r[1] for r in engine.connect().execute(text("PRAGMA table_info(indicadores_logro)"))}
@@ -182,7 +205,7 @@ def _():
 
 @test("§C2 CERO PÉRDIDA: la fila legacy se conserva íntegra y hereda el año del CURSO")
 def _():
-    assert len(_filas1) == 2, _filas1
+    assert len(_filas1) == 3, _filas1
     f = next(x for x in _filas1 if x[0] == 1)
     assert f[1] == COL and f[2] == PROF and f[3] == ASIG and f[4] == CURSO
     assert f[5] == 2, "cambió el período"
@@ -195,6 +218,18 @@ def _():
     g = next(x for x in _filas1 if x[0] == 2)
     assert g[6] == "sin año determinable", "se perdió o alteró el contenido"
     assert g[7] is None, f"se inventó un año: ano_escolar_id={g[7]}"
+
+
+@test("§G2 backfill TENANT-SAFE: curso de OTRO colegio NO se completa, fila intacta")
+def _():
+    g = next(x for x in _filas1 if x[0] == 3)
+    assert g[1] == COL, "cambió el colegio del indicador"
+    assert g[4] == CURSO_AJENO, "cambió el curso del indicador"
+    assert g[5] == 4 and g[6] == "curso de otro colegio", "se alteró la fila"
+    assert g[7] is None, (
+        f"se completó cruzando tenant: ano_escolar_id={g[7]} (el curso {CURSO_AJENO} "
+        f"es del colegio {COL_AJENO}, el indicador del colegio {COL})"
+    )
 
 
 @test("§C3 queda la clave institucional y se retira la legacy dependiente del profesor")
@@ -233,8 +268,8 @@ def _():
             {"c": COL, "p": PROF, "a": ASIG, "k": CURSO})
         conn.commit()
         n = conn.execute(text("SELECT COUNT(*) FROM indicadores_logro")).scalar()
-    # 2 filas del seed + la del año siguiente
-    assert n == 3, n
+    # 3 filas del seed + la del año siguiente
+    assert n == 4, n
 
 
 @test("§C5 IDEMPOTENCIA: un segundo arranque no altera esquema ni datos")
@@ -249,6 +284,9 @@ def _():
     # la fila sin año determinable sigue en NULL y con su contenido intacto
     huerf = [f for f in filas2 if f[0] == 2]
     assert len(huerf) == 1 and huerf[0][7] is None and huerf[0][6] == "sin año determinable", huerf
+    # la anomalía cross-tenant sigue sin año y sin alterar tras el 2do arranque
+    cruz = [f for f in filas2 if f[0] == 3]
+    assert len(cruz) == 1 and cruz[0][7] is None and cruz[0][6] == "curso de otro colegio", cruz
 
 
 print(f"\n{B}{'=' * 62}{X}")

@@ -108,7 +108,7 @@ GRADO_A, GRADO_B = 1, 2
 C1, C2, C3 = 1, 2, 3                     # C1/C2 -> colegio A ; C3 -> colegio B
 C4_PRIM, C5_PREV = 4, 5                  # C4 = primaria (colegio A) ; C5 = año anterior
 GRADO_PRIM = 3
-U_COORD_SEC, U_PROF_X = 14, 15
+U_COORD_SEC, U_PROF_X, U_PROF_INST = 14, 15, 16
 MAT, LEN, MAT_B = 101, 102, 201
 U_DIR_A, U_PROF_A, U_PROF_B, U_DIR_B = 10, 11, 12, 13
 PWD = "Prueba2026x"
@@ -147,6 +147,7 @@ def _seed():
             (U_DIR_B, "dir_b", "direccion", COL_B),
             (U_COORD_SEC, "coord_sec", "coordinador", COL_A),
             (U_PROF_X, "prof_x", "profesor", COL_A),
+            (U_PROF_INST, "prof_inst", "profesor", COL_A),
         ):
             u = M.Usuario(id=uid, username=uname, nombre=uname, apellido="T", role=rol, colegio_id=col)
             if uname == "coord_sec":
@@ -161,6 +162,15 @@ def _seed():
                                    curso_id=C1, asignatura_id=LEN, activo=True))
         d.add(M.AsignacionProfesor(id=4, colegio_id=COL_A, profesor_id=U_PROF_X,
                                    curso_id=C4_PRIM, asignatura_id=MAT, activo=True))
+        # Pares ACADÉMICOS del colegio a nombre de otro docente: dirección y
+        # coordinación pueden escribir sobre ellos aunque no sean suyos.
+        d.add(M.AsignacionProfesor(id=5, colegio_id=COL_A, profesor_id=U_PROF_INST,
+                                   curso_id=C2, asignatura_id=MAT, activo=True))
+        d.add(M.AsignacionProfesor(id=6, colegio_id=COL_A, profesor_id=U_PROF_INST,
+                                   curso_id=C5_PREV, asignatura_id=MAT, activo=True))
+        d.add(M.AsignacionProfesor(id=7, colegio_id=COL_A, profesor_id=U_PROF_INST,
+                                   curso_id=C5_PREV, asignatura_id=LEN, activo=True))
+        # (C2, LEN) queda DELIBERADAMENTE sin asignación: par NO académico.
         d.commit()
     finally:
         d.close()
@@ -462,6 +472,63 @@ def _():
     idx = {r[1] for r in engine.connect().execute(_sql("PRAGMA index_list(indicadores_logro)"))}
     assert any("uq_indicador_logro_institucional" in n or n.startswith("sqlite_autoindex")
                for n in idx), f"no se restauró la clave única: {idx}"
+
+
+@test("§G1 pareja académica: dirección puede escribir en un par REAL de otro docente")
+def _():
+    # (C2, MAT) está asignada a prof_inst, no a dirección: aun así es válida.
+    r = post_ind(DIR_A, C2, MAT, 3, "dirección sobre par de otro docente")
+    assert r.status_code == 201, r.text
+    assert len(_filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 3})) == 1
+
+
+@test("§G1-b dirección + asignatura del colegio NO vinculada al curso → 400 sin crear fila")
+def _():
+    n0 = len(_filas())
+    r = post_ind(DIR_A, C2, LEN, 1, "par inexistente")     # (C2, LEN) sin asignación
+    assert r.status_code == 400, r.text
+    assert "asignada a este curso" in r.json().get("error", ""), r.json()
+    assert not _filas({"curso_id": C2, "asignatura_id": LEN}), "creó un indicador huérfano"
+    assert len(_filas()) == n0, "hubo escrituras inesperadas"
+
+
+@test("§G1-c coordinador: mismo criterio dentro de su nivel (par inválido → 400)")
+def _():
+    r = post_ind(COORD_SEC, C2, LEN, 2, "par inexistente")
+    assert r.status_code == 400, r.text
+    assert not _filas({"curso_id": C2, "asignatura_id": LEN})
+    # y con un par válido de su nivel sí puede
+    assert post_ind(COORD_SEC, C2, MAT, 4, "coord sobre par válido").status_code == 201
+
+
+@test("§G1-d profesor conserva su comportamiento: 403 (no 400) por asignación propia")
+def _():
+    # (C1, LEN) ES un par académico válido, pero no de prof_a -> 403
+    assert post_ind(PROF_A, C1, LEN, 1, "x").status_code == 403
+    # (C2, LEN) ni siquiera es par válido -> el profesor igual recibe 403
+    assert post_ind(PROF_A, C2, LEN, 1, "x").status_code == 403
+    assert not _filas({"curso_id": C2, "asignatura_id": LEN})
+
+
+@test("§G1-e la asignación INACTIVA no habilita el par para dirección")
+def _():
+    d = SessionLocal()
+    try:
+        a = d.query(M.AsignacionProfesor).filter_by(id=5).first()   # (C2, MAT)
+        a.activo = False
+        d.commit()
+    finally:
+        d.close()
+    r = post_ind(DIR_A, C2, MAT, 2, "par desactivado")
+    assert r.status_code == 400, r.text
+    assert not _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 2})
+    d = SessionLocal()
+    try:
+        a = d.query(M.AsignacionProfesor).filter_by(id=5).first()
+        a.activo = True
+        d.commit()
+    finally:
+        d.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
