@@ -9,12 +9,13 @@ Ninguna validación aquí modifica datos — solo devuelve problemas encontrados
 
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 import re
 
 from models import (
     Curso, Grado, Estudiante, Usuario, Asignatura,
     AsignacionProfesor, Calificacion, CalificacionPrimaria,
+    CalificacionSecundaria,
     Asistencia, AnoEscolar, ConfiguracionColegio, Horario
 )
 
@@ -278,41 +279,98 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
             nom = next((a.nombre for a in asignaturas if a.id == asig_id), f"Asignatura id={asig_id}")
             r.add_error(f"La asignatura '{nom}' no tiene horario configurado para este curso")
     
-    # === 7. CALIFICACIONES por asignatura ===
-    # Contamos estudiantes SIN calificación en cada asignatura
+    # === 7. CALIFICACIONES por asignatura (modelo académico REAL: CalificacionSecundaria) ===
+    #
+    # R1.5: el Registro OFICIAL de Secundaria se genera desde CalificacionSecundaria
+    # (una fila por competencia 1-4) y su CF sale de _calcular_cf_secundaria(), que
+    # exige:
+    #   1. las 4 competencias DISTINTAS {1,2,3,4} cargadas para (estudiante, asignatura,
+    #      año escolar ACTIVO, colegio actual);
+    #   2. para CADA período p∈{1,2,3,4}: las 4 competencias con valor_periodo(p) != None
+    #      (o sea CalificacionSecundaria.calcular_pc_periodo(comps4, p) != None).
+    # Se valida EXACTAMENTE esa condición — la misma puerta que usa el generador —,
+    # NO "existe alguna fila". La tabla legacy `Calificacion` NO participa aquí:
+    # un curso moderno no puede pasar la validación por notas legacy.
     asig_nombre_by_id = {a.id: a.nombre for a in asignaturas}
-    
-    faltantes_por_asig: Dict[str, int] = {}
-    total_califs = 0
-    
+    _est_ids = [e.id for e in estudiantes]
+    REQ = (1, 2, 3, 4)
+    REQ_SET = set(REQ)
+
+    # Una sola consulta, acotada por: colegio actual (tolerando colegio_id NULL de
+    # datos antiguos — el filtro por estudiante_id ya garantiza el tenant), año
+    # ACTIVO, asignaturas asignadas al curso y estudiantes del curso. Una fila de
+    # otro año / otro colegio / otro estudiante NO entra.
+    _cs_rows = db.query(CalificacionSecundaria).filter(
+        CalificacionSecundaria.ano_escolar_id == ano.id,
+        CalificacionSecundaria.asignatura_id.in_(asignatura_ids),
+        CalificacionSecundaria.estudiante_id.in_(_est_ids),
+        or_(CalificacionSecundaria.colegio_id == colegio_id,
+            CalificacionSecundaria.colegio_id.is_(None)),
+    ).all()
+
+    # Consistencia de tenant: alguna fila de estos estudiantes/asignaturas/año con
+    # colegio_id de OTRO colegio es una anomalía de datos.
+    _cs_ajenas = db.query(CalificacionSecundaria).filter(
+        CalificacionSecundaria.ano_escolar_id == ano.id,
+        CalificacionSecundaria.asignatura_id.in_(asignatura_ids),
+        CalificacionSecundaria.estudiante_id.in_(_est_ids),
+        CalificacionSecundaria.colegio_id != None,  # noqa: E711
+        CalificacionSecundaria.colegio_id != colegio_id,
+    ).count()
+    if _cs_ajenas:
+        r.add_error(
+            f"INCONSISTENCIA: {_cs_ajenas} calificación(es) de secundaria de este "
+            f"curso tienen colegio_id de otro colegio. Contacte soporte técnico."
+        )
+
+    # Index: (estudiante_id, asignatura_id) -> {competencia_numero: fila}
+    _por_par: Dict[tuple, Dict[int, Any]] = {}
+    for cs in _cs_rows:
+        if cs.competencia_numero in REQ_SET:
+            _por_par.setdefault((cs.estudiante_id, cs.asignatura_id), {})[cs.competencia_numero] = cs
+
+    r.info['total_calificaciones_registradas'] = len(_cs_rows)
+    _pares_completos = 0
+    _pares_incompletos = 0
+
     for asig_id in asignatura_ids:
-        # Estudiantes que tienen calificación en esta asignatura
-        califs = db.query(Calificacion).filter(
-            Calificacion.asignatura_id == asig_id,
-            Calificacion.estudiante_id.in_([e.id for e in estudiantes])
-        ).all()
-        total_califs += len(califs)
-        
-        # Consistencia: verificar que todas las calificaciones pertenezcan al colegio correcto
-        for c in califs:
-            if c.colegio_id and c.colegio_id != colegio_id:
-                est_nombre = next((e.nombre_completo for e in estudiantes if e.id == c.estudiante_id), f"id={c.estudiante_id}")
-                r.add_error(
-                    f"INCONSISTENCIA: calificación de {est_nombre} en "
-                    f"{asig_nombre_by_id.get(asig_id, '?')} tiene colegio_id={c.colegio_id} "
-                    f"pero el curso es del colegio {colegio_id}"
+        asig_nom = asig_nombre_by_id.get(asig_id, f"Asignatura id={asig_id}")
+        incompletos: List[str] = []
+        for est in estudiantes:
+            by_num = _por_par.get((est.id, asig_id), {})
+            faltan_comp = sorted(REQ_SET - set(by_num))
+            if faltan_comp:
+                _pares_incompletos += 1
+                incompletos.append(
+                    f"{est.nombre_completo}: falta(n) la(s) competencia(s) "
+                    f"{', '.join(map(str, faltan_comp))}"
                 )
-        
-        estudiantes_con_calif = {c.estudiante_id for c in califs}
-        faltantes = len(estudiantes) - len(estudiantes_con_calif)
-        if faltantes > 0:
-            nom = asig_nombre_by_id.get(asig_id, f"Asignatura id={asig_id}")
-            faltantes_por_asig[nom] = faltantes
-    
-    for asig_nom, cant in faltantes_por_asig.items():
-        r.add_error(f"Faltan calificaciones en '{asig_nom}' para {cant} estudiante(s)")
-    
-    r.info['total_calificaciones_registradas'] = total_califs
+                continue
+            # Las 4 competencias distintas existen: validar cada período.
+            comps4 = [by_num[n] for n in REQ]
+            periodos_incompletos = [
+                p for p in REQ if CalificacionSecundaria.calcular_pc_periodo(comps4, p) is None
+            ]
+            if periodos_incompletos:
+                _pares_incompletos += 1
+                incompletos.append(
+                    f"{est.nombre_completo}: tiene las 4 competencias pero falta(n) "
+                    f"nota(s) del/los período(s) {', '.join(map(str, periodos_incompletos))}"
+                )
+                continue
+            _pares_completos += 1
+
+        if incompletos:
+            n = len(incompletos)
+            ejemplos = "; ".join(incompletos[:5])
+            extra = f" (y {n - 5} más)" if n > 5 else ""
+            r.add_error(
+                f"Faltan competencias/notas de secundaria en '{asig_nom}' para "
+                f"{n} estudiante(s). Ejemplos — {ejemplos}{extra}"
+            )
+
+    r.info['pares_completos_secundaria'] = _pares_completos
+    r.info['pares_incompletos_secundaria'] = _pares_incompletos
     
     # === 8. ASISTENCIA registrada ===
     total_asistencia = db.query(Asistencia).filter(
