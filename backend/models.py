@@ -18,6 +18,9 @@ def _now_dr():
 
 from database import Base
 from reglas_academicas import redondear_calificacion_final, ponderar_y_redondear
+# R3.1 — catálogo oficial de Salidas Optativas (constante MINERD, no dato del
+# colegio). `salidas_optativas` no importa nada de aquí: no hay ciclo.
+from salidas_optativas import nombre_salida as _nombre_salida_optativa
 
 # ============== COLEGIO (MULTI-TENANT) ==============
 
@@ -430,6 +433,23 @@ class Curso(Base):
     capacidad = Column(Integer, default=35)
     aula = Column(String(20))
     activo = Column(Boolean, default=True)
+    # R3.1: Salida Optativa de la Modalidad Académica (solo 4to-6to).
+    # Guarda el CÓDIGO ESTABLE del catálogo (`salidas_optativas.SALIDAS`):
+    # 'HLM' | 'HCS' | 'MYT' | 'CYT'. NULL = el curso todavía no la eligió, que
+    # es el estado de TODOS los cursos existentes tras la migración.
+    #
+    # Por qué un código y no una FK a una tabla de salidas: las 4 salidas son
+    # una constante del MINERD, iguales en todos los colegios, así que una
+    # tabla exigiría un seed (escritura contra producción real), podría quedar
+    # a medias en una migración y abriría la pregunta de a qué tenant pertenece
+    # cada fila. EducaOne ya guarda así el resto de sus enumeraciones
+    # institucionales (Grado.nivel, Grado.ciclo, Recreo.nivel,
+    # Estudiante.condicion): esta columna sigue ese mismo patrón.
+    #
+    # La política "una sola salida por colegio+año+curso" queda garantizada por
+    # construcción: `cursos` ya está acotado a (colegio_id, ano_escolar_id) y
+    # esto es UNA columna escalar, así que un curso no puede tener dos salidas.
+    salida_optativa_codigo = Column(String(8), nullable=True)
 
     grado = relationship('Grado', backref='cursos')
     tanda = relationship('Tanda', backref='cursos')
@@ -459,6 +479,9 @@ class Curso(Base):
             'nombre_completo': self.nombre_completo,
             'capacidad': self.capacidad,
             'aula': self.aula,
+            # R3.1: código estable ('CYT'...) + nombre solo para display.
+            'salida_optativa_codigo': self.salida_optativa_codigo,
+            'salida_optativa': _nombre_salida_optativa(self.salida_optativa_codigo),
             'estudiantes_count': len([e for e in self.estudiantes if e.activo]) if hasattr(self, 'estudiantes') else 0
         }
 
@@ -2106,6 +2129,114 @@ class IndicadorLogro(Base):
             'periodo': self.periodo,
             'contenido': self.contenido,
             'actualizado_en': self.fecha_actualizacion.isoformat() if self.fecha_actualizacion else None,
+        }
+
+
+class CursoComponenteOptativo(Base):
+    """
+    Qué ASIGNATURA REAL del colegio implementa cada componente optativo oficial
+    de un curso.
+
+    R3.1 — PUENTE ENTRE EL CATÁLOGO MINERD Y EL CATÁLOGO DEL COLEGIO
+    ----------------------------------------------------------------
+    El catálogo de salidas y componentes es una constante del sistema educativo
+    y vive en `salidas_optativas.py`. Lo que cambia de colegio a colegio es qué
+    fila de `asignaturas` representa a "Biología y Computación". Esta tabla
+    guarda exactamente eso y nada más:
+
+        curso 4to A -> salida 'CYT' -> componente 'CYT-CN-4' -> asignatura_id 123
+
+    Con ese puente, el Registro Escolar sabe a qué página va cada nota SIN
+    heurística de nombres, y las notas siguen viviendo donde ya viven:
+    `CalificacionSecundaria` y `EvaluacionExtraSecundaria` referencian
+    `asignatura_id`, así que un componente optativo es —para todo el resto del
+    sistema— una asignatura más. NO se crea un segundo sistema de notas.
+
+    IDENTIDAD
+    ---------
+    `componente_codigo` es el código estable del catálogo ('CYT-CN-4'), NUNCA
+    un nombre ni `Asignatura.codigo` (que en producción está duplicado y no
+    identifica nada).
+
+    INVARIANTES (ver también las validaciones de aplicación en app.py)
+    -----------------------------------------------------------------
+      * un componente del curso apunta a UNA sola asignatura
+        -> uq_curso_componente_optativo
+      * una asignatura no representa DOS componentes del mismo curso
+        -> uq_curso_componente_asignatura
+      * el componente debe pertenecer a la salida configurada en el curso y al
+        grado del curso -> `salidas_optativas.componente_pertenece()`
+      * el mapeo es tenant-safe: curso y asignatura deben ser del mismo colegio
+    """
+    __tablename__ = 'curso_componentes_optativos'
+    id = Column(Integer, primary_key=True)
+    # NOT NULL a propósito, igual que `ano_escolar_id` y por el mismo motivo:
+    # las dos UniqueConstraint de abajo incluyen `colegio_id`, y en PostgreSQL
+    # dos filas con NULL en una columna de la clave NO colisionan. Un solo NULL
+    # bastaría para que el mismo componente del mismo curso admitiera filas
+    # duplicadas, así que prohibirlo es lo que hace reales esas barreras.
+    #
+    # El resto de las tablas conserva `colegio_id` nullable por compatibilidad
+    # con instalaciones de un solo colegio anteriores al multi-tenant. Aquí no
+    # hace falta esa concesión: la tabla es NUEVA —no existe en producción— y
+    # el valor no se pide al cliente, se DERIVA de `Curso.colegio_id`
+    # (ver salida_optativa_service.construir_mapeo).
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False, index=True)
+    # La configuración vive dentro de un año escolar CONCRETO y no se hereda en
+    # silencio al año siguiente.
+    #
+    # NOT NULL a propósito (R3.1 final guard). Las dos UniqueConstraint de abajo
+    # incluyen `ano_escolar_id`, y en PostgreSQL dos filas con NULL en una
+    # columna de la clave NO colisionan: un solo NULL bastaría para que el mismo
+    # componente del mismo curso admitiera filas duplicadas. Prohibir el NULL es
+    # lo que convierte esas restricciones en una barrera real.
+    #
+    # Se puede exigir sin riesgo porque la tabla es NUEVA (producción no tiene
+    # ninguna fila R3) y porque los 7 cursos reales tienen los 7 su año escolar.
+    # No hay sentinel 0, ni default arbitrario, ni backfill.
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=False, index=True)
+    # Código estable del catálogo: 'HLM-LE-4', 'CYT-CN-6', ...
+    componente_codigo = Column(String(16), nullable=False)
+    # La asignatura REAL del colegio. Esta FK es la identidad académica.
+    asignatura_id = Column(Integer, ForeignKey('asignaturas.id'), nullable=False, index=True)
+    activo = Column(Boolean, default=True)
+
+    fecha_creacion = Column(DateTime, default=_now_dr)
+    fecha_actualizacion = Column(DateTime, default=_now_dr, onupdate=_now_dr)
+
+    curso = relationship('Curso', backref='componentes_optativos')
+    asignatura = relationship('Asignatura', backref='componentes_optativos')
+
+    __table_args__ = (
+        UniqueConstraint('colegio_id', 'ano_escolar_id', 'curso_id', 'componente_codigo',
+                         name='uq_curso_componente_optativo'),
+        UniqueConstraint('colegio_id', 'ano_escolar_id', 'curso_id', 'asignatura_id',
+                         name='uq_curso_componente_asignatura'),
+    )
+
+    @property
+    def componente(self):
+        """Componente oficial del catálogo, o None si el código no existe."""
+        from salidas_optativas import componente as _componente
+        return _componente(self.componente_codigo)
+
+    def to_dict(self):
+        comp = self.componente
+        return {
+            'id': self.id,
+            'curso_id': self.curso_id,
+            'ano_escolar_id': self.ano_escolar_id,
+            'componente_codigo': self.componente_codigo,
+            # Nombre oficial del catálogo MINERD — SOLO display.
+            'componente_nombre': comp.nombre_oficial if comp else None,
+            'salida_codigo': comp.salida if comp else None,
+            'slot': comp.slot if comp else None,
+            'horas_semana': comp.horas_semana if comp else None,
+            'asignatura_id': self.asignatura_id,
+            # Nombre que el colegio le puso a SU asignatura — SOLO display.
+            'asignatura': self.asignatura.nombre if self.asignatura else None,
+            'activo': self.activo,
         }
 
 

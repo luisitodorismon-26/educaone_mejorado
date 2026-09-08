@@ -665,6 +665,103 @@ async def lifespan(app):
                             logger.warning(f"No se pudo cambiar la clave de indicadores_logro: {e}")
                             raise
 
+        # === 6e. Salida Optativa de la Modalidad Académica (R3.1) ===
+        # Migración ESTRICTAMENTE ADITIVA. Dos piezas:
+        #   (1) `curso_componentes_optativos` — tabla NUEVA. La crea el
+        #       create_all() de más arriba, que ya corre bajo el mismo advisory
+        #       lock; aquí solo se verifica y se reporta.
+        #   (2) `cursos.salida_optativa_codigo` — columna NUEVA, nullable, SIN
+        #       DEFAULT y SIN backfill.
+        #
+        # NO HAY BACKFILL, A PROPÓSITO. La auditoría R3.0 confirmó contra
+        # producción que hoy NINGÚN curso de 4to/5to/6to tiene salida optativa
+        # y que el catálogo del colegio no contiene ninguna asignatura
+        # especializada. No existe historia que reconstruir, así que inventar
+        # una salida sería fabricar un dato institucional que nadie eligió.
+        # Todos los cursos existentes quedan en NULL y la Dirección elegirá la
+        # salida desde la UI (R3.2). NULL significa exactamente "todavía no
+        # configurada", nunca "ninguna".
+        #
+        # Rollback (Postgres):
+        #   ALTER TABLE cursos DROP COLUMN salida_optativa_codigo;
+        #   DROP TABLE curso_componentes_optativos;
+        # Ambos son seguros porque ninguna fila preexistente depende de ellos.
+        if 'cursos' in inspector.get_table_names():
+            _curso_cols = {c['name'] for c in inspector.get_columns('cursos')}
+            if 'salida_optativa_codigo' not in _curso_cols:
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            "ALTER TABLE cursos ADD COLUMN salida_optativa_codigo VARCHAR(8)"
+                        ))
+                        conn.commit()
+                        logger.info(
+                            "✅ Migración R3.1: columna salida_optativa_codigo agregada a cursos "
+                            "(NULL en todos los cursos existentes, sin backfill)"
+                        )
+                    except Exception as e:
+                        logger.warning(f"No se pudo agregar cursos.salida_optativa_codigo: {e}")
+                        raise
+
+        if 'curso_componentes_optativos' not in inspect(engine).get_table_names():
+            # create_all() debería haberla creado. Si no está, el verificador
+            # post-migración de más abajo aborta el arranque; esto solo deja
+            # rastro explícito de la causa.
+            logger.error(
+                "❌ Migración R3.1: la tabla curso_componentes_optativos no existe "
+                "tras create_all(). El Registro de Salida Optativa no podrá configurarse."
+            )
+        else:
+            # colegio_id y ano_escolar_id deben ser NOT NULL: AMBAS forman parte
+            # de las dos claves únicas y en PostgreSQL dos NULL no colisionan,
+            # así que un solo NULL en cualquiera de las dos abriría la puerta a
+            # componentes duplicados en el mismo curso. create_all() ya las crea
+            # así en esquemas nuevos; esto solo cubre un entorno que hubiera
+            # creado la tabla con una versión laxa.
+            _cco = {c['name']: c for c in inspect(engine).get_columns('curso_componentes_optativos')}
+            for _colname in ('colegio_id', 'ano_escolar_id'):
+                _col = _cco.get(_colname)
+                if _col is None or not _col.get('nullable'):
+                    continue
+                with engine.connect() as conn:
+                    _nulos = conn.execute(text(
+                        "SELECT COUNT(*) FROM curso_componentes_optativos "
+                        f"WHERE {_colname} IS NULL"
+                    )).scalar() or 0
+                    if _nulos:
+                        # Jamás se inventa un valor ni se borra la fila: se avisa.
+                        logger.error(
+                            "⚠️ curso_componentes_optativos: %d fila(s) con %s NULL. "
+                            "NO se promueve la columna a NOT NULL ni se modifica ninguna "
+                            "fila; corregirlas manualmente desde su curso.",
+                            _nulos, _colname,
+                        )
+                    elif engine.dialect.name == 'postgresql':
+                        try:
+                            conn.execute(text(
+                                "ALTER TABLE curso_componentes_optativos "
+                                f"ALTER COLUMN {_colname} SET NOT NULL"
+                            ))
+                            conn.commit()
+                            logger.info(
+                                "✅ Migración R3.1: curso_componentes_optativos.%s es NOT NULL",
+                                _colname,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"No se pudo exigir NOT NULL en "
+                                f"curso_componentes_optativos.{_colname}: {e}")
+                            raise
+                    else:
+                        # SQLite no admite ALTER COLUMN; reconstruir la tabla no
+                        # se improvisa. Solo afecta instalaciones SQLite.
+                        logger.warning(
+                            "curso_componentes_optativos.%s sigue siendo nullable "
+                            "(SQLite no admite ALTER COLUMN). No se reconstruye la "
+                            "tabla. Producción usa PostgreSQL.", _colname,
+                        )
+            logger.info("✅ Migración R3.1: curso_componentes_optativos disponible")
+
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
         # Acelera queries frecuentes:
