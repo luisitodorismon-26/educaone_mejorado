@@ -2174,9 +2174,23 @@ class IndicadorLogroSeleccion(Base):
     selección crearía una segunda verdad que podría quedar desfasada respecto al
     catálogo, y multiplicaría por selección algo que es constante del MINERD.
 
-    La clave incluye la versión curricular
-    (`SEC-2023|4|LEF|CE-LEF5|IL-19`), de modo que una selección de 2023 sigue
-    resolviendo contra el catálogo 2023 aunque después exista uno de 2027.
+    FORMA DE `catalogo_clave`
+    -------------------------
+
+        SEC-2023|2|EF|CE05|IL02
+        versión | grado | área | banda CE | posición IL
+
+    `CE05`/`IL02` son la POSICIÓN ESTRUCTURAL de la entrada en el documento
+    (`orden_ce`, `orden_il`), no códigos académicos: el documento oficial repite
+    tanto `ce_codigo` como `il_codigo` dentro de un mismo grado y área, así que
+    una clave basada en ellos sería ambigua. Los códigos oficiales se conservan
+    tal cual y solo se usan para display y para el Registro Escolar.
+
+    La versión curricular al frente y la posición estructural detrás hacen que
+    una selección histórica se resuelva de forma INEQUÍVOCA: una fila guardada
+    bajo `SEC-2023` sigue resolviendo contra el catálogo 2023 aunque después
+    exista uno de 2027, y dentro de esa versión la posición identifica una sola
+    entrada aunque sus códigos se repitan.
     """
     __tablename__ = 'indicador_logro_selecciones'
     id = Column(Integer, primary_key=True)

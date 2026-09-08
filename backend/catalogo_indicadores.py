@@ -21,12 +21,29 @@ IDENTIDAD
 ---------
 La clave estable es `catalogo_clave`:
 
-    SEC-2023|4|LEF|CE-LEF5|IL-19
-    versión | grado | área | competencia específica | indicador
+    SEC-2023|2|EF|CE05|IL02
+    versión | grado | área | banda CE | posición IL
 
-Incluye la CE porque el documento oficial reinicia la numeración de IL en
-algún bloque (6to Educación Física), de modo que `grado+área+IL` no bastaría.
-`IL-19` por sí solo NUNCA identifica nada.
+`CE05` e `IL02` son `orden_ce` y `orden_il`: la POSICIÓN ESTRUCTURAL de la
+entrada dentro del bloque del documento (banda de la tabla, y lugar dentro de
+esa banda). Son identidad TÉCNICA de EducaOne, NO códigos académicos: no
+existen en el documento oficial y no se imprimen nunca.
+
+La clave NO puede construirse con los códigos académicos porque el documento
+oficial los repite dentro de un mismo grado y área:
+
+  * `il_codigo` — 6to Educación Física reinicia la numeración en la banda 6, así
+    que IL-4..IL-9 aparecen dos veces en el mismo bloque;
+  * `ce_codigo` — 2do Educación Física rotula DOS bandas distintas como CE-EF4
+    (falta CE-EF5), y sus textos son competencias diferentes.
+
+Esos códigos se conservan EXACTAMENTE como los imprime el MINERD y se usan solo
+para display y para el Registro Escolar: `ce_codigo`, `il_codigo`, `ce_texto`,
+`il_texto`. Nunca se renumeran para ganar unicidad.
+
+Por eso `IL-19` por sí solo NUNCA identifica nada, y tampoco lo hace
+`(grado, área, il_codigo)`: `buscar_por_codigo()` devuelve una LISTA. La única
+forma de obtener exactamente una entrada es `resolver(catalogo_clave)`.
 """
 
 import io
