@@ -145,10 +145,12 @@ def get_asignaturas_por_grado(grado_numero: int):
 # tabla explícita, la asistencia de FIHR seguiría pisando sus páginas.
 #
 # `layout` describe la rejilla impresa en la hoja:
-#   "2meses" -> 2 meses por página, 21 días por mes. Es la geometría para la
-#               que está calibrada ASISTENCIA_TABLE / draw_asistencia().
-#   "4meses" -> 4 meses por página, 10 días por mes. Rejilla DISTINTA, todavía
-#               SIN CALIBRAR. Ver ASISTENCIA_LAYOUT_SIN_CALIBRAR más abajo.
+#   "2meses" -> 2 meses por página, 21 días por mes. Geometría de
+#               ASISTENCIA_TABLE / draw_asistencia().
+#   "4meses" -> 4 meses por página, 10 días por mes. Rejilla DISTINTA, con su
+#               propia calibración: ASISTENCIA_TABLE_4MESES /
+#               draw_asistencia_4meses(). Ambas están medidas contra el
+#               template; ninguna aproxima a la otra.
 ASISTENCIA_MAPA_SECUNDARIA = [
     {"paginas": [17, 18, 19, 20, 21], "layout": "2meses"},  # 0 Lengua Española
     {"paginas": [22, 23, 24, 25, 26], "layout": "2meses"},  # 1 Inglés
@@ -161,13 +163,12 @@ ASISTENCIA_MAPA_SECUNDARIA = [
     {"paginas": [53, 54, 55], "layout": "4meses"},          # 8 FIHR
 ]
 
-# Geometrías todavía no calibradas. Mientras un layout esté aquí, el generador
-# NO estampa esas páginas: prefiere dejarlas EN BLANCO (tal como las imprime el
-# MINERD, listas para llenar a mano) antes que dibujar marcas en columnas que
-# no le corresponden. Calibrar la rejilla de 4 meses × 10 días es un trabajo de
-# medición aparte, del mismo tipo que el que recibió COMPLETIVA_TABLE en B2, y
-# NO se improvisa aquí.
-ASISTENCIA_LAYOUT_SIN_CALIBRAR = {"4meses"}
+# Geometrías sin calibrar. Vacío desde el hardening de R3.1: las dos rejillas
+# del Registro de Secundaria están medidas contra el template. Se conserva como
+# barrera explícita — si algún día aparece un layout nuevo, se añade aquí y el
+# generador dejará esas páginas EN BLANCO (tal como las imprime el MINERD,
+# listas para llenar a mano) en vez de estampar marcas descuadradas.
+ASISTENCIA_LAYOUT_SIN_CALIBRAR: set = set()
 
 # Bloque de asistencia de la SALIDA OPTATIVA (solo 4to-6to): 10 páginas con el
 # encabezado impreso "SALIDA OPTATIVA ____ ASIGNATURA ____", es decir 2
@@ -564,6 +565,95 @@ ASISTENCIA_TABLE = {
     "mes_der_dia1_x": 317.40,
     "mes_der_dia_spacing": 11.49,
 }
+
+# --- ASISTENCIA COMPACTA: 4 meses × 10 días (Pgs 47-55) ---
+#
+# R3.1 hardening. Educación Artística, Educación Física y FIHR usan en el
+# template una rejilla DISTINTA de la de las seis asignaturas troncales: en vez
+# de 5 páginas de 2 meses × 21 días, ocupan 3 páginas de 4 meses × 10 días. Son
+# asignaturas de pocas horas semanales, así que 10 columnas de día por mes
+# bastan; el MINERD comprime tres asignaturas donde las otras usan cinco hojas.
+#
+# CALIBRACIÓN — cómo se obtuvieron estos números
+# ----------------------------------------------
+# Se extrajeron las líneas vectoriales de las 54 páginas reales (6 grados × 9
+# páginas 47-55) de los templates oficiales del repo. Resultados:
+#
+#   * cada página tiene EXACTAMENTE 49 líneas verticales de rejilla entre
+#     x=47.4 y x=577.1, es decir 48 celdas = 4 bloques × (10 días + T + %);
+#   * la dispersión entre las 54 páginas es 0.0000 pt dentro de cada paridad:
+#     la geometría es IDÉNTICA en los seis grados, así que NO hacen falta mapas
+#     por grado;
+#   * las páginas PARES están desplazadas +0.4364 pt en X respecto a las
+#     impares —constante en las 49 líneas—. Se modela explícitamente en vez de
+#     promediarse;
+#   * filas: 41 líneas horizontales, primera en y=180.485 y paso 14.1719,
+#     40 estudiantes; idéntico en las 54 páginas;
+#   * rótulos: 4 "Mes", 1 "DOCENTE" y 1 "DÍAS" por página, en las 54.
+#
+# VALIDACIÓN INDEPENDIENTE: los centros derivados de estas v-lines se
+# compararon contra los dígitos 1-10/T/% que el propio template imprime en la
+# cabecera. Desviación MÁXIMA sobre 54 páginas × 48 columnas = 0.13 pt, con
+# celdas de 11.03 pt de ancho. La suite R3.1 vuelve a comprobarlo.
+#
+# Nada de esto altera la rejilla de 2 meses: ASISTENCIA_TABLE queda intacta.
+_ASISTENCIA_4M_VLINES_IMPAR = [
+    47.43, 58.47, 69.50, 80.53, 91.57, 102.60, 113.64, 124.67, 135.71, 146.74,
+    157.77, 168.81, 179.84, 190.88, 201.91, 212.95, 223.98, 235.01, 246.05,
+    257.08, 268.12, 279.15, 290.19, 301.22, 312.25, 323.29, 334.32, 345.36,
+    356.39, 367.43, 378.46, 389.49, 400.53, 411.56, 422.60, 433.63, 444.67,
+    455.70, 466.73, 477.77, 488.80, 499.84, 510.87, 521.90, 532.94, 543.97,
+    555.01, 566.04, 577.08,
+]
+
+ASISTENCIA_TABLE_4MESES = {
+    "vlines_impar": _ASISTENCIA_4M_VLINES_IMPAR,
+    # Desplazamiento medido de las páginas pares (48, 50, 52, 54).
+    "dx_pagina_par": 0.4364,
+    "bloques": 4,
+    "dias_por_bloque": 10,
+    "cols_por_bloque": 12,           # 10 días + T + %
+    "primera_fila_y_plumber": 180.485,
+    "row_height": 14.1719,
+    "total_filas": 40,
+    # Fila "DÍAS" que el template deja en blanco para los días realmente
+    # trabajados, justo debajo de los números fijos 1-10 (top=149.4).
+    "dias_header_y_plumber": 169.4,
+    # Fila del nombre del mes, a la derecha del rótulo "Mes" de cada bloque.
+    "nombre_y_plumber": 115.9,
+    "nombre_x_impar": [75.7, 208.1, 340.5, 472.9],
+    "nombre_max_width": 100.0,
+    # El template imprime UN solo campo DOCENTE por página.
+    "docente_x": 115.0,
+    "docente_y_plumber": 92.0,
+}
+
+
+def _asistencia_4meses_bloques(pagina: int) -> List[Dict]:
+    """
+    Centros de columna de los 4 bloques de mes de una página 47-55.
+
+    `pagina` es el número 1-based del Registro: su paridad decide el
+    desplazamiento medido de +0.4364 pt. Devuelve, por bloque, los 10 centros
+    de día, el de T, el de % y los bordes del bloque (estos últimos solo para
+    que los tests puedan comprobar que nada se sale de la celda).
+    """
+    t = ASISTENCIA_TABLE_4MESES
+    dx = t["dx_pagina_par"] if pagina % 2 == 0 else 0.0
+    v = [x + dx for x in t["vlines_impar"]]
+    ancho = t["cols_por_bloque"]
+    bloques = []
+    for m in range(t["bloques"]):
+        base = m * ancho
+        bloques.append({
+            "dias": [(v[base + k] + v[base + k + 1]) / 2 for k in range(t["dias_por_bloque"])],
+            "total_x": (v[base + 10] + v[base + 11]) / 2,
+            "porcentaje_x": (v[base + 11] + v[base + 12]) / 2,
+            "nombre_x": t["nombre_x_impar"][m] + dx,
+            "x0": v[base],
+            "x1": v[base + ancho],
+        })
+    return bloques
 
 # --- CALIFICACIONES COMPLETIVAS / EXTRAORDINARIAS / ESPECIALES (Pgs 150+) ---
 # v2.20.1-B2: los x-center se DERIVAN de las v-lines oficiales del template,
@@ -1057,6 +1147,83 @@ def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = Fa
                        f"{est['porcentaje']:.0f}", size=FONT_SIZE_ASISTENCIA, center=True)
 
 
+def draw_asistencia_4meses(c: canvas.Canvas, meses_pagina: List[Optional[Dict]],
+                           pagina: int, docente: str = "", asignatura: str = ""):
+    """
+    Dibuja una página COMPLETA de la rejilla compacta 4 meses × 10 días
+    (páginas 47-55: Ed. Artística, Ed. Física y FIHR).
+
+    `meses_pagina` son los hasta 4 meses de ESA página, en orden; los huecos
+    pueden venir None o vacíos y se dejan en blanco. Cada mes tiene la misma
+    forma que en la rejilla de 2 meses (`nombre_mes`, `dias_labels`,
+    `asistencias` con `dias`/`total`/`porcentaje`), así que NO hay ninguna
+    transformación de datos: solo cambian las coordenadas.
+
+    Los estados P/A/E/T/J y el significado de total y porcentaje son EXACTAMENTE
+    los mismos que en `draw_asistencia`. Un valor None o "" se deja en blanco:
+    nunca se inventa una asistencia.
+    """
+    t = ASISTENCIA_TABLE_4MESES
+    bloques = _asistencia_4meses_bloques(pagina)
+    max_dias = t["dias_por_bloque"]
+
+    # Docente: el template imprime un único campo por página.
+    if docente:
+        _draw_text(c, t["docente_x"], _y(t["docente_y_plumber"]),
+                   docente, size=FONT_SIZE_NOTA, max_width=200)
+
+    for m, datos_mes in enumerate(meses_pagina[:t["bloques"]]):
+        if not datos_mes:
+            continue
+        blk = bloques[m]
+
+        if datos_mes.get("nombre_mes"):
+            _draw_text(c, blk["nombre_x"], _y(t["nombre_y_plumber"]),
+                       datos_mes["nombre_mes"], size=FONT_SIZE_NOTA,
+                       max_width=t["nombre_max_width"])
+
+        # Fila "DÍAS": los días realmente trabajados. La hoja oficial solo tiene
+        # 10 huecos por mes en esta rejilla; si se capturaron más, se avisa en
+        # vez de desbordar la celda o de escribir fuera de la tabla.
+        dias_labels = datos_mes.get("dias_labels", []) or []
+        if len(dias_labels) > max_dias:
+            logger.warning(
+                "Asistencia compacta (pg %s, %s, mes %r): %d días capturados y la hoja "
+                "oficial solo tiene %d columnas; se imprimen los primeros %d.",
+                pagina, asignatura or "?", datos_mes.get("nombre_mes", ""),
+                len(dias_labels), max_dias, max_dias,
+            )
+        header_y = _y(t["dias_header_y_plumber"] + 2.2)
+        for d, valor_dia in enumerate(dias_labels[:max_dias]):
+            _draw_text(c, blk["dias"][d], header_y, str(valor_dia), size=7, center=True)
+
+        for i, est in enumerate(datos_mes.get("asistencias", [])[:t["total_filas"]]):
+            if not est:
+                continue
+            row_y_plumber = t["primera_fila_y_plumber"] + (i * t["row_height"])
+            y = _y(row_y_plumber + t["row_height"] / 2 + 2)
+
+            for d, valor in enumerate((est.get("dias") or [])[:max_dias]):
+                if valor is None or valor == "":
+                    continue
+                if valor is True or valor == "P":
+                    mark = "P"
+                elif valor in ("A", "E", "T", "J"):
+                    mark = valor
+                else:
+                    mark = str(valor)
+                _draw_text(c, blk["dias"][d], y, mark,
+                           size=FONT_SIZE_ASISTENCIA, center=True)
+
+            if est.get("total") is not None:
+                _draw_text(c, blk["total_x"], y, str(est["total"]),
+                           size=FONT_SIZE_ASISTENCIA, center=True)
+
+            if est.get("porcentaje") is not None:
+                _draw_text(c, blk["porcentaje_x"], y, f"{est['porcentaje']:.0f}",
+                           size=FONT_SIZE_ASISTENCIA, center=True)
+
+
 def _fila_completiva(cd: Optional[Dict]) -> Optional[Dict]:
     """v2.20.1-B2: traduce la entrada de calificaciones de UN estudiante/asignatura
     a las 13 columnas oficiales de la página Completiva/Extraordinaria/Especial.
@@ -1533,20 +1700,54 @@ def generar_registro_escolar(
                 continue
 
             entrada = ASISTENCIA_MAPA_SECUNDARIA[a_idx]
+            meses = asig_data.get("meses", [])
+
             if entrada["layout"] in ASISTENCIA_LAYOUT_SIN_CALIBRAR:
-                # Rejilla de 4 meses × 10 días: ASISTENCIA_TABLE no la
-                # describe. Se deja la página del template intacta en vez de
-                # estampar marcas descuadradas sobre un documento oficial.
+                # Barrera: una rejilla sin medir se deja EN BLANCO antes que
+                # estampar marcas en columnas que no le corresponden.
                 logger.warning(
-                    "Asistencia de '%s' no se estampa: el template usa la rejilla '%s', "
-                    "todavía sin calibrar (páginas %s).",
+                    "Asistencia de '%s' no se estampa: la rejilla '%s' no está "
+                    "calibrada (páginas %s).",
                     asig, entrada["layout"], entrada["paginas"],
                 )
                 continue
 
-            # Cada asignatura tiene 5 páginas (10 meses, 2 por página)
-            meses = asig_data.get("meses", [])
+            if entrada["layout"] == "4meses":
+                # Ed. Artística / Ed. Física / FIHR: 3 páginas de 4 meses × 10
+                # días. Rejilla propia, calibrada en ASISTENCIA_TABLE_4MESES.
+                # El template imprime el DOCENTE en cada una de las 3 páginas;
+                # el constructor de datos solo lo pone en el primer mes.
+                docente = ""
+                for _m in meses:
+                    if _m and _m.get("docente"):
+                        docente = _m["docente"]
+                        break
+                por_pagina = ASISTENCIA_TABLE_4MESES["bloques"]
+                for pg_offset, pagina in enumerate(entrada["paginas"]):
+                    pg_idx = pagina - 1
+                    if pg_idx >= total_pages:
+                        break
+                    grupo = meses[pg_offset * por_pagina:(pg_offset + 1) * por_pagina]
+                    if not any(grupo):
+                        continue
+                    buf = io.BytesIO()
+                    c_asist = canvas.Canvas(buf, pagesize=letter)
+                    draw_asistencia_4meses(c_asist, grupo, pagina,
+                                           docente=docente, asignatura=asig)
+                    c_asist.showPage()
+                    c_asist.save()
+                    buf.seek(0)
+                    overlays[pg_idx] = buf
+                if len(meses) > por_pagina * len(entrada["paginas"]):
+                    logger.warning(
+                        "Asistencia de '%s': %d meses capturados y la hoja oficial "
+                        "solo tiene %d huecos (páginas %s).",
+                        asig, len(meses), por_pagina * len(entrada["paginas"]),
+                        entrada["paginas"],
+                    )
+                continue
 
+            # Cada asignatura tiene 5 páginas (10 meses, 2 por página)
             for pg_offset, pagina in enumerate(entrada["paginas"]):
                 pg_idx = pagina - 1  # 0-indexed
 

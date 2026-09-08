@@ -589,9 +589,9 @@ def _():
     for g in (4, 6):
         fuera = (_EST[g] & banda) - permitidas
         assert not fuera, f"grado {g} estampó fuera del mapa de asistencia: {sorted(fuera)}"
-    # las 6 asignaturas de rejilla calibrada sí reciben sus 5 páginas completas
-    for g in (4, 6):
-        for i in range(6):
+    # las 9 asignaturas reciben TODAS sus páginas (las 6 de 5 pgs y las 3 de 3)
+    for g in (1, 4, 6):
+        for i in range(9):
             faltan = set(MAPA_TEMPLATE[i]) - _EST[g]
             assert not faltan, f"grado {g}, asignatura {i}: sin estampar {sorted(faltan)}"
 
@@ -604,12 +604,8 @@ def _():
     # ciclo 1: esas mismas páginas son las de evaluaciones completivas
     invadidas1 = _EST[1] & PAGINAS_EVAL_CICLO_1
     assert not invadidas1, f"ciclo 1 invadió páginas de evaluaciones: {sorted(invadidas1)}"
-    # la rejilla sin calibrar se deja intacta en vez de estamparse torcida
-    for g in (1, 4, 6):
-        for i in (6, 7, 8):
-            tocadas = _EST[g] & set(MAPA_TEMPLATE[i])
-            assert not tocadas, (
-                f"grado {g}: se estampó la rejilla '4meses' sin calibrar en {sorted(tocadas)}")
+    # y tras el hardening ya no queda ninguna rejilla sin calibrar
+    assert RE.ASISTENCIA_LAYOUT_SIN_CALIBRAR == set(), RE.ASISTENCIA_LAYOUT_SIN_CALIBRAR
 
 
 @test("§17 totales de páginas intactos: 170 / 238 / 240")
@@ -664,6 +660,242 @@ def _():
     assert ahora_sge == _sge_mtime, "sge.db fue modificado"
     assert ahora_cred == _cred_mtime, "INITIAL_CREDENTIALS.txt fue modificado"
     assert _TMPDIR.replace("\\", "/") in str(engine.url).replace("\\", "/")
+
+
+# ===========================================================================
+# BLOQUE D — GEOMETRÍA DE LA REJILLA COMPACTA 4 MESES × 10 DÍAS (pgs 47-55)
+# ===========================================================================
+#
+# Referencia INDEPENDIENTE del código: líneas medidas sobre los templates
+# oficiales (6 grados × 9 páginas 47-55; dispersión 0.0000 pt dentro de cada
+# paridad, y +0.4364 pt constante en las páginas pares). Los tests comparan el
+# PDF realmente generado contra ESTOS números, no contra la tabla del módulo.
+
+VLINES_IMPAR_TPL = [
+    47.43, 58.47, 69.50, 80.53, 91.57, 102.60, 113.64, 124.67, 135.71, 146.74,
+    157.77, 168.81, 179.84, 190.88, 201.91, 212.95, 223.98, 235.01, 246.05,
+    257.08, 268.12, 279.15, 290.19, 301.22, 312.25, 323.29, 334.32, 345.36,
+    356.39, 367.43, 378.46, 389.49, 400.53, 411.56, 422.60, 433.63, 444.67,
+    455.70, 466.73, 477.77, 488.80, 499.84, 510.87, 521.90, 532.94, 543.97,
+    555.01, 566.04, 577.08,
+]
+DX_PAR_TPL = 0.4364
+FILA0_TPL = 180.485          # y_plumber de la 1ª línea horizontal de datos
+ROW_H_TPL = 14.1719
+FILAS_TPL = 40
+TOL = 0.15                   # margen: la validación contra los dígitos
+                             # impresos del template dio 0.13 pt máx.
+
+from reportlab.pdfbase.pdfmetrics import stringWidth      # noqa: E402
+
+IDX_ARTISTICA, IDX_FISICA, IDX_FIHR = 6, 7, 8
+
+
+def _celda(pagina, bloque, col):
+    """(x0, x1) de la columna `col` (0-9 días, 10=T, 11=%) del bloque."""
+    dx = DX_PAR_TPL if pagina % 2 == 0 else 0.0
+    i = bloque * 12 + col
+    return VLINES_IMPAR_TPL[i] + dx, VLINES_IMPAR_TPL[i + 1] + dx
+
+
+def _banda_fila(i):
+    """(y_top, y_bottom) en coordenadas plumber de la fila del estudiante i."""
+    top = FILA0_TPL + i * ROW_H_TPL
+    return top, top + ROW_H_TPL
+
+
+def _mes_compacto(nombre, ndias=10, nest=40):
+    return {
+        "nombre_mes": nombre,
+        "docente": "Prof. Prueba",
+        "dias_labels": list(range(1, ndias + 1)),
+        "asistencias": [{"dias": ["P"] * ndias, "total": ndias, "porcentaje": 100.0}
+                        for _ in range(nest)],
+    }
+
+
+def _generar_una(grado, asig_idx, nmeses=10, nest=40):
+    """Registro con asistencia SOLO para esa asignatura: atribución inequívoca."""
+    asigs = RE.ASIGNATURAS_CICLO_2 if grado >= 4 else RE.ASIGNATURAS_CICLO_1
+    nombre = asigs[asig_idx]
+    key = nombre.lower().replace(" ", "_").replace("-", "_")
+    return RE.generar_registro_escolar(
+        grado=grado,
+        datos_centro={"nombre": "Centro de prueba"},
+        datos_portada={"ano_escolar": "2025-2026", "seccion": "A"},
+        estudiantes=[{"nombre": f"Est {i}", "apellido": "Prueba", "no_lista": i}
+                     for i in range(1, nest + 1)],
+        asistencia_data={key: {"meses": [_mes_compacto(f"MES{i}", nest=nest)
+                                         for i in range(nmeses)]}},
+    )
+
+
+def _marcas(reader, pg_1based):
+    """[(x, y_reportlab, texto, size)] del texto dibujado por EducaOne."""
+    out = []
+
+    def visitor(text, cm, tm, fd, fs):
+        t = (text or "").strip()
+        # Se descartan los agregados multilinea que pypdf emite al reagrupar y
+        # el texto pre-impreso del template (que llega sin matriz propia).
+        if not t or "\n" in t or (tm[4] == 0 and tm[5] == 0):
+            return
+        out.append((round(tm[4], 3), round(tm[5], 3), t, fs))
+
+    reader.pages[pg_1based - 1].extract_text(visitor_text=visitor)
+    return out
+
+
+_PDF_ART = PdfReader(_io.BytesIO(_generar_una(4, IDX_ARTISTICA)))
+_PDF_EF = PdfReader(_io.BytesIO(_generar_una(4, IDX_FISICA)))
+_PDF_FIHR = PdfReader(_io.BytesIO(_generar_una(4, IDX_FIHR)))
+_EST_ART = _paginas_estampadas(_PDF_ART) & set(range(17, 66))
+_EST_EF = _paginas_estampadas(_PDF_EF) & set(range(17, 66))
+_EST_FIHR = _paginas_estampadas(_PDF_FIHR) & set(range(17, 66))
+print(f"    Ed. Artística sola -> {sorted(_EST_ART)}")
+print(f"    Ed. Física sola    -> {sorted(_EST_EF)}")
+print(f"    FIHR sola          -> {sorted(_EST_FIHR)}")
+
+
+@test("§D0 la tabla del módulo reproduce la geometría medida del template")
+def _():
+    t = RE.ASISTENCIA_TABLE_4MESES
+    assert t["vlines_impar"] == VLINES_IMPAR_TPL, "v-lines ≠ template"
+    assert abs(t["dx_pagina_par"] - DX_PAR_TPL) < 1e-9
+    assert abs(t["primera_fila_y_plumber"] - FILA0_TPL) < 1e-9
+    assert abs(t["row_height"] - ROW_H_TPL) < 1e-9
+    assert t["total_filas"] == FILAS_TPL
+    assert t["bloques"] == 4 and t["dias_por_bloque"] == 10
+    # ASISTENCIA_TABLE (2 meses) NO fue tocada por el hardening
+    assert RE.ASISTENCIA_TABLE["primera_fila_y_plumber"] == 179.88
+    assert RE.ASISTENCIA_TABLE["row_height"] == 14.21
+    assert len(RE.ASISTENCIA_TABLE["mes_izq_dia_centers"]) == 21
+
+
+@test("§D1 Educación Artística escribe SOLO en 47-49")
+def _():
+    assert _EST_ART == {47, 48, 49}, sorted(_EST_ART)
+
+
+@test("§D2 Educación Física escribe SOLO en 50-52")
+def _():
+    assert _EST_EF == {50, 51, 52}, sorted(_EST_EF)
+
+
+@test("§D3 FIHR escribe SOLO en 53-55")
+def _():
+    assert _EST_FIHR == {53, 54, 55}, sorted(_EST_FIHR)
+
+
+@test("§D4 ninguna de las tres invade las páginas 56-65 (Salida Optativa)")
+def _():
+    for nombre, est in (("Artística", _EST_ART), ("Ed. Física", _EST_EF), ("FIHR", _EST_FIHR)):
+        inv = est & PAGINAS_SALIDA_OPTATIVA
+        assert not inv, f"{nombre} invadió {sorted(inv)}"
+
+
+@test("§D5 ninguna invade las páginas de otra asignatura")
+def _():
+    assert _EST_ART & _EST_EF == set()
+    assert _EST_ART & _EST_FIHR == set()
+    assert _EST_EF & _EST_FIHR == set()
+    otras = {p for i, pgs in MAPA_TEMPLATE.items() if i < 6 for p in pgs}
+    for nombre, est in (("Artística", _EST_ART), ("Ed. Física", _EST_EF), ("FIHR", _EST_FIHR)):
+        assert not (est & otras), f"{nombre} invadió páginas troncales: {sorted(est & otras)}"
+
+
+@test("§D6 día 1 y día 10 caen DENTRO de su celda, en página impar y par")
+def _():
+    # 10 meses en 3 páginas de 4 huecos: la 3ª página solo lleva 2 bloques.
+    for reader, paginas in ((_PDF_ART, (47, 48, 49)), (_PDF_EF, (50, 51, 52)),
+                            (_PDF_FIHR, (53, 54, 55))):
+        for p_idx, pg in enumerate(paginas):
+            marcas = [m for m in _marcas(reader, pg) if m[2] == "P"]
+            assert marcas, f"pg {pg} sin marcas"
+            ocupados = max(0, min(4, 10 - 4 * p_idx))
+            assert ocupados == (4 if p_idx < 2 else 2), (pg, ocupados)
+            for bloque in range(ocupados):
+                for col in (0, 9):          # día 1 y día 10
+                    x0, x1 = _celda(pg, bloque, col)
+                    dentro = [m for m in marcas if x0 - TOL <= m[0]
+                              and m[0] + stringWidth(m[2], RE.FONT_NORMAL, m[3]) <= x1 + TOL]
+                    en_celda = [m for m in dentro if x0 <= m[0] <= x1]
+                    assert len(en_celda) == FILAS_TPL, (
+                        f"pg {pg} bloque {bloque} col {col}: {len(en_celda)} marcas "
+                        f"dentro de [{x0:.2f}, {x1:.2f}], esperadas {FILAS_TPL}")
+            # y NINGUNA marca fuera de la rejilla completa
+            izq, _ = _celda(pg, 0, 0)
+            _, der = _celda(pg, 3, 11)
+            for m in marcas:
+                ancho = stringWidth(m[2], RE.FONT_NORMAL, m[3])
+                assert izq - TOL <= m[0] and m[0] + ancho <= der + TOL, (pg, m)
+
+
+@test("§D7 el nombre del mes 1 y del mes 4 cae dentro de su bloque")
+def _():
+    for reader, paginas in ((_PDF_ART, (47, 48, 49)), (_PDF_EF, (50, 51, 52)),
+                            (_PDF_FIHR, (53, 54, 55))):
+        for pg in paginas:
+            meses = sorted((m for m in _marcas(reader, pg) if m[2].startswith("MES")),
+                           key=lambda m: m[0])
+            if not meses:
+                continue                    # pg 3: solo quedan 2 meses de 10
+            for m in meses:
+                bloque = next(b for b in range(4)
+                              if _celda(pg, b, 0)[0] - TOL <= m[0] < _celda(pg, b, 11)[1])
+                bx0, _ = _celda(pg, bloque, 0)
+                _, bx1 = _celda(pg, bloque, 11)
+                ancho = stringWidth(m[2], RE.FONT_NORMAL, m[3])
+                assert bx0 <= m[0] and m[0] + ancho <= bx1 + TOL, (pg, bloque, m)
+            # en las dos primeras páginas los 4 bloques están ocupados
+            if pg in (47, 48, 50, 51, 53, 54):
+                assert len(meses) == 4, (pg, meses)
+
+
+@test("§D8 estudiante 1 y estudiante 40 quedan dentro de la tabla")
+def _():
+    y_top_tabla = FILA0_TPL
+    y_bot_tabla = FILA0_TPL + FILAS_TPL * ROW_H_TPL
+    for reader, pg in ((_PDF_ART, 47), (_PDF_EF, 51), (_PDF_FIHR, 55)):
+        marcas = [m for m in _marcas(reader, pg) if m[2] == "P"]
+        ys = sorted({round(792 - m[1], 3) for m in marcas})   # a plumber
+        assert len(ys) == FILAS_TPL, f"pg {pg}: {len(ys)} filas distintas"
+        for i, y in enumerate(ys):
+            top, bot = _banda_fila(i)
+            assert top <= y <= bot, f"pg {pg} fila {i}: baseline {y:.2f} fuera de [{top:.2f}, {bot:.2f}]"
+        assert y_top_tabla <= ys[0] and ys[-1] <= y_bot_tabla, (pg, ys[0], ys[-1])
+
+
+@test("§D9/§D10/§D11 smoke 1ro / 4to / 6to: las 9 asignaturas dentro de su mapa")
+def _():
+    permitidas = {p for pgs in MAPA_TEMPLATE.values() for p in pgs}
+    banda = set(range(17, 66))
+    for g in (1, 4, 6):
+        est = _EST[g] & banda
+        assert est == permitidas, f"grado {g}: {sorted(est ^ permitidas)}"
+
+
+@test("§D12 la rejilla compacta respeta el límite de 10 días de la hoja oficial")
+def _():
+    # 21 días capturados (lo que trae el constructor de datos) -> se imprimen 10
+    # y ninguna marca se sale de la rejilla.
+    pdf = RE.generar_registro_escolar(
+        grado=4, datos_centro={"nombre": "X"},
+        datos_portada={"ano_escolar": "2025-2026"},
+        estudiantes=[{"nombre": f"E{i}", "apellido": "P", "no_lista": i} for i in range(1, 41)],
+        asistencia_data={"educación_artística": {"meses": [{
+            "nombre_mes": "AGO", "docente": "D",
+            "dias_labels": list(range(1, 22)),
+            "asistencias": [{"dias": ["P"] * 21, "total": 21, "porcentaje": 100.0}
+                            for _ in range(40)],
+        }]}})
+    r = PdfReader(_io.BytesIO(pdf))
+    assert len(r.pages) == 238
+    marcas = [m for m in _marcas(r, 47) if m[2] == "P"]
+    assert len(marcas) == 40 * 10, f"se imprimieron {len(marcas)} marcas, esperadas 400"
+    _, der = _celda(47, 0, 11)
+    for m in marcas:
+        assert m[0] + stringWidth(m[2], RE.FONT_NORMAL, m[3]) <= der + TOL, m
 
 
 print(f"\n{B}{'=' * 62}{X}")
