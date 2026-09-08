@@ -2172,9 +2172,19 @@ class CursoComponenteOptativo(Base):
     id = Column(Integer, primary_key=True)
     colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
     curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False, index=True)
-    # Igual que IndicadorLogro (R2): la configuración vive dentro de un año
-    # escolar concreto y no se hereda en silencio al año siguiente.
-    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=True, index=True)
+    # La configuración vive dentro de un año escolar CONCRETO y no se hereda en
+    # silencio al año siguiente.
+    #
+    # NOT NULL a propósito (R3.1 final guard). Las dos UniqueConstraint de abajo
+    # incluyen `ano_escolar_id`, y en PostgreSQL dos filas con NULL en una
+    # columna de la clave NO colisionan: un solo NULL bastaría para que el mismo
+    # componente del mismo curso admitiera filas duplicadas. Prohibir el NULL es
+    # lo que convierte esas restricciones en una barrera real.
+    #
+    # Se puede exigir sin riesgo porque la tabla es NUEVA (producción no tiene
+    # ninguna fila R3) y porque los 7 cursos reales tienen los 7 su año escolar.
+    # No hay sentinel 0, ni default arbitrario, ni backfill.
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=False, index=True)
     # Código estable del catálogo: 'HLM-LE-4', 'CYT-CN-6', ...
     componente_codigo = Column(String(16), nullable=False)
     # La asignatura REAL del colegio. Esta FK es la identidad académica.

@@ -101,6 +101,8 @@ ANO_A, ANO_B = 1, 2
 GRADO_1RO, GRADO_4TO, GRADO_5TO, GRADO_4TO_PRIM = 1, 4, 5, 40
 CURSO_1RO, CURSO_4TO, CURSO_5TO, CURSO_4TO_PRIM = 10, 14, 15, 19
 CURSO_B = 20                     # curso del colegio B (tenant ajeno)
+CURSO_SIN_ANO = 21               # 4to del colegio A SIN año escolar
+CURSO_ANO_AJENO = 22             # 4to del colegio A apuntando al año del B
 
 AULA_LEGACY = "A-201"            # dato previo que NO se puede perder
 
@@ -155,6 +157,8 @@ with engine.connect() as conn:
         (CURSO_5TO, GRADO_5TO, COL_A, ANO_A),
         (CURSO_4TO_PRIM, GRADO_4TO_PRIM, COL_A, ANO_A),
         (CURSO_B, GRADO_4TO, COL_B, ANO_B),
+        (CURSO_SIN_ANO, GRADO_4TO, COL_A, None),
+        (CURSO_ANO_AJENO, GRADO_4TO, COL_A, ANO_B),
     ):
         conn.execute(text(
             "INSERT INTO cursos (id, colegio_id, nombre, grado_id, ano_escolar_id, "
@@ -203,13 +207,14 @@ def _():
     assert "salida_optativa_codigo" in _cols1, "la columna no se agregó"
     salidas = {f[0]: f[8] for f in _filas1}
     assert salidas == {CURSO_1RO: None, CURSO_4TO: None, CURSO_5TO: None,
-                       CURSO_4TO_PRIM: None, CURSO_B: None}, salidas
+                       CURSO_4TO_PRIM: None, CURSO_B: None,
+                       CURSO_SIN_ANO: None, CURSO_ANO_AJENO: None}, salidas
     print(f"    los {len(salidas)} cursos previos quedaron en NULL")
 
 
 @test("§13 ningún dato legacy borrado: filas y columnas previas intactas")
 def _():
-    assert len(_filas1) == 5, f"se perdieron cursos: {len(_filas1)}"
+    assert len(_filas1) == 7, f"se perdieron cursos: {len(_filas1)}"
     for f in _filas1:
         assert f[6] == AULA_LEGACY, f"aula alterada en curso {f[0]}: {f[6]!r}"
         assert f[5] == 35 and f[7] in (1, True), f
@@ -487,6 +492,168 @@ def _():
         # y de todos modos la validación de aplicación lo habría rechazado antes
         ok, err = SVC.validar_mapeo_componente(db, _curso(db, CURSO_4TO), "HLM-LE-4", ASIG_CYT)
         assert not ok, err
+    finally:
+        db.close()
+
+
+# ===========================================================================
+# BLOQUE E — IDENTIDAD ANUAL DE LOS COMPONENTES (R3.1 final guard)
+# ===========================================================================
+
+def _n_mapeos(db):
+    return db.query(M.CursoComponenteOptativo).count()
+
+
+@test("§E1 ano_escolar_id es NOT NULL: sin año no se puede crear el mapeo")
+def _():
+    from sqlalchemy import inspect as _sa_inspect
+    col = _sa_inspect(M.CursoComponenteOptativo).columns["ano_escolar_id"]
+    assert not col.nullable, "ano_escolar_id sigue siendo nullable en el modelo"
+    # y el esquema FÍSICO creado por la migración también lo exige
+    fisico = {c["name"]: c for c in
+              __import__("sqlalchemy").inspect(engine).get_columns("curso_componentes_optativos")}
+    assert fisico["ano_escolar_id"]["nullable"] is False, fisico["ano_escolar_id"]
+
+    db = SessionLocal()
+    try:
+        antes = _n_mapeos(db)
+        db.add(M.CursoComponenteOptativo(
+            colegio_id=COL_A, curso_id=CURSO_4TO, ano_escolar_id=None,
+            componente_codigo="HLM-LE-4", asignatura_id=ASIG_HLM, activo=True))
+        try:
+            db.commit()
+            raise AssertionError("se aceptó un mapeo sin año escolar")
+        except IntegrityError:
+            db.rollback()
+        assert _n_mapeos(db) == antes, "se creó una fila pese al fallo"
+    finally:
+        db.close()
+
+
+@test("§E2 dos mapeos idénticos no pueden coexistir (la clave única muerde)")
+def _():
+    db = SessionLocal()
+    try:
+        antes = _n_mapeos(db)
+        # ya existe (CURSO_4TO, ANO_A, 'CYT-CN-4', ASIG_CYT) creado en §8
+        db.add(M.CursoComponenteOptativo(
+            colegio_id=COL_A, curso_id=CURSO_4TO, ano_escolar_id=ANO_A,
+            componente_codigo="CYT-CN-4", asignatura_id=ASIG_CYT, activo=True))
+        try:
+            db.commit()
+            raise AssertionError("se aceptó un mapeo duplicado")
+        except IntegrityError:
+            db.rollback()
+        assert _n_mapeos(db) == antes
+    finally:
+        db.close()
+
+
+@test("§E3 curso año A + mapeo año A -> permitido")
+def _():
+    db = SessionLocal()
+    try:
+        c = _curso(db, CURSO_4TO)
+        assert SVC.ano_de_curso(c) == ANO_A
+        ok, err = SVC.validar_ano_para_curso(db, c, ANO_A)
+        assert ok, err
+        ok, err = SVC.validar_ano_para_curso(db, c, None)   # derivado del curso
+        assert ok, err
+        ok, err = SVC.validar_mapeo_componente(db, c, "CYT-CN-4", ASIG_CYT, ANO_A)
+        assert ok, err
+    finally:
+        db.close()
+
+
+@test("§E4 curso año A + mapeo año B -> rechazado, y sin escribir nada")
+def _():
+    db = SessionLocal()
+    try:
+        antes = _n_mapeos(db)
+        c = _curso(db, CURSO_4TO)
+        ok, err = SVC.validar_ano_para_curso(db, c, ANO_B)
+        assert not ok and "no corresponde al curso" in err, err
+        ok, err = SVC.validar_mapeo_componente(db, c, "CYT-CN-4", ASIG_CYT, ANO_B)
+        assert not ok and "no corresponde al curso" in err, err
+        # resolver_componentes NO acepta un año ajeno en silencio
+        try:
+            SVC.resolver_componentes(db, c, ANO_B)
+            raise AssertionError("resolver_componentes aceptó un año ajeno")
+        except ValueError as e:
+            assert "no corresponde al curso" in str(e), e
+        assert _n_mapeos(db) == antes, "la validación escribió en la BD"
+    finally:
+        db.close()
+
+
+@test("§E5 curso SIN año -> rechazado (y resolver no adivina)")
+def _():
+    db = SessionLocal()
+    try:
+        antes = _n_mapeos(db)
+        c = _curso(db, CURSO_SIN_ANO)
+        assert SVC.ano_de_curso(c) is None
+        c.salida_optativa_codigo = "CYT"
+        db.commit()
+        c = _curso(db, CURSO_SIN_ANO)
+
+        ok, err = SVC.validar_ano_para_curso(db, c, None)
+        assert not ok and "no tiene año escolar" in err, err
+        ok, err = SVC.validar_mapeo_componente(db, c, "CYT-CN-4", ASIG_CYT)
+        assert not ok and "no tiene año escolar" in err, err
+        # el catálogo sí resuelve, pero sin año no se devuelve configuración
+        assert SVC.componentes_esperados(c), "el curso sí es 4to CYT"
+        assert SVC.resolver_componentes(db, c) == []
+        assert _n_mapeos(db) == antes
+    finally:
+        db.close()
+
+
+@test("§E6 año escolar de otro colegio -> rechazado")
+def _():
+    db = SessionLocal()
+    try:
+        antes = _n_mapeos(db)
+        c = _curso(db, CURSO_ANO_AJENO)          # curso del colegio A, año del B
+        c.salida_optativa_codigo = "CYT"
+        db.commit()
+        c = _curso(db, CURSO_ANO_AJENO)
+        ok, err = SVC.validar_ano_para_curso(db, c, None)
+        assert not ok and "otro colegio" in err, err
+        ok, err = SVC.validar_mapeo_componente(db, c, "CYT-CN-4", ASIG_CYT)
+        assert not ok and "otro colegio" in err, err
+        assert _n_mapeos(db) == antes
+    finally:
+        db.close()
+
+
+@test("§E7 resolver_componentes deriva el año del curso, no de un parámetro")
+def _():
+    import inspect as _pyinspect
+    firma = _pyinspect.signature(SVC.resolver_componentes)
+    assert firma.parameters["ano_escolar_id"].default is None, firma
+    db = SessionLocal()
+    try:
+        c = _curso(db, CURSO_4TO)
+        sin_param = SVC.resolver_componentes(db, c)
+        con_param = SVC.resolver_componentes(db, c, ANO_A)
+        assert sin_param == con_param and sin_param, sin_param
+        assert sin_param[0]["asignatura_id"] == ASIG_CYT
+    finally:
+        db.close()
+
+
+@test("§E8 la configuración de un año NO se ve desde otro año")
+def _():
+    db = SessionLocal()
+    try:
+        # mismo curso_id no puede existir en dos años (EducaOne crea un Curso
+        # nuevo por año), pero sí comprobamos que el filtro por año aísla:
+        filas_a = db.query(M.CursoComponenteOptativo).filter_by(
+            curso_id=CURSO_4TO, ano_escolar_id=ANO_A).count()
+        filas_b = db.query(M.CursoComponenteOptativo).filter_by(
+            curso_id=CURSO_4TO, ano_escolar_id=ANO_B).count()
+        assert filas_a == 1 and filas_b == 0, (filas_a, filas_b)
     finally:
         db.close()
 
@@ -896,6 +1063,71 @@ def _():
     _, der = _celda(47, 0, 11)
     for m in marcas:
         assert m[0] + stringWidth(m[2], RE.FONT_NORMAL, m[3]) <= der + TOL, m
+
+
+# ===========================================================================
+# BLOQUE F — RUTA DEGRADADA DE LA MIGRACIÓN (va al final: toca el esquema)
+# ===========================================================================
+#
+# Un entorno que hubiera creado la tabla con la versión laxa (ano_escolar_id
+# nullable) y tuviera filas con NULL. La migración NO debe inventarles un año
+# ni borrarlas: debe dejarlas intactas y reportar.
+
+@test("§F1 migración con filas ano_escolar_id NULL: no borra, no inventa, reporta")
+def _():
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS curso_componentes_optativos"))
+        conn.execute(text(
+            "CREATE TABLE curso_componentes_optativos ("
+            "  id INTEGER NOT NULL PRIMARY KEY,"
+            "  colegio_id INTEGER REFERENCES colegios(id),"
+            "  curso_id INTEGER NOT NULL REFERENCES cursos(id),"
+            "  ano_escolar_id INTEGER REFERENCES ano_escolar(id),"   # laxa
+            "  componente_codigo VARCHAR(16) NOT NULL,"
+            "  asignatura_id INTEGER NOT NULL REFERENCES asignaturas(id),"
+            "  activo BOOLEAN,"
+            "  fecha_creacion DATETIME,"
+            "  fecha_actualizacion DATETIME"
+            ")"
+        ))
+        conn.execute(text(
+            "INSERT INTO curso_componentes_optativos "
+            "(id, colegio_id, curso_id, ano_escolar_id, componente_codigo, asignatura_id, activo) "
+            "VALUES (1, :c, :k, NULL, 'CYT-CN-4', :a, 1)"),
+            {"c": COL_A, "k": CURSO_4TO, "a": ASIG_CYT})
+        conn.execute(text(
+            "INSERT INTO curso_componentes_optativos "
+            "(id, colegio_id, curso_id, ano_escolar_id, componente_codigo, asignatura_id, activo) "
+            "VALUES (2, :c, :k, :y, 'HLM-LE-4', :a, 1)"),
+            {"c": COL_A, "k": CURSO_4TO, "y": ANO_A, "a": ASIG_HLM})
+        conn.commit()
+
+    _arrancar_app()
+
+    with engine.connect() as conn:
+        filas = list(conn.execute(text(
+            "SELECT id, colegio_id, curso_id, ano_escolar_id, componente_codigo, "
+            "asignatura_id FROM curso_componentes_optativos ORDER BY id")))
+        nullable = {c["name"]: c["nullable"] for c in
+                    __import__("sqlalchemy").inspect(engine).get_columns(
+                        "curso_componentes_optativos")}
+
+    assert len(filas) == 2, f"la migración perdió filas: {filas}"
+    assert filas[0][3] is None, "la migración INVENTÓ un año para la fila NULL"
+    assert filas[1][3] == ANO_A, filas[1]
+    assert filas[0][4] == "CYT-CN-4" and filas[1][4] == "HLM-LE-4"
+    # con filas NULL presentes NO se promueve la columna: se reporta y se deja
+    assert nullable["ano_escolar_id"] is True, nullable
+
+    # restaurar el esquema correcto para no dejar la BD temporal degradada
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE curso_componentes_optativos"))
+        conn.commit()
+    M.Base.metadata.create_all(bind=engine)
+    restaurado = {c["name"]: c["nullable"] for c in
+                  __import__("sqlalchemy").inspect(engine).get_columns(
+                      "curso_componentes_optativos")}
+    assert restaurado["ano_escolar_id"] is False, restaurado
 
 
 print(f"\n{B}{'=' * 62}{X}")

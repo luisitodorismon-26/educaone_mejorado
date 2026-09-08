@@ -20,6 +20,7 @@ en el Registro (eso es R3.3). Aquí solo viven el modelo y sus reglas, para que
 ambas fases posteriores consuman las MISMAS validaciones en vez de reescribirlas.
 """
 
+import logging
 from typing import List, Optional, Tuple
 
 from salidas_optativas import (
@@ -30,6 +31,8 @@ from salidas_optativas import (
     grado_admite_salida,
     salida_valida,
 )
+
+logger = logging.getLogger(__name__)
 
 # Resultado uniforme de validación: (ok, mensaje_de_error_o_None)
 Resultado = Tuple[bool, Optional[str]]
@@ -86,8 +89,56 @@ def validar_salida_para_curso(curso, codigo: Optional[str]) -> Resultado:
     return True, None
 
 
+def ano_de_curso(curso) -> Optional[int]:
+    """
+    Año escolar al que pertenece el curso: la ÚNICA fuente de verdad del año
+    para su configuración optativa.
+
+    EducaOne crea una fila `Curso` NUEVA por año escolar —`clonar-cursos` y
+    `cierre-ano/promover` hacen `db.add(Curso(..., ano_escolar_id=destino))` y
+    mueven `estudiante.curso_id`; en todo el backend no existe una sola
+    escritura a `Curso.ano_escolar_id` fuera de la creación—. Por eso el año del
+    curso ES el año de su salida optativa, y no hace falta una segunda fuente.
+    """
+    return getattr(curso, 'ano_escolar_id', None)
+
+
+def validar_ano_para_curso(db, curso, ano_escolar_id: Optional[int] = None) -> Resultado:
+    """
+    Coherencia CURSO ↔ AÑO ESCOLAR, centralizada aquí para que la use tanto la
+    API de R3.2 como el Registro de R3.3 y no se reimplemente dos veces.
+
+    Comprueba que el curso tenga año, que el año pedido exista, que sea del
+    mismo colegio y que coincida con el del curso. `ano_escolar_id` None
+    significa "usar el del curso" y es la forma recomendada de llamarla.
+    """
+    from models import AnoEscolar
+
+    ano_curso = ano_de_curso(curso)
+    if ano_curso is None:
+        return False, (
+            "El curso no tiene año escolar asignado. Asígnele uno antes de "
+            "configurar su Salida Optativa."
+        )
+
+    if ano_escolar_id is not None and ano_escolar_id != ano_curso:
+        return False, (
+            f"El año escolar {ano_escolar_id} no corresponde al curso, que "
+            f"pertenece al año {ano_curso}."
+        )
+
+    ano = db.query(AnoEscolar).filter(AnoEscolar.id == ano_curso).first()
+    if ano is None:
+        return False, f"El año escolar {ano_curso} no existe."
+    if ano.colegio_id != getattr(curso, 'colegio_id', None):
+        return False, "El año escolar pertenece a otro colegio."
+
+    return True, None
+
+
 def validar_mapeo_componente(db, curso, componente_codigo: str,
-                             asignatura_id: Optional[int]) -> Resultado:
+                             asignatura_id: Optional[int],
+                             ano_escolar_id: Optional[int] = None) -> Resultado:
     """
     ¿Puede `asignatura_id` representar a `componente_codigo` en este curso?
 
@@ -95,12 +146,18 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
       1. el curso admite Salida Optativa y tiene una configurada;
       2. el componente existe en el catálogo oficial;
       3. el componente pertenece A ESA salida y A ESE grado;
-      4. la asignatura existe y es DEL MISMO COLEGIO que el curso (tenant-safe).
+      4. el curso tiene año escolar, ese año existe, es del mismo colegio y
+         coincide con el `ano_escolar_id` pedido (si se pasó uno);
+      5. la asignatura existe y es DEL MISMO COLEGIO que el curso (tenant-safe).
+
+    Es una función PURA de validación: no escribe nada. Si algo falla, el
+    llamador no debe crear la fila.
 
     Las dos unicidades restantes —un componente con dos asignaturas, y una
     asignatura en dos componentes del mismo curso— las garantizan las
     UniqueConstraint de `CursoComponenteOptativo`, que son la última línea de
-    defensa ante dos requests simultáneos.
+    defensa ante dos requests simultáneos. Funcionan porque `ano_escolar_id` es
+    NOT NULL: con NULL, PostgreSQL no las haría colisionar.
     """
     from models import Asignatura
 
@@ -125,6 +182,10 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
             f"salida {comp.salida} de {comp.grado}to y no puede usarse en un curso "
             f"de {grado_numero}to configurado como {salida}."
         )
+
+    ok_ano, err_ano = validar_ano_para_curso(db, curso, ano_escolar_id)
+    if not ok_ano:
+        return False, err_ano
 
     if asignatura_id is None:
         return False, "Debe indicar la asignatura que imparte este componente."
@@ -151,7 +212,7 @@ def componentes_esperados(curso):
                           grado_numero_de_curso(curso))
 
 
-def resolver_componentes(db, curso, ano_escolar_id: Optional[int]) -> List[dict]:
+def resolver_componentes(db, curso, ano_escolar_id: Optional[int] = None) -> List[dict]:
     """
     Resuelve la cadena completa para el Registro Escolar, ordenada por slot:
 
@@ -160,6 +221,12 @@ def resolver_componentes(db, curso, ano_escolar_id: Optional[int]) -> List[dict]
 
     `asignatura_id` None significa que el colegio configuró la salida pero
     todavía no dijo qué asignatura suya imparte ese componente. NO se adivina.
+
+    EL AÑO SE DERIVA DEL CURSO. `ano_escolar_id` es opcional y solo sirve como
+    verificación cruzada: si se pasa y NO coincide con el del curso, se lanza
+    ValueError en vez de devolver en silencio la configuración de otro año.
+    Un curso sin año devuelve lista vacía y deja rastro en el log: no se
+    adivina a qué año pertenece su configuración.
 
     R3.3 usará `slot` para saber a qué página del template va cada nota:
     slot == índice en `GRADO_CONFIG[g]['completiva_salida_optativa']`.
@@ -170,10 +237,23 @@ def resolver_componentes(db, curso, ano_escolar_id: Optional[int]) -> List[dict]
     if not esperados:
         return []
 
+    ano_curso = ano_de_curso(curso)
+    if ano_escolar_id is not None and ano_escolar_id != ano_curso:
+        raise ValueError(
+            f"ano_escolar_id={ano_escolar_id} no corresponde al curso "
+            f"{getattr(curso, 'id', '?')}, que pertenece al año {ano_curso}."
+        )
+    if ano_curso is None:
+        logger.warning(
+            "Curso %s tiene Salida Optativa configurada pero no tiene año escolar; "
+            "no se resuelven sus componentes.", getattr(curso, 'id', '?'),
+        )
+        return []
+
     filas = db.query(CursoComponenteOptativo).filter(
         CursoComponenteOptativo.curso_id == curso.id,
         CursoComponenteOptativo.colegio_id == getattr(curso, 'colegio_id', None),
-        CursoComponenteOptativo.ano_escolar_id == ano_escolar_id,
+        CursoComponenteOptativo.ano_escolar_id == ano_curso,
         CursoComponenteOptativo.activo == True,  # noqa: E712 (SQLAlchemy)
     ).all()
     por_codigo = {f.componente_codigo: f for f in filas}
