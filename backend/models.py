@@ -2170,7 +2170,18 @@ class CursoComponenteOptativo(Base):
     """
     __tablename__ = 'curso_componentes_optativos'
     id = Column(Integer, primary_key=True)
-    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
+    # NOT NULL a propósito, igual que `ano_escolar_id` y por el mismo motivo:
+    # las dos UniqueConstraint de abajo incluyen `colegio_id`, y en PostgreSQL
+    # dos filas con NULL en una columna de la clave NO colisionan. Un solo NULL
+    # bastaría para que el mismo componente del mismo curso admitiera filas
+    # duplicadas, así que prohibirlo es lo que hace reales esas barreras.
+    #
+    # El resto de las tablas conserva `colegio_id` nullable por compatibilidad
+    # con instalaciones de un solo colegio anteriores al multi-tenant. Aquí no
+    # hace falta esa concesión: la tabla es NUEVA —no existe en producción— y
+    # el valor no se pide al cliente, se DERIVA de `Curso.colegio_id`
+    # (ver salida_optativa_service.construir_mapeo).
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
     curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False, index=True)
     # La configuración vive dentro de un año escolar CONCRETO y no se hereda en
     # silencio al año siguiente.

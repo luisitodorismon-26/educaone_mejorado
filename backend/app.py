@@ -712,50 +712,53 @@ async def lifespan(app):
                 "tras create_all(). El Registro de Salida Optativa no podrá configurarse."
             )
         else:
-            # ano_escolar_id debe ser NOT NULL: forma parte de las dos claves
-            # únicas y en PostgreSQL dos NULL no colisionan, así que un NULL
-            # abriría la puerta a componentes duplicados en el mismo curso.
-            # create_all() ya lo crea así en esquemas nuevos; esto solo cubre un
-            # entorno que hubiera creado la tabla con la versión laxa.
+            # colegio_id y ano_escolar_id deben ser NOT NULL: AMBAS forman parte
+            # de las dos claves únicas y en PostgreSQL dos NULL no colisionan,
+            # así que un solo NULL en cualquiera de las dos abriría la puerta a
+            # componentes duplicados en el mismo curso. create_all() ya las crea
+            # así en esquemas nuevos; esto solo cubre un entorno que hubiera
+            # creado la tabla con una versión laxa.
             _cco = {c['name']: c for c in inspect(engine).get_columns('curso_componentes_optativos')}
-            _col_ano = _cco.get('ano_escolar_id')
-            if _col_ano is not None and _col_ano.get('nullable'):
+            for _colname in ('colegio_id', 'ano_escolar_id'):
+                _col = _cco.get(_colname)
+                if _col is None or not _col.get('nullable'):
+                    continue
                 with engine.connect() as conn:
                     _nulos = conn.execute(text(
                         "SELECT COUNT(*) FROM curso_componentes_optativos "
-                        "WHERE ano_escolar_id IS NULL"
+                        f"WHERE {_colname} IS NULL"
                     )).scalar() or 0
                     if _nulos:
-                        # Jamás se inventa un año ni se borra la fila: se avisa.
+                        # Jamás se inventa un valor ni se borra la fila: se avisa.
                         logger.error(
-                            "⚠️ curso_componentes_optativos: %d fila(s) con ano_escolar_id "
-                            "NULL. NO se promueve la columna a NOT NULL ni se modifica "
-                            "ninguna fila; corregirlas manualmente indicando su año.",
-                            _nulos,
+                            "⚠️ curso_componentes_optativos: %d fila(s) con %s NULL. "
+                            "NO se promueve la columna a NOT NULL ni se modifica ninguna "
+                            "fila; corregirlas manualmente desde su curso.",
+                            _nulos, _colname,
                         )
                     elif engine.dialect.name == 'postgresql':
                         try:
                             conn.execute(text(
                                 "ALTER TABLE curso_componentes_optativos "
-                                "ALTER COLUMN ano_escolar_id SET NOT NULL"
+                                f"ALTER COLUMN {_colname} SET NOT NULL"
                             ))
                             conn.commit()
                             logger.info(
-                                "✅ Migración R3.1: curso_componentes_optativos.ano_escolar_id "
-                                "es NOT NULL"
+                                "✅ Migración R3.1: curso_componentes_optativos.%s es NOT NULL",
+                                _colname,
                             )
                         except Exception as e:
                             logger.warning(
                                 f"No se pudo exigir NOT NULL en "
-                                f"curso_componentes_optativos.ano_escolar_id: {e}")
+                                f"curso_componentes_optativos.{_colname}: {e}")
                             raise
                     else:
                         # SQLite no admite ALTER COLUMN; reconstruir la tabla no
                         # se improvisa. Solo afecta instalaciones SQLite.
                         logger.warning(
-                            "curso_componentes_optativos.ano_escolar_id sigue siendo "
-                            "nullable (SQLite no admite ALTER COLUMN). No se reconstruye "
-                            "la tabla. Producción usa PostgreSQL."
+                            "curso_componentes_optativos.%s sigue siendo nullable "
+                            "(SQLite no admite ALTER COLUMN). No se reconstruye la "
+                            "tabla. Producción usa PostgreSQL.", _colname,
                         )
             logger.info("✅ Migración R3.1: curso_componentes_optativos disponible")
 

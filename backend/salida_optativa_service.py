@@ -103,16 +103,39 @@ def ano_de_curso(curso) -> Optional[int]:
     return getattr(curso, 'ano_escolar_id', None)
 
 
-def validar_ano_para_curso(db, curso, ano_escolar_id: Optional[int] = None) -> Resultado:
-    """
-    Coherencia CURSO ↔ AÑO ESCOLAR, centralizada aquí para que la use tanto la
-    API de R3.2 como el Registro de R3.3 y no se reimplemente dos veces.
+def colegio_de_curso(curso) -> Optional[int]:
+    """Colegio dueño del curso: la única fuente de tenant para su configuración."""
+    return getattr(curso, 'colegio_id', None)
 
-    Comprueba que el curso tenga año, que el año pedido exista, que sea del
-    mismo colegio y que coincida con el del curso. `ano_escolar_id` None
-    significa "usar el del curso" y es la forma recomendada de llamarla.
+
+def validar_ano_para_curso(db, curso, ano_escolar_id: Optional[int] = None,
+                           colegio_id: Optional[int] = None) -> Resultado:
+    """
+    Coherencia CURSO ↔ COLEGIO ↔ AÑO ESCOLAR, centralizada aquí para que la use
+    tanto la API de R3.2 como el Registro de R3.3 y no se reimplemente dos veces.
+
+    Comprueba que el curso tenga colegio y año, que el año exista, que sea del
+    mismo colegio y que coincidan con los valores pedidos. `ano_escolar_id` y
+    `colegio_id` None significan "usar los del curso" y es la forma recomendada
+    de llamarla: los valores nunca deberían venir del cliente.
     """
     from models import AnoEscolar
+
+    colegio_curso = colegio_de_curso(curso)
+    if colegio_curso is None:
+        # Regla propia de la Salida Optativa. El resto del sistema tolera
+        # `colegio_id` NULL por instalaciones de un solo colegio anteriores al
+        # multi-tenant, pero una configuración optativa sin dueño no podría
+        # aislarse por tenant. En producción los 7 cursos tienen colegio.
+        return False, (
+            "El curso no tiene colegio asignado. No se puede configurar su "
+            "Salida Optativa."
+        )
+    if colegio_id is not None and colegio_id != colegio_curso:
+        return False, (
+            f"El colegio {colegio_id} no corresponde al curso, que pertenece al "
+            f"colegio {colegio_curso}."
+        )
 
     ano_curso = ano_de_curso(curso)
     if ano_curso is None:
@@ -130,15 +153,38 @@ def validar_ano_para_curso(db, curso, ano_escolar_id: Optional[int] = None) -> R
     ano = db.query(AnoEscolar).filter(AnoEscolar.id == ano_curso).first()
     if ano is None:
         return False, f"El año escolar {ano_curso} no existe."
-    if ano.colegio_id != getattr(curso, 'colegio_id', None):
+    if ano.colegio_id != colegio_curso:
         return False, "El año escolar pertenece a otro colegio."
 
     return True, None
 
 
+def validar_coherencia_mapeo(mapeo, curso) -> Resultado:
+    """
+    Última línea: una fila `CursoComponenteOptativo` SOLO es coherente si su
+    tenant y su año son exactamente los del curso al que cuelga.
+
+    Se aplica a la fila ya construida —antes del commit en R3.2, y como
+    aserción de lectura en R3.3—, de modo que ningún camino pueda dejar un
+    mapeo apuntando a otro colegio o a otro año que su curso.
+    """
+    if getattr(mapeo, 'curso_id', None) != getattr(curso, 'id', None):
+        return False, "El mapeo no pertenece a este curso."
+    if getattr(mapeo, 'colegio_id', None) != colegio_de_curso(curso):
+        return False, (
+            "El colegio del mapeo no coincide con el del curso."
+        )
+    if getattr(mapeo, 'ano_escolar_id', None) != ano_de_curso(curso):
+        return False, (
+            "El año escolar del mapeo no coincide con el del curso."
+        )
+    return True, None
+
+
 def validar_mapeo_componente(db, curso, componente_codigo: str,
                              asignatura_id: Optional[int],
-                             ano_escolar_id: Optional[int] = None) -> Resultado:
+                             ano_escolar_id: Optional[int] = None,
+                             colegio_id: Optional[int] = None) -> Resultado:
     """
     ¿Puede `asignatura_id` representar a `componente_codigo` en este curso?
 
@@ -146,9 +192,13 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
       1. el curso admite Salida Optativa y tiene una configurada;
       2. el componente existe en el catálogo oficial;
       3. el componente pertenece A ESA salida y A ESE grado;
-      4. el curso tiene año escolar, ese año existe, es del mismo colegio y
-         coincide con el `ano_escolar_id` pedido (si se pasó uno);
+      4. el curso tiene colegio y año escolar, ese año existe, es del mismo
+         colegio y ambos coinciden con los valores pedidos (si se pasaron);
       5. la asignatura existe y es DEL MISMO COLEGIO que el curso (tenant-safe).
+
+    `ano_escolar_id` y `colegio_id` son OPCIONALES y solo sirven de verificación
+    cruzada cuando el llamador cree saberlos. Lo correcto es no pasarlos: el
+    valor bueno es siempre el del curso (ver `construir_mapeo`).
 
     Es una función PURA de validación: no escribe nada. Si algo falla, el
     llamador no debe crear la fila.
@@ -183,7 +233,7 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
             f"de {grado_numero}to configurado como {salida}."
         )
 
-    ok_ano, err_ano = validar_ano_para_curso(db, curso, ano_escolar_id)
+    ok_ano, err_ano = validar_ano_para_curso(db, curso, ano_escolar_id, colegio_id)
     if not ok_ano:
         return False, err_ano
 
@@ -197,10 +247,48 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
     # Tenant safety: nunca se acepta una asignatura de otro colegio, ni aunque
     # el id venga en el request. Se compara permitiendo NULL == NULL porque
     # `colegio_id` es nullable en instalaciones de un solo colegio.
-    if asig.colegio_id != getattr(curso, 'colegio_id', None):
+    if asig.colegio_id != colegio_de_curso(curso):
         return False, "La asignatura pertenece a otro colegio."
 
     return True, None
+
+
+def construir_mapeo(db, curso, componente_codigo: str, asignatura_id: Optional[int]):
+    """
+    Única vía admitida para CREAR un `CursoComponenteOptativo`.
+
+    Devuelve `(mapeo, None)` con la fila lista para `db.add()`, o `(None, error)`
+    si algo no valida — en cuyo caso NO se construye nada y no se toca la sesión.
+
+    `colegio_id` y `ano_escolar_id` se DERIVAN de `Curso`. No se aceptan del
+    cliente ni siquiera como parámetro: un request no puede colocar un
+    componente en otro colegio o en otro año, porque esos valores no viajan
+    hasta aquí. Es la misma razón por la que ambas columnas son NOT NULL —
+    participan en las claves únicas y en PostgreSQL dos NULL no colisionarían.
+
+    La fila resultante se comprueba además con `validar_coherencia_mapeo`, de
+    modo que la invariante quede afirmada sobre el objeto real y no solo sobre
+    los argumentos.
+    """
+    from models import CursoComponenteOptativo
+
+    ok, err = validar_mapeo_componente(db, curso, componente_codigo, asignatura_id)
+    if not ok:
+        return None, err
+
+    mapeo = CursoComponenteOptativo(
+        colegio_id=colegio_de_curso(curso),      # derivado, nunca del request
+        curso_id=curso.id,
+        ano_escolar_id=ano_de_curso(curso),      # derivado, nunca del request
+        componente_codigo=componente_codigo,
+        asignatura_id=asignatura_id,
+        activo=True,
+    )
+
+    ok, err = validar_coherencia_mapeo(mapeo, curso)
+    if not ok:
+        return None, err
+    return mapeo, None
 
 
 def componentes_esperados(curso):
@@ -238,25 +326,36 @@ def resolver_componentes(db, curso, ano_escolar_id: Optional[int] = None) -> Lis
         return []
 
     ano_curso = ano_de_curso(curso)
+    colegio_curso = colegio_de_curso(curso)
     if ano_escolar_id is not None and ano_escolar_id != ano_curso:
         raise ValueError(
             f"ano_escolar_id={ano_escolar_id} no corresponde al curso "
             f"{getattr(curso, 'id', '?')}, que pertenece al año {ano_curso}."
         )
-    if ano_curso is None:
+    if ano_curso is None or colegio_curso is None:
         logger.warning(
-            "Curso %s tiene Salida Optativa configurada pero no tiene año escolar; "
-            "no se resuelven sus componentes.", getattr(curso, 'id', '?'),
+            "Curso %s tiene Salida Optativa configurada pero le falta colegio o año "
+            "escolar (colegio=%r, año=%r); no se resuelven sus componentes.",
+            getattr(curso, 'id', '?'), colegio_curso, ano_curso,
         )
         return []
 
     filas = db.query(CursoComponenteOptativo).filter(
         CursoComponenteOptativo.curso_id == curso.id,
-        CursoComponenteOptativo.colegio_id == getattr(curso, 'colegio_id', None),
+        CursoComponenteOptativo.colegio_id == colegio_curso,
         CursoComponenteOptativo.ano_escolar_id == ano_curso,
         CursoComponenteOptativo.activo == True,  # noqa: E712 (SQLAlchemy)
     ).all()
-    por_codigo = {f.componente_codigo: f for f in filas}
+    # Defensa en profundidad: aunque el filtro ya acota tenant y año, se afirma
+    # sobre cada fila real. Una incoherencia se ignora y se reporta; nunca se
+    # devuelve como si fuera configuración válida de este curso.
+    por_codigo = {}
+    for f in filas:
+        ok, err = validar_coherencia_mapeo(f, curso)
+        if not ok:
+            logger.error("Mapeo optativo %s descartado: %s", f.id, err)
+            continue
+        por_codigo[f.componente_codigo] = f
 
     salida = []
     for comp in esperados:
