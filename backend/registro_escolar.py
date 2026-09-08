@@ -16,6 +16,7 @@ Autor: EducaOne
 
 import io
 import os
+import logging
 from datetime import date
 from typing import Dict, List, Optional, Any
 from reportlab.pdfgen import canvas
@@ -36,6 +37,8 @@ from boletin_minerd_secundaria import _fmt_nota
 # Es el MISMO helper que v2.20.0 usa en el modelo y el endpoint; se importa para
 # no poder divergir. reglas_academicas no importa este módulo (no hay ciclo).
 from reglas_academicas import redondear_calificacion_final
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # CONSTANTES
@@ -116,9 +119,67 @@ def get_asignaturas_por_grado(grado_numero: int):
     
     return [(a.lower().replace(" ", "_").replace("-", "_"), a) for a in asigs]
 
+# ---------------------------------------------------------------------------
+# R3.1 §5 — MAPA REAL DE PÁGINAS DE ASISTENCIA (Secundaria, 1ro-6to)
+# ---------------------------------------------------------------------------
+# Esto NO es una fórmula: es el mapa verificado PÁGINA POR PÁGINA contra los
+# seis templates oficiales del repo, leyendo el rótulo de asignatura impreso en
+# cada hoja. Los seis grados comparten exactamente el mismo mapa base.
+#
+# Hasta R3.0 el generador calculaba la página como
+#     asistencia_inicio + a_idx * 5
+# asumiendo 5 páginas para las nueve asignaturas. El template NO es uniforme:
+# las seis asignaturas de mayor carga usan 5 páginas de 2 meses cada una, y las
+# tres últimas (Ed. Artística, Ed. Física, FIHR) usan 3 páginas de 4 meses. La
+# fórmula acertaba solo en las seis primeras y a partir de ahí se desfasaba:
+#
+#   a_idx 6 Ed. Artística : fórmula 47-51  | real 47-49  -> invadía Ed. Física
+#   a_idx 7 Ed. Física    : fórmula 52-56  | real 50-52  -> invadía FIHR y pg 56
+#   a_idx 8 FIHR          : fórmula 57-61  | real 53-55  -> escribía FUERA
+#
+# Y esas páginas 56-61 no están vacías:
+#   * en 4to-6to son las hojas EN BLANCO de SALIDA OPTATIVA (56-65);
+#   * en 1ro-3ro son "ASISTENCIA A EVALUACIONES COMPLETIVAS/EXTRAORDINARIAS".
+#
+# Por eso corregir esto es prerrequisito directo de la Salida Optativa: sin la
+# tabla explícita, la asistencia de FIHR seguiría pisando sus páginas.
+#
+# `layout` describe la rejilla impresa en la hoja:
+#   "2meses" -> 2 meses por página, 21 días por mes. Es la geometría para la
+#               que está calibrada ASISTENCIA_TABLE / draw_asistencia().
+#   "4meses" -> 4 meses por página, 10 días por mes. Rejilla DISTINTA, todavía
+#               SIN CALIBRAR. Ver ASISTENCIA_LAYOUT_SIN_CALIBRAR más abajo.
+ASISTENCIA_MAPA_SECUNDARIA = [
+    {"paginas": [17, 18, 19, 20, 21], "layout": "2meses"},  # 0 Lengua Española
+    {"paginas": [22, 23, 24, 25, 26], "layout": "2meses"},  # 1 Inglés
+    {"paginas": [27, 28, 29, 30, 31], "layout": "2meses"},  # 2 Francés
+    {"paginas": [32, 33, 34, 35, 36], "layout": "2meses"},  # 3 Matemática
+    {"paginas": [37, 38, 39, 40, 41], "layout": "2meses"},  # 4 Ciencias Sociales
+    {"paginas": [42, 43, 44, 45, 46], "layout": "2meses"},  # 5 Ciencias de la Naturaleza
+    {"paginas": [47, 48, 49], "layout": "4meses"},          # 6 Educación Artística
+    {"paginas": [50, 51, 52], "layout": "4meses"},          # 7 Educación Física
+    {"paginas": [53, 54, 55], "layout": "4meses"},          # 8 FIHR
+]
+
+# Geometrías todavía no calibradas. Mientras un layout esté aquí, el generador
+# NO estampa esas páginas: prefiere dejarlas EN BLANCO (tal como las imprime el
+# MINERD, listas para llenar a mano) antes que dibujar marcas en columnas que
+# no le corresponden. Calibrar la rejilla de 4 meses × 10 días es un trabajo de
+# medición aparte, del mismo tipo que el que recibió COMPLETIVA_TABLE en B2, y
+# NO se improvisa aquí.
+ASISTENCIA_LAYOUT_SIN_CALIBRAR = {"4meses"}
+
+# Bloque de asistencia de la SALIDA OPTATIVA (solo 4to-6to): 10 páginas con el
+# encabezado impreso "SALIDA OPTATIVA ____ ASIGNATURA ____", es decir 2
+# componentes × 5 páginas. Un estudiante cursa como máximo 2 componentes, así
+# que el bloque alcanza justo. R3.1 lo DOCUMENTA pero no lo estampa: el render
+# de la Salida Optativa es R3.3.
+ASISTENCIA_SALIDA_OPTATIVA_CICLO_2 = [
+    [56, 57, 58, 59, 60],
+    [61, 62, 63, 64, 65],
+]
+
 # Páginas de cada sección por grado
-# Las páginas de asistencia son 5 pgs por asignatura (10 meses en 5 hojas de 2 meses)
-# excepto la última asignatura que puede tener menos
 GRADO_CONFIG = {
     # --- PRIMER CICLO (1er-3er) ---
     1: {
@@ -131,6 +192,9 @@ GRADO_CONFIG = {
         "emergencias": 13,
         "parentesco": 14,
         # Asistencia: pgs 17-62 (9 asignaturas, ~5 pgs c/u, 2 meses por página)
+        # LEGACY R3.1: estas dos claves YA NO enrutan la asistencia. El mapa
+        # real es ASISTENCIA_MAPA_SECUNDARIA. Se conservan solo porque las
+        # usan tests del pipeline XObject para elegir un rango de páginas.
         "asistencia_inicio": 17,
         "asistencia_pgs_por_asignatura": 5,
         # Calificaciones de rendimiento (spreads de 2 páginas por asignatura)
@@ -160,6 +224,9 @@ GRADO_CONFIG = {
         "condicion_inicial": 12,
         "emergencias": 13,
         "parentesco": 14,
+        # LEGACY R3.1: estas dos claves YA NO enrutan la asistencia. El mapa
+        # real es ASISTENCIA_MAPA_SECUNDARIA. Se conservan solo porque las
+        # usan tests del pipeline XObject para elegir un rango de páginas.
         "asistencia_inicio": 17,
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 131,
@@ -181,6 +248,9 @@ GRADO_CONFIG = {
         "condicion_inicial": 12,
         "emergencias": 13,
         "parentesco": 14,
+        # LEGACY R3.1: estas dos claves YA NO enrutan la asistencia. El mapa
+        # real es ASISTENCIA_MAPA_SECUNDARIA. Se conservan solo porque las
+        # usan tests del pipeline XObject para elegir un rango de páginas.
         "asistencia_inicio": 17,
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 131,
@@ -203,8 +273,11 @@ GRADO_CONFIG = {
         "condicion_inicial": 12,
         "emergencias": 13,
         "parentesco": 14,
+        # LEGACY R3.1: estas dos claves YA NO enrutan la asistencia. El mapa
+        # real es ASISTENCIA_MAPA_SECUNDARIA. Se conservan solo porque las
+        # usan tests del pipeline XObject para elegir un rango de páginas.
         "asistencia_inicio": 17,
-        "asistencia_pgs_por_asignatura": 5,  # Salida optativa agrega más
+        "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 179,
         "calificaciones_pgs_por_asignatura": 2,
         # Completivas: incluye salida optativa intercalada
@@ -229,6 +302,9 @@ GRADO_CONFIG = {
         "condicion_inicial": 12,
         "emergencias": 13,
         "parentesco": 14,
+        # LEGACY R3.1: estas dos claves YA NO enrutan la asistencia. El mapa
+        # real es ASISTENCIA_MAPA_SECUNDARIA. Se conservan solo porque las
+        # usan tests del pipeline XObject para elegir un rango de páginas.
         "asistencia_inicio": 17,
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 179,
@@ -251,6 +327,9 @@ GRADO_CONFIG = {
         "condicion_inicial": 12,
         "emergencias": 13,
         "parentesco": 14,
+        # LEGACY R3.1: estas dos claves YA NO enrutan la asistencia. El mapa
+        # real es ASISTENCIA_MAPA_SECUNDARIA. Se conservan solo porque las
+        # usan tests del pipeline XObject para elegir un rango de páginas.
         "asistencia_inicio": 17,
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 179,
@@ -1435,26 +1514,45 @@ def generar_registro_escolar(
         overlays[pg_idx] = buf
     
     # --- ASISTENCIA ---
+    # R3.1 §5: el destino de cada página sale de ASISTENCIA_MAPA_SECUNDARIA
+    # (mapa verificado contra el template), NO de una fórmula. Ver el comentario
+    # extenso junto a esa tabla: la fórmula anterior desfasaba las tres últimas
+    # asignaturas y terminaba escribiendo sobre las páginas de Salida Optativa
+    # (4to-6to) o sobre las de evaluaciones completivas (1ro-3ro).
     if asistencia_data:
-        asist_inicio = config["asistencia_inicio"] - 1  # 0-indexed
-        pgs_por_asig = config["asistencia_pgs_por_asignatura"]
-        
         for a_idx, asig in enumerate(asignaturas):
+            if a_idx >= len(ASISTENCIA_MAPA_SECUNDARIA):
+                # a_idx 9 = "Salida Optativa" en ciclo 2. Su bloque de
+                # asistencia (pgs 56-65) se estampa en R3.3, no aquí.
+                continue
+
             asig_key = asig.lower().replace(" ", "_").replace("-", "_")
             asig_data = asistencia_data.get(asig_key, {})
-            
+
             if not asig_data:
                 continue
-            
-            # Cada asignatura tiene ~5 páginas (10 meses, 2 por página)
+
+            entrada = ASISTENCIA_MAPA_SECUNDARIA[a_idx]
+            if entrada["layout"] in ASISTENCIA_LAYOUT_SIN_CALIBRAR:
+                # Rejilla de 4 meses × 10 días: ASISTENCIA_TABLE no la
+                # describe. Se deja la página del template intacta en vez de
+                # estampar marcas descuadradas sobre un documento oficial.
+                logger.warning(
+                    "Asistencia de '%s' no se estampa: el template usa la rejilla '%s', "
+                    "todavía sin calibrar (páginas %s).",
+                    asig, entrada["layout"], entrada["paginas"],
+                )
+                continue
+
+            # Cada asignatura tiene 5 páginas (10 meses, 2 por página)
             meses = asig_data.get("meses", [])
-            
-            for pg_offset in range(pgs_por_asig):
-                pg_idx = asist_inicio + (a_idx * pgs_por_asig) + pg_offset
-                
+
+            for pg_offset, pagina in enumerate(entrada["paginas"]):
+                pg_idx = pagina - 1  # 0-indexed
+
                 if pg_idx >= total_pages:
                     break
-                
+
                 # Mes izquierdo
                 mes_izq_idx = pg_offset * 2
                 mes_der_idx = pg_offset * 2 + 1
