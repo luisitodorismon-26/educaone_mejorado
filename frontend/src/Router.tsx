@@ -30,6 +30,7 @@ import { EvaluacionesPage } from './pages/evaluaciones';
 import { NotasPage } from './pages/notas';
 import { EvalInternaPage } from './pages/eval-interna';
 import { ItemsCompletivosPage } from './pages/items-completivos';
+import { IndicadoresLogroPage } from './pages/indicadores-logro';
 import { SuperAdminPage } from './pages/superadmin';
 import { CambiarPasswordPage } from './pages/cambiar-password';
 import { EvaluacionesExtraPage } from './pages/evaluaciones-extra';
@@ -86,6 +87,10 @@ export const AppRouter = () => {
         
         <Route path="/items-completivos" element={
           <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><ItemsCompletivosPage /></MainLayout></ProtectedRoute>
+        } />
+        
+        <Route path="/indicadores-logro" element={
+          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><IndicadoresLogroPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/boletines" element={

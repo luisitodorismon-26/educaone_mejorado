@@ -1,0 +1,1 @@
+export { IndicadoresLogroPage } from './IndicadoresLogroPage';

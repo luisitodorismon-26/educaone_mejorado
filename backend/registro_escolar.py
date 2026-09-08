@@ -539,6 +539,48 @@ COMPLETIVA_TABLE = {
     },
 }
 
+# --- INDICADORES DE LOGRO (R2) ---
+# Tabla "ESPECIFICACIÓN CURRICULAR APLICADA POR PERÍODO", una página por
+# asignatura y por período. Columnas del template: CE | Indicadores de Logro |
+# Contenidos Claves. EducaOne solo posee el texto de "Indicadores de Logro",
+# así que SOLO se escribe en esa columna; CE y Contenidos Claves quedan
+# intactos (no se inventa contenido).
+#
+# Geometría verificada sobre el template (idéntica en los 6 grados, pág. 612x792):
+#   v-lines : 36.2 | 96.0 | 335.8 | 575.5   -> col "Indicadores de Logro" = 96.0..335.8
+#   h-lines : 36.2 (título) | 57.9 | 79.5 (fin encabezados) | 756.0 (fin del cuerpo)
+INDICADOR_BOX = {
+    "x0": 96.0,
+    "x1": 335.8,
+    "y_top_plumber": 79.5,     # borde inferior de la fila de encabezados
+    "y_bottom_plumber": 756.0,  # borde inferior del cuerpo
+    "padding": 4.0,
+    "font_size": 8.0,
+    "line_height": 10.0,
+}
+
+# Páginas (1-indexed) del PERÍODO 1 de cada asignatura BASE, por ciclo. Los
+# períodos 2, 3 y 4 son las tres páginas siguientes.
+# Ciclo 1 (1ro-3ro): bloques regulares de 6 págs (2 de referencia + 4 períodos).
+# Ciclo 2 (4to-6to): irregular, porque los bloques de Salida Optativa se
+# intercalan entre las asignaturas base. Verificado página por página en los
+# seis templates; el orden es el de ASIGNATURAS_CICLO_1 (las 9 base).
+INDICADORES_P1_CICLO_1 = [65, 71, 77, 83, 89, 95, 101, 107, 113]
+INDICADORES_P1_CICLO_2 = [77, 95, 107, 113, 125, 137, 149, 155, 161]
+
+
+def pagina_indicador(ciclo: int, asig_idx: int, periodo: int) -> Optional[int]:
+    """Página (1-indexed) de la tabla de indicadores de una asignatura/período.
+
+    Devuelve None si el índice de asignatura no es una de las 9 base (p. ej.
+    Salida Optativa, cuyo mapeo por modalidad aún no existe — ver R3).
+    """
+    base = INDICADORES_P1_CICLO_2 if ciclo == 2 else INDICADORES_P1_CICLO_1
+    if not (0 <= asig_idx < len(base)) or periodo not in (1, 2, 3, 4):
+        return None
+    return base[asig_idx] + (periodo - 1)
+
+
 # --- PROMOCIÓN DEL GRADO (Pgs 159+) ---
 # Spread landscape - cada página muestra la mitad
 # V-lines pg 159: 36.8, 48.7, 190.7, 332.7, luego cada ~20.2
@@ -1084,6 +1126,83 @@ def draw_completiva(c: canvas.Canvas, datos: Dict):
                        size=FONT_SIZE_NOTA, center=True)
 
 
+def _wrap_texto(texto: str, ancho_max: float, font: str, size: float) -> List[str]:
+    """Parte `texto` en líneas que caben en `ancho_max`. Determinista.
+
+    Respeta los saltos de línea que escribió el docente. Una palabra más ancha
+    que la columna se corta por caracteres en vez de desbordar la caja.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    lineas: List[str] = []
+    for parrafo in str(texto).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        palabras = parrafo.split()
+        if not palabras:
+            lineas.append("")
+            continue
+        actual = ""
+        for palabra in palabras:
+            # Palabra sola más ancha que la columna: partirla por caracteres.
+            while stringWidth(palabra, font, size) > ancho_max:
+                corte = len(palabra)
+                while corte > 1 and stringWidth(palabra[:corte], font, size) > ancho_max:
+                    corte -= 1
+                if actual:
+                    lineas.append(actual)
+                    actual = ""
+                lineas.append(palabra[:corte])
+                palabra = palabra[corte:]
+            tentativa = f"{actual} {palabra}".strip()
+            if actual and stringWidth(tentativa, font, size) > ancho_max:
+                lineas.append(actual)
+                actual = palabra
+            else:
+                actual = tentativa
+        if actual:
+            lineas.append(actual)
+    return lineas
+
+
+def draw_indicadores(c: canvas.Canvas, datos: Dict):
+    """Escribe los indicadores de logro del período en su columna oficial.
+
+    datos: {"texto": str}. Solo se dibuja dentro de la columna
+    "Indicadores de Logro" del template (ver INDICADOR_BOX). Si el texto no
+    cabe, se trunca de forma determinista con '…' — NUNCA se dibuja fuera de
+    la caja ni se invade la grilla vecina.
+    """
+    texto = (datos or {}).get("texto")
+    if not texto or not str(texto).strip():
+        return
+
+    box = INDICADOR_BOX
+    pad = box["padding"]
+    size = box["font_size"]
+    lh = box["line_height"]
+    x = box["x0"] + pad
+    ancho = (box["x1"] - box["x0"]) - (2 * pad)
+    y_top = _y(box["y_top_plumber"]) - pad - size
+    y_min = _y(box["y_bottom_plumber"]) + pad
+    max_lineas = max(int((y_top - y_min) // lh) + 1, 0)
+    if max_lineas <= 0:
+        return
+
+    lineas = _wrap_texto(str(texto).strip(), ancho, FONT_NORMAL, size)
+    if len(lineas) > max_lineas:
+        lineas = lineas[:max_lineas]
+        if lineas:
+            from reportlab.pdfbase.pdfmetrics import stringWidth
+            ultima = lineas[-1]
+            while ultima and stringWidth(ultima + "…", FONT_NORMAL, size) > ancho:
+                ultima = ultima[:-1]
+            lineas[-1] = (ultima + "…") if ultima else "…"
+
+    for i, linea in enumerate(lineas):
+        if not linea:
+            continue
+        _draw_text(c, x, y_top - (i * lh), linea, size=size)
+
+
 def draw_promocion_izq(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: List[str]):
     """
     Dibuja la página izquierda del spread de promoción.
@@ -1241,6 +1360,7 @@ def generar_registro_escolar(
     estudiantes: List[Dict],
     asistencia_data: Optional[Dict] = None,
     calificaciones_data: Optional[Dict] = None,
+    indicadores_data: Optional[Dict] = None,
     completiva_data: Optional[Dict] = None,
     promocion_data: Optional[List[Dict]] = None,
     estadisticas_data: Optional[Dict] = None,
@@ -1257,6 +1377,9 @@ def generar_registro_escolar(
         estudiantes: Lista de hasta 40 estudiantes con sus datos
         asistencia_data: Dict con asistencia por asignatura y mes
         calificaciones_data: Dict con calificaciones por competencia (spreads)
+        indicadores_data: {asig_idx: {periodo: texto}} — indicadores de logro
+            trabajados; se escriben en la columna "Indicadores de Logro" de la
+            página de ESPECIFICACIÓN CURRICULAR de esa asignatura y período.
         completiva_data: Dict con calificaciones completivas/extraordinarias
         promocion_data: Lista de estudiantes con notas finales para promoción
         estadisticas_data: Dict con estadísticas de fin de año
@@ -1473,6 +1596,33 @@ def generar_registro_escolar(
                     buf2.seek(0)
                     overlays[pg_der] = buf2
     
+    # --- INDICADORES DE LOGRO (R2) ---
+    # Una página por (asignatura, período). Solo se estampan las que traen
+    # texto: una asignatura/período sin indicador deja su página idéntica al
+    # template (no se escribe "N/A" ni "Sin indicadores").
+    if indicadores_data:
+        for a_idx, por_periodo in (indicadores_data or {}).items():
+            if not por_periodo:
+                continue
+            try:
+                a_idx_int = int(a_idx)
+            except (TypeError, ValueError):
+                continue
+            for periodo, texto in por_periodo.items():
+                if not texto or not str(texto).strip():
+                    continue
+                try:
+                    periodo_int = int(periodo)
+                except (TypeError, ValueError):
+                    continue
+                pg_num = pagina_indicador(ciclo, a_idx_int, periodo_int)
+                if not pg_num:
+                    continue
+                pg_idx = pg_num - 1
+                if pg_idx >= total_pages:
+                    continue
+                overlays[pg_idx] = _create_overlay_page(draw_indicadores, {"texto": texto})
+
     # --- CALIFICACIONES COMPLETIVAS ---
     if completiva_data:
         # Usar lista explícita de páginas si existe, sino calcular por offset
@@ -1983,6 +2133,23 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         if califs:
             calificaciones_data[asig_idx] = califs
 
+    # === TRADUCIR INDICADORES DE LOGRO (R2) ===
+    # asignaturas_data[nombre]['indicadores'] = {periodo: texto} — ya resuelto
+    # en una sola consulta por el loader. Se reindexa por posición MINERD para
+    # que `pagina_indicador()` sepa a qué página va cada asignatura/período.
+    indicadores_data = {}
+    for asig_idx, asig_nombre in enumerate(asigs_minerd):
+        if asig_nombre not in asignaturas_data:
+            continue
+        por_periodo = asignaturas_data[asig_nombre].get('indicadores') or {}
+        limpio = {
+            int(p): str(t).strip()
+            for p, t in por_periodo.items()
+            if t is not None and str(t).strip()
+        }
+        if limpio:
+            indicadores_data[asig_idx] = limpio
+
     # === TRADUCIR COMPLETIVA / EXTRAORDINARIA / ESPECIAL (v2.20.1-B2) ===
     # Una entrada por asignatura, con una lista alineada al orden de estudiantes
     # del Registro. Fuente única de la cascada: `evaluacion_extra` ya serializado
@@ -2041,6 +2208,7 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         estudiantes=estudiantes_nuevo,
         asistencia_data=asistencia_data if asistencia_data else None,
         calificaciones_data=calificaciones_data if calificaciones_data else None,
+        indicadores_data=indicadores_data if indicadores_data else None,
         completiva_data=completiva_data if completiva_data else None,
         promocion_data=promocion_data if any(p for p in promocion_data) else None,
         marca_borrador=marca_borrador,
