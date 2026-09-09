@@ -52,7 +52,8 @@ from models import (
     SolicitudEdicionNota, BloqueHorario, DiaNoLaborable, Usuario,
     NotaPersonal, EvaluacionProfesor, ConfigEvalInterna, EvalInternaEstudiante,
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
-    HistorialComunicacionPadres, IndicadorLogro, ItemCompletivo, Notificacion,
+    HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
+    ItemCompletivo, Notificacion,
     AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
     AlertaAtendida, PushSubscription, init_db
 )
@@ -807,6 +808,40 @@ async def lifespan(app):
             )
         else:
             logger.info("✅ Migración R2.1B: indicador_logro_selecciones disponible")
+
+        # === 6g. Área curricular oficial de la asignatura (R2.1C) ===
+        # Identidad EXPLÍCITA hacia los 9 bloques del Registro de Secundaria.
+        # Hizo falta porque ninguno de los campos existentes sirve: `area` es un
+        # rótulo libre que en producción agrupa Lengua Española, Inglés y
+        # Francés bajo "Lenguas" —tres bloques oficiales distintos—, y `codigo`
+        # se repite entre filas (R3.1). Resolver por nombre acertaría en este
+        # colegio y fallaría en silencio en el siguiente.
+        #
+        # Columna NUEVA, nullable, SIN DEFAULT y SIN BACKFILL. No se infiere
+        # ningún valor desde nombre/codigo/area: Dirección la configura desde la
+        # UI. NULL es un estado VÁLIDO —la asignatura no pertenece a ninguno de
+        # los 9 bloques (Música es el caso real)— y no impide profesor, horario,
+        # calificaciones ni boletín.
+        #
+        # Rollback (Postgres):
+        #   ALTER TABLE asignaturas DROP COLUMN area_curricular_codigo;
+        if 'asignaturas' in inspector.get_table_names():
+            _asig_cols = {c['name'] for c in inspector.get_columns('asignaturas')}
+            if 'area_curricular_codigo' not in _asig_cols:
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            "ALTER TABLE asignaturas ADD COLUMN area_curricular_codigo VARCHAR(8)"
+                        ))
+                        conn.commit()
+                        logger.info(
+                            "✅ Migración R2.1C: columna area_curricular_codigo agregada a "
+                            "asignaturas (NULL en todas, sin backfill)"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"No se pudo agregar asignaturas.area_curricular_codigo: {e}")
+                        raise
 
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
@@ -3094,10 +3129,73 @@ async def generar_bloques_tanda(tanda_id, request: Request, db: Session = Depend
     db.commit()
     return {'message': f'Se generaron {numero - 1} bloques para {tanda.nombre}'}
 
+def _area_curricular_desde_payload(data, actual):
+    """
+    Interpreta `area_curricular_codigo` de un body de asignatura.
+
+    Devuelve `(valor, error)`. Ausente = no se toca. Explícitamente null/'' =
+    desvincular. Cualquier otra cosa debe ser uno de los 9 códigos oficiales;
+    los nombres ("Lenguas", "Inglés") se rechazan con 400.
+    """
+    import catalogo_indicadores as _cat
+    if 'area_curricular_codigo' not in data:
+        return actual, None
+    bruto = data.get('area_curricular_codigo')
+    if bruto is None or (isinstance(bruto, str) and not bruto.strip()):
+        return None, None
+    codigo = str(bruto).strip()
+    if not _cat.area_valida(codigo):
+        validos = ', '.join(_cat.codigos_area_validos())
+        return None, (
+            f"Área curricular desconocida: {codigo!r}. Debe ser uno de: {validos}, "
+            f"o vacío si la asignatura no pertenece al Registro de Secundaria."
+        )
+    return codigo, None
+
+
+def _asignatura_tiene_selecciones(db, asignatura_id):
+    """Cuántas selecciones oficiales de IL cuelgan de esta asignatura."""
+    return (db.query(IndicadorLogroSeleccion)
+            .join(IndicadorLogro,
+                  IndicadorLogroSeleccion.indicador_logro_id == IndicadorLogro.id)
+            .filter(IndicadorLogro.asignatura_id == asignatura_id)
+            .count())
+
+
+def _asignatura_dict(a):
+    import catalogo_indicadores as _cat
+    return {
+        'id': a.id,
+        'nombre': a.nombre,
+        'codigo': a.codigo,
+        'area': a.area,
+        # R2.1C: bloque curricular oficial del Registro. NULL = la asignatura no
+        # pertenece a ninguno de los 9 bloques (estado válido, no un error).
+        'area_curricular_codigo': a.area_curricular_codigo,
+        'area_curricular_nombre': _cat.nombre_area(a.area_curricular_codigo),
+    }
+
+
 @app.get("/api/asignaturas")
 async def get_asignaturas(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(activo=True).all()
-    return [{'id': a.id, 'nombre': a.nombre, 'codigo': a.codigo, 'area': a.area} for a in asignaturas]
+    return [_asignatura_dict(a) for a in asignaturas]
+
+
+@app.get("/api/asignaturas/areas-curriculares")
+async def get_areas_curriculares(request: Request, current_user: Usuario = Depends(get_current_user)):
+    """
+    Las 9 áreas oficiales para el selector de Dirección.
+
+    Sale del catálogo versionado, no de una segunda lista: si el catálogo
+    cambia, el selector cambia con él.
+    """
+    import catalogo_indicadores as _cat
+    return {
+        'version_curricular': _cat.VERSION_ACTUAL,
+        'areas': [{'codigo': c, 'nombre': _cat.nombre_area(c)}
+                  for c in _cat.codigos_area_validos()],
+    }
 
 @app.post("/api/asignaturas")
 async def crear_asignatura(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
@@ -3110,10 +3208,17 @@ async def crear_asignatura(request: Request, db: Session = Depends(get_db), curr
     if not isinstance(data, dict) or not data.get('nombre'):
         return JSONResponse({'error': 'nombre es requerido'}, status_code=400)
     
+    # R2.1C: el área curricular es OPCIONAL al crear. Una asignatura nueva no
+    # tiene por qué pertenecer al Registro de Secundaria.
+    area_curr, err_area = _area_curricular_desde_payload(data, None)
+    if err_area:
+        return JSONResponse({'error': err_area}, status_code=400)
+
     asig = Asignatura(
         nombre=data['nombre'],
         codigo=data.get('codigo'),
         area=data.get('area'),
+        area_curricular_codigo=area_curr,
         colegio_id=current_user.colegio_id,
     )
     db.add(asig)
@@ -3130,9 +3235,30 @@ async def update_asignatura(id, request: Request, db: Session = Depends(get_db),
         data = await request.json()
     except Exception:
         return JSONResponse({'error': 'Body inválido'}, status_code=400)
+    # R2.1C — PROTECCIÓN HISTÓRICA. Las selecciones de Indicadores ya guardadas
+    # pertenecen al área que la asignatura tenía cuando se registraron. Cambiar
+    # el área (o desvincularla) las dejaría apuntando a un catálogo que ya no
+    # corresponde. No se borran, no se transforman, no se reinterpretan: se
+    # rechaza el cambio con 409 y se deja la decisión a un proceso controlado.
+    area_curr, err_area = _area_curricular_desde_payload(data, asig.area_curricular_codigo)
+    if err_area:
+        return JSONResponse({'error': err_area}, status_code=400)
+    if area_curr != asig.area_curricular_codigo:
+        n_sel = _asignatura_tiene_selecciones(db, asig.id)
+        if n_sel:
+            return JSONResponse({
+                'error': 'Esta asignatura ya tiene Indicadores de Logro registrados '
+                         'con el área curricular actual. No puede cambiarse el área '
+                         'sin un proceso controlado de migración.',
+                'area_curricular_actual': asig.area_curricular_codigo,
+                'area_curricular_solicitada': area_curr,
+                'selecciones_existentes': n_sel,
+            }, status_code=409)
+
     asig.nombre = data.get('nombre', asig.nombre)
     asig.codigo = data.get('codigo', asig.codigo)
     asig.area = data.get('area', asig.area)
+    asig.area_curricular_codigo = area_curr
     db.commit()
     cache_clear_tenant(current_user.colegio_id)
     return {'message': 'Asignatura actualizada'}
@@ -15788,6 +15914,146 @@ def _ano_coherente_con_curso(db, current_user, curso, ano_param):
     return ano, None
 
 
+def _guardas_indicadores(db, current_user, request, curso_id, asignatura_id):
+    """
+    Todas las guardas comunes de Indicadores de Logro, en un solo sitio.
+
+    Devuelve `(curso, asignatura, None)` o `(None, None, JSONResponse)`. Son las
+    MISMAS guardas de R2: tenant, pareja académica real, asignación activa del
+    profesor y lente de nivel.
+    """
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    asignatura = get_tenant_or_404(db, Asignatura, asignatura_id, current_user,
+                                   name='asignatura')
+
+    if current_user.role == 'profesor' and not _profesor_tiene_par_activo(
+        db, current_user, curso.id, asignatura.id
+    ):
+        return None, None, JSONResponse(
+            {'error': 'No tiene asignación activa para este curso y asignatura'},
+            status_code=403)
+
+    if not _par_curso_asignatura_valido(db, current_user, curso.id, asignatura.id):
+        return None, None, JSONResponse(
+            {'error': 'Esa asignatura no está asignada a este curso. Verifique las '
+                      'asignaciones del curso antes de registrar indicadores.'},
+            status_code=400)
+
+    if _indicador_nivel_bloqueado(db, current_user, request, curso.id):
+        return None, None, JSONResponse(
+            {'error': 'Este curso está fuera de tu nivel asignado'}, status_code=403)
+
+    return curso, asignatura, None
+
+
+def _selecciones_dict(indicador):
+    """Selecciones del período, resueltas contra el catálogo y ordenadas."""
+    filas = []
+    for s in getattr(indicador, 'selecciones', []) or []:
+        filas.append(s.to_dict())
+    # Orden oficial del template: banda y luego posición dentro de la banda.
+    filas.sort(key=lambda d: (d.get('grado_numero') or 0,
+                              d.get('ce_codigo') or '',
+                              d.get('il_codigo') or ''))
+    return filas
+
+
+def _estado_periodo(indicador):
+    """
+    pendiente | parcial | completo.
+
+    El MINERD no exige que ambas columnas se llenen a la vez, así que el estado
+    es informativo y NUNCA bloquea el guardado:
+      pendiente = 0 indicadores y 0 contenidos
+      parcial   = hay indicadores o contenidos, pero no ambos
+      completo  = >=1 indicador y >=1 contenido clave
+    """
+    if indicador is None:
+        return 'pendiente'
+    n_il = len(getattr(indicador, 'selecciones', []) or [])
+    n_cc = len(indicador.lineas_contenidos_claves())
+    if n_il and n_cc:
+        return 'completo'
+    if n_il or n_cc:
+        return 'parcial'
+    return 'pendiente'
+
+
+def _indicador_dict_r21(indicador):
+    d = indicador.to_dict()
+    d['selecciones'] = _selecciones_dict(indicador)
+    d['estado'] = _estado_periodo(indicador)
+    return d
+
+
+@app.get("/api/indicadores-logro/catalogo")
+async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+    """
+    Catálogo oficial que corresponde a un (curso, asignatura).
+
+    El cliente manda SOLO curso_id y asignatura_id. El grado, el área y la
+    versión curricular los deriva el servidor: aceptar esos valores del cliente
+    permitiría saltarse las validaciones y guardar indicadores de otra área.
+
+    Si la asignatura no está vinculada a ninguno de los 9 bloques oficiales
+    (Música, por ejemplo) responde 409 con `motivo: sin_vinculo_curricular`.
+    Es una respuesta CONTROLADA, no un fallo: no se intenta resolver por nombre,
+    código ni rótulo `area`.
+    """
+    import indicadores_curriculares as IC
+
+    try:
+        curso_id = int(request.query_params.get('curso_id') or 0)
+        asignatura_id = int(request.query_params.get('asignatura_id') or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'curso_id y asignatura_id inválidos'}, status_code=400)
+    if not curso_id or not asignatura_id:
+        return JSONResponse({'error': 'curso_id y asignatura_id son requeridos'},
+                            status_code=400)
+
+    curso, asignatura, err = _guardas_indicadores(db, current_user, request,
+                                                  curso_id, asignatura_id)
+    if err:
+        return err
+
+    ano = _ano_registro_indicadores(db, current_user, request.query_params.get('ano_escolar_id'))
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar disponible'}, status_code=400)
+
+    ok, contexto, mensaje = IC.resolver_contexto(db, curso, asignatura)
+    if not ok:
+        if contexto == IC.SIN_VINCULO_CURRICULAR:
+            return JSONResponse({
+                'error': mensaje,
+                'motivo': IC.SIN_VINCULO_CURRICULAR,
+                'asignatura_id': asignatura.id,
+                'puede_configurar': current_user.role == 'direccion',
+            }, status_code=409)
+        return JSONResponse({'error': mensaje}, status_code=400)
+
+    q = request.query_params.get('q')
+    grupos = IC.catalogo_agrupado(contexto, q)
+
+    # "Usado en P2": informativo, nunca bloquea reutilizar un indicador.
+    usados = {}
+    for il in tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter(
+        IndicadorLogro.ano_escolar_id == ano.id,
+        IndicadorLogro.curso_id == curso.id,
+        IndicadorLogro.asignatura_id == asignatura.id,
+    ).all():
+        for s in il.selecciones or []:
+            usados.setdefault(s.catalogo_clave, []).append(il.periodo)
+
+    return {
+        'curso_id': curso.id,
+        'asignatura_id': asignatura.id,
+        'ano_escolar_id': ano.id,
+        **contexto,
+        'competencias': grupos,
+        'usado_en_periodos': {k: sorted(set(v)) for k, v in usados.items()},
+    }
+
+
 @app.get("/api/indicadores-logro")
 async def get_indicadores_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Indicadores de logro del AÑO ESCOLAR (activo por defecto).
@@ -15821,7 +16087,10 @@ async def get_indicadores_logro(request: Request, db: Session = Depends(get_db),
     query = filtrar_por_asignacion_activa(query, IndicadorLogro, db, current_user)
     query = _indicadores_lente_nivel(query, db, current_user, request)
 
-    return [i.to_dict() for i in query.order_by(IndicadorLogro.periodo).all()]
+    # R2.1C: cada período trae ahora sus selecciones oficiales resueltas contra
+    # el catálogo, los contenidos claves y su estado. `contenido` (legacy R2)
+    # sigue en la respuesta por compatibilidad, pero la UI nueva no lo edita.
+    return [_indicador_dict_r21(i) for i in query.order_by(IndicadorLogro.periodo).all()]
 
 
 @app.post("/api/indicadores-logro")
@@ -15951,6 +16220,233 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
     return JSONResponse({'message': 'Indicador creado', 'id': indicador.id}, status_code=201)
 
 
+@app.post("/api/indicadores-logro/periodo")
+async def guardar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+    """
+    Guarda un período COMPLETO y de forma ATÓMICA (R2.1C).
+
+    Body:
+        curso_id, asignatura_id, periodo,
+        catalogo_claves: ["SEC-2023|4|LEF|CE01|IL02", ...],
+        contenidos_claves: "linea 1\\nlinea 2\\n..."
+
+    Reemplaza el conjunto de selecciones del período por el recibido. Se admiten
+    varios IL, de varias CE y de varias Competencias Fundamentales; el mismo IL
+    puede usarse en períodos distintos, pero no dos veces en el mismo.
+
+    Se permite guardar PARCIALMENTE (solo indicadores, o solo contenidos): el
+    MINERD no exige llenar ambas columnas a la vez y el profesor debe poder ir
+    guardando mientras trabaja.
+
+    Si CUALQUIER clave falla la validación no se guarda NADA: rollback completo.
+    """
+    import indicadores_curriculares as IC
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+
+    try:
+        curso_id = int(data.get('curso_id') or 0)
+        asignatura_id = int(data.get('asignatura_id') or 0)
+        periodo = int(data.get('periodo') or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'curso_id, asignatura_id y periodo inválidos'},
+                            status_code=400)
+    if not curso_id or not asignatura_id:
+        return JSONResponse({'error': 'curso_id y asignatura_id son requeridos'},
+                            status_code=400)
+    if periodo not in (1, 2, 3, 4):
+        return JSONResponse({'error': 'El período debe ser 1, 2, 3 o 4'}, status_code=400)
+
+    claves = data.get('catalogo_claves')
+    if claves is None:
+        claves = []
+    if not isinstance(claves, list):
+        return JSONResponse({'error': 'catalogo_claves debe ser una lista'}, status_code=400)
+    if len(claves) > 200:
+        return JSONResponse({'error': 'Demasiados indicadores seleccionados'}, status_code=400)
+
+    contenidos = data.get('contenidos_claves')
+    if contenidos is not None and not isinstance(contenidos, str):
+        return JSONResponse({'error': 'contenidos_claves debe ser texto'}, status_code=400)
+    if contenidos is not None and len(contenidos) > INDICADOR_LOGRO_MAX_CHARS:
+        return JSONResponse(
+            {'error': f'Los contenidos claves superan {INDICADOR_LOGRO_MAX_CHARS} caracteres'},
+            status_code=400)
+
+    curso, asignatura, err = _guardas_indicadores(db, current_user, request,
+                                                  curso_id, asignatura_id)
+    if err:
+        return err
+
+    ano, err_ano = _ano_coherente_con_curso(db, current_user, curso, data.get('ano_escolar_id'))
+    if err_ano:
+        return JSONResponse({'error': err_ano}, status_code=400)
+
+    ok, contexto, mensaje = IC.resolver_contexto(db, curso, asignatura)
+    if not ok:
+        if contexto == IC.SIN_VINCULO_CURRICULAR:
+            return JSONResponse({'error': mensaje, 'motivo': IC.SIN_VINCULO_CURRICULAR},
+                                status_code=409)
+        return JSONResponse({'error': mensaje}, status_code=400)
+
+    # --- Validar TODAS las claves ANTES de tocar la sesión ---
+    vistas, limpias, errores = set(), [], []
+    for bruta in claves:
+        clave = str(bruta or '').strip()
+        if not clave:
+            errores.append('Se recibió una clave vacía.')
+            continue
+        if clave in vistas:
+            continue                      # duplicado en el request: se ignora, no falla
+        ok_c, _entrada, err_c = IC.validar_catalogo_clave(clave, contexto)
+        if not ok_c:
+            errores.append(err_c)
+            continue
+        vistas.add(clave)
+        limpias.append(clave)
+    if errores:
+        return JSONResponse({
+            'error': 'No se guardó nada: hay indicadores que no corresponden a esta '
+                     'asignatura o grado.',
+            'detalles': errores[:10],
+        }, status_code=400)
+
+    # --- Upsert institucional (misma identidad que R2) ---
+    coincidencias = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter_by(
+        ano_escolar_id=ano.id, curso_id=curso.id,
+        asignatura_id=asignatura.id, periodo=periodo,
+    ).order_by(IndicadorLogro.id).all()
+    if len(coincidencias) > 1:
+        logger.error(
+            f"ANOMALÍA indicadores_logro: {len(coincidencias)} filas para "
+            f"(colegio={current_user.colegio_id}, año={ano.id}, curso={curso.id}, "
+            f"asignatura={asignatura.id}, período={periodo}). No se modificó ninguna."
+        )
+        return JSONResponse(
+            {'error': 'Hay más de un registro para este período. Contacte soporte '
+                      'técnico antes de continuar: no se modificó ningún dato.'},
+            status_code=409)
+
+    indicador = coincidencias[0] if coincidencias else None
+    anterior = _indicador_dict_r21(indicador) if indicador else None
+
+    try:
+        if indicador is None:
+            indicador = IndicadorLogro(
+                colegio_id=current_user.colegio_id,
+                profesor_id=current_user.id,
+                asignatura_id=asignatura.id,
+                curso_id=curso.id,
+                ano_escolar_id=ano.id,
+                periodo=periodo,
+            )
+            db.add(indicador)
+            db.flush()
+        else:
+            indicador.profesor_id = current_user.id      # último editor
+
+        if contenidos is not None:
+            # Se guarda TAL CUAL: una línea = un contenido, orden preservado,
+            # sin recortar espacios internos.
+            indicador.contenidos_claves = contenidos or None
+
+        # Reemplazo atómico del conjunto de selecciones del período.
+        actuales = {s.catalogo_clave: s for s in (indicador.selecciones or [])}
+        for clave, fila in actuales.items():
+            if clave not in vistas:
+                db.delete(fila)
+        for clave in limpias:
+            if clave not in actuales:
+                db.add(IndicadorLogroSeleccion(
+                    indicador_logro_id=indicador.id, catalogo_clave=clave))
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.exception("Error guardando el período de indicadores")
+        return JSONResponse(
+            {'error': f'No se guardó nada: {e.__class__.__name__}'}, status_code=500)
+
+    db.refresh(indicador)
+    resultado = _indicador_dict_r21(indicador)
+    # Una acción Guardar = una entrada de auditoría, no una por checkbox.
+    log_auditoria(db, 'actualizar' if anterior else 'crear', 'indicadores_logro',
+                  indicador.id, anterior, resultado, user=current_user, request=request)
+    return {'message': 'Período guardado', **resultado}
+
+
+@app.delete("/api/indicadores-logro/periodo")
+async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+    """
+    "Limpiar período": borra las selecciones y los contenidos claves de UN
+    período concreto (R2.1C).
+
+    Solo toca ese período: ni otros períodos, ni otras asignaturas, ni otros
+    cursos. El contenedor `IndicadorLogro` se conserva —es la identidad
+    institucional del período y su historial de auditoría—; queda vacío, que es
+    el estado "pendiente".
+
+    Si el período tuviera `contenido` legacy de R2 no vacío, NO se borra en
+    silencio: se responde 409 para que alguien decida qué hacer con él.
+    """
+    try:
+        curso_id = int(request.query_params.get('curso_id') or 0)
+        asignatura_id = int(request.query_params.get('asignatura_id') or 0)
+        periodo = int(request.query_params.get('periodo') or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'Parámetros inválidos'}, status_code=400)
+    if periodo not in (1, 2, 3, 4):
+        return JSONResponse({'error': 'El período debe ser 1, 2, 3 o 4'}, status_code=400)
+
+    curso, asignatura, err = _guardas_indicadores(db, current_user, request,
+                                                  curso_id, asignatura_id)
+    if err:
+        return err
+
+    ano, err_ano = _ano_coherente_con_curso(db, current_user, curso,
+                                            request.query_params.get('ano_escolar_id'))
+    if err_ano:
+        return JSONResponse({'error': err_ano}, status_code=400)
+
+    indicador = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter_by(
+        ano_escolar_id=ano.id, curso_id=curso.id,
+        asignatura_id=asignatura.id, periodo=periodo,
+    ).first()
+    if indicador is None:
+        return {'message': 'El período ya estaba vacío', 'estado': 'pendiente'}
+
+    if (indicador.contenido or '').strip():
+        return JSONResponse({
+            'error': 'Este período conserva texto del registro anterior (R2). No se '
+                     'elimina automáticamente para no perder información: contacte '
+                     'a soporte técnico.',
+            'motivo': 'contenido_legacy_presente',
+        }, status_code=409)
+
+    anterior = _indicador_dict_r21(indicador)
+    try:
+        for fila in list(indicador.selecciones or []):
+            db.delete(fila)
+        indicador.contenidos_claves = None
+        indicador.profesor_id = current_user.id
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Error limpiando el período de indicadores")
+        return JSONResponse({'error': 'No se pudo limpiar el período'}, status_code=500)
+
+    db.refresh(indicador)
+    log_auditoria(db, 'eliminar', 'indicadores_logro', indicador.id,
+                  anterior, _indicador_dict_r21(indicador),
+                  user=current_user, request=request)
+    return {'message': 'Período limpiado', **_indicador_dict_r21(indicador)}
+
+
 @app.delete("/api/indicadores-logro/{id}")
 async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
     """Eliminar un indicador. Tenant safe (get_tenant_or_404 evita IDOR).
@@ -15971,6 +16467,21 @@ async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(g
         return JSONResponse(
             {'error': 'Este curso está fuera de tu nivel asignado'}, status_code=403
         )
+    # R2.1C — este DELETE es el de R2 y borra la fila entera. Con la relación
+    # `selecciones` en cascada, eso arrastraría los Indicadores de Logro
+    # OFICIALES del período. No se permite en silencio: para vaciar un período
+    # de R2.1 está DELETE /api/indicadores-logro/periodo, que es explícito y
+    # conserva el contenedor institucional.
+    n_sel = len(indicador.selecciones or [])
+    if n_sel or (indicador.contenidos_claves or '').strip():
+        return JSONResponse({
+            'error': 'Este período tiene Indicadores de Logro oficiales o Contenidos '
+                     'Claves registrados. Usa "Limpiar período" para vaciarlo sin '
+                     'perder el registro institucional.',
+            'motivo': 'periodo_con_datos_r21',
+            'selecciones': n_sel,
+        }, status_code=409)
+
     previo = indicador.to_dict()
     db.delete(indicador)
     db.commit()
