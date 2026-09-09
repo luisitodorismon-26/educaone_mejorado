@@ -78,7 +78,10 @@ export const ConfiguracionPage = () => {
   // Forms
   const [gradoForm, setGradoForm] = useState({ nombre: '', nombre_completo: '', orden: 1, ciclo: '', nivel: 'secundaria' });
   const [tandaForm, setTandaForm] = useState({ nombre: '', hora_inicio: '07:30', hora_fin: '12:30' });
-  const [asignaturaForm, setAsignaturaForm] = useState({ nombre: '', codigo: '', area: '' });
+  const [asignaturaForm, setAsignaturaForm] = useState({ nombre: '', codigo: '', area: '', area_curricular_codigo: '' });
+  // R2.1C: las 9 áreas del Registro de Secundaria salen del catálogo oficial,
+  // no de una lista duplicada en el front.
+  const [areasCurriculares, setAreasCurriculares] = useState<{ codigo: string; nombre: string }[]>([]);
   const [cursoForm, setCursoForm] = useState({ grado_id: 0, seccion: '', tanda_id: 0, capacidad: 35 });
   const [feriadoForm, setFeriadoForm] = useState({ fecha: '', nombre: '', tipo: 'feriado', recurrente: false });
   const [anoForm, setAnoForm] = useState({ nombre: '', fecha_inicio: '', fecha_fin: '' });
@@ -98,6 +101,10 @@ export const ConfiguracionPage = () => {
         api.get('/configuracion/modulos').catch(() => ({ data: null })),  // legacy: trae sub-políticas
         api.get('/configuracion').catch(() => ({ data: null })),           // moderno: { modulos: { x: {plan,usa,activo} } }
       ]);
+      // R2.1C — catálogo oficial de áreas curriculares (no bloquea la pantalla)
+      api.get('/asignaturas/areas-curriculares')
+        .then(r => setAreasCurriculares(r.data?.areas || []))
+        .catch(() => setAreasCurriculares([]));
       setConfig(configRes.data);
       setGrados(gradosRes.data);
       setTandas(tandasRes.data);
@@ -261,18 +268,24 @@ export const ConfiguracionPage = () => {
     setAsignaturaForm(asig ? {
       nombre: asig.nombre,
       codigo: asig.codigo || '',
-      area: asig.area || ''
-    } : { nombre: '', codigo: '', area: '' });
+      area: asig.area || '',
+      area_curricular_codigo: asig.area_curricular_codigo || ''
+    } : { nombre: '', codigo: '', area: '', area_curricular_codigo: '' });
     setShowModal(true);
   };
 
   const saveAsignatura = async () => {
     setSaving(true);
     try {
+      // '' significa "sin vincular al Registro": se manda null explícito.
+      const payload = {
+        ...asignaturaForm,
+        area_curricular_codigo: asignaturaForm.area_curricular_codigo || null,
+      };
       if (editingItem) {
-        await api.put(`/asignaturas/${editingItem.id}`, asignaturaForm);
+        await api.put(`/asignaturas/${editingItem.id}`, payload);
       } else {
-        await api.post('/asignaturas', asignaturaForm);
+        await api.post('/asignaturas', payload);
       }
       loadData();
       setShowModal(false);
@@ -1188,6 +1201,21 @@ export const ConfiguracionPage = () => {
           <div className="grid grid-cols-2 gap-4">
             <Input label="Código" placeholder="Ej: MAT" value={asignaturaForm.codigo} onChange={e => setAsignaturaForm({ ...asignaturaForm, codigo: e.target.value })} />
             <Input label="Área" placeholder="Ej: Ciencias" value={asignaturaForm.area} onChange={e => setAsignaturaForm({ ...asignaturaForm, area: e.target.value })} />
+          </div>
+          <div>
+            <Select
+              label="Área curricular MINERD — Secundaria"
+              value={asignaturaForm.area_curricular_codigo}
+              onChange={e => setAsignaturaForm({ ...asignaturaForm, area_curricular_codigo: e.target.value })}
+              options={areasCurriculares.map(a => ({ value: a.codigo, label: `${a.nombre} (${a.codigo})` }))}
+              placeholder="No vinculada al Registro"
+            />
+            <p className="mt-1 text-xs text-gray-500">
+              Solo selecciona un área si esta asignatura corresponde a uno de los bloques
+              oficiales del Registro Escolar de Secundaria. Las materias adicionales del colegio
+              pueden permanecer como <strong>No vinculada al Registro</strong> y seguir
+              funcionando normalmente en boletines, notas, horarios y reportes.
+            </p>
           </div>
         </div>
       </Modal>

@@ -250,6 +250,29 @@ def buscar(texto: str, version: Optional[str] = None, grado: Optional[int] = Non
     return salida
 
 
+def codigos_area_validos(version: Optional[str] = None) -> List[str]:
+    """
+    Los códigos de área oficiales de esta versión curricular, en orden.
+
+    FUENTE ÚNICA de verdad para validar `Asignatura.area_curricular_codigo`.
+    No se mantiene una segunda lista en ningún otro archivo: si un día cambia
+    el catálogo, la validación cambia con él.
+    """
+    return list(_cargar(version or VERSION_ACTUAL)["areas"].keys())
+
+
+def nombre_area(codigo: str, version: Optional[str] = None) -> Optional[str]:
+    """Nombre oficial del área para display. None si el código no existe."""
+    if not codigo:
+        return None
+    return _cargar(version or VERSION_ACTUAL)["areas"].get(codigo)
+
+
+def area_valida(codigo: Optional[str], version: Optional[str] = None) -> bool:
+    """True solo si `codigo` es uno de los 9 bloques oficiales."""
+    return bool(codigo) and codigo in _cargar(version or VERSION_ACTUAL)["areas"]
+
+
 def metadatos(version: Optional[str] = None) -> dict:
     """Cabecera del catálogo (áreas, competencias fundamentales, fuentes)."""
     doc = _cargar(version or VERSION_ACTUAL)

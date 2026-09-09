@@ -418,8 +418,29 @@ class Asignatura(Base):
     id = Column(Integer, primary_key=True)
     colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
     nombre = Column(String(100), nullable=False)
+    # Código institucional legacy del colegio. NO identifica el área oficial:
+    # en producción se repite entre filas (R3.1) y su valor es convención de
+    # cada centro. Se conserva tal cual.
     codigo = Column(String(10))
+    # Rótulo descriptivo que escribe el colegio. NO es identidad curricular:
+    # en producción "Lenguas" agrupa Lengua Española, Inglés y Francés — tres
+    # bloques oficiales distintos— y es texto libre editable desde la UI.
     area = Column(String(50))
+    # R2.1C — BLOQUE CURRICULAR OFICIAL DEL REGISTRO DE SECUNDARIA.
+    #
+    # No es "el área general de la asignatura": es el bloque de CE + Indicadores
+    # de Logro que le corresponde en el Registro Escolar MINERD. Uno de
+    # LE | LEI | LEF | MAT | CS | CN | EA | EF | FIHR, validados contra el
+    # catálogo oficial (catalogo_indicadores.codigos_area_validos()).
+    #
+    # NULL es un estado VÁLIDO y frecuente, no un error de datos: significa que
+    # la asignatura no corresponde a ninguno de los 9 bloques del Registro.
+    # Música es el caso real en producción. Una asignatura con NULL conserva
+    # profesor, horario, calificaciones, recuperaciones y boletín con total
+    # normalidad; simplemente queda fuera de las páginas de CE/IL del Registro.
+    #
+    # Se resuelve SIEMPRE por este campo. Nunca por `nombre`, `codigo` ni `area`.
+    area_curricular_codigo = Column(String(8), nullable=True)
     activo = Column(Boolean, default=True)
 
 class Curso(Base):
