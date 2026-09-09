@@ -1,0 +1,5 @@
+# El catálogo oficial de indicadores (R2.1B) es un artefacto DETERMINISTA: su
+# SHA-256 se verifica en la suite de tests para garantizar que el JSON del repo
+# es exactamente el que produce el extractor. Git no debe convertir sus finales
+# de línea al hacer checkout en Windows, o el hash cambiaría.
+backend/catalogos/*.json text eol=lf

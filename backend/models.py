@@ -7,7 +7,7 @@ from sqlalchemy import (
     Column, Integer, String, Text, Float, Boolean, Date, DateTime,
     ForeignKey, Table, UniqueConstraint, Index
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, date
 
@@ -2100,8 +2100,19 @@ class IndicadorLogro(Base):
     ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=True, index=True)
     periodo = Column(Integer, nullable=False)  # 1-4
 
-    # Texto libre que el profesor escribe sobre lo que trabajó
+    # LEGACY / DEPRECATED (R2). Campo de texto libre de la primera versión,
+    # cuando el profesor escribía a mano los indicadores. R2.1 lo sustituye por
+    # `selecciones` (IL del catálogo oficial) + `contenidos_claves`.
+    # NO se borra ni se convierte: producción tenía 0 filas al auditarlo en
+    # R2.1A, pero ZERO DATA LOSS aplica igual. Se deja de escribir en él.
     contenido = Column(Text)
+
+    # R2.1B — Contenidos Claves de la tercera columna del Registro.
+    # Son MANUALES: el profesor escribe una línea por tema y el orden es el que
+    # escribió. Se guarda tal cual sale del textarea (una línea = un contenido);
+    # no se recortan espacios internos ni se reordena. No tienen relación
+    # uno-a-uno con los indicadores.
+    contenidos_claves = Column(Text, nullable=True)
 
     fecha_creacion = Column(DateTime, default=_now_dr)
     fecha_actualizacion = Column(DateTime, default=_now_dr, onupdate=_now_dr)
@@ -2127,9 +2138,106 @@ class IndicadorLogro(Base):
             'curso_id': self.curso_id,
             'ano_escolar_id': self.ano_escolar_id,
             'periodo': self.periodo,
+            # legacy R2 — se conserva por ZERO DATA LOSS, ya no se escribe
             'contenido': self.contenido,
+            'contenidos_claves': self.contenidos_claves,
             'actualizado_en': self.fecha_actualizacion.isoformat() if self.fecha_actualizacion else None,
         }
+
+    def lineas_contenidos_claves(self):
+        """
+        Los Contenidos Claves como lista ordenada, una entrada por línea.
+
+        Se descartan las líneas en blanco (no son un contenido) pero NUNCA se
+        tocan los espacios internos ni el orden: el Registro debe imprimir
+        exactamente lo que el profesor escribió.
+        """
+        if not self.contenidos_claves:
+            return []
+        return [ln for ln in self.contenidos_claves.splitlines() if ln.strip()]
+
+
+class IndicadorLogroSeleccion(Base):
+    """
+    Un Indicador de Logro OFICIAL que el profesor marcó como trabajado en el
+    período.
+
+    R2.1B — SIN SEGUNDA IDENTIDAD INSTITUCIONAL
+    -------------------------------------------
+    Esta tabla NO repite colegio / año / curso / asignatura / período: todo eso
+    ya vive en el padre `IndicadorLogro`, que es el contenedor institucional del
+    período. El tenant y el año se heredan EXCLUSIVAMENTE del padre, así que no
+    pueden divergir de él.
+
+    Tampoco guarda copia del texto oficial: `catalogo_clave` resuelve contra el
+    JSON versionado (`catalogo_indicadores.resolver`). Duplicar el texto en cada
+    selección crearía una segunda verdad que podría quedar desfasada respecto al
+    catálogo, y multiplicaría por selección algo que es constante del MINERD.
+
+    FORMA DE `catalogo_clave`
+    -------------------------
+
+        SEC-2023|2|EF|CE05|IL02
+        versión | grado | área | banda CE | posición IL
+
+    `CE05`/`IL02` son la POSICIÓN ESTRUCTURAL de la entrada en el documento
+    (`orden_ce`, `orden_il`), no códigos académicos: el documento oficial repite
+    tanto `ce_codigo` como `il_codigo` dentro de un mismo grado y área, así que
+    una clave basada en ellos sería ambigua. Los códigos oficiales se conservan
+    tal cual y solo se usan para display y para el Registro Escolar.
+
+    La versión curricular al frente y la posición estructural detrás hacen que
+    una selección histórica se resuelva de forma INEQUÍVOCA: una fila guardada
+    bajo `SEC-2023` sigue resolviendo contra el catálogo 2023 aunque después
+    exista uno de 2027, y dentro de esa versión la posición identifica una sola
+    entrada aunque sus códigos se repitan.
+    """
+    __tablename__ = 'indicador_logro_selecciones'
+    id = Column(Integer, primary_key=True)
+    indicador_logro_id = Column(Integer, ForeignKey('indicadores_logro.id'),
+                                nullable=False, index=True)
+    # Clave estable del catálogo oficial. NO es un nombre ni un código suelto.
+    catalogo_clave = Column(String(120), nullable=False)
+    fecha_creacion = Column(DateTime, default=_now_dr)
+
+    indicador = relationship('IndicadorLogro',
+                             backref=backref('selecciones',
+                                             cascade='all, delete-orphan',
+                                             order_by='IndicadorLogroSeleccion.id'))
+
+    __table_args__ = (
+        # Un mismo IL no se marca dos veces en el mismo período. Ambas columnas
+        # son NOT NULL, así que la restricción muerde de verdad en PostgreSQL
+        # (lección de R3.1: un NULL dentro de una clave única la desactiva).
+        UniqueConstraint('indicador_logro_id', 'catalogo_clave',
+                         name='uq_indicador_logro_seleccion'),
+    )
+
+    def to_dict(self, incluir_catalogo=True):
+        d = {
+            'id': self.id,
+            'indicador_logro_id': self.indicador_logro_id,
+            'catalogo_clave': self.catalogo_clave,
+        }
+        if incluir_catalogo:
+            # El texto oficial se resuelve, nunca se almacena aquí.
+            from catalogo_indicadores import CatalogoError, resolver
+            try:
+                e = resolver(self.catalogo_clave)
+                d.update({
+                    'il_codigo': e['il_codigo'],
+                    'il_texto': e['il_texto'],
+                    'ce_codigo': e['ce_codigo'],
+                    'ce_texto': e['ce_texto'],
+                    'competencia_fundamental_codigo': e['competencia_fundamental_codigo'],
+                    'competencia_fundamental_nombre': e['competencia_fundamental_nombre'],
+                    'grado_numero': e['grado_numero'],
+                    'area_codigo': e['area_codigo'],
+                })
+            except CatalogoError as err:
+                # Nunca se inventa un texto ni se adivina por nombre: se reporta.
+                d['error_catalogo'] = str(err)
+        return d
 
 
 class CursoComponenteOptativo(Base):

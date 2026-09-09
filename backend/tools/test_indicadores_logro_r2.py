@@ -431,8 +431,10 @@ def _():
     # GUARDA de la API se reconstruye la tabla SIN esa restricción (solo en esta
     # DB temporal), se inserta la anomalía y al final se restaura el esquema.
     from sqlalchemy import text as _sql
+    # R2.1B: la lista incluye `contenidos_claves`. Si se omitiera, la tabla
+    # reconstruida perdería la columna y todos los tests posteriores fallarían.
     _COLS = ("id, colegio_id, profesor_id, asignatura_id, curso_id, ano_escolar_id, "
-             "periodo, contenido, fecha_creacion, fecha_actualizacion")
+             "periodo, contenido, contenidos_claves, fecha_creacion, fecha_actualizacion")
     with engine.connect() as conn:
         conn.execute(_sql(f"CREATE TABLE il_bak AS SELECT {_COLS} FROM indicadores_logro"))
         conn.execute(_sql("DROP TABLE indicadores_logro"))
@@ -440,8 +442,8 @@ def _():
             "CREATE TABLE indicadores_logro ("
             " id INTEGER NOT NULL PRIMARY KEY, colegio_id INTEGER, profesor_id INTEGER NOT NULL,"
             " asignatura_id INTEGER NOT NULL, curso_id INTEGER NOT NULL, ano_escolar_id INTEGER,"
-            " periodo INTEGER NOT NULL, contenido TEXT, fecha_creacion DATETIME,"
-            " fecha_actualizacion DATETIME)"))
+            " periodo INTEGER NOT NULL, contenido TEXT, contenidos_claves TEXT,"
+            " fecha_creacion DATETIME, fecha_actualizacion DATETIME)"))
         conn.execute(_sql(f"INSERT INTO indicadores_logro ({_COLS}) SELECT {_COLS} FROM il_bak"))
         conn.execute(_sql(
             "INSERT INTO indicadores_logro (colegio_id, profesor_id, asignatura_id, curso_id,"

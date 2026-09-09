@@ -762,6 +762,52 @@ async def lifespan(app):
                         )
             logger.info("✅ Migración R3.1: curso_componentes_optativos disponible")
 
+        # === 6f. Indicadores oficiales + Contenidos Claves (R2.1B) ===
+        # Migración ESTRICTAMENTE ADITIVA, sin backfill y sin conversiones:
+        #   (1) `indicadores_logro.contenidos_claves` — columna NUEVA, nullable.
+        #   (2) `indicador_logro_selecciones` — tabla NUEVA, la crea el
+        #       create_all() de más arriba (mismo advisory lock); aquí solo se
+        #       verifica y se reporta.
+        #
+        # Lo que esta migración NO hace, a propósito:
+        #   * NO toca `indicadores_logro.contenido` (legacy R2). No se borra, no
+        #     se convierte, no se migra a selecciones: interpretar texto libre
+        #     como códigos oficiales sería inventar datos académicos.
+        #     R2.1A verificó 0 filas en producción, pero ZERO DATA LOSS aplica
+        #     igual.
+        #   * NO inserta los ~1 134 indicadores del catálogo. El catálogo vive
+        #     en backend/catalogos/*.json, versionado en Git (ver
+        #     catalogo_indicadores.py). Ninguna fila de catálogo llega a la BD.
+        #
+        # Rollback (Postgres):
+        #   DROP TABLE indicador_logro_selecciones;
+        #   ALTER TABLE indicadores_logro DROP COLUMN contenidos_claves;
+        if 'indicadores_logro' in inspector.get_table_names():
+            _il_cols = {c['name'] for c in inspector.get_columns('indicadores_logro')}
+            if 'contenidos_claves' not in _il_cols:
+                with engine.connect() as conn:
+                    try:
+                        conn.execute(text(
+                            "ALTER TABLE indicadores_logro ADD COLUMN contenidos_claves TEXT"
+                        ))
+                        conn.commit()
+                        logger.info(
+                            "✅ Migración R2.1B: columna contenidos_claves agregada a "
+                            "indicadores_logro (nullable, sin backfill)"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"No se pudo agregar indicadores_logro.contenidos_claves: {e}")
+                        raise
+
+        if 'indicador_logro_selecciones' not in inspect(engine).get_table_names():
+            logger.error(
+                "❌ Migración R2.1B: la tabla indicador_logro_selecciones no existe "
+                "tras create_all(). No se podrán registrar indicadores oficiales."
+            )
+        else:
+            logger.info("✅ Migración R2.1B: indicador_logro_selecciones disponible")
+
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
         # Acelera queries frecuentes:
