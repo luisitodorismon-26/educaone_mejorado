@@ -89,8 +89,11 @@ export const AppRouter = () => {
           <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><ItemsCompletivosPage /></MainLayout></ProtectedRoute>
         } />
         
+        {/* R2.1E: pantalla de edición solo para el profesor de la asignatura.
+            Dirección/coordinación que escriban la URL a mano son redirigidos
+            por ProtectedRoute; revisan el resultado en el Registro Escolar. */}
         <Route path="/indicadores-logro" element={
-          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><IndicadoresLogroPage /></MainLayout></ProtectedRoute>
+          <ProtectedRoute roles={['profesor']}><MainLayout><IndicadoresLogroPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/boletines" element={

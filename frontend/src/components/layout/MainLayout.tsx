@@ -241,7 +241,10 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     { path: '/recuperaciones-primaria', label: 'Recuperaciones (Primaria)', icon: AlertTriangle, roles: ['direccion', 'coordinador', 'secretaria', 'profesor'], section: 'Académico', nivel: 'primaria' },
     { path: '/evaluaciones-extra', label: 'Evaluaciones Extra', icon: AlertTriangle, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico', nivel: 'secundaria' },
     { path: '/items-completivos', label: 'Detalle de evaluaciones (Registro)', icon: ClipboardCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico', nivel: 'secundaria' },
-    { path: '/indicadores-logro', label: 'Indicadores de Logro (Registro)', icon: Target, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico', nivel: 'secundaria' },
+    // R2.1E: los Indicadores de Logro los trabaja el PROFESOR de la asignatura.
+    // Dirección y coordinación revisan el resultado dentro del Registro Escolar,
+    // que sigue en su menú; no necesitan esta pantalla de edición.
+    { path: '/indicadores-logro', label: 'Indicadores de Logro (Registro)', icon: Target, roles: ['profesor'], section: 'Académico', nivel: 'secundaria' },
     { path: '/asistencia', label: 'Asistencia', icon: CalendarCheck, roles: ['direccion', 'coordinador', 'profesor'], section: 'Académico' },
     { path: '/boletines', label: 'Boletines', icon: FileBarChart, roles: ['direccion', 'coordinador', 'secretaria'], section: 'Académico' },
     { path: '/registro-escolar', label: 'Registro Escolar', icon: FileBarChart, roles: ['direccion', 'coordinador', 'profesor', 'secretaria'], modulo: 'registro_escolar', section: 'Académico' },

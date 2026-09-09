@@ -16227,11 +16227,15 @@ def _contexto_curricular(db, current_user, curso, asignatura):
     ok, contexto, mensaje = IC.resolver_contexto(db, curso, asignatura)
     if not ok:
         if contexto == IC.SIN_VINCULO_CURRICULAR:
+            # R2.1E: ya no se devuelve `puede_configurar`. Estos endpoints son
+            # professor-only, así que el valor sería siempre False y sugeriría
+            # una capacidad que quien pregunta nunca tiene. El profesor recibe
+            # el mensaje neutro y avisa a Dirección; configurar el área es de
+            # Dirección, desde Configuración → Asignaturas.
             return None, JSONResponse({
                 'error': mensaje,
                 'motivo': IC.SIN_VINCULO_CURRICULAR,
                 'asignatura_id': asignatura.id,
-                'puede_configurar': current_user.role == 'direccion',
             }, status_code=409)
         return None, JSONResponse({'error': mensaje}, status_code=400)
 
@@ -16294,7 +16298,7 @@ def _indicador_dict_r21(indicador):
 
 
 @app.get("/api/indicadores-logro/catalogo")
-async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """
     Catálogo oficial que corresponde a un (curso, asignatura).
 
@@ -16355,7 +16359,7 @@ async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_d
 
 
 @app.get("/api/indicadores-logro")
-async def get_indicadores_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_indicadores_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """Indicadores de logro del AÑO ESCOLAR (activo por defecto).
 
     Filtros opcionales: curso_id, asignatura_id, periodo, ano_escolar_id.
@@ -16394,7 +16398,7 @@ async def get_indicadores_logro(request: Request, db: Session = Depends(get_db),
 
 
 @app.post("/api/indicadores-logro")
-async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """Crear o actualizar el indicador INSTITUCIONAL del período.
 
     Identidad: colegio + año escolar + curso + asignatura + período.
@@ -16521,7 +16525,7 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
 
 
 @app.post("/api/indicadores-logro/periodo")
-async def guardar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def guardar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """
     Guarda un período COMPLETO y de forma ATÓMICA (R2.1C).
 
@@ -16678,7 +16682,7 @@ async def guardar_periodo_indicadores(request: Request, db: Session = Depends(ge
 
 
 @app.delete("/api/indicadores-logro/periodo")
-async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """
     "Limpiar período": borra las selecciones y los contenidos claves de UN
     período concreto (R2.1C).
@@ -16745,7 +16749,7 @@ async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(ge
 
 
 @app.delete("/api/indicadores-logro/{id}")
-async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """Eliminar un indicador. Tenant safe (get_tenant_or_404 evita IDOR).
 
     Profesor: solo con asignación ACTIVA sobre la pareja exacta
