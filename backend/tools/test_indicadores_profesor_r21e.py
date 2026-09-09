@@ -368,27 +368,83 @@ def _():
         d.close()
 
 
+def _area_de(asig_id):
+    d = SessionLocal()
+    try:
+        return d.query(M.Asignatura).get(asig_id).area_curricular_codigo
+    finally:
+        d.close()
+
+
 @test("§C3 un área explícita GANA sobre la inferencia")
 def _():
+    # "Inglés" inferiría LEI, pero Dirección dijo LEF: manda Dirección.
     r = client.post("/api/asignaturas",
                     json={"nombre": "Inglés", "area_curricular_codigo": "LEF"},
                     headers=auth(DIR))
     assert r.status_code == 201, r.text[:160]
-    d = SessionLocal()
-    try:
-        assert d.query(M.Asignatura).get(r.json()["id"]).area_curricular_codigo == "LEF"
-    finally:
-        d.close()
-    # y un NULL explícito también gana: se respeta la decisión de Dirección
+    assert _area_de(r.json()["id"]) == "LEF"
+
+
+@test("§C4 'Inglés' con area_curricular_codigo=null SÍ se autovincula a LEI")
+def _():
+    # Configuración → Asignaturas manda SIEMPRE la clave, y con `null` cuando el
+    # selector quedó vacío (`asignaturaForm.area_curricular_codigo || null`).
+    # Ese `null` significa "no elegí área", no "desvincular": en un alta no hay
+    # nada que desvincular. Si el alta no infiriera aquí, R2.1E no serviría para
+    # las asignaturas creadas desde la UI, que son todas.
     r = client.post("/api/asignaturas",
-                    json={"nombre": "Matemática", "area_curricular_codigo": None},
+                    json={"nombre": "Inglés", "codigo": "IN", "area": "Lenguas",
+                          "area_curricular_codigo": None},
                     headers=auth(DIR))
     assert r.status_code == 201, r.text[:160]
-    d = SessionLocal()
-    try:
-        assert d.query(M.Asignatura).get(r.json()["id"]).area_curricular_codigo is None
-    finally:
-        d.close()
+    assert _area_de(r.json()["id"]) == "LEI"
+
+
+@test("§C5 'Matemática' con area_curricular_codigo=null se autovincula a MAT")
+def _():
+    r = client.post("/api/asignaturas",
+                    json={"nombre": "Matemática", "codigo": "MA", "area": "Matemática",
+                          "area_curricular_codigo": None},
+                    headers=auth(DIR))
+    assert r.status_code == 201, r.text[:160]
+    assert _area_de(r.json()["id"]) == "MAT"
+
+
+@test("§C6 'Música' con area_curricular_codigo=null sigue en NULL")
+def _():
+    # No hay alias oficial para Música: NULL es su estado correcto, no un fallo.
+    r = client.post("/api/asignaturas",
+                    json={"nombre": "Música", "codigo": "MS", "area": "",
+                          "area_curricular_codigo": None},
+                    headers=auth(DIR))
+    assert r.status_code == 201, r.text[:160]
+    assert _area_de(r.json()["id"]) is None
+    # y el string vacío se comporta igual que el null
+    r = client.post("/api/asignaturas",
+                    json={"nombre": "Taller de Inglés", "area_curricular_codigo": ""},
+                    headers=auth(DIR))
+    assert r.status_code == 201, r.text[:160]
+    assert _area_de(r.json()["id"]) is None
+
+
+@test("§C7 el PUT NO infiere: sigue siendo la vía manual de Dirección")
+def _():
+    # Frontera deliberada. En el alta, `null` = "no elegí". En la edición, `null`
+    # = "desvincular", y debe poder desvincularse una materia cuyo nombre sí
+    # tiene alias: si el PUT infiriera, Dirección no podría sacar del Registro
+    # una asignatura llamada "Inglés" —el sistema se la volvería a poner.
+    r = client.post("/api/asignaturas", json={"nombre": "Inglés"}, headers=auth(DIR))
+    assert r.status_code == 201, r.text[:160]
+    aid = r.json()["id"]
+    assert _area_de(aid) == "LEI", "el alta debería haber autovinculado"
+
+    r = client.put(f"/api/asignaturas/{aid}",
+                   json={"nombre": "Inglés", "codigo": "IN", "area": "Lenguas",
+                         "area_curricular_codigo": None},
+                   headers=auth(DIR))
+    assert r.status_code == 200, r.text[:200]
+    assert _area_de(aid) is None, "el PUT no debe reinferir desde el nombre"
 
 
 # ===========================================================================

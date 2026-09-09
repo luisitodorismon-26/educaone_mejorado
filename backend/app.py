@@ -3250,12 +3250,22 @@ async def crear_asignatura(request: Request, db: Session = Depends(get_db), curr
     if err_area:
         return JSONResponse({'error': err_area}, status_code=400)
 
-    # R2.1E: si no se indicó área, se intenta inferirla del NOMBRE, pero solo
+    # R2.1E: si al CREAR no hay área, se intenta inferirla del NOMBRE, pero solo
     # con coincidencia EXACTA contra la tabla de alias oficiales. "Inglés" es
     # LEI en cualquier colegio del país y no debería exigir configuración
     # manual; "Inglés Conversacional" no coincide y se queda en NULL, que es un
     # estado válido. Si el cliente mandó un área explícita, manda esa.
-    if area_curr is None and 'area_curricular_codigo' not in data:
+    #
+    # La condición mira el VALOR resuelto, no si la clave venía en el body. Un
+    # formulario que envía `area_curricular_codigo: null` porque su campo está
+    # vacío está diciendo "no elegí área", exactamente igual que omitirla —y eso
+    # es justo lo que manda Configuración → Asignaturas. Distinguir ambos casos
+    # dejaba sin autovincular precisamente a las creadas desde la UI.
+    #
+    # Esto es solo del alta. El PUT NO infiere: ahí `area_curricular_codigo:
+    # null` significa "desvincular", y sigue siendo la vía manual de Dirección
+    # para ajustar o quitar un mapping ya existente.
+    if area_curr is None:
         from area_curricular_autovinculo import inferir_area
         area_curr = inferir_area(data.get('nombre'))
         if area_curr:
@@ -16363,9 +16373,13 @@ async def get_indicadores_logro(request: Request, db: Session = Depends(get_db),
     """Indicadores de logro del AÑO ESCOLAR (activo por defecto).
 
     Filtros opcionales: curso_id, asignatura_id, periodo, ano_escolar_id.
-    Profesor: solo las parejas EXACTAS (curso, asignatura) con asignación
-    ACTIVA — da igual quién escribió el indicador (continuidad institucional).
-    Dirección/coordinación: su colegio, bajo la lente de nivel vigente.
+
+    R2.1E: professor-only. Devuelve solo las parejas EXACTAS (curso, asignatura)
+    con asignación ACTIVA del profesor que pregunta —da igual quién escribió el
+    indicador: la continuidad institucional se mantiene cuando una asignatura
+    cambia de profesor. Un profesor sin asignaciones recibe una lista vacía.
+    Dirección y coordinación reciben 403; revisan el resultado en el Registro
+    Escolar, no aquí.
     """
     curso_id = request.query_params.get('curso_id')
     asignatura_id = request.query_params.get('asignatura_id')
@@ -16442,10 +16456,13 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
             {'error': 'No tiene asignación activa para este curso y asignatura'}, status_code=403
         )
 
-    # R2-final-guard §1: la pareja (curso, asignatura) debe ser académica REAL,
-    # para TODOS los roles. Dirección/coordinación pueden escribir sobre pares
-    # válidos aunque el docente asignado sea otra persona, pero no sobre
-    # combinaciones inexistentes (indicador huérfano).
+    # R2-final-guard §1: la pareja (curso, asignatura) debe ser académica REAL.
+    # Impide crear un indicador huérfano sobre una combinación inexistente.
+    # R2.1E: el endpoint es professor-only y la guarda de asignación de arriba
+    # ya es más estricta que ésta, así que hoy nunca se llega aquí con un par
+    # inválido. Se conserva como defensa en profundidad: si mañana cambiara
+    # quién puede escribir, esta comprobación sigue siendo la que evita el
+    # huérfano.
     if not _par_curso_asignatura_valido(db, current_user, curso_id, asignatura_id):
         return JSONResponse(
             {'error': 'Esa asignatura no está asignada a este curso. Verifique las '
@@ -16752,9 +16769,9 @@ async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(ge
 async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """Eliminar un indicador. Tenant safe (get_tenant_or_404 evita IDOR).
 
-    Profesor: solo con asignación ACTIVA sobre la pareja exacta
-    (curso, asignatura) del indicador — no por haberlo escrito él.
-    Dirección/coordinación: dentro de su colegio.
+    R2.1E: professor-only, y solo con asignación ACTIVA sobre la pareja exacta
+    (curso, asignatura) del indicador — no por haberlo escrito él. Dirección y
+    coordinación reciben 403.
     """
     indicador = get_tenant_or_404(db, IndicadorLogro, id, current_user, name='indicador')
     if current_user.role == 'profesor' and not _profesor_tiene_par_activo(
