@@ -841,6 +841,174 @@ def _():
     assert cat(PROF_A, C4, LEF).json()["area_codigo"] == "LEF"
 
 
+# ===========================================================================
+# BLOQUE E — UN SOLO BLOQUE OFICIAL POR CURSO
+# ===========================================================================
+#
+# Dos asignaturas institucionales DISTINTAS activas en el mismo curso no pueden
+# representar el mismo bloque del Registro: R2.1D no sabría cuál imprimir.
+
+ING_CONV = 105          # "Inglés Conversacional": segunda asignatura mapeada a LEI
+EXTRA_NULL = 106        # materia adicional sin vínculo
+PROF_C = 15
+
+
+def _preparar_colision():
+    """LEI en dos asignaturas distintas del curso C4; LEF solo en una."""
+    d = SessionLocal()
+    try:
+        if d.query(M.Asignatura).get(ING_CONV) is None:
+            d.add(M.Asignatura(id=ING_CONV, colegio_id=COL_A, nombre="Inglés Conversacional",
+                               codigo="INC", area="Lenguas", area_curricular_codigo="LEI"))
+            d.add(M.Asignatura(id=EXTRA_NULL, colegio_id=COL_A, nombre="Robótica",
+                               codigo="RB", area="", area_curricular_codigo=None))
+            u = M.Usuario(id=PROF_C, username="prof_c", nombre="prof_c", apellido="T",
+                          role="profesor", colegio_id=COL_A)
+            u.set_password(PWD)
+            d.add(u)
+            # LEI original queda vinculada, para provocar la colisión en C4
+            d.query(M.Asignatura).get(LEI).area_curricular_codigo = "LEI"
+            # ambas activas en C4, y también un segundo profesor sobre LEI
+            d.add(M.AsignacionProfesor(id=30, colegio_id=COL_A, profesor_id=U_PROF_A,
+                                       curso_id=C4, asignatura_id=ING_CONV, activo=True))
+            d.add(M.AsignacionProfesor(id=31, colegio_id=COL_A, profesor_id=PROF_C,
+                                       curso_id=C4, asignatura_id=LEI, activo=True))
+            d.add(M.AsignacionProfesor(id=32, colegio_id=COL_A, profesor_id=U_PROF_A,
+                                       curso_id=C4, asignatura_id=EXTRA_NULL, activo=True))
+            # En C1 solo hay UNA asignatura LEI: el mismo código, otro curso.
+            d.add(M.AsignacionProfesor(id=33, colegio_id=COL_A, profesor_id=U_PROF_A,
+                                       curso_id=C1, asignatura_id=ING_CONV, activo=True))
+            d.commit()
+    finally:
+        d.close()
+
+
+_preparar_colision()
+PROF_C_TOK = login("prof_c")
+
+
+@test("§E1 dos asignaturas LEI en el mismo curso: el catálogo responde 409")
+def _():
+    r = cat(PROF_A, C4, LEI)
+    assert r.status_code == 409, (r.status_code, r.text[:180])
+    d = r.json()
+    assert d["motivo"] == "bloque_curricular_duplicado", d
+    assert d["area_codigo"] == "LEI"
+    ids = {a["id"] for a in d["asignaturas_en_conflicto"]}
+    assert ids == {LEI, ING_CONV}, ids
+    assert "más de una asignatura vinculada al bloque" in d["error"]
+    # simétrico: da igual por cuál de las dos se pregunte
+    r2 = cat(PROF_A, C4, ING_CONV)
+    assert r2.status_code == 409 and r2.json()["motivo"] == "bloque_curricular_duplicado"
+
+
+@test("§E2 con colisión el guardado también se rechaza con 409")
+def _():
+    antes = n_selecciones()
+    r = guardar(PROF_A, C4, LEI, 1, [K_LEI4], "algo")
+    assert r.status_code == 409, (r.status_code, r.text[:180])
+    assert r.json()["motivo"] == "bloque_curricular_duplicado"
+    assert n_selecciones() == antes
+
+
+@test("§E3 varios profesores sobre la MISMA asignatura NO son colisión")
+def _():
+    d = SessionLocal()
+    try:
+        n = (d.query(M.AsignacionProfesor)
+             .filter_by(curso_id=C4, asignatura_id=LEI, activo=True).count())
+        assert n == 2, f"el escenario necesita 2 profesores sobre LEI, hay {n}"
+    finally:
+        d.close()
+    # LEF sigue teniendo una sola asignatura en C4 pese a tener 1 profesor
+    assert cat(PROF_A, C4, LEF).status_code == 200
+    # y la colisión de LEI viene de asignatura_id distintos, no de los profesores
+    d = SessionLocal()
+    try:
+        import indicadores_curriculares as IC
+        curso = d.query(M.Curso).get(C4)
+        otras = IC.colision_bloque_en_curso(d, curso, d.query(M.Asignatura).get(LEF), "LEF")
+        assert otras == [], otras
+    finally:
+        d.close()
+
+
+@test("§E4 el mismo bloque en CURSOS distintos está permitido")
+def _():
+    # ING_CONV (LEI) también está activa en C1, donde es la única con ese bloque
+    r = cat(PROF_A, C1, ING_CONV)
+    assert r.status_code == 200, (r.status_code, r.text[:180])
+    assert r.json()["area_codigo"] == "LEI" and r.json()["grado_numero"] == 1
+    # la guarda es POR CURSO: no hay unicidad global de Asignatura
+    d = SessionLocal()
+    try:
+        n = (d.query(M.Asignatura)
+             .filter_by(colegio_id=COL_A, area_curricular_codigo="LEI").count())
+        assert n == 2, f"{n} asignaturas LEI en el colegio (deben poder coexistir)"
+    finally:
+        d.close()
+
+
+@test("§E5 una materia adicional (NULL) no participa en la colisión")
+def _():
+    d = SessionLocal()
+    try:
+        import indicadores_curriculares as IC
+        curso = d.query(M.Curso).get(C4)
+        # Robótica está activa en C4 con área NULL: no colisiona con nada
+        otras = IC.colision_bloque_en_curso(d, curso, d.query(M.Asignatura).get(EXTRA_NULL), None)
+        assert otras == [], otras
+    finally:
+        d.close()
+    r = cat(PROF_A, C4, EXTRA_NULL)
+    assert r.status_code == 409 and r.json()["motivo"] == "sin_vinculo_curricular", r.text[:160]
+
+
+@test("§E6 bloques DISTINTOS en el mismo curso conviven sin problema")
+def _():
+    # C4 tiene LEF (Frances) y LEI (dos asignaturas): LEF sigue funcionando
+    r = cat(PROF_A, C4, LEF)
+    assert r.status_code == 200, r.text[:160]
+    assert r.json()["area_codigo"] == "LEF"
+    assert guardar(PROF_A, C4, LEF, 2, [K_LEF4_B], "sigue funcionando").status_code == 200
+
+
+@test("§E7 ante la colisión no se crea ni modifica ningún IndicadorLogro")
+def _():
+    def foto():
+        d = SessionLocal()
+        try:
+            return {(i.curso_id, i.asignatura_id, i.periodo):
+                    (sorted(s.catalogo_clave for s in i.selecciones), i.contenidos_claves)
+                    for i in d.query(M.IndicadorLogro).all()}
+        finally:
+            d.close()
+
+    antes = foto()
+    for periodo in (1, 2, 3, 4):
+        r = guardar(PROF_A, C4, LEI, periodo, [K_LEI4], "no debe quedar")
+        assert r.status_code == 409, (periodo, r.status_code)
+    assert foto() == antes, "la colisión alteró datos existentes"
+
+
+@test("§E8 al desvincular una de las dos, el bloque vuelve a resolver")
+def _():
+    r = client.put(f"/api/asignaturas/{ING_CONV}", json={"area_curricular_codigo": None},
+                   headers=auth(DIR_A))
+    assert r.status_code == 200, r.text          # no tiene selecciones: se permite
+    r2 = cat(PROF_A, C4, LEI)
+    assert r2.status_code == 200, (r2.status_code, r2.text[:180])
+    assert r2.json()["area_codigo"] == "LEI" and r2.json()["grado_numero"] == 4
+    assert guardar(PROF_A, C4, LEI, 1, [K_LEI4], "ahora sí").status_code == 200
+    # se restaura la colisión para no dejar el escenario alterado
+    d = SessionLocal()
+    try:
+        d.query(M.Asignatura).get(ING_CONV).area_curricular_codigo = "LEI"
+        d.commit()
+    finally:
+        d.close()
+
+
 @test("§Z ZERO DATA LOSS: sge.db, credenciales y catálogo intactos")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

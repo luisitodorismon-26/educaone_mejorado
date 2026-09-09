@@ -107,6 +107,47 @@ def area_de_asignatura(asignatura) -> Resolucion:
     return True, codigo, None
 
 
+def colision_bloque_en_curso(db, curso, asignatura, area_codigo) -> list:
+    """
+    Otras asignaturas del MISMO curso vinculadas al MISMO bloque oficial.
+
+    Un bloque del Registro solo puede tener UNA fuente institucional dentro de
+    un curso. Si "Inglés" e "Inglés Conversacional" estuvieran ambas mapeadas a
+    LEI en 4to A, R2.1D no podría decidir cuál imprimir — y elegir una en
+    silencio sería inventar la respuesta.
+
+    La guarda es POR CURSO, no global: dos asignaturas distintas del colegio
+    pueden compartir LEI mientras no coincidan en el mismo curso.
+
+    Fuente: `AsignacionProfesor` ACTIVA, la misma relación académica que ya usa
+    R2 para validar la pareja (curso, asignatura). `ano_escolar_id` de la
+    asignación NO se filtra —140/143 filas reales lo tienen NULL y exigirlo
+    rompería las asignaciones legacy—: el año viene del propio Curso, que en
+    EducaOne es una fila nueva por año escolar.
+
+    Varios profesores sobre la MISMA `asignatura_id` no son colisión: solo
+    cuenta que haya `asignatura_id` DISTINTOS con el mismo bloque.
+    """
+    from models import Asignatura, AsignacionProfesor
+
+    if not area_codigo:
+        return []
+
+    filas = (db.query(Asignatura.id, Asignatura.nombre)
+             .join(AsignacionProfesor,
+                   AsignacionProfesor.asignatura_id == Asignatura.id)
+             .filter(AsignacionProfesor.curso_id == curso.id,
+                     AsignacionProfesor.activo == True,          # noqa: E712
+                     AsignacionProfesor.colegio_id == curso.colegio_id,
+                     Asignatura.colegio_id == curso.colegio_id,
+                     Asignatura.activo == True,                  # noqa: E712
+                     Asignatura.area_curricular_codigo == area_codigo,
+                     Asignatura.id != asignatura.id)
+             .distinct()
+             .all())
+    return [{'id': f[0], 'nombre': f[1]} for f in filas]
+
+
 def resolver_contexto(db, curso, asignatura) -> Resolucion:
     """
     Coordenadas completas del catálogo para un (curso, asignatura):

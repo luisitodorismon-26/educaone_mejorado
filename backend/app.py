@@ -15946,6 +15946,45 @@ def _guardas_indicadores(db, current_user, request, curso_id, asignatura_id):
     return curso, asignatura, None
 
 
+def _contexto_curricular(db, current_user, curso, asignatura):
+    """
+    Coordenadas del catálogo para (curso, asignatura), con la guarda de bloque
+    único. Devuelve `(contexto, None)` o `(None, JSONResponse)`.
+
+    Concentra aquí las dos razones por las que un par válido puede NO tener
+    catálogo, para que el GET y el POST respondan exactamente igual.
+    """
+    import indicadores_curriculares as IC
+
+    ok, contexto, mensaje = IC.resolver_contexto(db, curso, asignatura)
+    if not ok:
+        if contexto == IC.SIN_VINCULO_CURRICULAR:
+            return None, JSONResponse({
+                'error': mensaje,
+                'motivo': IC.SIN_VINCULO_CURRICULAR,
+                'asignatura_id': asignatura.id,
+                'puede_configurar': current_user.role == 'direccion',
+            }, status_code=409)
+        return None, JSONResponse({'error': mensaje}, status_code=400)
+
+    # Un bloque oficial no puede tener dos fuentes institucionales en el mismo
+    # curso: no se elige una en silencio, lo resuelve Dirección.
+    otras = IC.colision_bloque_en_curso(db, curso, asignatura, contexto['area_codigo'])
+    if otras:
+        return None, JSONResponse({
+            'error': f"Este curso tiene más de una asignatura vinculada al bloque "
+                     f"curricular {contexto['area_codigo']} del Registro Escolar. "
+                     f"Dirección debe dejar solo una asignatura vinculada a ese bloque "
+                     f"y mantener las materias adicionales como 'No vinculada al Registro'.",
+            'motivo': 'bloque_curricular_duplicado',
+            'area_codigo': contexto['area_codigo'],
+            'asignaturas_en_conflicto': [
+                {'id': asignatura.id, 'nombre': asignatura.nombre}] + otras,
+        }, status_code=409)
+
+    return contexto, None
+
+
 def _selecciones_dict(indicador):
     """Selecciones del período, resueltas contra el catálogo y ordenadas."""
     filas = []
@@ -16020,16 +16059,9 @@ async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_d
     if not ano:
         return JSONResponse({'error': 'No hay año escolar disponible'}, status_code=400)
 
-    ok, contexto, mensaje = IC.resolver_contexto(db, curso, asignatura)
-    if not ok:
-        if contexto == IC.SIN_VINCULO_CURRICULAR:
-            return JSONResponse({
-                'error': mensaje,
-                'motivo': IC.SIN_VINCULO_CURRICULAR,
-                'asignatura_id': asignatura.id,
-                'puede_configurar': current_user.role == 'direccion',
-            }, status_code=409)
-        return JSONResponse({'error': mensaje}, status_code=400)
+    contexto, err_ctx = _contexto_curricular(db, current_user, curso, asignatura)
+    if err_ctx:
+        return err_ctx
 
     q = request.query_params.get('q')
     grupos = IC.catalogo_agrupado(contexto, q)
@@ -16287,12 +16319,9 @@ async def guardar_periodo_indicadores(request: Request, db: Session = Depends(ge
     if err_ano:
         return JSONResponse({'error': err_ano}, status_code=400)
 
-    ok, contexto, mensaje = IC.resolver_contexto(db, curso, asignatura)
-    if not ok:
-        if contexto == IC.SIN_VINCULO_CURRICULAR:
-            return JSONResponse({'error': mensaje, 'motivo': IC.SIN_VINCULO_CURRICULAR},
-                                status_code=409)
-        return JSONResponse({'error': mensaje}, status_code=400)
+    contexto, err_ctx = _contexto_curricular(db, current_user, curso, asignatura)
+    if err_ctx:
+        return err_ctx
 
     # --- Validar TODAS las claves ANTES de tocar la sesión ---
     vistas, limpias, errores = set(), [], []
