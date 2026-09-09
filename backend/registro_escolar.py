@@ -728,6 +728,57 @@ INDICADOR_BOX = {
     "line_height": 10.0,
 }
 
+# --- ESPECIFICACIÓN CURRICULAR APLICADA POR PERÍODO (R2.1D) ---
+#
+# La tabla oficial tiene TRES columnas. `INDICADOR_BOX` (arriba) describe la
+# central desde R2; aquí se añaden las otras dos con la geometría medida sobre
+# los templates.
+#
+# Medición: las 216 páginas de la sección (6 grados × 9 asignaturas base ×
+# 4 períodos) comparten UNA SOLA firma geométrica, dispersión nula:
+#
+#   v-lines : 36.25 | 96.01 | 335.76 | 575.50
+#   h-lines : 36.25 (título) | 57.86 (encabezados) | 79.47 (inicio cuerpo)
+#             | 756.00 (fin cuerpo)
+#
+# El cuerpo está VACÍO en el template: no hay filas preimpresas que respetar,
+# solo los bordes de las tres columnas. `INDICADOR_BOX` coincide con la columna
+# central dentro de 0.04 pt, así que se conserva tal cual —lo usa el renderer
+# de R2 y su suite— y las dos nuevas llevan el valor exacto medido.
+CE_BOX = {
+    "x0": 36.25,
+    "x1": 96.01,
+    "y_top_plumber": 79.47,
+    "y_bottom_plumber": 756.0,
+    "padding": 4.0,
+}
+CONTENIDOS_BOX = {
+    "x0": 335.76,
+    "x1": 575.50,
+    "y_top_plumber": 79.47,
+    "y_bottom_plumber": 756.0,
+    "padding": 4.0,
+}
+
+# Escalas admitidas, en orden. NO hay búsqueda continua ni tamaños menores:
+# o cabe en una de las dos, o el Registro no se emite.
+ESPEC_ESCALAS = ((8.0, 10.0), (6.5, 8.0))
+
+
+class EspecificacionCurricularOverflow(Exception):
+    """
+    La especificación curricular de un período no cabe ni en la escala menor.
+
+    Un Registro oficial incompleto no es aceptable: antes que recortar texto
+    oficial en silencio, la generación se detiene y el endpoint lo convierte en
+    un 422 con el detalle de qué período se pasó y por cuánto. NO se borra ni se
+    modifica ningún dato: la decisión de redistribuir es del centro.
+    """
+
+    def __init__(self, detalle: Dict):
+        self.detalle = detalle
+        super().__init__(detalle.get("mensaje", "especificacion_curricular_no_cabe"))
+
 # Páginas (1-indexed) del PERÍODO 1 de cada asignatura BASE, por ciclo. Los
 # períodos 2, 3 y 4 son las tres páginas siguientes.
 # Ciclo 1 (1ro-3ro): bloques regulares de 6 págs (2 de referencia + 4 períodos).
@@ -1449,6 +1500,155 @@ def draw_indicadores(c: canvas.Canvas, datos: Dict):
         _draw_text(c, x, y_top - (i * lh), linea, size=size)
 
 
+def _espec_capacidad(box: Dict, size: float, line_height: float) -> int:
+    """Cuántas líneas de `size` caben en el cuerpo de una columna."""
+    y_top = _y(box["y_top_plumber"]) - box["padding"] - size
+    y_min = _y(box["y_bottom_plumber"]) + box["padding"]
+    return max(int((y_top - y_min) // line_height) + 1, 0)
+
+
+def _espec_maquetar(datos: Dict, size: float, line_height: float) -> Dict:
+    """
+    Maqueta un período a una escala dada, SIN dibujar y SIN recortar.
+
+    Devuelve el plan completo —incluidas las líneas que se salen— para que el
+    llamador decida: nunca trunca por su cuenta.
+
+      filas_il   : líneas de la columna "Indicadores de Logro"
+      marcas_ce  : [(índice_de_línea, ce_codigo)] para alinear cada código CE
+                   con el arranque de su grupo
+      filas_cc   : líneas de la columna "Contenidos Claves"
+      cabe       : bool
+    """
+    ancho_il = (INDICADOR_BOX["x1"] - INDICADOR_BOX["x0"]) - 2 * INDICADOR_BOX["padding"]
+    ancho_cc = (CONTENIDOS_BOX["x1"] - CONTENIDOS_BOX["x0"]) - 2 * CONTENIDOS_BOX["padding"]
+
+    filas_il: List[str] = []
+    marcas_ce: List[tuple] = []
+
+    # Los grupos vienen ya ordenados por `orden_ce` desde el loader; se reordena
+    # aquí también para que el render sea determinista aunque cambie la fuente.
+    grupos = sorted((datos or {}).get("grupos_ce") or [],
+                    key=lambda g: (g.get("orden_ce") or 0, g.get("ce_codigo") or ""))
+    for grupo in grupos:
+        indicadores = sorted(grupo.get("indicadores") or [],
+                             key=lambda i: (i.get("orden_il") or 0, i.get("il_codigo") or ""))
+        if not indicadores:
+            continue
+        if filas_il:
+            filas_il.append("")            # separación entre grupos de CE
+        # El código de la CE se alinea con la PRIMERA línea de su primer IL.
+        marcas_ce.append((len(filas_il), grupo.get("ce_codigo") or ""))
+        for pos, il in enumerate(indicadores):
+            if pos:
+                filas_il.append("")        # separación entre indicadores
+            etiqueta = f"{il.get('il_codigo') or ''} {il.get('il_texto') or ''}".strip()
+            filas_il.extend(_wrap_texto(etiqueta, ancho_il, FONT_NORMAL, size))
+
+    filas_cc: List[str] = []
+    for linea in (datos or {}).get("contenidos") or []:
+        texto = str(linea)
+        if not texto.strip():
+            continue                       # una línea vacía no es un contenido
+        filas_cc.extend(_wrap_texto(texto, ancho_cc, FONT_NORMAL, size))
+
+    cap_il = _espec_capacidad(INDICADOR_BOX, size, line_height)
+    cap_cc = _espec_capacidad(CONTENIDOS_BOX, size, line_height)
+    return {
+        "size": size,
+        "line_height": line_height,
+        "filas_il": filas_il,
+        "marcas_ce": marcas_ce,
+        "filas_cc": filas_cc,
+        "capacidad_il": cap_il,
+        "capacidad_cc": cap_cc,
+        "cabe": len(filas_il) <= cap_il and len(filas_cc) <= cap_cc,
+    }
+
+
+def espec_plan(datos: Dict, contexto: Optional[Dict] = None) -> Dict:
+    """
+    Elige la escala de una página de especificación curricular.
+
+    Preflight determinista y acotado: se prueba 8/10 y, si algo no cabe, se
+    recalcula TODA la página —CE, Indicadores y Contenidos— con 6.5/8. La misma
+    escala rige las tres columnas de esa página.
+
+    Si tampoco cabe en 6.5/8 lanza `EspecificacionCurricularOverflow`: no se
+    emite un Registro parcial ni se recorta texto oficial.
+    """
+    plan = None
+    for size, lh in ESPEC_ESCALAS:
+        plan = _espec_maquetar(datos, size, lh)
+        if plan["cabe"]:
+            return plan
+
+    ctx = dict(contexto or {})
+    detalle = {
+        "motivo": "especificacion_curricular_no_cabe",
+        "lineas_indicadores": len(plan["filas_il"]),
+        "lineas_contenidos": len(plan["filas_cc"]),
+        "capacidad": min(plan["capacidad_il"], plan["capacidad_cc"]),
+        "capacidad_indicadores": plan["capacidad_il"],
+        "capacidad_contenidos": plan["capacidad_cc"],
+        "font_size_minimo": plan["size"],
+        "mensaje": (
+            "La especificación curricular del período excede el espacio disponible "
+            "del Registro Escolar. Reduzca o distribuya los indicadores/contenidos "
+            "entre períodos."
+        ),
+    }
+    detalle.update(ctx)
+    logger.warning(
+        "Especificación curricular sin espacio: %s líneas IL / %s líneas CC "
+        "para capacidades %s / %s (contexto=%s)",
+        detalle["lineas_indicadores"], detalle["lineas_contenidos"],
+        plan["capacidad_il"], plan["capacidad_cc"], ctx,
+    )
+    raise EspecificacionCurricularOverflow(detalle)
+
+
+def draw_especificacion_curricular(c: canvas.Canvas, datos: Dict):
+    """
+    Dibuja las TRES columnas de "ESPECIFICACIÓN CURRICULAR APLICADA POR PERÍODO".
+
+    `datos` es el plan que devuelve `espec_plan()` bajo la clave "plan", más el
+    contenido ya maquetado. No trunca NUNCA: si algo no cabía, `espec_plan()` ya
+    habría abortado la generación antes de llegar aquí.
+
+    CE          : solo `ce_codigo`, una vez por grupo, alineado con el arranque
+                  de su primer indicador. El texto completo de una CE ocuparía
+                  32 líneas en una columna de 51.8 pt: el MINERD imprime códigos.
+    Indicadores : `il_codigo` + `il_texto` verbatim del catálogo oficial.
+    Contenidos  : una entrada por línea escrita por el docente, en su orden.
+
+    Nunca se imprime `catalogo_clave`, `orden_ce`, `orden_il` ni la versión
+    curricular: son identidad técnica interna.
+    """
+    plan = (datos or {}).get("plan")
+    if not plan:
+        return
+    size = plan["size"]
+    lh = plan["line_height"]
+
+    def _pinta(box, filas, x_extra=0.0):
+        x = box["x0"] + box["padding"] + x_extra
+        y_top = _y(box["y_top_plumber"]) - box["padding"] - size
+        for i, linea in enumerate(filas):
+            if linea:
+                _draw_text(c, x, y_top - (i * lh), linea, size=size)
+
+    _pinta(INDICADOR_BOX, plan["filas_il"])
+    _pinta(CONTENIDOS_BOX, plan["filas_cc"])
+
+    # Códigos de CE, cada uno a la altura de su grupo.
+    x_ce = CE_BOX["x0"] + CE_BOX["padding"]
+    y_ce_top = _y(INDICADOR_BOX["y_top_plumber"]) - INDICADOR_BOX["padding"] - size
+    for indice, ce_codigo in plan["marcas_ce"]:
+        if ce_codigo:
+            _draw_text(c, x_ce, y_ce_top - (indice * lh), ce_codigo, size=size)
+
+
 def draw_promocion_izq(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: List[str]):
     """
     Dibuja la página izquierda del spread de promoción.
@@ -1607,6 +1807,7 @@ def generar_registro_escolar(
     asistencia_data: Optional[Dict] = None,
     calificaciones_data: Optional[Dict] = None,
     indicadores_data: Optional[Dict] = None,
+    especificacion_data: Optional[Dict] = None,
     completiva_data: Optional[Dict] = None,
     promocion_data: Optional[List[Dict]] = None,
     estadisticas_data: Optional[Dict] = None,
@@ -1623,7 +1824,10 @@ def generar_registro_escolar(
         estudiantes: Lista de hasta 40 estudiantes con sus datos
         asistencia_data: Dict con asistencia por asignatura y mes
         calificaciones_data: Dict con calificaciones por competencia (spreads)
-        indicadores_data: {asig_idx: {periodo: texto}} — indicadores de logro
+        especificacion_data: {slot_bloque: {periodo: {"grupos_ce": [...],
+            "contenidos": [...]}}} — R2.1D. `slot_bloque` sale de
+            `Asignatura.area_curricular_codigo`, no del nombre de la materia.
+        indicadores_data: LEGACY R2. {asig_idx: {periodo: texto}} — indicadores de logro
             trabajados; se escriben en la columna "Indicadores de Logro" de la
             página de ESPECIFICACIÓN CURRICULAR de esa asignatura y período.
         completiva_data: Dict con calificaciones completivas/extraordinarias
@@ -1895,10 +2099,50 @@ def generar_registro_escolar(
                     buf2.seek(0)
                     overlays[pg_der] = buf2
     
-    # --- INDICADORES DE LOGRO (R2) ---
-    # Una página por (asignatura, período). Solo se estampan las que traen
-    # texto: una asignatura/período sin indicador deja su página idéntica al
-    # template (no se escribe "N/A" ni "Sin indicadores").
+    # --- ESPECIFICACIÓN CURRICULAR: CE + IL + CONTENIDOS CLAVES (R2.1D) ---
+    # Una página por (bloque oficial, período). La clave es el SLOT del bloque
+    # curricular (LE=0 … FIHR=8), derivado de `Asignatura.area_curricular_codigo`
+    # por el loader: NUNCA del nombre, del código legacy ni del rótulo `area`.
+    # Un período sin datos deja su página idéntica al template.
+    if especificacion_data:
+        for slot, por_periodo in (especificacion_data or {}).items():
+            if not por_periodo:
+                continue
+            try:
+                slot_int = int(slot)
+            except (TypeError, ValueError):
+                continue
+            for periodo, datos_periodo in por_periodo.items():
+                if not datos_periodo:
+                    continue
+                try:
+                    periodo_int = int(periodo)
+                except (TypeError, ValueError):
+                    continue
+                if not (datos_periodo.get("grupos_ce") or datos_periodo.get("contenidos")):
+                    continue
+                pg_num = pagina_indicador(ciclo, slot_int, periodo_int)
+                if not pg_num:
+                    continue
+                pg_idx = pg_num - 1
+                if pg_idx >= total_pages:
+                    continue
+                # Preflight: elige 8/10 o 6.5/8, o aborta la generación entera.
+                plan = espec_plan(datos_periodo, {
+                    "slot": slot_int,
+                    "periodo": periodo_int,
+                    "pagina": pg_num,
+                    **{k: v for k, v in datos_periodo.items()
+                       if k in ("asignatura_id", "area_codigo", "asignatura")},
+                })
+                overlays[pg_idx] = _create_overlay_page(
+                    draw_especificacion_curricular, {"plan": plan})
+
+    # --- INDICADORES DE LOGRO (R2 legacy) ---
+    # Camino anterior, de texto libre en una sola columna. El loader ya no lo
+    # alimenta —un período con `contenido` legacy bloquea la generación con 409
+    # para no falsificar el Registro—, pero se conserva funcional porque su
+    # suite lo ejercita directamente y porque borrarlo no aportaría nada.
     if indicadores_data:
         for a_idx, por_periodo in (indicadores_data or {}).items():
             if not por_periodo:
@@ -2257,7 +2501,8 @@ def _calcular_edad(fecha_nacimiento) -> int:
 # ============================================================================
 
 def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudiantes,
-                                   asignaturas_data, grado_numero, marca_borrador=False):
+                                   asignaturas_data, grado_numero, marca_borrador=False,
+                                   especificacion_data=None):
     """
     Wrapper que traduce datos de app.py al formato del generador de registro.
     
@@ -2508,6 +2753,9 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         asistencia_data=asistencia_data if asistencia_data else None,
         calificaciones_data=calificaciones_data if calificaciones_data else None,
         indicadores_data=indicadores_data if indicadores_data else None,
+        # R2.1D: llega ya resuelto y validado desde app.py, indexado por SLOT
+        # del bloque curricular oficial. Ningún objeto ORM cruza al threadpool.
+        especificacion_data=especificacion_data or None,
         completiva_data=completiva_data if completiva_data else None,
         promocion_data=promocion_data if any(p for p in promocion_data) else None,
         marca_borrador=marca_borrador,

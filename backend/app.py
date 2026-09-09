@@ -14765,6 +14765,16 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     asignaturas_data = _cargar_datos_asignaturas_secundaria(
         db, current_user, curso_id, grado_numero, estudiantes_db[:90]
     )
+
+    # R2.1D — CE + Indicadores + Contenidos Claves, indexados por el SLOT del
+    # bloque oficial. Una anomalía institucional (bloque duplicado, legacy sin
+    # convertir, clave incoherente) corta aquí con 409: mejor no emitir el
+    # Registro que emitirlo falseado.
+    try:
+        especificacion_data = _cargar_especificacion_curricular(
+            db, current_user, curso, grado_numero)
+    except EspecificacionCurricularConflicto as _exc:
+        return _respuesta_conflicto_espec(_exc)
     
     try:
         # v2.19.6: el sello BORRADOR se estampa DENTRO de la generación.
@@ -14787,6 +14797,7 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
             colegio_info, curso_info, ano_escolar,
             estudiantes_raw, asignaturas_data, grado_numero,
             marca_borrador=True,
+            especificacion_data=especificacion_data,
         )
         
         filename = f"BORRADOR_Registro_Secundaria_{curso.nombre_completo.replace(' ', '_')}.pdf"
@@ -14797,6 +14808,11 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
     except Exception as e:
+        # R2.1D: una especificación curricular que no cabe no es un fallo del
+        # servidor, es un dato que el centro debe redistribuir. 422, no 500.
+        _r = _respuesta_conflicto_espec(e)
+        if _r is not None:
+            return _r
         import traceback
         logger.error(f"Error preview secundaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({
@@ -14916,12 +14932,23 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     asignaturas_data = _cargar_datos_asignaturas_secundaria(
         db, current_user, curso_id, grado_numero, estudiantes_db[:90]
     )
+
+    # R2.1D — CE + Indicadores + Contenidos Claves, indexados por el SLOT del
+    # bloque oficial. Una anomalía institucional (bloque duplicado, legacy sin
+    # convertir, clave incoherente) corta aquí con 409: mejor no emitir el
+    # Registro que emitirlo falseado.
+    try:
+        especificacion_data = _cargar_especificacion_curricular(
+            db, current_user, curso, grado_numero)
+    except EspecificacionCurricularConflicto as _exc:
+        return _respuesta_conflicto_espec(_exc)
     
     # === 3. GENERAR PDF ===
     try:
         pdf_bytes = generar_registro_desde_sistema(
             colegio_info, curso_info, ano_escolar,
-            estudiantes_raw, asignaturas_data, grado_numero
+            estudiantes_raw, asignaturas_data, grado_numero,
+            especificacion_data=especificacion_data,
         )
         
         filename = f"Registro_Escolar_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
@@ -14932,6 +14959,10 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
     except Exception as e:
+        # R2.1D: overflow -> 422 con detalle accionable; nunca un PDF parcial.
+        _r = _respuesta_conflicto_espec(e)
+        if _r is not None:
+            return _r
         import traceback
         logger.error(f"Error generando registro secundaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({
@@ -14939,6 +14970,193 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             'detalle': str(e),
             'validacion': validacion.to_dict(),
         }, status_code=500)
+
+
+# R2.1D — correspondencia BLOQUE OFICIAL -> SLOT del Registro.
+# Es un mapeo de LAYOUT, no una fuente curricular: dice en qué posición del
+# documento va cada bloque, en el mismo orden que ASIGNATURAS_CICLO_1.
+AREA_CURRICULAR_A_SLOT = {
+    'LE': 0, 'LEI': 1, 'LEF': 2, 'MAT': 3, 'CS': 4,
+    'CN': 5, 'EA': 6, 'EF': 7, 'FIHR': 8,
+}
+
+
+class EspecificacionCurricularConflicto(Exception):
+    """Anomalía institucional que impide emitir el Registro. Se vuelve 409."""
+
+    def __init__(self, detalle):
+        self.detalle = detalle
+        super().__init__(detalle.get('motivo', 'conflicto'))
+
+
+def _cargar_especificacion_curricular(db: Session, current_user, curso, grado_numero):
+    """
+    CE + Indicadores + Contenidos Claves del curso, listos para el generador.
+
+    Devuelve `{slot: {periodo: {"grupos_ce": [...], "contenidos": [...]}}}`, con
+    el slot derivado EXCLUSIVAMENTE de `Asignatura.area_curricular_codigo`.
+    Nunca del nombre, del código legacy ni del rótulo `area`.
+
+    Consultas: 1 para las asignaturas del curso, 1 para los períodos y 1 para
+    las selecciones. Sin N+1. El catálogo se resuelve en memoria contra el JSON
+    versionado. Nada de ORM cruza al threadpool: todo sale como dicts planos.
+
+    Lanza `EspecificacionCurricularConflicto` (-> 409) ante:
+      * dos asignaturas distintas del curso apuntando al mismo bloque oficial;
+      * un período con `contenido` legacy de R2 sin convertir;
+      * una `catalogo_clave` guardada que ya no resuelve o no corresponde al
+        grado/área/versión de su asignatura.
+    En los tres casos NO se elige, NO se mezcla y NO se modifica ningún dato.
+    """
+    import catalogo_indicadores as CAT
+
+    ano = _ano_registro_indicadores(db, current_user, None)
+    if ano is None:
+        return {}
+
+    # (1) Asignaturas ACADÉMICAS del curso, con su bloque oficial.
+    filas = (db.query(Asignatura.id, Asignatura.nombre, Asignatura.area_curricular_codigo)
+             .join(AsignacionProfesor, AsignacionProfesor.asignatura_id == Asignatura.id)
+             .filter(AsignacionProfesor.curso_id == curso.id,
+                     AsignacionProfesor.activo == True,          # noqa: E712
+                     AsignacionProfesor.colegio_id == curso.colegio_id,
+                     Asignatura.colegio_id == curso.colegio_id,
+                     Asignatura.activo == True)                  # noqa: E712
+             .distinct().all())
+
+    # Materias con área NULL: quedan fuera de ESTA sección y de nada más.
+    por_area = {}
+    asig_a_area = {}
+    for aid, nombre, area in filas:
+        if not area:
+            continue
+        por_area.setdefault(area, []).append({'id': aid, 'nombre': nombre})
+        asig_a_area[aid] = area
+
+    # (2) Colisión histórica: dos fuentes para el mismo bloque. No se adivina.
+    duplicados = {a: v for a, v in por_area.items() if len(v) > 1}
+    if duplicados:
+        area, conflicto = sorted(duplicados.items())[0]
+        raise EspecificacionCurricularConflicto({
+            'motivo': 'bloque_curricular_duplicado',
+            'area_codigo': area,
+            'curso_id': curso.id,
+            'asignaturas_en_conflicto': sorted(conflicto, key=lambda x: x['id']),
+            'mensaje': f'Este curso tiene más de una asignatura vinculada al bloque '
+                       f'curricular {area} del Registro Escolar. Dirección debe dejar '
+                       f'solo una asignatura vinculada a ese bloque.',
+        })
+
+    if not asig_a_area:
+        return {}
+
+    # (3) Períodos del curso + año, en una consulta.
+    periodos = tenant_filter(db.query(IndicadorLogro), IndicadorLogro, current_user).filter(
+        IndicadorLogro.curso_id == curso.id,
+        IndicadorLogro.ano_escolar_id == ano.id,
+    ).all()
+    if not periodos:
+        return {}
+
+    # (4) Legacy R2 sin convertir: no se imprime como IL oficial ni se destruye.
+    for il in periodos:
+        if (il.contenido or '').strip() and il.asignatura_id in asig_a_area:
+            raise EspecificacionCurricularConflicto({
+                'motivo': 'indicadores_legacy_pendientes_conversion',
+                'asignatura_id': il.asignatura_id,
+                'periodo': il.periodo,
+                'curso_id': curso.id,
+                'mensaje': 'Este período conserva indicadores escritos a mano con el '
+                           'formato anterior. No se imprimen como indicadores '
+                           'oficiales ni se convierten automáticamente: contacte a '
+                           'soporte técnico para migrarlos.',
+            })
+
+    # (5) Selecciones de TODOS esos períodos en una sola consulta.
+    ids = [il.id for il in periodos]
+    selecciones = {}
+    if ids:
+        for sel in db.query(IndicadorLogroSeleccion).filter(
+            IndicadorLogroSeleccion.indicador_logro_id.in_(ids)
+        ).all():
+            selecciones.setdefault(sel.indicador_logro_id, []).append(sel.catalogo_clave)
+
+    salida = {}
+    for il in periodos:
+        area = asig_a_area.get(il.asignatura_id)
+        if area is None:
+            continue                       # materia sin bloque oficial: se ignora
+        slot = AREA_CURRICULAR_A_SLOT.get(area)
+        if slot is None:
+            continue
+
+        # Resolver y VALIDAR cada clave contra el catálogo oficial.
+        grupos = {}
+        for clave in selecciones.get(il.id, []):
+            try:
+                e = CAT.resolver(clave)
+            except CAT.CatalogoError as err:
+                raise EspecificacionCurricularConflicto({
+                    'motivo': 'catalogo_clave_invalida',
+                    'asignatura_id': il.asignatura_id, 'periodo': il.periodo,
+                    'catalogo_clave': clave, 'detalle': str(err),
+                    'mensaje': 'Un indicador guardado ya no corresponde al catálogo '
+                               'oficial. No se imprime nada inventado: contacte a '
+                               'soporte técnico.',
+                })
+            if (e['version_curricular'] != CAT.VERSION_ACTUAL
+                    or e['grado_numero'] != grado_numero
+                    or e['area_codigo'] != area):
+                raise EspecificacionCurricularConflicto({
+                    'motivo': 'catalogo_clave_incoherente',
+                    'asignatura_id': il.asignatura_id, 'periodo': il.periodo,
+                    'catalogo_clave': clave,
+                    'esperado': {'version': CAT.VERSION_ACTUAL,
+                                 'grado_numero': grado_numero, 'area_codigo': area},
+                    'encontrado': {'version': e['version_curricular'],
+                                   'grado_numero': e['grado_numero'],
+                                   'area_codigo': e['area_codigo']},
+                    'mensaje': 'Un indicador guardado pertenece a otro grado o área. '
+                               'No se imprime: contacte a soporte técnico.',
+                })
+            g = grupos.setdefault(e['orden_ce'], {
+                'orden_ce': e['orden_ce'],
+                'ce_codigo': e['ce_codigo'],
+                'indicadores': [],
+            })
+            g['indicadores'].append({
+                'orden_il': e['orden_il'],
+                'il_codigo': e['il_codigo'],
+                'il_texto': e['il_texto'],
+            })
+
+        # Agrupado por POSICIÓN (orden_ce), no por ce_codigo: el documento
+        # oficial repite códigos de CE en bandas distintas (2do Ed. Física).
+        grupos_ce = [
+            {**g, 'indicadores': sorted(g['indicadores'], key=lambda i: i['orden_il'])}
+            for _, g in sorted(grupos.items())
+        ]
+        contenidos = il.lineas_contenidos_claves()
+        if not grupos_ce and not contenidos:
+            continue                       # período vacío: página intacta
+
+        salida.setdefault(slot, {})[il.periodo] = {
+            'grupos_ce': grupos_ce,
+            'contenidos': contenidos,
+            'asignatura_id': il.asignatura_id,
+            'area_codigo': area,
+        }
+    return salida
+
+
+def _respuesta_conflicto_espec(exc):
+    """Traduce las anomalías de la especificación curricular a HTTP."""
+    from registro_escolar import EspecificacionCurricularOverflow
+    if isinstance(exc, EspecificacionCurricularOverflow):
+        return JSONResponse(exc.detalle, status_code=422)
+    if isinstance(exc, EspecificacionCurricularConflicto):
+        return JSONResponse(exc.detalle, status_code=409)
+    return None
 
 
 def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, grado_numero, estudiantes_db):
@@ -15002,19 +15220,15 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         ).all():
             _extras_idx[(_ev_row.estudiante_id, _ev_row.asignatura_id)] = _ev_row
 
-    # R2: TODOS los indicadores de logro del curso + año activo en UNA consulta.
-    # Índice O(1) por (asignatura_id, periodo). Es material del CURSO, no del
-    # estudiante: no hay ninguna consulta por estudiante ni por celda.
-    _indicadores_idx = {}
-    if _ano_registro is not None:
-        for _il in tenant_filter(
-            db.query(IndicadorLogro), IndicadorLogro, current_user
-        ).filter(
-            IndicadorLogro.curso_id == curso_id,
-            IndicadorLogro.ano_escolar_id == _ano_registro.id,
-        ).all():
-            if _il.contenido and str(_il.contenido).strip():
-                _indicadores_idx[(_il.asignatura_id, _il.periodo)] = str(_il.contenido).strip()
+    # R2.1D: aquí vivía la consulta que cargaba `IndicadorLogro.contenido` para
+    # alimentar `indicadores_data`. Se retira porque su resultado ya no se usa:
+    # la especificación curricular la carga `_cargar_especificacion_curricular()`,
+    # que indexa por el SLOT del bloque oficial en vez de por la posición del
+    # NOMBRE de la asignatura. Dejarla sería un SELECT por Registro sin destino.
+    #
+    # El campo legacy sigue en la base y no se toca: si un período lo conserva
+    # no vacío, esa función corta la generación con 409 en vez de imprimirlo
+    # como si fuera un indicador oficial.
 
     def _serial_ev(_ev):
         """dict plano y serializable (sin ORM, sin sesión) para el threadpool."""
@@ -15266,14 +15480,20 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
                 
                 asistencias_por_est[idx] = est_asist
         
-        # R2: indicadores de logro del período, ya resueltos del índice bulk.
-        # Solo texto plano: nada de ORM cruza al threadpool.
+        # R2.1D: esta vía queda DESCONECTADA a propósito.
+        #
+        # Alimentaba `indicadores_data`, que indexa por la POSICIÓN DEL NOMBRE
+        # de la asignatura en la lista MINERD. Con R2.1C el bloque oficial se
+        # decide por `Asignatura.area_curricular_codigo`, y resolver por nombre
+        # permitiría que una materia sin vínculo curricular —o con un nombre
+        # parecido— ocupara el bloque de otra. La especificación curricular la
+        # carga ahora `_cargar_especificacion_curricular()`, que indexa por slot
+        # del bloque oficial.
+        #
+        # El campo legacy `IndicadorLogro.contenido` no se pierde ni se
+        # reinterpreta: si un período lo conserva no vacío, esa función corta la
+        # generación con 409 en vez de imprimirlo como indicador oficial.
         indicadores_asig = {}
-        if asignatura:
-            for _p in (1, 2, 3, 4):
-                _txt = _indicadores_idx.get((asignatura.id, _p))
-                if _txt:
-                    indicadores_asig[_p] = _txt
 
         asignaturas_data[asig_nombre] = {
             'docente': docente_nombre,

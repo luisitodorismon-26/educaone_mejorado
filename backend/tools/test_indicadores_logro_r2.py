@@ -740,10 +740,14 @@ def _():
         d.close()
         event.remove(engine, "before_cursor_execute", _cap)
 
-    assert len(sqls) == 1, f"{len(sqls)} consultas a indicadores_logro:\n" + "\n".join(sqls)
-    # y el texto llega al diccionario que consume el generador
-    mate = data.get("Matemática", {}).get("indicadores", {})
-    assert 1 in mate and "continuado" in mate[1], mate
+    # R2.1D: este loader ya NO consulta indicadores_logro. Alimentaba
+    # `indicadores_data`, indexado por la POSICIÓN DEL NOMBRE de la asignatura;
+    # desde R2.1C el bloque oficial lo decide `area_curricular_codigo`, y la
+    # especificación curricular la carga `_cargar_especificacion_curricular()`,
+    # que hace su propio bulk (verificado en la suite R2.1D §AE).
+    assert len(sqls) == 0, f"{len(sqls)} consultas a indicadores_logro:\n" + "\n".join(sqls)
+    assert data.get("Matemática", {}).get("indicadores", {}) == {}, \
+        "el loader no debe volver a alimentar la vía legacy indexada por nombre"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
