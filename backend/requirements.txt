@@ -1,17 +1,40 @@
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-python-multipart>=0.0.6
-SQLAlchemy>=2.0.36
-Werkzeug>=3.0.1
-gunicorn>=21.2.0
-python-dotenv>=1.0.0
-PyJWT>=2.8.0
-psycopg2-binary>=2.9.9
-bleach>=6.1.0
-cryptography>=41.0.0
-reportlab>=4.0.0
-Pillow>=10.0.0
-pypdf>=4.0.0
-alembic>=1.13.0
-redis>=5.0.0
+# EducaOne — dependencias DIRECTAS del backend.
+#
+# INFRA-1: versiones FIJAS (==), no rangos abiertos (>=).
+#
+# Con `>=` cada build de Render podía traer una versión distinta sin que
+# cambiara una sola línea de código: el mismo commit dejaba de ser el mismo
+# despliegue. Estos números NO son una actualización ni un downgrade: son
+# exactamente los que Render instaló en el último build correcto
+# (2026-09-09), leídos del log de ese deploy.
+#
+# Solo se fijan las dependencias DIRECTAS. Las transitivas se dejan resolver
+# a pip a propósito: un `pip freeze` de una máquina Windows/Python 3.13 no
+# describe el entorno real (Linux/Python 3.14.3) y fijarlas a ciegas podría
+# romper el build. Un lock completo con hashes es trabajo de una fase aparte,
+# hecha en un entorno idéntico al de producción.
+#
+# NOTA: el repo no fija la versión de Python. Render usa su default —hoy
+# 3.14.3, según el log del build— y ese default puede cambiar solo. Fijarlo
+# requiere autorización aparte: no se toca aquí.
+#
+# Para cambiar una versión: verificar antes que el deploy con ella fue
+# correcto, y actualizar este archivo en el mismo commit.
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+SQLAlchemy==2.0.52
+Werkzeug==3.1.8
+gunicorn==26.2.0
+python-dotenv==1.2.3
+PyJWT==2.13.0
+psycopg2-binary==2.9.12
+bleach==6.4.0
+cryptography==50.0.1
+reportlab==5.0.1
+Pillow==12.3.0
+pypdf==6.18.0
+alembic==1.19.2
+redis==8.1.0
 pywebpush==2.4.0
