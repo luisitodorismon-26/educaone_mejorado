@@ -1208,13 +1208,13 @@ export const ConfiguracionPage = () => {
               value={asignaturaForm.area_curricular_codigo}
               onChange={e => setAsignaturaForm({ ...asignaturaForm, area_curricular_codigo: e.target.value })}
               options={areasCurriculares.map(a => ({ value: a.codigo, label: `${a.nombre} (${a.codigo})` }))}
-              placeholder="Sin asignar"
+              placeholder="No vinculada al Registro"
             />
             <p className="mt-1 text-xs text-gray-500">
-              Determina el bloque de Competencias e Indicadores de Logro del Registro Escolar
-              de Secundaria. Déjala <strong>Sin asignar</strong> si la asignatura no forma parte
-              del Registro oficial (por ejemplo, materias complementarias del colegio): seguirá
-              teniendo profesor, horario, calificaciones y boletín con normalidad.
+              Solo selecciona un área si esta asignatura corresponde a uno de los bloques
+              oficiales del Registro Escolar de Secundaria. Las materias adicionales del colegio
+              pueden permanecer como <strong>No vinculada al Registro</strong> y seguir
+              funcionando normalmente en boletines, notas, horarios y reportes.
             </p>
           </div>
         </div>
