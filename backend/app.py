@@ -843,6 +843,42 @@ async def lifespan(app):
                             f"No se pudo agregar asignaturas.area_curricular_codigo: {e}")
                         raise
 
+        # === 6h. Autovínculo curricular de asignaturas oficiales (R2.1E) ===
+        # NO es una migración de schema: no crea, altera ni borra columnas.
+        # Rellena `area_curricular_codigo` SOLO en filas que lo tienen NULL y
+        # cuyo nombre coincide EXACTAMENTE con un alias oficial inequívoco
+        # ("Inglés" -> LEI). Es idempotente: una fila ya vinculada no se vuelve
+        # a mirar, así que correrlo N veces equivale a correrlo una.
+        #
+        # Lo que NO hace: no cambia nombres, ni códigos legacy, ni el rótulo
+        # `area`, ni ninguna selección de indicadores ni contenido clave; no
+        # toca mappings ya existentes; y si autovincular provocara una colisión
+        # de bloque en un curso, deja la fila en NULL y lo reporta en vez de
+        # elegir por su cuenta.
+        #
+        # Rollback: UPDATE asignaturas SET area_curricular_codigo = NULL
+        #           WHERE id IN (...las que reporte el log...);
+        if 'asignaturas' in inspect(engine).get_table_names():
+            _cols_asig = {c['name'] for c in inspect(engine).get_columns('asignaturas')}
+            if 'area_curricular_codigo' in _cols_asig:
+                try:
+                    from area_curricular_autovinculo import autovincular_existentes
+                    _s_auto = SessionLocal()
+                    try:
+                        _res = autovincular_existentes(_s_auto)
+                    finally:
+                        _s_auto.close()
+                    if _res['vinculadas'] or _res['colisiones']:
+                        logger.info(
+                            "✅ R2.1E autovínculo curricular: %d vinculada(s), "
+                            "%d sin alias oficial, %d omitida(s) por colisión",
+                            _res['vinculadas'], _res['sin_alias'], _res['colisiones'])
+                except Exception as e:
+                    # El autovínculo es una comodidad: nunca debe impedir el
+                    # arranque. Si falla, las asignaturas siguen configurables
+                    # a mano desde Configuración.
+                    logger.warning(f"No se pudo ejecutar el autovínculo curricular: {e}")
+
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
         # Acelera queries frecuentes:
@@ -3213,6 +3249,18 @@ async def crear_asignatura(request: Request, db: Session = Depends(get_db), curr
     area_curr, err_area = _area_curricular_desde_payload(data, None)
     if err_area:
         return JSONResponse({'error': err_area}, status_code=400)
+
+    # R2.1E: si no se indicó área, se intenta inferirla del NOMBRE, pero solo
+    # con coincidencia EXACTA contra la tabla de alias oficiales. "Inglés" es
+    # LEI en cualquier colegio del país y no debería exigir configuración
+    # manual; "Inglés Conversacional" no coincide y se queda en NULL, que es un
+    # estado válido. Si el cliente mandó un área explícita, manda esa.
+    if area_curr is None and 'area_curricular_codigo' not in data:
+        from area_curricular_autovinculo import inferir_area
+        area_curr = inferir_area(data.get('nombre'))
+        if area_curr:
+            logger.info("Autovínculo al crear: %r -> bloque %s",
+                        data.get('nombre'), area_curr)
 
     asig = Asignatura(
         nombre=data['nombre'],
