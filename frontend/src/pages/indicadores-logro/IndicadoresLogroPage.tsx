@@ -65,8 +65,10 @@ const ETIQUETA_ESTADO: Record<string, { texto: string; clase: string }> = {
 
 export const IndicadoresLogroPage = () => {
   const { user } = useAuth();
+  // R2.1E: la ruta ya es profesor-only, pero el filtro de cursos se conserva
+  // por defensa en profundidad. `esDireccion` desapareció con el mensaje que
+  // remitía a Configuración: esa pantalla no es del profesor.
   const esProfesor = user?.role === 'profesor';
-  const esDireccion = user?.role === 'direccion';
 
   const [cursos, setCursos] = useState<Curso[]>([]);
   const [asignaturas, setAsignaturas] = useState<Asignatura[]>([]);
@@ -355,18 +357,19 @@ export const IndicadoresLogroPage = () => {
 
           {cargando && <div className="flex justify-center py-10"><Spinner /></div>}
 
-          {/* Asignatura sin bloque oficial en el Registro: NO es un error */}
+          {/* Asignatura sin bloque oficial en el Registro: NO es un error.
+              R2.1E: esta pantalla es del profesor, así que el mensaje no lo
+              manda a Configuración —no es su pantalla— sino a Dirección. */}
           {!cargando && sinVinculo && (
             <Alert variant="info">
               <div className="flex gap-2">
                 <Info className="w-5 h-5 shrink-0 mt-0.5" />
                 <div>
-                  <p>{sinVinculo}</p>
-                  {esDireccion && (
-                    <p className="mt-2 text-sm">
-                      Puedes configurarla en <strong>Configuración → Asignaturas</strong>.
-                    </p>
-                  )}
+                  <p>
+                    Esta asignatura no forma parte de un bloque curricular del Registro
+                    Escolar de Secundaria. Si consideras que debería estar vinculada,
+                    comunícalo a Dirección.
+                  </p>
                 </div>
               </div>
             </Alert>

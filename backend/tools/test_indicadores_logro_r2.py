@@ -111,6 +111,9 @@ GRADO_PRIM = 3
 U_COORD_SEC, U_PROF_X, U_PROF_INST = 14, 15, 16
 MAT, LEN, MAT_B = 101, 102, 201
 U_DIR_A, U_PROF_A, U_PROF_B, U_DIR_B = 10, 11, 12, 13
+# R2.1E: los endpoints de Indicadores son professor-only. Las pruebas de
+# tenant necesitan un PROFESOR del colegio B, no su dirección.
+U_PROF_COLB = 17
 PWD = "Prueba2026x"
 
 
@@ -148,6 +151,7 @@ def _seed():
             (U_COORD_SEC, "coord_sec", "coordinador", COL_A),
             (U_PROF_X, "prof_x", "profesor", COL_A),
             (U_PROF_INST, "prof_inst", "profesor", COL_A),
+            (U_PROF_COLB, "prof_colb", "profesor", COL_B),
         ):
             u = M.Usuario(id=uid, username=uname, nombre=uname, apellido="T", role=rol, colegio_id=col)
             if uname == "coord_sec":
@@ -170,6 +174,9 @@ def _seed():
                                    curso_id=C5_PREV, asignatura_id=MAT, activo=True))
         d.add(M.AsignacionProfesor(id=7, colegio_id=COL_A, profesor_id=U_PROF_INST,
                                    curso_id=C5_PREV, asignatura_id=LEN, activo=True))
+        # Profesor del colegio B sobre su propio par.
+        d.add(M.AsignacionProfesor(id=8, colegio_id=COL_B, profesor_id=U_PROF_COLB,
+                                   curso_id=C3, asignatura_id=MAT_B, activo=True))
         # (C2, LEN) queda DELIBERADAMENTE sin asignación: par NO académico.
         d.commit()
     finally:
@@ -213,6 +220,11 @@ PROF_B = login("prof_b")
 DIR_B = login("dir_b")
 COORD_SEC = login("coord_sec")
 PROF_X = login("prof_x")
+PROF_COLB = login("prof_colb")
+# R2.1E: prof_inst es el docente de los pares institucionales (C2, MAT) y
+# (C5_PREV, MAT/LEN). Antes esos pares los escribía dirección; ahora los escribe
+# su propio profesor.
+PROF_INST = login("prof_inst")
 print(f"{G}✓ DB de test AISLADA:{X} {_eu}")
 
 
@@ -281,9 +293,9 @@ def _():
 def _():
     # C5 pertenece al año anterior. El default sigue siendo el año ACTIVO, así
     # que escribir en un año histórico exige pedirlo EXPLÍCITAMENTE.
-    r = post_ind(DIR_A, C5_PREV, MAT, 1, "Indicador del año anterior")
+    r = post_ind(PROF_INST, C5_PREV, MAT, 1, "Indicador del año anterior")
     assert r.status_code == 400, "sin ano_escolar_id explícito debe rechazarse"
-    r = post_ind(DIR_A, C5_PREV, MAT, 1, "Indicador del año anterior",
+    r = post_ind(PROF_INST, C5_PREV, MAT, 1, "Indicador del año anterior",
                  ano_escolar_id=ANO_A_PREV)
     assert r.status_code == 201, r.text
     filas = _filas({"asignatura_id": MAT, "periodo": 1})
@@ -294,23 +306,26 @@ def _():
 
 @test("§1 el indicador de un año NO aparece en el listado de otro año")
 def _():
-    actual = get_ind(DIR_A, curso_id=C1, asignatura_id=MAT).json()          # año activo
-    previo = get_ind(DIR_A, curso_id=C5_PREV, asignatura_id=MAT,
+    actual = get_ind(PROF_B, curso_id=C1, asignatura_id=MAT).json()         # año activo
+    assert actual, "el listado del año activo no puede venir vacío"
+    previo = get_ind(PROF_INST, curso_id=C5_PREV, asignatura_id=MAT,
                      ano_escolar_id=ANO_A_PREV).json()
     assert all(i["ano_escolar_id"] == ANO_A for i in actual), actual
     assert all(i["ano_escolar_id"] == ANO_A_PREV for i in previo), previo
     assert not any(i["contenido"] == "Indicador del año anterior" for i in actual)
     assert len(previo) == 1 and previo[0]["contenido"] == "Indicador del año anterior"
     # el listado del año ACTIVO no muestra el curso del año anterior
-    assert get_ind(DIR_A, curso_id=C5_PREV, asignatura_id=MAT).json() == []
+    assert get_ind(PROF_INST, curso_id=C5_PREV, asignatura_id=MAT).json() == []
 
 
 @test("§2 tenant: Colegio B no lee NADA del Colegio A (ni por id directo)")
 def _():
-    assert get_ind(DIR_B, curso_id=C1, asignatura_id=MAT).json() == []
-    assert get_ind(DIR_B).json() == []
+    # Un PROFESOR del colegio B no ve nada del colegio A (R2.1E: dirección ya
+    # no consume estos endpoints, así que el tenant se prueba con un profesor).
+    assert get_ind(PROF_COLB, curso_id=C1, asignatura_id=MAT).json() == []
+    assert get_ind(PROF_COLB).json() == []
     ajeno = _filas({"curso_id": C1, "asignatura_id": MAT, "ano_escolar_id": ANO_A, "periodo": 1})[0]
-    r = client.delete(f"/api/indicadores-logro/{ajeno.id}", headers=auth(DIR_B))
+    r = client.delete(f"/api/indicadores-logro/{ajeno.id}", headers=auth(PROF_COLB))
     assert r.status_code == 404, f"IDOR: {r.status_code}"
     assert _filas({"curso_id": C1, "asignatura_id": MAT, "ano_escolar_id": ANO_A, "periodo": 1}), "se borró un dato ajeno"
 
@@ -322,17 +337,17 @@ VACIO_MIXTO = " " + chr(10) + chr(9) + " "
 def _():
     # (a) vacío sobre par sin indicador -> no crea basura
     n0 = len(_filas())
-    r = post_ind(DIR_A, C1, LEN, 3, "   ")
+    r = post_ind(PROF_X, C1, LEN, 3, "   ")
     assert r.status_code == 200 and r.json().get("id") is None, r.text
     assert len(_filas()) == n0, "se creó una fila con contenido vacío"
 
     # (b) vacío sobre uno EXISTENTE -> 400, y la fila queda INTACTA
-    assert post_ind(DIR_A, C1, LEN, 3, "contenido original").status_code == 201
+    assert post_ind(PROF_X, C1, LEN, 3, "contenido original").status_code == 201
     antes = _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 3})
     assert len(antes) == 1
     id_antes, texto_antes = antes[0].id, antes[0].contenido
     for vacio in ("", "   ", VACIO_MIXTO):
-        r = post_ind(DIR_A, C1, LEN, 3, vacio)
+        r = post_ind(PROF_X, C1, LEN, 3, vacio)
         assert r.status_code == 400, f"POST vacío devolvió {r.status_code}: {r.text[:120]}"
         assert "Eliminar" in r.json().get("error", ""), r.json()
     despues = _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 3})
@@ -340,29 +355,30 @@ def _():
     assert despues[0].id == id_antes and despues[0].contenido == texto_antes, "se alteró el contenido"
 
     # (c) la ÚNICA vía de borrado es DELETE explícito
-    r = client.delete(f"/api/indicadores-logro/{id_antes}", headers=auth(DIR_A))
+    r = client.delete(f"/api/indicadores-logro/{id_antes}", headers=auth(PROF_X))
     assert r.status_code == 200, r.text
     assert _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 3}) == []
 
 
 @test("§R2-extra DELETE: profesor sin asignación activa exacta → 403; con ella → 200")
 def _():
-    assert post_ind(DIR_A, C1, LEN, 4, "para borrar").status_code == 201
+    assert post_ind(PROF_X, C1, LEN, 4, "para borrar").status_code == 201
     fila = _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 4})[0]
     # prof_b solo tiene (C1, MAT), no (C1, LEN)
     assert client.delete(f"/api/indicadores-logro/{fila.id}", headers=auth(PROF_B)).status_code == 403
     assert _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 4}), "se borró pese al 403"
-    assert client.delete(f"/api/indicadores-logro/{fila.id}", headers=auth(DIR_A)).status_code == 200
+    assert client.delete(f"/api/indicadores-logro/{fila.id}", headers=auth(PROF_X)).status_code == 200
     assert _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 4}) == []
 
 
 @test("§R2-extra validaciones: período fuera de 1-4 → 400; texto > límite → 400")
 def _():
-    assert post_ind(DIR_A, C1, MAT, 5, "x").status_code == 400
-    assert post_ind(DIR_A, C1, MAT, 0, "x").status_code == 400
+    # prof_b es el docente vigente de (C1, MAT) desde §5.
+    assert post_ind(PROF_B, C1, MAT, 5, "x").status_code == 400
+    assert post_ind(PROF_B, C1, MAT, 0, "x").status_code == 400
     from app import INDICADOR_LOGRO_MAX_CHARS as LIM
-    assert post_ind(DIR_A, C1, MAT, 4, "a" * (LIM + 1)).status_code == 400
-    assert post_ind(DIR_A, C1, MAT, 4, "a" * LIM).status_code == 201
+    assert post_ind(PROF_B, C1, MAT, 4, "a" * (LIM + 1)).status_code == 400
+    assert post_ind(PROF_B, C1, MAT, 4, "a" * LIM).status_code == 201
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -372,14 +388,14 @@ def _():
 def _():
     n0 = len(_filas())
     # (a) coherente: C1 pertenece a ANO_A
-    assert post_ind(DIR_A, C1, LEN, 2, "coherente", ano_escolar_id=ANO_A).status_code == 201
+    assert post_ind(PROF_X, C1, LEN, 2, "coherente", ano_escolar_id=ANO_A).status_code == 201
     # (b) incoherente: C1 es de ANO_A, se pide ANO_A_PREV
-    r = post_ind(DIR_A, C1, LEN, 1, "año equivocado", ano_escolar_id=ANO_A_PREV)
+    r = post_ind(PROF_X, C1, LEN, 1, "año equivocado", ano_escolar_id=ANO_A_PREV)
     assert r.status_code == 400, r.text
     assert "año escolar" in r.json().get("error", "").lower(), r.json()
     assert not _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 1}), "creó la fila pese al 400"
     # (c) al revés: curso del año anterior con el año activo
-    r = post_ind(DIR_A, C5_PREV, LEN, 1, "otra vez mal", ano_escolar_id=ANO_A)
+    r = post_ind(PROF_INST, C5_PREV, LEN, 1, "otra vez mal", ano_escolar_id=ANO_A)
     assert r.status_code == 400, r.text
     assert not _filas({"curso_id": C5_PREV, "asignatura_id": LEN, "periodo": 1})
     # nada más se creó salvo (a)
@@ -390,29 +406,34 @@ def _():
 def _():
     fila = _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 2})[0]
     original = fila.contenido
-    r = post_ind(DIR_A, C1, LEN, 2, "intento de pisar", ano_escolar_id=ANO_A_PREV)
+    r = post_ind(PROF_X, C1, LEN, 2, "intento de pisar", ano_escolar_id=ANO_A_PREV)
     assert r.status_code == 400, r.text
     assert _filas({"curso_id": C1, "asignatura_id": LEN, "periodo": 2})[0].contenido == original
 
 
-@test("§H3 lente de nivel: coordinador de secundaria NO escribe ni borra en primaria")
+@test("§H3 R2.1E: coordinación NO consume la herramienta de Indicadores (403)")
 def _():
-    # (a) curso de SECUNDARIA -> permitido
-    r = post_ind(COORD_SEC, C2, MAT, 1, "coord en secundaria")
-    assert r.status_code == 201, r.text
-    # (b) curso de PRIMARIA -> bloqueado, sin escribir
-    r = post_ind(COORD_SEC, C4_PRIM, MAT, 1, "coord en primaria")
-    assert r.status_code == 403, r.text
-    assert not _filas({"curso_id": C4_PRIM}), "escribió fuera de su nivel"
-    # (c) DELETE de un indicador de primaria -> bloqueado
-    assert post_ind(DIR_A, C4_PRIM, MAT, 1, "creado por dirección").status_code == 201
+    # Hasta R2.1D el coordinador podía escribir dentro de su lente de nivel.
+    # R2.1E lo retira: Indicadores y Contenidos Claves los trabaja el PROFESOR
+    # de la asignatura; coordinación revisa el resultado en el Registro Escolar.
+    # La lente de nivel deja de ser relevante aquí porque no hay acceso alguno.
+    n0 = len(_filas())
+    for curso in (C2, C4_PRIM):                       # secundaria y primaria
+        r = post_ind(COORD_SEC, curso, MAT, 1, "coord ya no escribe")
+        assert r.status_code == 403, (curso, r.status_code, r.text[:110])
+    assert len(_filas()) == n0, "escribió pese al 403"
+
+    # Contraparte positiva: el docente del par de SECUNDARIA sí escribe.
+    assert post_ind(PROF_INST, C2, MAT, 1, "su propio par de secundaria").status_code == 201
+
+    # Un profesor con asignación activa SÍ trabaja su propio par de primaria.
+    assert post_ind(PROF_X, C4_PRIM, MAT, 1, "creado por su profesor").status_code == 201
     prim = _filas({"curso_id": C4_PRIM, "asignatura_id": MAT, "periodo": 1})[0]
+    # y coordinación tampoco puede borrarlo ni verlo
     r = client.delete(f"/api/indicadores-logro/{prim.id}", headers=auth(COORD_SEC))
     assert r.status_code == 403, r.text
-    assert _filas({"curso_id": C4_PRIM, "asignatura_id": MAT, "periodo": 1}), "borró fuera de su nivel"
-    # (d) el GET tampoco se lo muestra
-    vistos = get_ind(COORD_SEC, curso_id=C4_PRIM).json()
-    assert vistos == [], vistos
+    assert _filas({"curso_id": C4_PRIM, "asignatura_id": MAT, "periodo": 1}), "borró pese al 403"
+    assert get_ind(COORD_SEC, curso_id=C4_PRIM).status_code == 403
 
 
 @test("§H3-b profesor con asignación REAL cross-level: permitido en ambos niveles")
@@ -454,7 +475,7 @@ def _():
     antes = sorted((f.id, f.contenido) for f in
                    _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 1}))
     assert len(antes) == 2, antes
-    r = post_ind(DIR_A, C2, MAT, 1, "intento sobre duplicados")
+    r = post_ind(PROF_INST, C2, MAT, 1, "intento sobre duplicados")
     assert r.status_code == 409, r.text
     despues = sorted((f.id, f.contenido) for f in
                      _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 1}))
@@ -476,31 +497,40 @@ def _():
                for n in idx), f"no se restauró la clave única: {idx}"
 
 
-@test("§G1 pareja académica: dirección puede escribir en un par REAL de otro docente")
+@test("§G1 R2.1E: dirección YA NO escribe indicadores, ni en un par válido")
 def _():
-    # (C2, MAT) está asignada a prof_inst, no a dirección: aun así es válida.
+    # (C2, MAT) es un par académico real de prof_inst. Hasta R2.1D dirección
+    # podía escribir sobre él; R2.1E lo prohíbe: 403 por rol.
+    n0 = len(_filas())
     r = post_ind(DIR_A, C2, MAT, 3, "dirección sobre par de otro docente")
-    assert r.status_code == 201, r.text
+    assert r.status_code == 403, (r.status_code, r.text[:120])
+    assert not _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 3})
+    assert len(_filas()) == n0
+    # el docente del par sí puede
+    assert post_ind(PROF_INST, C2, MAT, 3, "su propio par").status_code == 201
     assert len(_filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 3})) == 1
 
 
-@test("§G1-b dirección + asignatura del colegio NO vinculada al curso → 400 sin crear fila")
+@test("§G1-b R2.1E: dirección sobre un par inexistente también es 403, sin crear fila")
 def _():
+    # Antes daba 400 ("no está asignada a este curso"). Ahora el rol se evalúa
+    # primero: 403. En ambos casos NO se crea un indicador huérfano, que es la
+    # propiedad que este test protege.
     n0 = len(_filas())
     r = post_ind(DIR_A, C2, LEN, 1, "par inexistente")     # (C2, LEN) sin asignación
-    assert r.status_code == 400, r.text
-    assert "asignada a este curso" in r.json().get("error", ""), r.json()
+    assert r.status_code == 403, (r.status_code, r.text[:120])
     assert not _filas({"curso_id": C2, "asignatura_id": LEN}), "creó un indicador huérfano"
     assert len(_filas()) == n0, "hubo escrituras inesperadas"
 
 
-@test("§G1-c coordinador: mismo criterio dentro de su nivel (par inválido → 400)")
+@test("§G1-c R2.1E: coordinación tampoco escribe, ni sobre un par válido")
 def _():
-    r = post_ind(COORD_SEC, C2, LEN, 2, "par inexistente")
-    assert r.status_code == 400, r.text
+    n0 = len(_filas())
+    assert post_ind(COORD_SEC, C2, LEN, 2, "par inexistente").status_code == 403
     assert not _filas({"curso_id": C2, "asignatura_id": LEN})
-    # y con un par válido de su nivel sí puede
-    assert post_ind(COORD_SEC, C2, MAT, 4, "coord sobre par válido").status_code == 201
+    assert post_ind(COORD_SEC, C2, MAT, 4, "coord sobre par válido").status_code == 403
+    assert not _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 4})
+    assert len(_filas()) == n0
 
 
 @test("§G1-d profesor conserva su comportamiento: 403 (no 400) por asignación propia")
@@ -521,8 +551,14 @@ def _():
         d.commit()
     finally:
         d.close()
+    # R2.1E: dirección recibe 403 por rol antes de llegar a la comprobación de
+    # pareja. Lo que este test protege —que una asignación INACTIVA no habilite
+    # el par— se sigue verificando con el propio docente, que pasa a 403 porque
+    # su asignación dejó de estar activa.
     r = post_ind(DIR_A, C2, MAT, 2, "par desactivado")
-    assert r.status_code == 400, r.text
+    assert r.status_code == 403, (r.status_code, r.text[:120])
+    r = post_ind(PROF_INST, C2, MAT, 2, "par desactivado")
+    assert r.status_code == 403, (r.status_code, r.text[:120])
     assert not _filas({"curso_id": C2, "asignatura_id": MAT, "periodo": 2})
     d = SessionLocal()
     try:

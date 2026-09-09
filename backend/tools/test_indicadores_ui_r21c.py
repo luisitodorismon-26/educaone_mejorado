@@ -108,6 +108,10 @@ G4, G1, G_PRIM, G_MALO = 4, 1, 90, 91      # grados
 C4, C1, C_PRIM, C_MALO, C_B = 40, 10, 70, 80, 30
 LEF, LEI, MUSICA, MAT1, LEF_B = 101, 102, 103, 104, 201
 U_DIR_A, U_PROF_A, U_COORD, U_DIR_B, U_PROF_B = 10, 11, 12, 13, 14
+# R2.1E: los endpoints de Indicadores son professor-only, así que las pruebas
+# de continuidad y de tenant necesitan PROFESORES, no dirección.
+U_PROF_A2 = 16      # 2º profesor del colegio A sobre el MISMO par (C4, LEF)
+U_PROF_COLB = 17    # profesor del colegio B, para el aislamiento cross-tenant
 PWD = "Prueba2026x"
 
 # Claves reales del catálogo
@@ -165,6 +169,8 @@ def _seed():
             (U_COORD, "coord_a", "coordinador", COL_A),
             (U_DIR_B, "dir_b", "direccion", COL_B),
             (U_PROF_B, "prof_b", "profesor", COL_A),
+            (U_PROF_A2, "prof_a2", "profesor", COL_A),
+            (U_PROF_COLB, "prof_colb", "profesor", COL_B),
         ):
             u = M.Usuario(id=uid, username=uname, nombre=uname, apellido="T", role=rol, colegio_id=col)
             u.set_password(PWD)
@@ -178,6 +184,11 @@ def _seed():
                                        curso_id=cu, asignatura_id=asig, activo=True))
         # prof_b NO tiene ninguna asignación.
         d.add(M.AsignacionProfesor(id=20, colegio_id=COL_B, profesor_id=U_DIR_B,
+                                   curso_id=C_B, asignatura_id=LEF_B, activo=True))
+        # 2º profesor sobre (C4, LEF): dos docentes en el mismo par es legítimo.
+        d.add(M.AsignacionProfesor(id=21, colegio_id=COL_A, profesor_id=U_PROF_A2,
+                                   curso_id=C4, asignatura_id=LEF, activo=True))
+        d.add(M.AsignacionProfesor(id=22, colegio_id=COL_B, profesor_id=U_PROF_COLB,
                                    curso_id=C_B, asignatura_id=LEF_B, activo=True))
         d.commit()
     finally:
@@ -228,6 +239,8 @@ PROF_A = login("prof_a")
 COORD = login("coord_a")
 DIR_B = login("dir_b")
 PROF_B = login("prof_b")
+PROF_A2 = login("prof_a2")
+PROF_COLB = login("prof_colb")
 
 
 # ===========================================================================
@@ -245,8 +258,17 @@ def _():
         assert legacy in fisico
 
 
-@test("§A2 migración idempotente y sin inferir valores desde nombre/codigo/area")
+@test("§A2 migración idempotente; la columna no la rellena el ALTER sino R2.1E")
 def _():
+    # R2.1E: la MIGRACIÓN de schema sigue sin inferir nada —solo agrega la
+    # columna, nullable y sin DEFAULT—. Lo que rellena valores en el arranque es
+    # el autovínculo curricular (§6h), un paso posterior e independiente que
+    # actúa SOLO sobre filas NULL y SOLO con alias oficiales exactos.
+    #
+    # Este test comprueba las dos cosas por separado: que el ALTER es aditivo e
+    # idempotente, y que el relleno posterior es exactamente el del catálogo de
+    # alias, nunca una heurística sobre `codigo` o `area`.
+    from area_curricular_autovinculo import inferir_area
     with engine.connect() as conn:
         conn.execute(text("DROP TABLE IF EXISTS asignaturas_bak"))
         conn.execute(text(
@@ -275,10 +297,21 @@ def _():
             "SELECT id, nombre, codigo, area, area_curricular_codigo FROM asignaturas ORDER BY id")))
     assert "area_curricular_codigo" in cols
     assert len(filas) == 5, filas
-    # NINGÚN backfill: "Frances"/codigo LE/area "Lenguas" no produjo un valor
-    assert all(f[4] is None for f in filas), filas
-    # y los campos legacy no se tocaron
+    # Los campos legacy NO se tocaron: el autovínculo solo escribe la columna nueva.
     assert [f[1] for f in filas] == ["Frances", "Inglés", "Musica", "Matemática", "Frances"]
+    assert [f[2] for f in filas] == ["LE", "LE", "MS", "MA", "LE"]
+    assert [f[3] for f in filas] == ["Lenguas", "Lenguas", "", "Matemática", "Lenguas"]
+
+    # El valor de cada fila es EXACTAMENTE el que dicta el alias de su NOMBRE.
+    # Nada salió de `codigo` ni de `area`: las dos "Frances" tienen codigo "LE"
+    # y area "Lenguas", y aun así quedaron en LEF, no en LE.
+    for _id, nombre, _cod, _area, valor in filas:
+        assert valor == inferir_area(nombre), (nombre, valor, inferir_area(nombre))
+    por_nombre = {f[1]: f[4] for f in filas}
+    assert por_nombre["Frances"] == "LEF" and por_nombre["Inglés"] == "LEI"
+    assert por_nombre["Matemática"] == "MAT"
+    # "Musica" no es un alias oficial: se queda sin vincular, que es válido.
+    assert por_nombre["Musica"] is None, por_nombre
 
     with engine.connect() as conn:   # restaurar el escenario de los tests
         conn.execute(text("DROP TABLE asignaturas_bak"))
@@ -414,16 +447,21 @@ def _():
 
 @test("§C5 RBAC/IDOR del catálogo")
 def _():
+    # R2.1E: la herramienta de Indicadores es del PROFESOR. Dirección y
+    # coordinación ya no la consumen: revisan el resultado en el Registro.
+    assert cat(DIR_A, C4, LEF).status_code == 403
+    assert cat(COORD, C4, LEF).status_code == 403
     # profesor sin asignación al par
     assert cat(PROF_B, C4, LEF).status_code == 403
-    # par no académico (C1, MAT1) -> 400
-    assert cat(DIR_A, C1, MAT1).status_code == 400
-    # otro tenant: el curso del colegio B no existe para el colegio A
-    assert cat(DIR_A, C_B, LEF_B).status_code == 404
-    assert cat(DIR_B, C4, LEF).status_code == 404
-    # dirección y coordinación sí pueden ver el par académico
-    assert cat(DIR_A, C4, LEF).status_code == 200
-    assert cat(COORD, C4, LEF).status_code == 200
+    # otro tenant: un profesor del colegio B no alcanza un curso del A
+    assert cat(PROF_COLB, C4, LEF).status_code == 404
+    assert cat(PROF_A, C_B, LEF_B).status_code == 404
+    # el profesor del par SÍ
+    assert cat(PROF_A, C4, LEF).status_code == 200
+    # NOTA: el 400 de "par no académico" ya no es alcanzable. Para un profesor
+    # la guarda de asignación activa (403) se evalúa antes, y es más estricta:
+    # tener el par asignado implica que el par existe. La comprobación de pareja
+    # sigue en el código como defensa en profundidad.
 
 
 @test("§C6 el buscador acepta código y texto, y devuelve el contexto CF/CE")
@@ -552,8 +590,8 @@ def _():
 @test("§D7 guardado PARCIAL permitido y estados pendiente/parcial/completo")
 def _():
     # solo indicadores
-    r = guardar(DIR_A, C4, MAT1, 1, [], "")   # par no académico -> 400, no cuenta
-    assert r.status_code == 400
+    # R2.1E: dirección ya no guarda indicadores.
+    assert guardar(DIR_A, C4, MAT1, 1, [], "").status_code == 403
     r = guardar(PROF_A, C1, LEF, 1, [K_LEF1], "")
     assert r.status_code == 200, r.text
     assert r.json()["estado"] == "parcial", r.json()["estado"]
@@ -603,13 +641,14 @@ def _():
         contenidos_antes = il.contenidos_claves
     finally:
         d.close()
-    # dirección edita el mismo período: pasa a ser el último editor
-    r = guardar(DIR_A, C4, LEF, 1, antes, contenidos_antes)
+    # Un SEGUNDO PROFESOR con asignación activa sobre el mismo par edita el
+    # período: pasa a ser el último editor sin perder nada de lo anterior.
+    r = guardar(PROF_A2, C4, LEF, 1, antes, contenidos_antes)
     assert r.status_code == 200, r.text
     d = SessionLocal()
     try:
         il = d.query(M.IndicadorLogro).filter_by(curso_id=C4, asignatura_id=LEF, periodo=1).first()
-        assert il.profesor_id == U_DIR_A
+        assert il.profesor_id == U_PROF_A2
         assert sorted(s.catalogo_clave for s in il.selecciones) == antes
         assert il.contenidos_claves == contenidos_antes
     finally:
@@ -650,7 +689,7 @@ def _():
         d.close()
     r = client.post("/api/indicadores-logro",
                     json={"curso_id": C4, "asignatura_id": LEF, "periodo": 1,
-                          "contenido": "texto legacy"}, headers=auth(DIR_A))
+                          "contenido": "texto legacy"}, headers=auth(PROF_A))
     assert r.status_code == 200, r.text
     d = SessionLocal()
     try:
@@ -669,7 +708,7 @@ def _():
         il_id, antes = il.id, sorted(s.catalogo_clave for s in il.selecciones)
     finally:
         d.close()
-    r = client.delete(f"/api/indicadores-logro/{il_id}", headers=auth(DIR_A))
+    r = client.delete(f"/api/indicadores-logro/{il_id}", headers=auth(PROF_A))
     assert r.status_code == 409, (r.status_code, r.text[:160])
     assert r.json()["motivo"] == "periodo_con_datos_r21"
     d = SessionLocal()
@@ -686,7 +725,7 @@ def _():
     # P1 tiene 'texto legacy' desde §D12
     r = client.delete("/api/indicadores-logro/periodo",
                       params={"curso_id": C4, "asignatura_id": LEF, "periodo": 1},
-                      headers=auth(DIR_A))
+                      headers=auth(PROF_A))
     assert r.status_code == 409, (r.status_code, r.text[:160])
     assert r.json()["motivo"] == "contenido_legacy_presente"
     d = SessionLocal()
@@ -701,7 +740,11 @@ def _():
 def _():
     antes = n_selecciones()
     assert guardar(PROF_B, C4, LEF, 2, [K_LEF4_A]).status_code == 403
-    assert guardar(DIR_B, C4, LEF, 2, [K_LEF4_A]).status_code == 404
+    # dirección y coordinación: 403 por rol (R2.1E)
+    assert guardar(DIR_A, C4, LEF, 2, [K_LEF4_A]).status_code == 403
+    assert guardar(COORD, C4, LEF, 2, [K_LEF4_A]).status_code == 403
+    # tenant: un profesor del colegio B no alcanza el curso del A
+    assert guardar(PROF_COLB, C4, LEF, 2, [K_LEF4_A]).status_code == 404
     assert client.post("/api/indicadores-logro/periodo",
                        json={"curso_id": C4, "asignatura_id": LEF, "periodo": 2,
                              "catalogo_claves": [K_LEF4_A]}).status_code in (401, 403)
@@ -734,9 +777,11 @@ def _():
     d = r.json()
     assert d["motivo"] == "sin_vinculo_curricular", d
     assert "no está vinculada a un área curricular" in d["error"], d["error"]
-    assert d["puede_configurar"] is False        # prof_a no es dirección
-    r2 = cat(DIR_A, C4, MUSICA)
-    assert r2.status_code == 409 and r2.json()["puede_configurar"] is True
+    # R2.1E: ya no se devuelve `puede_configurar`. El endpoint es professor-only,
+    # así que el valor sería siempre False y anunciaría una capacidad inexistente.
+    assert "puede_configurar" not in d, d
+    # y dirección ni siquiera llega hasta aquí
+    assert cat(DIR_A, C4, MUSICA).status_code == 403
 
 
 @test("§B3 una materia sin vínculo NO recibe indicadores de otra materia")

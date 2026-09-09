@@ -843,6 +843,42 @@ async def lifespan(app):
                             f"No se pudo agregar asignaturas.area_curricular_codigo: {e}")
                         raise
 
+        # === 6h. Autovínculo curricular de asignaturas oficiales (R2.1E) ===
+        # NO es una migración de schema: no crea, altera ni borra columnas.
+        # Rellena `area_curricular_codigo` SOLO en filas que lo tienen NULL y
+        # cuyo nombre coincide EXACTAMENTE con un alias oficial inequívoco
+        # ("Inglés" -> LEI). Es idempotente: una fila ya vinculada no se vuelve
+        # a mirar, así que correrlo N veces equivale a correrlo una.
+        #
+        # Lo que NO hace: no cambia nombres, ni códigos legacy, ni el rótulo
+        # `area`, ni ninguna selección de indicadores ni contenido clave; no
+        # toca mappings ya existentes; y si autovincular provocara una colisión
+        # de bloque en un curso, deja la fila en NULL y lo reporta en vez de
+        # elegir por su cuenta.
+        #
+        # Rollback: UPDATE asignaturas SET area_curricular_codigo = NULL
+        #           WHERE id IN (...las que reporte el log...);
+        if 'asignaturas' in inspect(engine).get_table_names():
+            _cols_asig = {c['name'] for c in inspect(engine).get_columns('asignaturas')}
+            if 'area_curricular_codigo' in _cols_asig:
+                try:
+                    from area_curricular_autovinculo import autovincular_existentes
+                    _s_auto = SessionLocal()
+                    try:
+                        _res = autovincular_existentes(_s_auto)
+                    finally:
+                        _s_auto.close()
+                    if _res['vinculadas'] or _res['colisiones']:
+                        logger.info(
+                            "✅ R2.1E autovínculo curricular: %d vinculada(s), "
+                            "%d sin alias oficial, %d omitida(s) por colisión",
+                            _res['vinculadas'], _res['sin_alias'], _res['colisiones'])
+                except Exception as e:
+                    # El autovínculo es una comodidad: nunca debe impedir el
+                    # arranque. Si falla, las asignaturas siguen configurables
+                    # a mano desde Configuración.
+                    logger.warning(f"No se pudo ejecutar el autovínculo curricular: {e}")
+
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
         # Acelera queries frecuentes:
@@ -3213,6 +3249,28 @@ async def crear_asignatura(request: Request, db: Session = Depends(get_db), curr
     area_curr, err_area = _area_curricular_desde_payload(data, None)
     if err_area:
         return JSONResponse({'error': err_area}, status_code=400)
+
+    # R2.1E: si al CREAR no hay área, se intenta inferirla del NOMBRE, pero solo
+    # con coincidencia EXACTA contra la tabla de alias oficiales. "Inglés" es
+    # LEI en cualquier colegio del país y no debería exigir configuración
+    # manual; "Inglés Conversacional" no coincide y se queda en NULL, que es un
+    # estado válido. Si el cliente mandó un área explícita, manda esa.
+    #
+    # La condición mira el VALOR resuelto, no si la clave venía en el body. Un
+    # formulario que envía `area_curricular_codigo: null` porque su campo está
+    # vacío está diciendo "no elegí área", exactamente igual que omitirla —y eso
+    # es justo lo que manda Configuración → Asignaturas. Distinguir ambos casos
+    # dejaba sin autovincular precisamente a las creadas desde la UI.
+    #
+    # Esto es solo del alta. El PUT NO infiere: ahí `area_curricular_codigo:
+    # null` significa "desvincular", y sigue siendo la vía manual de Dirección
+    # para ajustar o quitar un mapping ya existente.
+    if area_curr is None:
+        from area_curricular_autovinculo import inferir_area
+        area_curr = inferir_area(data.get('nombre'))
+        if area_curr:
+            logger.info("Autovínculo al crear: %r -> bloque %s",
+                        data.get('nombre'), area_curr)
 
     asig = Asignatura(
         nombre=data['nombre'],
@@ -16179,11 +16237,15 @@ def _contexto_curricular(db, current_user, curso, asignatura):
     ok, contexto, mensaje = IC.resolver_contexto(db, curso, asignatura)
     if not ok:
         if contexto == IC.SIN_VINCULO_CURRICULAR:
+            # R2.1E: ya no se devuelve `puede_configurar`. Estos endpoints son
+            # professor-only, así que el valor sería siempre False y sugeriría
+            # una capacidad que quien pregunta nunca tiene. El profesor recibe
+            # el mensaje neutro y avisa a Dirección; configurar el área es de
+            # Dirección, desde Configuración → Asignaturas.
             return None, JSONResponse({
                 'error': mensaje,
                 'motivo': IC.SIN_VINCULO_CURRICULAR,
                 'asignatura_id': asignatura.id,
-                'puede_configurar': current_user.role == 'direccion',
             }, status_code=409)
         return None, JSONResponse({'error': mensaje}, status_code=400)
 
@@ -16246,7 +16308,7 @@ def _indicador_dict_r21(indicador):
 
 
 @app.get("/api/indicadores-logro/catalogo")
-async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """
     Catálogo oficial que corresponde a un (curso, asignatura).
 
@@ -16307,13 +16369,17 @@ async def get_catalogo_indicadores(request: Request, db: Session = Depends(get_d
 
 
 @app.get("/api/indicadores-logro")
-async def get_indicadores_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_indicadores_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """Indicadores de logro del AÑO ESCOLAR (activo por defecto).
 
     Filtros opcionales: curso_id, asignatura_id, periodo, ano_escolar_id.
-    Profesor: solo las parejas EXACTAS (curso, asignatura) con asignación
-    ACTIVA — da igual quién escribió el indicador (continuidad institucional).
-    Dirección/coordinación: su colegio, bajo la lente de nivel vigente.
+
+    R2.1E: professor-only. Devuelve solo las parejas EXACTAS (curso, asignatura)
+    con asignación ACTIVA del profesor que pregunta —da igual quién escribió el
+    indicador: la continuidad institucional se mantiene cuando una asignatura
+    cambia de profesor. Un profesor sin asignaciones recibe una lista vacía.
+    Dirección y coordinación reciben 403; revisan el resultado en el Registro
+    Escolar, no aquí.
     """
     curso_id = request.query_params.get('curso_id')
     asignatura_id = request.query_params.get('asignatura_id')
@@ -16346,7 +16412,7 @@ async def get_indicadores_logro(request: Request, db: Session = Depends(get_db),
 
 
 @app.post("/api/indicadores-logro")
-async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """Crear o actualizar el indicador INSTITUCIONAL del período.
 
     Identidad: colegio + año escolar + curso + asignatura + período.
@@ -16390,10 +16456,13 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
             {'error': 'No tiene asignación activa para este curso y asignatura'}, status_code=403
         )
 
-    # R2-final-guard §1: la pareja (curso, asignatura) debe ser académica REAL,
-    # para TODOS los roles. Dirección/coordinación pueden escribir sobre pares
-    # válidos aunque el docente asignado sea otra persona, pero no sobre
-    # combinaciones inexistentes (indicador huérfano).
+    # R2-final-guard §1: la pareja (curso, asignatura) debe ser académica REAL.
+    # Impide crear un indicador huérfano sobre una combinación inexistente.
+    # R2.1E: el endpoint es professor-only y la guarda de asignación de arriba
+    # ya es más estricta que ésta, así que hoy nunca se llega aquí con un par
+    # inválido. Se conserva como defensa en profundidad: si mañana cambiara
+    # quién puede escribir, esta comprobación sigue siendo la que evita el
+    # huérfano.
     if not _par_curso_asignatura_valido(db, current_user, curso_id, asignatura_id):
         return JSONResponse(
             {'error': 'Esa asignatura no está asignada a este curso. Verifique las '
@@ -16473,7 +16542,7 @@ async def guardar_indicador_logro(request: Request, db: Session = Depends(get_db
 
 
 @app.post("/api/indicadores-logro/periodo")
-async def guardar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def guardar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """
     Guarda un período COMPLETO y de forma ATÓMICA (R2.1C).
 
@@ -16630,7 +16699,7 @@ async def guardar_periodo_indicadores(request: Request, db: Session = Depends(ge
 
 
 @app.delete("/api/indicadores-logro/periodo")
-async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """
     "Limpiar período": borra las selecciones y los contenidos claves de UN
     período concreto (R2.1C).
@@ -16697,12 +16766,12 @@ async def limpiar_periodo_indicadores(request: Request, db: Session = Depends(ge
 
 
 @app.delete("/api/indicadores-logro/{id}")
-async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))):
+async def eliminar_indicador_logro(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('profesor'))):
     """Eliminar un indicador. Tenant safe (get_tenant_or_404 evita IDOR).
 
-    Profesor: solo con asignación ACTIVA sobre la pareja exacta
-    (curso, asignatura) del indicador — no por haberlo escrito él.
-    Dirección/coordinación: dentro de su colegio.
+    R2.1E: professor-only, y solo con asignación ACTIVA sobre la pareja exacta
+    (curso, asignatura) del indicador — no por haberlo escrito él. Dirección y
+    coordinación reciben 403.
     """
     indicador = get_tenant_or_404(db, IndicadorLogro, id, current_user, name='indicador')
     if current_user.role == 'profesor' and not _profesor_tiene_par_activo(
