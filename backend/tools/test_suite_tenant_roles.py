@@ -17,21 +17,79 @@ código != 0 y muestra exactamente qué.
 """
 import sys
 import os
+import atexit
+import tempfile
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# DB limpia para los tests
-db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sge.db')
-for ext in ['', '-shm', '-wal']:
-    if os.path.exists(db_path + ext):
-        os.remove(db_path + ext)
-init_creds = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'INITIAL_CREDENTIALS.txt')
-if os.path.exists(init_creds):
-    os.remove(init_creds)
+# ─────────────────────────────────────────────────────────────────
+# AISLAMIENTO (INFRA-1)
+# ─────────────────────────────────────────────────────────────────
+# Esta suite usaba la base por defecto —`backend/sge.db`— y, para partir
+# limpia, BORRABA del repo `sge.db`, `sge.db-shm`, `sge.db-wal` e
+# `INITIAL_CREDENTIALS.txt`. Eso destruía la base de desarrollo del
+# programador y, al correr suites en paralelo, hacía intermitentes las
+# comprobaciones de ZERO DATA LOSS de las demás (que vigilan el mtime de
+# esos mismos archivos).
+#
+# Ahora la suite vive en su propio directorio temporal. Los archivos del
+# repo no se leen, no se escriben, no se renombran y no se borran: al final
+# se verifica que siguen exactamente como estaban.
+#
+# El DATABASE_URL se fija ANTES de importar `database`, `models` o `app`,
+# porque `database.py` resuelve el engine en tiempo de import
+# (`os.environ.get('DATABASE_URL', 'sqlite:///sge.db')`).
+_BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TMPDIR = tempfile.mkdtemp(prefix="eo_tenant_roles_")
+_TEST_DB = os.path.join(_TMPDIR, "tenant_roles.db").replace("\\", "/")
+os.environ["DATABASE_URL"] = "sqlite:///" + _TEST_DB
+os.environ.setdefault("ENVIRONMENT", "development")
+
+# Huella de los archivos protegidos, tomada ANTES de importar nada.
+_PROTEGIDOS = {
+    nombre: (os.path.getmtime(p), os.path.getsize(p)) if os.path.exists(p) else None
+    for nombre, p in (
+        (n, os.path.join(_BACKEND, n)) for n in
+        ("sge.db", "sge.db-wal", "sge.db-shm", "INITIAL_CREDENTIALS.txt")
+    )
+}
+
+
+@atexit.register
+def _limpiar_tempdir():
+    try:
+        import shutil
+        shutil.rmtree(_TMPDIR, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _verificar_archivos_protegidos(etiqueta):
+    """Ningún archivo real del repo puede haber cambiado por culpa del test."""
+    for nombre, antes in _PROTEGIDOS.items():
+        ruta = os.path.join(_BACKEND, nombre)
+        ahora = (os.path.getmtime(ruta), os.path.getsize(ruta)) if os.path.exists(ruta) else None
+        if ahora != antes:
+            raise AssertionError(
+                f"SEGURIDAD ({etiqueta}): {nombre} cambió durante la suite "
+                f"({antes} -> {ahora}). Esta suite NUNCA debe tocarlo."
+            )
+
 
 from database import engine
 from models import Base
+
+# Barrera dura: si por lo que sea el engine resolviera a la base del repo,
+# la suite se detiene ANTES de crear una sola tabla.
+_url = str(engine.url).replace("\\", "/")
+assert _TMPDIR.replace("\\", "/") in _url, (
+    f"SEGURIDAD: el engine no apunta al directorio temporal: {_url}")
+assert "sge.db" not in _url, f"SEGURIDAD: el test usaría sge.db del repo: {_url}"
+assert os.environ["DATABASE_URL"] == "sqlite:///" + _TEST_DB, \
+    "SEGURIDAD: DATABASE_URL fue sobrescrito tras el arranque"
+_verificar_archivos_protegidos("arranque")
+
 Base.metadata.create_all(bind=engine)
 
 from fastapi.testclient import TestClient
@@ -3066,6 +3124,17 @@ with client:
 print(f"\n{BOLD}{'=' * 60}{RESET}")
 print(f"{BOLD}  RESUMEN: {pasados}/{total} tests pasaron{RESET}")
 print(f"{BOLD}{'=' * 60}{RESET}\n")
+
+# INFRA-1: la suite corrió entera contra su base temporal; los archivos del
+# repo deben seguir intactos. Si no lo están, es un fallo de la suite aunque
+# todas las pruebas hayan pasado.
+try:
+    _verificar_archivos_protegidos("cierre")
+    print(f"{GREEN}✓ SEGURIDAD: sge.db e INITIAL_CREDENTIALS.txt del repo intactos{RESET}")
+    print(f"  DB del test: {_TEST_DB}")
+except AssertionError as _e:
+    print(f"{RED}{BOLD}{_e}{RESET}")
+    sys.exit(1)
 
 if fallos:
     print(f"{RED}{BOLD}TESTS FALLIDOS:{RESET}\n")
