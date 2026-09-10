@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { Modal, Button, Input, Select, Alert } from '../../components/ui';
+import { SalidaOptativaSection } from './SalidaOptativaSection';
 
 interface ConfigColegio {
   nombre: string;
@@ -1230,6 +1231,12 @@ export const ConfiguracionPage = () => {
             <Input label="Capacidad" type="number" value={cursoForm.capacidad} onChange={e => setCursoForm({ ...cursoForm, capacidad: parseInt(e.target.value) || 35 })} />
           </div>
           <Select label="Tanda" value={cursoForm.tanda_id} onChange={e => setCursoForm({ ...cursoForm, tanda_id: parseInt(e.target.value) || 0 })} options={tandas.map(t => ({ value: t.id, label: t.nombre }))} placeholder="Sin tanda" />
+          {/* R3.2: la Salida Optativa necesita un curso ya creado (su id, su año
+              y su grado), así que solo aparece al EDITAR. La propia sección se
+              oculta sola si el grado no es 4to-6to de Secundaria. */}
+          {editingItem && (
+            <SalidaOptativaSection cursoId={editingItem.id} asignaturas={asignaturas} />
+          )}
         </div>
       </Modal>
 

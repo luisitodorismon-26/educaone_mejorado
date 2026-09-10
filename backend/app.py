@@ -55,7 +55,7 @@ from models import (
     HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
     ItemCompletivo, Notificacion,
     AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
-    AlertaAtendida, PushSubscription, init_db
+    AlertaAtendida, PushSubscription, CursoComponenteOptativo, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -3659,6 +3659,348 @@ async def delete_curso(id, request: Request, db: Session = Depends(get_db), curr
     db.commit()
     cache_clear(f'cursos:{current_user.colegio_id}')
     return {'message': 'Curso eliminado'}
+
+
+# ============== SALIDA OPTATIVA (R3.2) ==============
+# La configuración vive donde ya se configura el curso, no en una pantalla
+# nueva del menú: es un atributo del curso, igual que su tanda o su aula.
+#
+# Todo lo que estos endpoints validan sale de `salida_optativa_service` (R3.1).
+# No se reimplementa aquí ninguna regla del catálogo: si mañana cambia el
+# catálogo MINERD, cambia en un solo sitio.
+
+
+def _salida_optativa_estado(db, curso):
+    """
+    Estado completo de la Salida Optativa de un curso, para pintar la sección.
+
+    Incluye siempre el catálogo, de modo que el frontend no necesite una copia
+    propia de las 4 salidas ni de los nombres oficiales de los componentes.
+    """
+    import salidas_optativas as _cat
+    import salida_optativa_service as _svc
+    from salida_optativa_historia import historia_academica
+
+    grado_numero = _svc.grado_numero_de_curso(curso)
+    aplica = _cat.grado_admite_salida(grado_numero)
+    salida = getattr(curso, 'salida_optativa_codigo', None)
+
+    componentes = []
+    for item in _svc.resolver_componentes(db, curso):
+        comp = item['componente']
+        asig_id = item['asignatura_id']
+        asig = db.query(Asignatura).filter(Asignatura.id == asig_id).first() if asig_id else None
+        componentes.append({
+            'componente_codigo': comp.codigo,
+            'nombre_oficial': comp.nombre_oficial,
+            'slot': comp.slot,
+            'horas_semana': comp.horas_semana,
+            'asignatura_id': asig_id,
+            'asignatura_nombre': asig.nombre if asig else None,
+            # Se informa para que la UI pueda deshabilitar el selector ANTES de
+            # que Dirección intente un cambio que el servidor va a rechazar.
+            'tiene_historia': bool(historia_academica(db, curso, asig_id)),
+        })
+
+    faltantes = [c['componente_codigo'] for c in componentes if c['asignatura_id'] is None]
+    return {
+        'curso_id': curso.id,
+        'ano_escolar_id': getattr(curso, 'ano_escolar_id', None),
+        'grado_numero': grado_numero,
+        'aplica': aplica,
+        'salida_optativa_codigo': salida,
+        'salida_optativa_nombre': _cat.nombre_salida(salida),
+        'salidas_disponibles': [{'codigo': c, 'nombre': n}
+                                for c, n in sorted(_cat.SALIDAS.items())],
+        'componentes': componentes,
+        'faltantes': faltantes,
+        # `configurada` exige salida elegida Y todos los componentes vinculados.
+        # Es lo que R3.3 necesita para no imprimir una página a medias.
+        'configurada': bool(salida) and not faltantes and aplica,
+    }
+
+
+@app.get("/api/cursos/{id}/salida-optativa")
+async def get_salida_optativa(id, request: Request, db: Session = Depends(get_db),
+                              current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Configuración de Salida Optativa del curso, más el catálogo oficial."""
+    curso = get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    return _salida_optativa_estado(db, curso)
+
+
+@app.put("/api/cursos/{id}/salida-optativa")
+async def guardar_salida_optativa(id, request: Request, db: Session = Depends(get_db),
+                                  current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Guarda la salida y sus mapeos de componentes de forma ATÓMICA.
+
+    Body:
+        {"salida_optativa_codigo": "HLM"|null,
+         "componentes": {"HLM-LE-4": 12, "HLM-IN-4": 15}}
+
+    `componentes` ausente = no tocar los mapeos. Un componente con valor `null`
+    pide retirar ese vínculo.
+
+    ZERO DATA LOSS (R3.2 §7-§8): antes de cambiar la salida o de reescribir un
+    mapeo se comprueba si la asignatura saliente tiene historia académica en
+    este curso. Si la tiene, se responde 409 y NO se toca absolutamente nada —
+    ni el mapeo, ni la asignatura, ni las notas. Nunca hay cascade delete y
+    nunca se mueven datos de una asignatura a otra.
+    """
+    import salidas_optativas as _cat
+    import salida_optativa_service as _svc
+    from salida_optativa_historia import (MENSAJE_BLOQUEO, historia_academica,
+                                          mapeos_con_historia, resumen_historia)
+
+    curso = get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+
+    grado_numero = _svc.grado_numero_de_curso(curso)
+    if not _cat.grado_admite_salida(grado_numero):
+        return JSONResponse({
+            'error': 'Este curso no tiene Salida Optativa: solo existe en la '
+                     'Modalidad Académica de 4to a 6to de Secundaria.'
+        }, status_code=400)
+
+    ok, err = _svc.validar_ano_para_curso(db, curso)
+    if not ok:
+        return JSONResponse({'error': err}, status_code=400)
+
+    salida_actual = getattr(curso, 'salida_optativa_codigo', None)
+    cambia_salida = 'salida_optativa_codigo' in data
+    salida_nueva = data.get('salida_optativa_codigo') if cambia_salida else salida_actual
+    if isinstance(salida_nueva, str) and not salida_nueva.strip():
+        salida_nueva = None
+
+    ok, err = _svc.validar_salida_para_curso(curso, salida_nueva)
+    if not ok:
+        return JSONResponse({'error': err}, status_code=400)
+
+    existentes = db.query(CursoComponenteOptativo).filter(
+        CursoComponenteOptativo.curso_id == curso.id,
+        CursoComponenteOptativo.colegio_id == curso.colegio_id,
+        CursoComponenteOptativo.ano_escolar_id == curso.ano_escolar_id,
+        CursoComponenteOptativo.activo == True,          # noqa: E712
+    ).all()
+    por_codigo = {m.componente_codigo: m for m in existentes}
+
+    # --- GUARDA 1: cambiar de salida invalida TODOS los mapeos actuales ---
+    if salida_nueva != salida_actual and existentes:
+        bloqueados = mapeos_con_historia(db, curso, existentes)
+        if bloqueados:
+            return JSONResponse({
+                'error': MENSAJE_BLOQUEO,
+                'motivo': 'historia_academica',
+                'componentes_bloqueados': [{
+                    'componente_codigo': b['componente_codigo'],
+                    'asignatura_id': b['asignatura_id'],
+                    'detalle': resumen_historia(b['evidencias']),
+                } for b in bloqueados],
+            }, status_code=409)
+
+    componentes = data.get('componentes')
+    if componentes is not None and not isinstance(componentes, dict):
+        return JSONResponse({'error': "'componentes' debe ser un objeto "
+                                      "{componente_codigo: asignatura_id}"}, status_code=400)
+
+    # --- Validación COMPLETA antes de escribir una sola fila ---
+    # Se valida contra la salida NUEVA, no contra la que había: guardar salida y
+    # componentes es una sola operación y debe validarse como tal.
+    planes = []
+    if componentes:
+        if salida_nueva is None:
+            return JSONResponse({
+                'error': 'No se pueden asignar componentes sin una Salida Optativa elegida.'
+            }, status_code=400)
+        for codigo, asignatura_id in componentes.items():
+            if not _cat.componente_pertenece(codigo, salida_nueva, grado_numero):
+                comp = _cat.componente(codigo)
+                if comp is None:
+                    return JSONResponse({
+                        'error': f'Componente optativo desconocido: {codigo!r}.'
+                    }, status_code=400)
+                return JSONResponse({
+                    'error': f'El componente {codigo!r} ({comp.nombre_oficial}) pertenece a '
+                             f'la salida {comp.salida} de {comp.grado}to y no puede usarse '
+                             f'en un curso de {grado_numero}to configurado como {salida_nueva}.'
+                }, status_code=400)
+
+            if asignatura_id is None:
+                planes.append((codigo, None))
+                continue
+
+            asig = db.query(Asignatura).filter(Asignatura.id == asignatura_id).first()
+            if asig is None:
+                return JSONResponse({'error': f'La asignatura {asignatura_id} no existe.'},
+                                    status_code=400)
+            if asig.colegio_id != curso.colegio_id:
+                # Mismo texto y mismo código para un id inexistente y para uno de
+                # otro colegio: la respuesta no debe revelar qué ids existen.
+                return JSONResponse({'error': 'La asignatura pertenece a otro colegio.'},
+                                    status_code=400)
+            if asig.activo is False:
+                return JSONResponse({
+                    'error': f'La asignatura {asig.nombre!r} está inactiva y no puede '
+                             f'representar un componente optativo.'
+                }, status_code=400)
+            planes.append((codigo, asignatura_id))
+
+        # Una asignatura no puede representar dos componentes del mismo curso.
+        # La UniqueConstraint lo garantiza al final, pero un 400 explicado es
+        # mejor que un IntegrityError.
+        elegidas = [a for _, a in planes if a is not None]
+        if len(set(elegidas)) != len(elegidas):
+            return JSONResponse({
+                'error': 'Una misma asignatura no puede representar dos componentes '
+                         'del mismo curso.'
+            }, status_code=400)
+
+    # --- GUARDA 2: reescribir o retirar un mapeo con historia ---
+    for codigo, asignatura_id in planes:
+        actual = por_codigo.get(codigo)
+        if actual is None or actual.asignatura_id == asignatura_id:
+            continue        # alta nueva, o idempotente: no se pierde nada
+        ev = historia_academica(db, curso, actual.asignatura_id)
+        if ev:
+            return JSONResponse({
+                'error': MENSAJE_BLOQUEO,
+                'motivo': 'historia_academica',
+                'componentes_bloqueados': [{
+                    'componente_codigo': codigo,
+                    'asignatura_id': actual.asignatura_id,
+                    'detalle': resumen_historia(ev),
+                }],
+            }, status_code=409)
+
+    # --- GUARDA 3: la asignatura elegida no puede estar ya en OTRO componente ---
+    # `uq_curso_componente_asignatura` lo impide a nivel de tabla; comprobarlo
+    # aquí convierte un IntegrityError en un 400 que explica qué pasa. Solo
+    # aplica si la salida NO cambia: si cambia, los mapeos viejos se retiran.
+    if salida_nueva == salida_actual:
+        pedidos = {c for c, _ in planes}
+        for codigo, asignatura_id in planes:
+            if asignatura_id is None:
+                continue
+            for m in existentes:
+                if (m.componente_codigo != codigo
+                        and m.componente_codigo not in pedidos
+                        and m.asignatura_id == asignatura_id):
+                    return JSONResponse({
+                        'error': 'Una misma asignatura no puede representar dos '
+                                 'componentes del mismo curso. Ya está asignada a '
+                                 f'{m.componente_codigo}.'
+                    }, status_code=400)
+
+    # --- ESCRITURA (ya todo validado) ---
+    curso.salida_optativa_codigo = salida_nueva
+
+    # Cambiar de salida deja los mapeos viejos sin componente al que pertenecer.
+    # Solo se llega aquí si NINGUNO tenía historia, así que retirarlos no pierde
+    # ningún dato académico: se retira la RELACIÓN (R3.2 §8), nunca la Asignatura
+    # ni ninguna nota.
+    #
+    # Se BORRA la fila en vez de marcarla `activo=False` porque las dos
+    # UniqueConstraint de R3.1 —(curso, año, componente) y (curso, año,
+    # asignatura)— no incluyen `activo`: una fila desactivada seguiría ocupando
+    # su hueco e impediría volver a usar esa asignatura o ese componente. El
+    # rastro del cambio queda en `log_auditoria`, que es donde va la historia de
+    # configuración; aquí solo vive el estado vigente.
+    #
+    # PRIMERO todas las bajas y un flush, DESPUÉS las altas. El unit of work de
+    # SQLAlchemy emite los INSERT antes que los DELETE dentro de un mismo flush,
+    # así que sin este corte una asignatura que se mueve de componente chocaría
+    # contra `uq_curso_componente_asignatura` con su propia fila saliente.
+    hay_bajas = False
+    if salida_nueva != salida_actual:
+        for m in existentes:
+            db.delete(m)
+            hay_bajas = True
+        por_codigo = {}
+    for codigo, asignatura_id in planes:
+        if asignatura_id is None and por_codigo.get(codigo) is not None:
+            db.delete(por_codigo.pop(codigo))
+            hay_bajas = True
+    if hay_bajas:
+        db.flush()
+
+    for codigo, asignatura_id in planes:
+        if asignatura_id is None:
+            continue
+        actual = por_codigo.get(codigo)
+        if actual is not None:
+            actual.asignatura_id = asignatura_id
+            actual.activo = True
+            db.flush()          # la reasignación también compite por la unicidad
+            continue
+        mapeo, err = _svc.construir_mapeo(db, curso, codigo, asignatura_id)
+        if err:
+            db.rollback()
+            return JSONResponse({'error': err}, status_code=400)
+        db.add(mapeo)
+
+    db.commit()
+    log_auditoria(db, 'actualizar', 'cursos', curso.id, None,
+                  {'salida_optativa_codigo': salida_nueva,
+                   'componentes': componentes}, user=current_user, request=request)
+    cache_clear(f'cursos:{current_user.colegio_id}')
+    db.refresh(curso)
+    return _salida_optativa_estado(db, curso)
+
+
+@app.delete("/api/cursos/{id}/salida-optativa/componentes/{componente_codigo}")
+async def quitar_componente_optativo(id, componente_codigo, request: Request,
+                                     db: Session = Depends(get_db),
+                                     current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Retira el vínculo componente -> asignatura. Nunca borra la Asignatura.
+
+    Misma protección que el guardado: si esa asignatura tiene historia académica
+    en este curso, 409 y no se toca nada.
+    """
+    from salida_optativa_historia import (MENSAJE_BLOQUEO_MAPEO, historia_academica,
+                                          resumen_historia)
+
+    curso = get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    mapeo = db.query(CursoComponenteOptativo).filter(
+        CursoComponenteOptativo.curso_id == curso.id,
+        CursoComponenteOptativo.colegio_id == curso.colegio_id,
+        CursoComponenteOptativo.ano_escolar_id == curso.ano_escolar_id,
+        CursoComponenteOptativo.componente_codigo == componente_codigo,
+        CursoComponenteOptativo.activo == True,          # noqa: E712
+    ).first()
+    if mapeo is None:
+        return JSONResponse({'error': 'Ese componente no está vinculado en este curso.'},
+                            status_code=404)
+
+    ev = historia_academica(db, curso, mapeo.asignatura_id)
+    if ev:
+        return JSONResponse({
+            'error': MENSAJE_BLOQUEO_MAPEO,
+            'motivo': 'historia_academica',
+            'componentes_bloqueados': [{
+                'componente_codigo': componente_codigo,
+                'asignatura_id': mapeo.asignatura_id,
+                'detalle': resumen_historia(ev),
+            }],
+        }, status_code=409)
+
+    # Se retira la RELACIÓN (R3.2 §8). La Asignatura y toda su historia quedan
+    # intactas. Se borra la fila en vez de desactivarla por la misma razón que
+    # en el guardado: las UniqueConstraint de R3.1 no miran `activo`, y una fila
+    # zombi bloquearía volver a vincular ese componente.
+    db.delete(mapeo)
+    db.commit()
+    log_auditoria(db, 'actualizar', 'cursos', curso.id, None,
+                  {'quitar_componente': componente_codigo}, user=current_user, request=request)
+    cache_clear(f'cursos:{current_user.colegio_id}')
+    db.refresh(curso)
+    return _salida_optativa_estado(db, curso)
+
 
 # ============== USUARIOS ==============
 
