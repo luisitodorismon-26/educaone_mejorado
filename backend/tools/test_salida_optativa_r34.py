@@ -718,6 +718,271 @@ def _():
                      src, re.S), "el filtro de items debe usar nivelesProfesor"
 
 
+# ===========================================================================
+# BLOQUE D — CIERRE DEL CICLO DE ASIGNACIONES (fix final de auditoría)
+# ===========================================================================
+
+def _aps_activas(curso_id, asignatura_id):
+    d = SessionLocal()
+    try:
+        return d.query(M.AsignacionProfesor).filter(
+            M.AsignacionProfesor.curso_id == curso_id,
+            M.AsignacionProfesor.asignatura_id == asignatura_id,
+            M.AsignacionProfesor.activo == True).all()          # noqa: E712
+    finally:
+        d.close()
+
+
+def _aps_todas(curso_id, asignatura_id):
+    d = SessionLocal()
+    try:
+        return d.query(M.AsignacionProfesor).filter(
+            M.AsignacionProfesor.curso_id == curso_id,
+            M.AsignacionProfesor.asignatura_id == asignatura_id).all()
+    finally:
+        d.close()
+
+
+@test("§D1 §2: se puede QUITAR el profesor (profesor_id=null) sin perder nada")
+def _():
+    r = put(C4_A, DIR_A, salida_optativa_codigo="HLM", profesores={HLM_LE_4: U_PROF})
+    assert r.status_code == 200, r.text[:250]
+    m = mapeo_de(C4_A, HLM_LE_4)
+    antes_nota = nota(EST_1, m.asignatura_id)
+    assert _aps_activas(C4_A, m.asignatura_id), "debe haber responsable"
+
+    r = put(C4_A, DIR_A, profesores={HLM_LE_4: None})
+    assert r.status_code == 200, r.text[:250]
+    assert _aps_activas(C4_A, m.asignatura_id) == [], "debe quedar sin responsable"
+    # se conserva TODO lo demás
+    assert mapeo_de(C4_A, HLM_LE_4).asignatura_id == m.asignatura_id
+    assert _aps_todas(C4_A, m.asignatura_id), "las asignaciones se desactivan, no se borran"
+    assert nota(EST_1, m.asignatura_id) == antes_nota, "las notas no se tocan"
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asignatura).get(m.asignatura_id) is not None
+    finally:
+        d.close()
+    est = get_estado(C4_A, DIR_A).json()
+    comp = {c["componente_codigo"]: c for c in est["componentes"]}[HLM_LE_4]
+    assert comp["profesor_id"] is None, comp
+    put(C4_A, DIR_A, profesores={HLM_LE_4: U_PROF})       # se restituye
+
+
+@test("§D2 §2-B: profesor null SIN mapeo no crea nada y es idempotente")
+def _():
+    assert mapeo_de(C4_A, HLM_IN_4) is not None
+    r = client.delete(f"/api/cursos/{C4_A}/salida-optativa/componentes/{HLM_IN_4}",
+                      headers=auth(DIR_A))
+    assert r.status_code == 200, r.text[:250]
+    assert mapeo_de(C4_A, HLM_IN_4) is None
+    d = SessionLocal()
+    try:
+        n_asig = d.query(M.Asignatura).count()
+        n_map = d.query(M.CursoComponenteOptativo).count()
+    finally:
+        d.close()
+    for _ in range(3):
+        r = put(C4_A, DIR_A, profesores={HLM_IN_4: None})
+        assert r.status_code == 200, r.text[:250]
+    assert mapeo_de(C4_A, HLM_IN_4) is None, "no debe crear mapeo"
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asignatura).count() == n_asig, "no debe crear Asignatura"
+        assert d.query(M.CursoComponenteOptativo).count() == n_map, "no debe crear mapeo"
+    finally:
+        d.close()
+
+
+@test("§D3 §3-B: DELETE de un componente retira la responsabilidad docente")
+def _():
+    r = put(C4_A, DIR_A, profesores={HLM_IN_4: U_PROF2})
+    assert r.status_code == 200, r.text[:250]
+    m = mapeo_de(C4_A, HLM_IN_4)
+    assert _aps_activas(C4_A, m.asignatura_id), "debe haber responsable"
+    r = client.delete(f"/api/cursos/{C4_A}/salida-optativa/componentes/{HLM_IN_4}",
+                      headers=auth(DIR_A))
+    assert r.status_code == 200, r.text[:250]
+    assert _aps_activas(C4_A, m.asignatura_id) == [], \
+        "al quitar el componente la asignacion debe quedar inactiva"
+    assert _aps_todas(C4_A, m.asignatura_id), "no se borra, se desactiva"
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asignatura).get(m.asignatura_id) is not None
+    finally:
+        d.close()
+
+
+@test("§D4 §3-A: cambiar de Salida retira los mapeos Y sus responsables")
+def _():
+    r = put(C4_OTRO, DIR_A, salida_optativa_codigo="HLM", profesores={HLM_LE_4: U_PROF2})
+    assert r.status_code == 200, r.text[:250]
+    m = mapeo_de(C4_OTRO, HLM_LE_4)
+    asig_prev = m.asignatura_id
+    assert _aps_activas(C4_OTRO, asig_prev), "debe haber responsable"
+
+    r = put(C4_OTRO, DIR_A, salida_optativa_codigo="CYT")
+    assert r.status_code == 200, r.text[:250]
+    assert mapeo_de(C4_OTRO, HLM_LE_4) is None, "el mapeo HLM debe desaparecer"
+    assert _aps_activas(C4_OTRO, asig_prev) == [], \
+        "la responsabilidad docente del mapeo retirado debe quedar inactiva"
+    assert _aps_todas(C4_OTRO, asig_prev), "no se borra"
+    tok = login("prof_b")
+    filas = client.get("/api/dashboard/profesor", headers=auth(tok)).json()["cursos_asignados"]
+    assert not any(f["curso_id"] == C4_OTRO and f["asignatura_id"] == asig_prev
+                   for f in filas), filas
+
+
+@test("§D5 §3-C: si la guarda de historia bloquea con 409, NADA se desactiva")
+def _():
+    r = put(C4_A, DIR_A, salida_optativa_codigo="HLM", profesores={HLM_LE_4: U_PROF})
+    assert r.status_code == 200, r.text[:250]
+    m = mapeo_de(C4_A, HLM_LE_4)
+    assert nota(EST_1, m.asignatura_id) is not None, "el componente ya tiene notas"
+    activas_antes = sorted(a.id for a in _aps_activas(C4_A, m.asignatura_id))
+    assert activas_antes, "debe haber responsable antes"
+
+    r = put(C4_A, DIR_A, salida_optativa_codigo="CYT")
+    assert r.status_code == 409, r.text[:250]
+    assert mapeo_de(C4_A, HLM_LE_4).asignatura_id == m.asignatura_id
+    assert sorted(a.id for a in _aps_activas(C4_A, m.asignatura_id)) == activas_antes, \
+        "un cambio bloqueado no debe desactivar responsabilidades"
+    assert nota(EST_1, m.asignatura_id) is not None
+    d = SessionLocal()
+    try:
+        assert d.query(M.Curso).get(C4_A).salida_optativa_codigo == "HLM"
+    finally:
+        d.close()
+
+
+@test("§D6 §4: identidad INDEPENDIENTE inactiva CON historia -> 409, sin repuntar")
+def _():
+    m = mapeo_de(C4_A, HLM_LE_4)
+    asig_id = m.asignatura_id
+    assert nota(EST_1, asig_id) is not None, "tiene historia"
+    d = SessionLocal()
+    try:
+        a = d.query(M.Asignatura).get(asig_id)
+        assert a.area_curricular_codigo is None, "es independiente"
+        a.activo = False
+        d.commit()
+        n_asig = d.query(M.Asignatura).count()
+    finally:
+        d.close()
+    try:
+        r = put(C4_A, DIR_A, profesores={HLM_LE_4: U_PROF})
+        assert r.status_code == 409, (r.status_code, r.text[:300])
+        assert r.json()["motivo"] == "identidad_inactiva_con_historia", r.json()
+        assert mapeo_de(C4_A, HLM_LE_4).asignatura_id == asig_id
+        d = SessionLocal()
+        try:
+            assert d.query(M.Asignatura).count() == n_asig, "no debe crear otra"
+            assert d.query(M.Asignatura).get(asig_id).activo is False, \
+                "no debe reactivarla sola"
+        finally:
+            d.close()
+        assert nota(EST_1, asig_id) is not None
+    finally:
+        d = SessionLocal()
+        try:
+            d.query(M.Asignatura).get(asig_id).activo = True
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("§D7 §4: identidad inactiva SIN historia sí puede repuntarse")
+def _():
+    d = SessionLocal()
+    try:
+        d.add(M.Asignatura(id=300, colegio_id=COL_A, nombre="Retirada sin notas",
+                           codigo="RS", area="", activo=False))
+        d.commit()
+        d.add(M.CursoComponenteOptativo(
+            colegio_id=COL_A, curso_id=C4_A, ano_escolar_id=ANO_A,
+            componente_codigo=HLM_IN_4, asignatura_id=300, activo=True))
+        d.commit()
+    finally:
+        d.close()
+    r = put(C4_A, DIR_A, profesores={HLM_IN_4: U_PROF})
+    assert r.status_code == 200, r.text[:300]
+    m = mapeo_de(C4_A, HLM_IN_4)
+    assert m.asignatura_id != 300, "debe repuntar a una identidad propia"
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asignatura).get(300) is not None, "la vieja no se borra"
+        assert d.query(M.Asignatura).get(300).activo is False, "ni se reactiva"
+    finally:
+        d.close()
+
+
+@test("§D8 §5: queda como MÁXIMO UNA asignación activa por curso+asignatura")
+def _():
+    m = mapeo_de(C4_A, HLM_LE_4)
+    d = SessionLocal()
+    try:
+        for ap in d.query(M.AsignacionProfesor).filter(
+                M.AsignacionProfesor.curso_id == C4_A,
+                M.AsignacionProfesor.asignatura_id == m.asignatura_id).all():
+            d.delete(ap)
+        d.commit()
+        d.add(M.AsignacionProfesor(id=901, colegio_id=COL_A, profesor_id=U_PROF,
+                                   curso_id=C4_A, asignatura_id=m.asignatura_id,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.add(M.AsignacionProfesor(id=902, colegio_id=COL_A, profesor_id=U_PROF2,
+                                   curso_id=C4_A, asignatura_id=m.asignatura_id,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.commit()
+    finally:
+        d.close()
+    assert len(_aps_activas(C4_A, m.asignatura_id)) == 2, "precondicion: dos activas"
+
+    r = put(C4_A, DIR_A, profesores={HLM_LE_4: U_PROF})
+    assert r.status_code == 200, r.text[:250]
+    activas = _aps_activas(C4_A, m.asignatura_id)
+    assert len(activas) == 1, [(a.id, a.profesor_id) for a in activas]
+    assert activas[0].profesor_id == U_PROF, activas[0].profesor_id
+    assert activas[0].id == 901, "debe CONSERVAR la fila del profesor pedido"
+    assert len(_aps_todas(C4_A, m.asignatura_id)) == 2, "la otra se desactiva, no se borra"
+
+
+@test("§D9 §1: profesor MIXTO con nivel_asignado fijo ve AMBOS conjuntos")
+def _():
+    d = SessionLocal()
+    try:
+        u = d.query(M.Usuario).get(U_PROF_MIXTO)
+        u.nivel_asignado = "secundaria"       # division principal, NO lo que imparte
+        d.commit()
+    finally:
+        d.close()
+    try:
+        assert niveles("prof_mix") == {"primaria": True, "secundaria": True}, \
+            "el backend debe seguir reportando ambos niveles"
+        src = _leer(os.path.join("components", "layout", "MainLayout.tsx"))
+        bloque = src[src.index("const filteredNavItems"):]
+        i_prof = bloque.index("user.role === 'profesor'")
+        i_lente = bloque.index("lenteNivelMenu")
+        assert i_prof < i_lente, \
+            "el filtro por asignaciones debe evaluarse ANTES del lente de division"
+        assert "} else if (item.nivel && lenteNivelMenu" in bloque, \
+            "el lente de division debe quedar en la rama de los OTROS roles"
+    finally:
+        d = SessionLocal()
+        try:
+            d.query(M.Usuario).get(U_PROF_MIXTO).nivel_asignado = None
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("§D10 §2: la UI manda el null explícito para retirar al profesor")
+def _():
+    src = _leer(os.path.join("pages", "configuracion", "SalidaOptativaSection.tsx"))
+    assert "if (pid) soloProfes[cod] = pid;" not in src, \
+        "no debe descartar los null: haria imposible retirar al profesor"
+    assert "?? null" in src and "enviaProfes" in src, "debe enviar el null explicito"
+
+
 @test("§ZZ ZERO DATA LOSS: sge.db e INITIAL_CREDENTIALS.txt intactos")
 def _():
     ahora_sge = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

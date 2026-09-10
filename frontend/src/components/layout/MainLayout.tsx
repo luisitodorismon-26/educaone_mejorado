@@ -330,21 +330,26 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   const filteredNavItems = NAV_ITEMS.filter(item => {
     if (!user || !item.roles.includes(user.role)) return false;
 
-    // v2.15: items exclusivos de una división se ocultan bajo el lente contrario
-    if (item.nivel && lenteNivelMenu && item.nivel !== lenteNivelMenu) return false;
-
-    // R3.4 §15-§16: para el PROFESOR el nivel no sale de `nivel_asignado` —que
-    // suele estar vacío y se interpretaba como "ambos"— sino de sus
-    // ASIGNACIONES ACTIVAS. Un profesor de Secundaria no debe ver
-    // "Recuperaciones (Primaria)", que no puede usar.
+    // R3.4 §1 — PARA EL PROFESOR, la ÚNICA fuente de los items específicos de
+    // nivel son sus ASIGNACIONES ACTIVAS. `nivel_asignado` NO participa: es a
+    // lo sumo su división principal, y un profesor con nivel_asignado
+    // "secundaria" que además da clases en Primaria perdía los items de
+    // Primaria que sí puede usar. Por eso este bloque va ANTES del lente de
+    // división y hace `return` en los dos sentidos, sin caer nunca en él.
     //
     // FAIL-SAFE: mientras `nivelesProfesor` es null (cargando, o la llamada
     // falló) los items específicos de nivel NO se muestran. Es preferible que
     // aparezcan un instante después a ofrecerle una función de un nivel que
     // quizá no imparte. Los items sin `nivel` no se ven afectados.
-    if (item.nivel && user.role === 'profesor') {
-      if (!nivelesProfesor) return false;
-      if (!nivelesProfesor[item.nivel]) return false;
+    if (user.role === 'profesor') {
+      if (item.nivel) {
+        if (!nivelesProfesor) return false;
+        if (!nivelesProfesor[item.nivel]) return false;
+      }
+    } else if (item.nivel && lenteNivelMenu && item.nivel !== lenteNivelMenu) {
+      // v2.15: para los demás roles sigue mandando el lente de división.
+      // Dirección, coordinación, psicología y secretaría no cambian en R3.4.
+      return false;
     }
 
     // Verificar si el módulo está habilitado

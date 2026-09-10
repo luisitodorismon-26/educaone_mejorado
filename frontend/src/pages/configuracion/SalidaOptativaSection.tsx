@@ -134,17 +134,24 @@ export const SalidaOptativaSection = ({ cursoId, asignaturas }: {
     setOk(null);
     setGuardando(true);
     try {
-      // Se manda SOLO lo que Dirección eligió. `profesores` es la vía normal:
-      // el backend crea o reutiliza la identidad calificable del componente y
-      // deja la asignación docente activa, sin pasos manuales.
-      const soloProfes: Record<string, number | null> = {};
-      Object.entries(profes).forEach(([cod, pid]) => {
-        if (pid) soloProfes[cod] = pid;
+      // `profesores` es la vía normal: el backend crea o reutiliza la identidad
+      // calificable del componente y deja la asignación docente activa.
+      //
+      // R3.4 §2: se manda el componente SIEMPRE que Dirección haya tocado su
+      // selector, incluido el `null` de "Sin asignar". Antes se filtraban los
+      // null y por eso retirar a un profesor era imposible. Un `null` sobre un
+      // componente que ni siquiera tiene mapeo es inofensivo: el backend no
+      // crea nada.
+      const enviaProfes: Record<string, number | null> = {};
+      (estado?.componentes || []).forEach(c => {
+        const elegido = profes[c.componente_codigo] ?? null;
+        if (elegido !== c.profesor_id) enviaProfes[c.componente_codigo] = elegido;
+        else if (elegido) enviaProfes[c.componente_codigo] = elegido;
       });
       const r = await api.put(`/cursos/${cursoId}/salida-optativa`, {
         salida_optativa_codigo: salida || null,
         componentes: mapeos,
-        ...(Object.keys(soloProfes).length ? { profesores: soloProfes } : {}),
+        ...(Object.keys(enviaProfes).length ? { profesores: enviaProfes } : {}),
       });
       aplicar(r.data);
       setOk('Configuración guardada');

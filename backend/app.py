@@ -3962,15 +3962,25 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
     # SQLAlchemy emite los INSERT antes que los DELETE dentro de un mismo flush,
     # así que sin este corte una asignatura que se mueve de componente chocaría
     # contra `uq_curso_componente_asignatura` con su propia fila saliente.
+    #
+    # R3.4 §3: retirar el mapeo debe retirar también la responsabilidad docente
+    # que R3.4 creó sobre él; si no, el profesor seguiría viendo en su dashboard
+    # una materia que ya no imparte. Solo `activo = False`: no se borra ninguna
+    # asignación, ninguna Asignatura ni ninguna nota. Se llega aquí únicamente
+    # con el cambio ya autorizado —un 409 de la guarda de historia sale mucho
+    # antes—, así que un cambio bloqueado no desactiva nada.
     hay_bajas = False
     if salida_nueva != salida_actual:
         for m in existentes:
+            _doc.retirar_responsabilidad(db, curso, m.asignatura_id)
             db.delete(m)
             hay_bajas = True
         por_codigo = {}
     for codigo, asignatura_id in planes:
         if asignatura_id is None and por_codigo.get(codigo) is not None:
-            db.delete(por_codigo.pop(codigo))
+            _baja = por_codigo.pop(codigo)
+            _doc.retirar_responsabilidad(db, curso, _baja.asignatura_id)
+            db.delete(_baja)
             hay_bajas = True
     if hay_bajas:
         db.flush()
@@ -4006,8 +4016,24 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
         for codigo, profesor_id in profesores.items():
             comp = _cat.componente(codigo)
             mapeo_actual = vigentes.get(codigo)
-            asig_comp, creada, correccion = _doc.resolver_identidad_calificable(
-                db, curso, comp, mapeo_actual)
+
+            # R3.4 §2-B: retirar al profesor de un componente que ni siquiera
+            # tiene mapeo no debe CREAR nada. Es un no-op idempotente.
+            if profesor_id is None and mapeo_actual is None:
+                continue
+
+            try:
+                asig_comp, creada, correccion = _doc.resolver_identidad_calificable(
+                    db, curso, comp, mapeo_actual)
+            except _doc.RepunteBloqueado as _rb:
+                # R3.4 §4: la asignatura del componente está inactiva y tiene
+                # historia. Repuntar la desconectaría del Registro.
+                db.rollback()
+                return JSONResponse({
+                    'error': _rb.mensaje,
+                    'motivo': 'identidad_inactiva_con_historia',
+                    'componentes_bloqueados': [_rb.detalle],
+                }, status_code=409)
 
             if mapeo_actual is None:
                 mapeo, err = _svc.construir_mapeo(db, curso, codigo, asig_comp.id)
@@ -4092,6 +4118,11 @@ async def quitar_componente_optativo(id, componente_codigo, request: Request,
     # intactas. Se borra la fila en vez de desactivarla por la misma razón que
     # en el guardado: las UniqueConstraint de R3.1 no miran `activo`, y una fila
     # zombi bloquearía volver a vincular ese componente.
+    #
+    # R3.4 §3: con el mapeo se va también la responsabilidad docente que R3.4
+    # había creado. Se desactiva, nunca se borra.
+    import salida_optativa_docente as _doc
+    _doc.retirar_responsabilidad(db, curso, mapeo.asignatura_id)
     db.delete(mapeo)
     db.commit()
     log_auditoria(db, 'actualizar', 'cursos', curso.id, None,

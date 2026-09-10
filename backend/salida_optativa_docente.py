@@ -80,32 +80,65 @@ def crear_asignatura_dedicada(db, curso, componente):
     return asig
 
 
+class RepunteBloqueado(Exception):
+    """El componente no puede cambiar de identidad sin desconectar su historia."""
+
+    def __init__(self, mensaje, detalle=None):
+        super().__init__(mensaje)
+        self.mensaje = mensaje
+        self.detalle = detalle or {}
+
+
 def resolver_identidad_calificable(db, curso, componente, mapeo_actual
                                    ) -> Tuple[object, bool, Optional[dict]]:
     """
     Identidad calificable del componente. Devuelve `(asignatura, creada, correccion)`.
 
-    Tres casos, y ninguno toca una sola nota:
+    Cuatro casos, y ninguno toca una sola nota:
 
       1. No hay mapeo -> se crea la asignatura dedicada.
-      2. El mapeo ya apunta a una identidad INDEPENDIENTE -> se REUTILIZA tal
-         cual (R3.4 §8), aunque la haya elegido Dirección a mano.
-      3. El mapeo apunta a una TRONCAL (legacy de R3.2) -> se crea la identidad
+      2. El mapeo ya apunta a una identidad INDEPENDIENTE y activa -> se
+         REUTILIZA tal cual (R3.4 §8), aunque la haya elegido Dirección a mano.
+      3. El mapeo apunta a una identidad INDEPENDIENTE pero INACTIVA:
+           * si esa asignatura tiene historia académica de ESTE curso y año,
+             repuntar la desconectaría del Registro, así que se levanta
+             `RepunteBloqueado` -> 409. No se reactiva sola, no se copian notas
+             y no se mueve nada: la decisión es de Dirección (R3.4 §4).
+           * si no tiene historia, se crea una dedicada nueva como en el caso 1.
+      4. El mapeo apunta a una TRONCAL (legacy de R3.2) -> se crea la identidad
          dedicada y se repunta SOLO `CursoComponenteOptativo`. Las notas de la
          troncal se quedan donde están, con su asignatura de siempre: no se
          mueven, no se copian y no se borran. Lo que se corrige es la REFERENCIA
-         del componente, que estaba consumiendo historia ajena. `correccion`
-         describe el cambio para dejarlo en auditoría.
+         del componente, que estaba consumiendo historia ajena. Este bypass de
+         la guarda de historia existe SOLO para este caso, porque esa historia
+         no es del componente. `correccion` lo deja en auditoría.
     """
     from models import Asignatura
+    from salida_optativa_historia import historia_academica, resumen_historia
 
     if mapeo_actual is not None:
         actual = db.query(Asignatura).filter(
             Asignatura.id == mapeo_actual.asignatura_id,
             Asignatura.colegio_id == curso.colegio_id,
         ).first()
-        if es_identidad_independiente(actual) and actual.activo is not False:
-            return actual, False, None
+        if es_identidad_independiente(actual):
+            if actual.activo is not False:
+                return actual, False, None
+            # Independiente pero inactiva: solo se abandona si no deja historia
+            # colgando. Su historia SÍ es del componente, así que aquí no hay
+            # bypass posible.
+            ev = historia_academica(db, curso, actual.id)
+            if ev:
+                raise RepunteBloqueado(
+                    'La asignatura que imparte este componente está inactiva y ya '
+                    'tiene datos académicos registrados. Reactívela desde '
+                    'Configuración -> Asignaturas antes de asignar el profesor: '
+                    'darle una identidad nueva desconectaría esas calificaciones '
+                    'del Registro.',
+                    {'componente_codigo': componente.codigo,
+                     'asignatura_id': actual.id,
+                     'asignatura_nombre': actual.nombre,
+                     'detalle': resumen_historia(ev)})
         if actual is not None:
             nueva = crear_asignatura_dedicada(db, curso, componente)
             correccion = {
@@ -114,9 +147,12 @@ def resolver_identidad_calificable(db, curso, componente, mapeo_actual
                 'asignatura_anterior_nombre': actual.nombre,
                 'asignatura_anterior_area_curricular': actual.area_curricular_codigo,
                 'asignatura_nueva_id': nueva.id,
-                'motivo': ('el componente apuntaba a una asignatura troncal del '
-                           'Registro; sus calificaciones pertenecen a esa troncal '
-                           'y permanecen intactas'),
+                'motivo': (
+                    'el componente apuntaba a una asignatura troncal del Registro; '
+                    'sus calificaciones pertenecen a esa troncal y permanecen intactas'
+                    if actual.area_curricular_codigo is not None else
+                    'el componente apuntaba a una asignatura inactiva y sin datos '
+                    'academicos; se le da identidad propia'),
             }
             logger.warning(
                 "R3.4: el componente %s del curso %s apuntaba a la troncal %s (%r, bloque "
@@ -167,11 +203,21 @@ def asignar_profesor(db, curso, asignatura, profesor_id) -> Optional[str]:
     if profe.activo is False:
         return 'Ese profesor esta inactivo.'
 
+    # R3.4 §5: `asignaciones_profesor` no tiene unique constraint que garantice
+    # un solo responsable por (curso, asignatura), así que puede haber varias
+    # activas. El resultado de esta función debe dejar como MÁXIMO UNA.
+    #
+    # Antes se hacía `return` en cuanto el profesor pedido aparecía entre las
+    # vigentes, y las demás activas se quedaban ahí. Ahora se conserva la suya y
+    # se desactivan todas las otras. Nunca se borra ninguna fila.
+    conservada = None
     for v in vigentes:
-        if v.profesor_id == profesor_id:
-            return None                  # ya estaba: idempotente
-    for v in vigentes:
+        if v.profesor_id == profesor_id and conservada is None:
+            conservada = v               # la suya se queda activa
+            continue
         v.activo = False                 # se desactiva, nunca se borra
+    if conservada is not None:
+        return None
 
     # Reactivar una asignación previa del mismo profesor si existía, en vez de
     # acumular filas equivalentes.
@@ -194,6 +240,41 @@ def asignar_profesor(db, curso, asignatura, profesor_id) -> Optional[str]:
         activo=True,
     ))
     return None
+
+
+def retirar_responsabilidad(db, curso, asignatura_id) -> int:
+    """
+    Desactiva las asignaciones docentes de (curso, asignatura). Devuelve cuántas.
+
+    R3.4 §3 — CIERRE DEL CICLO. R3.4 crea `AsignacionProfesor` automáticamente al
+    configurar un componente, así que cuando R3.2 retira la relación
+    `CursoComponenteOptativo` —al cambiar de Salida Optativa o al quitar un
+    componente— esa responsabilidad docente se quedaba activa y el profesor
+    seguía viendo en su dashboard una materia que ya no imparte.
+
+    Solo se marca `activo = False`: no se borra ninguna asignación, ninguna
+    Asignatura y ninguna calificación. Y se llama ÚNICAMENTE cuando el cambio de
+    mapeo ya está autorizado; si la guarda de historia devolvió 409, no se toca
+    nada, porque el mapeo sigue en pie.
+    """
+    from models import AsignacionProfesor
+
+    if asignatura_id is None:
+        return 0
+    n = 0
+    for ap in db.query(AsignacionProfesor).filter(
+        AsignacionProfesor.curso_id == curso.id,
+        AsignacionProfesor.asignatura_id == asignatura_id,
+        AsignacionProfesor.colegio_id == curso.colegio_id,
+        AsignacionProfesor.activo == True,          # noqa: E712
+    ).all():
+        ap.activo = False
+        n += 1
+    if n:
+        logger.info("R3.4: %d asignación(es) docente(s) retiradas del curso %s / "
+                    "asignatura %s al deshacerse su mapeo optativo.",
+                    n, curso.id, asignatura_id)
+    return n
 
 
 def asignaturas_optativas_del_colegio(db, colegio_id) -> set:
