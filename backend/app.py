@@ -3679,6 +3679,7 @@ def _salida_optativa_estado(db, curso):
     """
     import salidas_optativas as _cat
     import salida_optativa_service as _svc
+    import salida_optativa_docente as _doc
     from salida_optativa_historia import historia_academica
 
     grado_numero = _svc.grado_numero_de_curso(curso)
@@ -3690,6 +3691,17 @@ def _salida_optativa_estado(db, curso):
         comp = item['componente']
         asig_id = item['asignatura_id']
         asig = db.query(Asignatura).filter(Asignatura.id == asig_id).first() if asig_id else None
+        # R3.4: profesor responsable = la asignación ACTIVA sobre (curso,
+        # asignatura dedicada). No hay un registro paralelo de docentes
+        # optativos: es la misma AsignacionProfesor de siempre.
+        ap = None
+        if asig_id is not None:
+            ap = db.query(AsignacionProfesor).filter(
+                AsignacionProfesor.curso_id == curso.id,
+                AsignacionProfesor.asignatura_id == asig_id,
+                AsignacionProfesor.colegio_id == curso.colegio_id,
+                AsignacionProfesor.activo == True,          # noqa: E712
+            ).order_by(AsignacionProfesor.id).first()
         componentes.append({
             'componente_codigo': comp.codigo,
             'nombre_oficial': comp.nombre_oficial,
@@ -3697,6 +3709,12 @@ def _salida_optativa_estado(db, curso):
             'horas_semana': comp.horas_semana,
             'asignatura_id': asig_id,
             'asignatura_nombre': asig.nombre if asig else None,
+            # R3.4: si es una identidad propia del componente o una troncal
+            # heredada de R3.2. La UI lo usa para avisar antes de corregirla.
+            'identidad_independiente': _doc.es_identidad_independiente(asig),
+            'profesor_id': ap.profesor_id if ap else None,
+            'profesor_nombre': (ap.profesor.nombre_completo
+                                if (ap and ap.profesor) else None),
             # Se informa para que la UI pueda deshabilitar el selector ANTES de
             # que Dirección intente un cambio que el servidor va a rechazar.
             'tiene_historia': bool(historia_academica(db, curso, asig_id)),
@@ -3749,6 +3767,7 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
     """
     import salidas_optativas as _cat
     import salida_optativa_service as _svc
+    import salida_optativa_docente as _doc
     from salida_optativa_historia import (MENSAJE_BLOQUEO, historia_academica,
                                           mapeos_con_historia, resumen_historia)
 
@@ -3807,6 +3826,32 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
     if componentes is not None and not isinstance(componentes, dict):
         return JSONResponse({'error': "'componentes' debe ser un objeto "
                                       "{componente_codigo: asignatura_id}"}, status_code=400)
+
+    # R3.4: {componente_codigo: profesor_id}. Es la vía que usa la UI. Elegir un
+    # profesor implica que el componente necesita una identidad calificable
+    # propia, y el backend se encarga de garantizarla.
+    profesores = data.get('profesores')
+    if profesores is not None and not isinstance(profesores, dict):
+        return JSONResponse({'error': "'profesores' debe ser un objeto "
+                                      "{componente_codigo: profesor_id}"}, status_code=400)
+    correcciones = []
+    if profesores:
+        if salida_nueva is None:
+            return JSONResponse({
+                'error': 'No se puede asignar profesores sin una Salida Optativa elegida.'
+            }, status_code=400)
+        for codigo in profesores:
+            if not _cat.componente_pertenece(codigo, salida_nueva, grado_numero):
+                comp = _cat.componente(codigo)
+                if comp is None:
+                    return JSONResponse({
+                        'error': f'Componente optativo desconocido: {codigo!r}.'
+                    }, status_code=400)
+                return JSONResponse({
+                    'error': f'El componente {codigo!r} ({comp.nombre_oficial}) pertenece a '
+                             f'la salida {comp.salida} de {comp.grado}to y no puede usarse '
+                             f'en un curso de {grado_numero}to configurado como {salida_nueva}.'
+                }, status_code=400)
 
     # --- Validación COMPLETA antes de escribir una sola fila ---
     # Se valida contra la salida NUEVA, no contra la que había: guardar salida y
@@ -3945,10 +3990,62 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
             return JSONResponse({'error': err}, status_code=400)
         db.add(mapeo)
 
+    # --- R3.4: PROFESOR RESPONSABLE DE CADA COMPONENTE ---
+    # Este es el flujo que usa la UI: Dirección solo elige un profesor y EducaOne
+    # se encarga del resto —garantizar la identidad calificable del componente y
+    # dejar la asignación docente activa—, sin obligarla a crear asignaturas a
+    # mano ni a pasar por Asignaciones.
+    if profesores:
+        db.flush()
+        vigentes = {m.componente_codigo: m for m in db.query(CursoComponenteOptativo).filter(
+            CursoComponenteOptativo.curso_id == curso.id,
+            CursoComponenteOptativo.colegio_id == curso.colegio_id,
+            CursoComponenteOptativo.ano_escolar_id == curso.ano_escolar_id,
+            CursoComponenteOptativo.activo == True,          # noqa: E712
+        ).all()}
+        for codigo, profesor_id in profesores.items():
+            comp = _cat.componente(codigo)
+            mapeo_actual = vigentes.get(codigo)
+            asig_comp, creada, correccion = _doc.resolver_identidad_calificable(
+                db, curso, comp, mapeo_actual)
+
+            if mapeo_actual is None:
+                mapeo, err = _svc.construir_mapeo(db, curso, codigo, asig_comp.id)
+                if err:
+                    db.rollback()
+                    return JSONResponse({'error': err}, status_code=400)
+                db.add(mapeo)
+            elif mapeo_actual.asignatura_id != asig_comp.id:
+                # Repunte del caso legacy: el componente apuntaba a una troncal.
+                # Solo cambia la REFERENCIA; las notas de la troncal siguen en su
+                # asignatura de siempre. Por eso no pasa por la guarda de
+                # historia de R3.2: esa historia no es del componente.
+                mapeo_actual.asignatura_id = asig_comp.id
+                mapeo_actual.activo = True
+            if correccion:
+                correcciones.append(correccion)
+            db.flush()
+
+            err = _doc.asignar_profesor(db, curso, asig_comp, profesor_id)
+            if err:
+                db.rollback()
+                return JSONResponse({'error': err}, status_code=404 if
+                                    err == 'Profesor no encontrado' else 400)
+
     db.commit()
     log_auditoria(db, 'actualizar', 'cursos', curso.id, None,
                   {'salida_optativa_codigo': salida_nueva,
-                   'componentes': componentes}, user=current_user, request=request)
+                   'componentes': componentes,
+                   'profesores': profesores,
+                   # R3.4 §7: el repunte de un componente que consumía una
+                   # troncal queda registrado con su origen y su destino.
+                   'correcciones_identidad': correcciones or None},
+                  user=current_user, request=request)
+    # `log_auditoria` solo hace flush; el commit lo decide el endpoint (ver su
+    # docstring). Sin este commit la fila se perdia al cerrar la sesion, porque
+    # `get_db` no comitea: el repunte de identidad de R3.4 §7 tiene que quedar
+    # registrado, y el de R3.2 tambien lo estaba perdiendo.
+    db.commit()
     cache_clear(f'cursos:{current_user.colegio_id}')
     db.refresh(curso)
     return _salida_optativa_estado(db, curso)
@@ -3999,6 +4096,7 @@ async def quitar_componente_optativo(id, componente_codigo, request: Request,
     db.commit()
     log_auditoria(db, 'actualizar', 'cursos', curso.id, None,
                   {'quitar_componente': componente_codigo}, user=current_user, request=request)
+    db.commit()          # ver nota sobre log_auditoria en el PUT
     cache_clear(f'cursos:{current_user.colegio_id}')
     db.refresh(curso)
     return _salida_optativa_estado(db, curso)
@@ -8303,17 +8401,55 @@ async def get_dashboard_profesor(db: Session = Depends(get_db), current_user: Us
                  .group_by(Estudiante.curso_id).all())
         conteo_por_curso = {cid: n for cid, n in filas}
     
+    # R3.4: qué asignaciones del profesor son componentes de Salida Optativa.
+    # Se resuelve por la RELACIÓN persistida (curso + asignatura), nunca por el
+    # nombre de la asignatura, y se manda como METADATO: la identidad que usa
+    # el frontend para calificar sigue siendo `asignatura_id`, igual que en una
+    # materia normal. Así no hace falta una pantalla de calificaciones aparte.
+    import salidas_optativas as _cat_opt
+    import salida_optativa_docente as _doc_niveles
+    _comp_por_clave = {}
+    if asignaciones:
+        for _m in tenant_filter(db.query(CursoComponenteOptativo),
+                                CursoComponenteOptativo, current_user).filter(
+            CursoComponenteOptativo.curso_id.in_({a.curso_id for a in asignaciones}),
+            CursoComponenteOptativo.activo == True,          # noqa: E712
+        ).all():
+            _comp_por_clave[(_m.curso_id, _m.asignatura_id)] = _m
+    _salida_por_curso = {
+        c.id: c.salida_optativa_codigo
+        for c in tenant_filter(db.query(Curso), Curso, current_user).filter(
+            Curso.id.in_({a.curso_id for a in asignaciones})).all()
+    } if asignaciones else {}
+
     cursos_asignados = []
     for a in asignaciones:
         estudiantes_count = conteo_por_curso.get(a.curso_id, 0)
-        cursos_asignados.append({
+        fila = {
             'curso_id': a.curso_id,
             'curso': a.curso.nombre_completo if a.curso else None,
             'tanda': a.curso.tanda.nombre if a.curso and a.curso.tanda else None,
             'asignatura': a.asignatura.nombre if a.asignatura else None,
             'asignatura_id': a.asignatura_id,
-            'estudiantes': estudiantes_count
-        })
+            'estudiantes': estudiantes_count,
+            'es_salida_optativa': False,
+            'componente_codigo': None,
+            'componente_nombre': None,
+            'salida_codigo': None,
+            'salida_nombre': None,
+        }
+        _m = _comp_por_clave.get((a.curso_id, a.asignatura_id))
+        if _m is not None:
+            _comp = _cat_opt.componente(_m.componente_codigo)
+            _sal = _salida_por_curso.get(a.curso_id)
+            fila.update({
+                'es_salida_optativa': True,
+                'componente_codigo': _m.componente_codigo,
+                'componente_nombre': _comp.nombre_oficial if _comp else None,
+                'salida_codigo': _sal,
+                'salida_nombre': _cat_opt.nombre_salida(_sal),
+            })
+        cursos_asignados.append(fila)
     
     # Estudiantes pendientes de calificar (período activo)
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
@@ -15871,6 +16007,17 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
     asigs_colegio = tenant_filter(
         db.query(Asignatura), Asignatura, current_user
     ).all()
+
+    # R3.4 §14 — una asignatura que representa un componente de Salida Optativa
+    # NUNCA puede hacer de materia troncal. El segundo pase de
+    # `_resolver_asignatura` compara por SUBCADENA, y cuatro nombres oficiales
+    # del catálogo caen dentro de él ("Manejo de la Información en Inglés"
+    # contiene "Inglés", "Matemática Financiera y Tecnología" contiene
+    # "Matemática", "Física y Computación" contiene "Física"). Sin excluirlas,
+    # crear la identidad dedicada de R3.4 podría hacer que una optativa ocupara
+    # la página troncal en un colegio sin nombre exacto para esa materia.
+    from salida_optativa_docente import asignaturas_optativas_del_colegio
+    _asigs_optativas = asignaturas_optativas_del_colegio(db, current_user.colegio_id)
     
     # v2.19.7: año escolar activo del colegio. Las notas de secundaria viven en
     # CalificacionSecundaria, que SÍ está acotada por año, y el CF oficial lo
@@ -15944,7 +16091,7 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         
         # Candidatas asignadas al curso primero, luego huérfanas del colegio
         ordenadas = sorted(
-            asigs_colegio,
+            (a for a in asigs_colegio if a.id not in _asigs_optativas),
             key=lambda a: (0 if a.id in asigs_con_asignacion else 1, a.id)
         )
         
