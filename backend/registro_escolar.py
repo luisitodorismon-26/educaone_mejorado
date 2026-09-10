@@ -1809,6 +1809,7 @@ def generar_registro_escolar(
     indicadores_data: Optional[Dict] = None,
     especificacion_data: Optional[Dict] = None,
     completiva_data: Optional[Dict] = None,
+    salida_optativa_data: Optional[Dict] = None,
     promocion_data: Optional[List[Dict]] = None,
     estadisticas_data: Optional[Dict] = None,
     template_dir: Optional[str] = None,
@@ -2191,20 +2192,6 @@ def generar_registro_escolar(
                 buf = _create_overlay_page(draw_completiva, asig_comp)
                 overlays[pg_idx] = buf
             
-            # Salida optativa (solo 4to-6to) — DESACTIVADO en v2.20.1-B2.1.
-            # Las seis páginas 211/212/214/217/219/221 son bloques de Salida
-            # Optativa intercalados con distintas áreas del template. EducaOne
-            # modela hoy UNA sola asignatura genérica "Salida Optativa" y NO hay
-            # un mapeo inequívoco asignatura real → página específica; replicar
-            # la misma nota en las seis crearía información académica falsa.
-            # Por eso NO se estampa ningún overlay de completiva_data genérico
-            # sobre esas páginas: quedan idénticas al template.
-            # TODO futuro: mapear la Salida Optativa real por área/página y
-            # entonces reactivar este bloque con datos por página (no replicados).
-            #
-            # salida_opt_paginas = config.get("completiva_salida_optativa", [])
-            # if salida_opt_paginas and completiva_data.get("salida_optativa"):
-            #     ...  # requiere mapping por página, aún inexistente
         else:
             # Fallback: calcular por offset
             comp_inicio = config["completiva_inicio"] - 1
@@ -2219,6 +2206,50 @@ def generar_registro_escolar(
                 buf = _create_overlay_page(draw_completiva, asig_comp)
                 overlays[pg_idx] = buf
     
+    # --- SALIDA OPTATIVA (R3.3) ---
+    # Reemplaza al bloque desactivado en v2.20.1-B2.1. Aquel se apagó porque
+    # EducaOne modelaba UNA asignatura genérica "Salida Optativa" y estampar su
+    # nota en las seis páginas habría inventado información académica. R3.1/R3.2
+    # aportaron el mapeo que faltaba, así que ahora cada página recibe SOLO la
+    # nota del componente que le corresponde.
+    #
+    # El slot es la posición del componente en el catálogo oficial y, por
+    # construcción, el índice en `completiva_salida_optativa`:
+    #   slot 0 -> pg 211 (HLM/Lengua)   slot 3 -> pg 217 (MYT/Matemática)
+    #   slot 1 -> pg 212 (HCS/Lengua)   slot 4 -> pg 219 (HCS/C. Sociales)
+    #   slot 2 -> pg 214 (HLM/Inglés)   slot 5 -> pg 221 (CYT/C. Naturaleza)
+    # Verificado contra los templates oficiales: cada una de esas páginas lleva
+    # impreso "SALIDA OPTATIVA: <salida>" con el nombre del componente.
+    #
+    # Los números son PÁGINA HUMANA (1-based) y se convierten con `- 1`, igual
+    # que `completiva_paginas` y `promocion_inicio`.
+    #
+    # Se usan `draw_completiva` y `_create_overlay_page` existentes: mismo
+    # pipeline XObject, sin `merge_page`, sin motor nuevo.
+    if salida_optativa_data:
+        salida_opt_paginas = config.get("completiva_salida_optativa", [])
+        for slot, datos_comp in salida_optativa_data.items():
+            try:
+                slot_int = int(slot)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= slot_int < len(salida_opt_paginas)):
+                continue
+            if not datos_comp:
+                continue
+            # R3.3 §14: si NINGUNA fila trae dato, la página se queda idéntica al
+            # template. Un overlay vacío no es neutro: dejaría constancia de que
+            # EducaOne escribió esa página del Registro sin tener nada que
+            # escribir. El wrapper `generar_registro_desde_sistema` ya filtra
+            # así, pero esta función también se llama directamente y la regla
+            # tiene que valer en los dos caminos.
+            if not any(f for f in (datos_comp.get("calificaciones") or [])):
+                continue
+            pg_idx = salida_opt_paginas[slot_int] - 1
+            if pg_idx >= total_pages:
+                continue
+            overlays[pg_idx] = _create_overlay_page(draw_completiva, datos_comp)
+
     # --- PROMOCIÓN ---
     if promocion_data:
         prom_inicio = config["promocion_inicio"] - 1
@@ -2502,7 +2533,7 @@ def _calcular_edad(fecha_nacimiento) -> int:
 
 def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudiantes,
                                    asignaturas_data, grado_numero, marca_borrador=False,
-                                   especificacion_data=None):
+                                   especificacion_data=None, salida_optativa_data=None):
     """
     Wrapper que traduce datos de app.py al formato del generador de registro.
     
@@ -2732,6 +2763,28 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
                 "calificaciones": filas,
             }
 
+    # === TRADUCIR SALIDA OPTATIVA (R3.3) ===
+    # Llega desde app.py ya resuelta por `CursoComponenteOptativo` e indexada por
+    # SLOT. Aquí solo se aplica `_fila_completiva`, EXACTAMENTE la misma función
+    # que traduce una asignatura normal: misma cascada, mismo redondeo, ninguna
+    # fórmula nueva. Un componente sin ninguna fila con dato NO entra, y su
+    # página queda idéntica al template.
+    salida_optativa_filas = {}
+    for slot, data_comp in (salida_optativa_data or {}).items():
+        califs = (data_comp or {}).get('calificaciones', {}) or {}
+        filas = []
+        tiene_algo = False
+        for i in range(num_est):
+            fila = _fila_completiva(califs.get(i))
+            filas.append(fila)
+            if fila:
+                tiene_algo = True
+        if tiene_algo:
+            salida_optativa_filas[slot] = {
+                'docente': (data_comp or {}).get('docente', ''),
+                'calificaciones': filas,
+            }
+
     # === TRADUCIR PROMOCION ===
     promocion_data = []
     for idx in range(num_est):
@@ -2757,6 +2810,8 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         # del bloque curricular oficial. Ningún objeto ORM cruza al threadpool.
         especificacion_data=especificacion_data or None,
         completiva_data=completiva_data if completiva_data else None,
+        # R3.3: indexada por SLOT del catálogo oficial, igual que especificacion_data.
+        salida_optativa_data=salida_optativa_filas or None,
         promocion_data=promocion_data if any(p for p in promocion_data) else None,
         marca_borrador=marca_borrador,
     )

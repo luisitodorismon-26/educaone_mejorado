@@ -15342,13 +15342,19 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             db, current_user, curso, grado_numero)
     except EspecificacionCurricularConflicto as _exc:
         return _respuesta_conflicto_espec(_exc)
-    
+
+    # R3.3 — Salida Optativa, indexada por SLOT. Un curso sin salida configurada
+    # devuelve {} y el Registro se comporta EXACTAMENTE como antes de R3.3.
+    salida_optativa_data = _cargar_salida_optativa_registro(
+        db, current_user, curso, estudiantes_db[:90])
+
     # === 3. GENERAR PDF ===
     try:
         pdf_bytes = generar_registro_desde_sistema(
             colegio_info, curso_info, ano_escolar,
             estudiantes_raw, asignaturas_data, grado_numero,
             especificacion_data=especificacion_data,
+            salida_optativa_data=salida_optativa_data or None,
         )
         
         filename = f"Registro_Escolar_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
@@ -15559,6 +15565,253 @@ def _respuesta_conflicto_espec(exc):
     return None
 
 
+
+
+def _serial_evaluacion_extra(_ev):
+    """dict plano y serializable (sin ORM, sin sesión) para el threadpool."""
+    if _ev is None:
+        return None
+    return {
+        'cf_original': _ev.cf_original,
+        'cec': _ev.cec,
+        'completiva_final': _ev.completiva_final,
+        'ceex': _ev.ceex,
+        'extraordinaria_final': _ev.extraordinaria_final,
+        'ce': _ev.ce,
+        'especial_final': _ev.especial_final,
+        'condicion_final': _ev.condicion_final,
+        'nota_final': _ev.nota_final,
+        'fase_pendiente': _ev.fase_pendiente(),
+    }
+
+
+def _cargar_salida_optativa_registro(db, current_user, curso, estudiantes_db):
+    """
+    Notas de los componentes de Salida Optativa, indexadas por SLOT.
+
+    R3.3 — LA ÚNICA CONFIGURACIÓN ADMITIDA
+    --------------------------------------
+    La cadena es `Curso.salida_optativa_codigo` -> `CursoComponenteOptativo` ->
+    `Asignatura`. NO se resuelve por nombre: da igual cómo se llame la materia
+    del colegio, y una materia extra del boletín que nadie vinculó NO entra.
+
+    Devuelve `{slot: {'docente': str, 'calificaciones': {idx_est: {...}}}}`, la
+    MISMA forma que una asignatura normal, para que el generador aplique la
+    misma cascada de completiva/extraordinaria y el mismo redondeo. Un
+    componente sin asignatura vinculada NO aparece en el dict: su página queda
+    idéntica al template en vez de rellenarse con ceros o nombres inventados.
+    """
+    import salida_optativa_service as _svc
+
+    if curso is None or not getattr(curso, 'salida_optativa_codigo', None):
+        return {}
+
+    try:
+        resueltos = _svc.resolver_componentes(db, curso)
+    except ValueError as e:
+        # Incoherencia de año: nunca se imprime configuración de otro año.
+        logger.error("Salida Optativa no resuelta para curso %s: %s", curso.id, e)
+        return {}
+    if not resueltos:
+        return {}
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    ids_est = [e.id for e in estudiantes_db]
+
+    extras_idx = {}
+    if ano is not None and ids_est:
+        for ev in tenant_filter(
+            db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria, current_user
+        ).filter(
+            EvaluacionExtraSecundaria.ano_escolar_id == ano.id,
+            EvaluacionExtraSecundaria.estudiante_id.in_(ids_est),
+        ).all():
+            extras_idx[(ev.estudiante_id, ev.asignatura_id)] = ev
+
+    docentes = {}
+    for ap in tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, activo=True).order_by(AsignacionProfesor.id).all():
+        docentes.setdefault(ap.asignatura_id, ap)
+
+    salida = {}
+    for item in resueltos:
+        asig_id = item['asignatura_id']
+        if asig_id is None:
+            continue                      # componente sin vincular: no se inventa
+        # `tenant_filter` es la barrera: una asignatura de otro colegio no se
+        # resuelve aunque su id estuviera en la tabla.
+        asig = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter(
+            Asignatura.id == asig_id).first()
+        if asig is None:
+            logger.warning("Componente %s del curso %s apunta a la asignatura %s, que no "
+                           "es de este colegio; se omite.",
+                           item['componente'].codigo, curso.id, asig_id)
+            continue
+
+        califs = _calificaciones_de_asignatura(
+            db, current_user, asig, estudiantes_db, ano, extras_idx,
+            _serial_evaluacion_extra)
+        if not califs:
+            continue                      # sin notas: la página queda como el template
+
+        ap = docentes.get(asig.id)
+        salida[item['slot']] = {
+            'docente': ap.profesor.nombre_completo if (ap and ap.profesor) else '',
+            'calificaciones': califs,
+        }
+    return salida
+
+
+def _calificaciones_de_asignatura(db, current_user, asignatura, estudiantes_db,
+                                 _ano_registro, _extras_idx, _serial_ev):
+    """
+    Notas de UNA asignatura para el Registro de Secundaria, por índice de
+    estudiante.
+
+    R3.3 — EXTRAÍDO SIN CAMBIOS de `_cargar_datos_asignaturas_secundaria`.
+    Lo consumen ahora DOS llamadores: las asignaturas MINERD normales y los
+    componentes de Salida Optativa. Es una extracción deliberada: la Salida
+    Optativa debe leer las MISMAS fuentes y aplicar las MISMAS fórmulas que
+    una materia normal (`calcular_pc_periodo`, `_calcular_cf_secundaria`, la
+    cascada de `EvaluacionExtraSecundaria`). Duplicar este bloque habría
+    creado una segunda verdad para las mismas notas.
+    """
+    calificaciones = {}
+    if asignatura is None:
+        return {}
+    # v2.19.6: UNA consulta por asignatura para todo el curso. Antes era
+    # una por estudiante: con 38 estudiantes y 13 asignaturas eran ~500
+    # viajes a la base. En Render la base es un host aparte, así que cada
+    # viaje cuesta latencia de red y se sumaban segundos enteros.
+    # `.setdefault` conserva el criterio del `.first()` anterior
+    # (quedarse con la primera fila), ahora de forma determinista.
+    _por_estudiante = {}
+    for _c in tenant_filter(db.query(Calificacion), Calificacion, current_user).filter(
+        Calificacion.asignatura_id == asignatura.id,
+        Calificacion.estudiante_id.in_([e.id for e in estudiantes_db]),
+    ).order_by(Calificacion.id).all():
+        _por_estudiante.setdefault(_c.estudiante_id, _c)
+
+    # v2.19.7: la secundaria REAL no escribe en `Calificacion` sino en
+    # `CalificacionSecundaria`, una fila por competencia (1-4). El
+    # Registro leía solo la tabla legacy —vacía en producción— y por eso
+    # las páginas de notas salían en blanco aunque el profesor tuviera
+    # todo cargado. Acá se leen las competencias del curso en UNA
+    # consulta y se calculan PC y CF con las MISMAS funciones que ya usa
+    # el boletín: CalificacionSecundaria.calcular_pc_periodo y
+    # _calcular_cf_secundaria. No hay fórmula nueva.
+    _competencias_por_est = {}
+    if _ano_registro is not None:
+        for _cs in tenant_filter(
+            db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
+        ).filter(
+            CalificacionSecundaria.asignatura_id == asignatura.id,
+            CalificacionSecundaria.ano_escolar_id == _ano_registro.id,
+            CalificacionSecundaria.estudiante_id.in_([e.id for e in estudiantes_db]),
+        ).all():
+            _competencias_por_est.setdefault(_cs.estudiante_id, []).append(_cs)
+
+    for idx, est in enumerate(estudiantes_db):
+        comps = _competencias_por_est.get(est.id)
+        if comps:
+            # PC del período = promedio de las 4 competencias. Devuelve
+            # None si falta alguna: un estudiante incompleto queda en
+            # blanco, nunca con un promedio inventado.
+            pc1, pc2, pc3, pc4 = (
+                CalificacionSecundaria.calcular_pc_periodo(comps, p) for p in (1, 2, 3, 4)
+            )
+            cf, _literal, cf_exacto = _calcular_cf_secundaria(
+                db, est.id, asignatura.id,
+                _ano_registro.id if _ano_registro else None,
+                con_exacto=True,
+                competencias=comps,
+            )
+            # v2.19.7 (2): las competencias NO se colapsan antes de
+            # llegar al generador. El spread del Registro tiene CUATRO
+            # bloques de detalle P1/RP1..P4/RP4 —uno por competencia— y
+            # además el bloque resumen. Antes solo se enviaban los
+            # promedios, así que los cuatro bloques de detalle salían
+            # vacíos teniendo el dato cargado.
+            detalle = {}
+            for _c in comps:
+                num = _c.competencia_numero
+                if not num:
+                    continue
+                detalle[num] = {
+                    'p1': _c.p1, 'rp1': _c.rp1,
+                    'p2': _c.p2, 'rp2': _c.rp2,
+                    'p3': _c.p3, 'rp3': _c.rp3,
+                    'p4': _c.p4, 'rp4': _c.rp4,
+                }
+
+            # v2.19.7 (3): el bloque "Promedio de Competencias
+            # Específicas" del template rotula sus columnas
+            # "PC1: Competencia 1" … "PC4: Competencia 4", así que cada
+            # columna es el promedio FINAL de esa competencia a lo largo
+            # de P1-P4 — no el promedio de las cuatro competencias en un
+            # período. Se usa el método del propio modelo, que aplica
+            # valor_periodo() (max(P, RP)) y devuelve None si falta
+            # algún período.
+            promedios_competencia = {
+                _c.competencia_numero: _c.calcular_promedio_competencia()
+                for _c in comps if _c.competencia_numero
+            }
+
+            calificaciones[idx] = {
+                # Notas por competencia y período, tal como están en la
+                # base. Un valor NULL queda NULL: no se inventa nada.
+                'competencias': detalle,
+                # Lo que va al bloque resumen del Registro.
+                'promedios_competencia': promedios_competencia,
+                # Los rpN de primer nivel pertenecen al modelo legacy
+                # `Calificacion` (una recuperación por período, sin
+                # competencia). En secundaria la recuperación vive
+                # DENTRO de cada competencia, en `competencias[n]`.
+                'rp1': None, 'rp2': None, 'rp3': None, 'rp4': None,
+                # pc1..pc4 son los promedios POR PERÍODO. El Registro ya
+                # no los imprime (ver promedios_competencia), pero son
+                # la base del CF oficial y los consume el boletín, así
+                # que se conservan.
+                'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
+                'cf': cf,
+                # v2.20.1-B2: CF exacta (para % de completiva/extraordinaria)
+                # y cascada de evaluaciones extra, ya serializadas.
+                'cf_exacto': cf_exacto,
+                'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
+            }
+            continue
+
+        calif = _por_estudiante.get(est.id)
+        if calif:
+            # PC: usar valor persistido; si está NULL, recalcular con la lógica
+            # oficial del modelo (que retorna None si faltan parciales).
+            pc1 = calif.pc1 if calif.pc1 is not None else calif.calcular_pc(1)
+            pc2 = calif.pc2 if calif.pc2 is not None else calif.calcular_pc(2)
+            pc3 = calif.pc3 if calif.pc3 is not None else calif.calcular_pc(3)
+            pc4 = calif.pc4 if calif.pc4 is not None else calif.calcular_pc(4)
+            
+            # CF: usar valor persistido; si está NULL, recalcular sólo si los
+            # 4 PC están completos (calcular_cf retorna None en caso contrario).
+            cf = calif.cf
+            if cf is None and all(p is not None for p in (pc1, pc2, pc3, pc4)):
+                cf = round((pc1 + pc2 + pc3 + pc4) / 4, 2)
+            
+            calificaciones[idx] = {
+                'rp1': calif.rp1,
+                'rp2': calif.rp2,
+                'rp3': calif.rp3,
+                'rp4': calif.rp4,
+                'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
+                'cf': cf,
+                # v2.20.1-B2: el modelo legacy Calificacion no guarda CF
+                # exacta; el % usa la misma CF. La cascada extra vive solo
+                # en EvaluacionExtraSecundaria (puede o no existir).
+                'cf_exacto': cf,
+                'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
+            }
+    return calificaciones
+
 def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, grado_numero, estudiantes_db):
     """
     Helper: carga asignaturas, docentes, calificaciones y asistencia
@@ -15630,22 +15883,9 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
     # no vacío, esa función corta la generación con 409 en vez de imprimirlo
     # como si fuera un indicador oficial.
 
-    def _serial_ev(_ev):
-        """dict plano y serializable (sin ORM, sin sesión) para el threadpool."""
-        if _ev is None:
-            return None
-        return {
-            'cf_original': _ev.cf_original,
-            'cec': _ev.cec,
-            'completiva_final': _ev.completiva_final,
-            'ceex': _ev.ceex,
-            'extraordinaria_final': _ev.extraordinaria_final,
-            'ce': _ev.ce,
-            'especial_final': _ev.especial_final,
-            'condicion_final': _ev.condicion_final,
-            'nota_final': _ev.nota_final,
-            'fase_pendiente': _ev.fase_pendiente(),
-        }
+    # R3.3: el cuerpo vive ahora en `_serial_evaluacion_extra`, a nivel de
+    # módulo, para que el loader de Salida Optativa serialice EXACTAMENTE igual.
+    _serial_ev = _serial_evaluacion_extra
 
     # v2.19.6: una sola consulta en vez de una por asignatura del colegio.
     asigs_con_asignacion = {
@@ -15716,138 +15956,9 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         # CF aparece SOLO cuando los 4 PC están completos.
         # Confiamos en la lógica de Calificacion.calcular_pc / calcular_cf del modelo,
         # que retorna None si faltan datos (no hay fallbacks que inventen promedios).
-        calificaciones = {}
-        if asignatura:
-            # v2.19.6: UNA consulta por asignatura para todo el curso. Antes era
-            # una por estudiante: con 38 estudiantes y 13 asignaturas eran ~500
-            # viajes a la base. En Render la base es un host aparte, así que cada
-            # viaje cuesta latencia de red y se sumaban segundos enteros.
-            # `.setdefault` conserva el criterio del `.first()` anterior
-            # (quedarse con la primera fila), ahora de forma determinista.
-            _por_estudiante = {}
-            for _c in tenant_filter(db.query(Calificacion), Calificacion, current_user).filter(
-                Calificacion.asignatura_id == asignatura.id,
-                Calificacion.estudiante_id.in_([e.id for e in estudiantes_db]),
-            ).order_by(Calificacion.id).all():
-                _por_estudiante.setdefault(_c.estudiante_id, _c)
-
-            # v2.19.7: la secundaria REAL no escribe en `Calificacion` sino en
-            # `CalificacionSecundaria`, una fila por competencia (1-4). El
-            # Registro leía solo la tabla legacy —vacía en producción— y por eso
-            # las páginas de notas salían en blanco aunque el profesor tuviera
-            # todo cargado. Acá se leen las competencias del curso en UNA
-            # consulta y se calculan PC y CF con las MISMAS funciones que ya usa
-            # el boletín: CalificacionSecundaria.calcular_pc_periodo y
-            # _calcular_cf_secundaria. No hay fórmula nueva.
-            _competencias_por_est = {}
-            if _ano_registro is not None:
-                for _cs in tenant_filter(
-                    db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-                ).filter(
-                    CalificacionSecundaria.asignatura_id == asignatura.id,
-                    CalificacionSecundaria.ano_escolar_id == _ano_registro.id,
-                    CalificacionSecundaria.estudiante_id.in_([e.id for e in estudiantes_db]),
-                ).all():
-                    _competencias_por_est.setdefault(_cs.estudiante_id, []).append(_cs)
-
-            for idx, est in enumerate(estudiantes_db):
-                comps = _competencias_por_est.get(est.id)
-                if comps:
-                    # PC del período = promedio de las 4 competencias. Devuelve
-                    # None si falta alguna: un estudiante incompleto queda en
-                    # blanco, nunca con un promedio inventado.
-                    pc1, pc2, pc3, pc4 = (
-                        CalificacionSecundaria.calcular_pc_periodo(comps, p) for p in (1, 2, 3, 4)
-                    )
-                    cf, _literal, cf_exacto = _calcular_cf_secundaria(
-                        db, est.id, asignatura.id,
-                        _ano_registro.id if _ano_registro else None,
-                        con_exacto=True,
-                        competencias=comps,
-                    )
-                    # v2.19.7 (2): las competencias NO se colapsan antes de
-                    # llegar al generador. El spread del Registro tiene CUATRO
-                    # bloques de detalle P1/RP1..P4/RP4 —uno por competencia— y
-                    # además el bloque resumen. Antes solo se enviaban los
-                    # promedios, así que los cuatro bloques de detalle salían
-                    # vacíos teniendo el dato cargado.
-                    detalle = {}
-                    for _c in comps:
-                        num = _c.competencia_numero
-                        if not num:
-                            continue
-                        detalle[num] = {
-                            'p1': _c.p1, 'rp1': _c.rp1,
-                            'p2': _c.p2, 'rp2': _c.rp2,
-                            'p3': _c.p3, 'rp3': _c.rp3,
-                            'p4': _c.p4, 'rp4': _c.rp4,
-                        }
-
-                    # v2.19.7 (3): el bloque "Promedio de Competencias
-                    # Específicas" del template rotula sus columnas
-                    # "PC1: Competencia 1" … "PC4: Competencia 4", así que cada
-                    # columna es el promedio FINAL de esa competencia a lo largo
-                    # de P1-P4 — no el promedio de las cuatro competencias en un
-                    # período. Se usa el método del propio modelo, que aplica
-                    # valor_periodo() (max(P, RP)) y devuelve None si falta
-                    # algún período.
-                    promedios_competencia = {
-                        _c.competencia_numero: _c.calcular_promedio_competencia()
-                        for _c in comps if _c.competencia_numero
-                    }
-
-                    calificaciones[idx] = {
-                        # Notas por competencia y período, tal como están en la
-                        # base. Un valor NULL queda NULL: no se inventa nada.
-                        'competencias': detalle,
-                        # Lo que va al bloque resumen del Registro.
-                        'promedios_competencia': promedios_competencia,
-                        # Los rpN de primer nivel pertenecen al modelo legacy
-                        # `Calificacion` (una recuperación por período, sin
-                        # competencia). En secundaria la recuperación vive
-                        # DENTRO de cada competencia, en `competencias[n]`.
-                        'rp1': None, 'rp2': None, 'rp3': None, 'rp4': None,
-                        # pc1..pc4 son los promedios POR PERÍODO. El Registro ya
-                        # no los imprime (ver promedios_competencia), pero son
-                        # la base del CF oficial y los consume el boletín, así
-                        # que se conservan.
-                        'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
-                        'cf': cf,
-                        # v2.20.1-B2: CF exacta (para % de completiva/extraordinaria)
-                        # y cascada de evaluaciones extra, ya serializadas.
-                        'cf_exacto': cf_exacto,
-                        'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
-                    }
-                    continue
-
-                calif = _por_estudiante.get(est.id)
-                if calif:
-                    # PC: usar valor persistido; si está NULL, recalcular con la lógica
-                    # oficial del modelo (que retorna None si faltan parciales).
-                    pc1 = calif.pc1 if calif.pc1 is not None else calif.calcular_pc(1)
-                    pc2 = calif.pc2 if calif.pc2 is not None else calif.calcular_pc(2)
-                    pc3 = calif.pc3 if calif.pc3 is not None else calif.calcular_pc(3)
-                    pc4 = calif.pc4 if calif.pc4 is not None else calif.calcular_pc(4)
-                    
-                    # CF: usar valor persistido; si está NULL, recalcular sólo si los
-                    # 4 PC están completos (calcular_cf retorna None en caso contrario).
-                    cf = calif.cf
-                    if cf is None and all(p is not None for p in (pc1, pc2, pc3, pc4)):
-                        cf = round((pc1 + pc2 + pc3 + pc4) / 4, 2)
-                    
-                    calificaciones[idx] = {
-                        'rp1': calif.rp1,
-                        'rp2': calif.rp2,
-                        'rp3': calif.rp3,
-                        'rp4': calif.rp4,
-                        'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
-                        'cf': cf,
-                        # v2.20.1-B2: el modelo legacy Calificacion no guarda CF
-                        # exacta; el % usa la misma CF. La cascada extra vive solo
-                        # en EvaluacionExtraSecundaria (puede o no existir).
-                        'cf_exacto': cf,
-                        'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
-                    }
+        calificaciones = _calificaciones_de_asignatura(
+            db, current_user, asignatura, estudiantes_db,
+            _ano_registro, _extras_idx, _serial_ev)
         
         # Asistencia por materia
         asistencias_por_est = {}
