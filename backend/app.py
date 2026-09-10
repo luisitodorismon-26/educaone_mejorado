@@ -8334,7 +8334,11 @@ async def get_dashboard_profesor(db: Session = Depends(get_db), current_user: Us
     """Dashboard específico para profesores. Si no es profesor devuelve vacío (no error)."""
     if current_user.role != 'profesor':
         # No es error — el frontend puede llamar este endpoint desde dashboard general
-        return {'es_profesor': False, 'horarios_hoy': [], 'clases_pendientes': [], 'alertas': []}
+        # R3.4: `niveles_asignados` viaja también aquí para que el sidebar tenga
+        # siempre la clave. Para quien no es profesor no aplica la regla de
+        # niveles por asignación: su política de división no cambia en R3.4.
+        return {'es_profesor': False, 'horarios_hoy': [], 'clases_pendientes': [],
+                'alertas': [], 'niveles_asignados': None}
     
     hoy = today_rd()
     ahora = now_rd()
@@ -8511,7 +8515,13 @@ async def get_dashboard_profesor(db: Session = Depends(get_db), current_user: Us
         'horario_hoy': horario_dia,
         'cursos_asignados': cursos_asignados,
         'pendientes_calificar': pendientes_calificar,
-        'periodo_activo': periodo_activo
+        'periodo_activo': periodo_activo,
+        # R3.4 §17: FUENTE ÚNICA de los niveles del profesor, calculada en el
+        # servidor a partir de sus asignaciones activas -> curso -> Grado.nivel.
+        # El sidebar la consume tal cual; el frontend no reimplementa ninguna
+        # heurística de grados ni infiere por el texto del nombre.
+        'niveles_asignados': _doc_niveles.niveles_asignados_de_profesor(
+            db, current_user.id, current_user.colegio_id),
     }
 
 @app.get("/api/dashboard/direccion")

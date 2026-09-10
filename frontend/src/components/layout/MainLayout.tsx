@@ -72,6 +72,10 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   const [isSidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [modulosConfig, setModulosConfig] = useState<any>(null);
+  // R3.4 §17: niveles REALES del profesor, calculados por el backend a partir
+  // de sus asignaciones activas. `null` = todavía no se sabe.
+  const [nivelesProfesor, setNivelesProfesor] =
+    useState<{ primaria: boolean; secundaria: boolean } | null>(null);
   const [notificaciones, setNotificaciones] = useState<any[]>([]);
   // v2.15 F1: switch de división (solo dirección). La elección vive en
   // localStorage y el interceptor de api.ts la manda en cada petición.
@@ -122,6 +126,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
       loadConfig();
       loadNotificaciones();
       loadModulosConfig();
+      loadNivelesProfesor();
       const interval = setInterval(loadNotificaciones, 30000);
       return () => clearInterval(interval);
     } else {
@@ -142,6 +147,20 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
       setConfig(res.data);
     } catch (e) {
       console.error('Error cargando config:', e);
+    }
+  };
+
+  // R3.4: fuente ÚNICA de los niveles del profesor. No se infiere en el
+  // frontend a partir del nombre de los grados: lo resuelve el backend con
+  // Grado.nivel. Si la llamada falla se deja en null (fail-safe: no se le
+  // ofrece al profesor una función de un nivel que quizá no imparte).
+  const loadNivelesProfesor = async () => {
+    if (user?.role !== 'profesor') return;
+    try {
+      const res = await api.get('/dashboard/profesor');
+      setNivelesProfesor(res.data?.niveles_asignados ?? null);
+    } catch (e) {
+      setNivelesProfesor(null);
     }
   };
 
@@ -313,6 +332,20 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
 
     // v2.15: items exclusivos de una división se ocultan bajo el lente contrario
     if (item.nivel && lenteNivelMenu && item.nivel !== lenteNivelMenu) return false;
+
+    // R3.4 §15-§16: para el PROFESOR el nivel no sale de `nivel_asignado` —que
+    // suele estar vacío y se interpretaba como "ambos"— sino de sus
+    // ASIGNACIONES ACTIVAS. Un profesor de Secundaria no debe ver
+    // "Recuperaciones (Primaria)", que no puede usar.
+    //
+    // FAIL-SAFE: mientras `nivelesProfesor` es null (cargando, o la llamada
+    // falló) los items específicos de nivel NO se muestran. Es preferible que
+    // aparezcan un instante después a ofrecerle una función de un nivel que
+    // quizá no imparte. Los items sin `nivel` no se ven afectados.
+    if (item.nivel && user.role === 'profesor') {
+      if (!nivelesProfesor) return false;
+      if (!nivelesProfesor[item.nivel]) return false;
+    }
 
     // Verificar si el módulo está habilitado
     if (item.modulo && modulosConfig) {
