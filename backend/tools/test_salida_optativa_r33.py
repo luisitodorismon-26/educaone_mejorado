@@ -367,6 +367,8 @@ G4, G4B = 4, 104
 CURSO_A, CURSO_A2, CURSO_B = 14, 19, 20
 ASIG_OPT, ASIG_EXTRA, ASIG_B = 101, 102, 201
 EST_A = 500
+EST_HIST = 501                  # estudiante del curso HISTÓRICO (año A2)
+NOTA_A1, NOTA_A2 = 80.0, 55.0   # distintas a propósito: distinguen el año
 U_DIR_A = 30
 PWD = "Prueba2026x"
 
@@ -407,6 +409,10 @@ def _seed_bd():
         d.add(u)
         d.add(M.Estudiante(id=EST_A, colegio_id=COL_A, nombre="E", apellido="T",
                            curso_id=CURSO_A, activo=True))
+        # El estudiante del curso HISTÓRICO: su curso pertenece al año A2, que
+        # NO es el activo del colegio.
+        d.add(M.Estudiante(id=EST_HIST, colegio_id=COL_A, nombre="H", apellido="T",
+                           curso_id=CURSO_A2, activo=True))
         d.commit()
         # notas para AMBAS asignaturas: la vinculada y la extra
         for aid in (ASIG_OPT, ASIG_EXTRA):
@@ -414,7 +420,17 @@ def _seed_bd():
                 d.add(M.CalificacionSecundaria(
                     colegio_id=COL_A, estudiante_id=EST_A, asignatura_id=aid,
                     ano_escolar_id=ANO_A1, competencia_numero=comp_n,
-                    p1=80.0, p2=80.0, p3=80.0, p4=80.0))
+                    p1=NOTA_A1, p2=NOTA_A1, p3=NOTA_A1, p4=NOTA_A1))
+        # El estudiante histórico tiene notas en LOS DOS años, con valores
+        # distintos, y sobre la MISMA asignatura. Si el loader leyera el año
+        # activo del colegio (A1) en vez del año del curso (A2), cargaría
+        # NOTA_A1 y el test lo cazaría.
+        for ano_id, nota in ((ANO_A1, NOTA_A1), (ANO_A2, NOTA_A2)):
+            for comp_n in (1, 2, 3, 4):
+                d.add(M.CalificacionSecundaria(
+                    colegio_id=COL_A, estudiante_id=EST_HIST, asignatura_id=ASIG_OPT,
+                    ano_escolar_id=ano_id, competencia_numero=comp_n,
+                    p1=nota, p2=nota, p3=nota, p4=nota))
         d.commit()
     finally:
         d.close()
@@ -490,6 +506,46 @@ def _():
         assert n == 1, n
     finally:
         d.close()
+
+
+@test("§C4b CURSO HISTÓRICO: se leen las notas de SU año, no las del año activo")
+def _():
+    # CURSO_A2 pertenece al año A2, que NO es el activo del colegio (lo es A1).
+    # Su mapeo se creó en §C4. El estudiante histórico tiene notas en los dos
+    # años sobre la misma asignatura, con valores distintos.
+    res = _resolver(CURSO_A2)
+    assert set(res) == {5}, res
+    califs = res[5]["calificaciones"]
+    assert 0 in califs, califs
+    cf = califs[0].get("cf")
+    assert cf is not None, califs[0]
+    # NOTA_A2 = 55 es la del año del curso; NOTA_A1 = 80 es la del año activo.
+    assert abs(cf - NOTA_A2) < 0.01, (
+        "se cargó %r; con NOTA_A1=%s estaría leyendo el año ACTIVO en vez del "
+        "año del curso" % (cf, NOTA_A1))
+    assert abs(cf - NOTA_A1) > 0.01, cf
+
+
+@test("§C4c un curso cuyo año no existe no cae al año activo: devuelve {}")
+def _():
+    d = SessionLocal()
+    try:
+        c = d.query(M.Curso).get(CURSO_A2)
+        original = c.ano_escolar_id
+        c.ano_escolar_id = 987654          # año inexistente
+        d.commit()
+    finally:
+        d.close()
+    try:
+        assert _resolver(CURSO_A2) == {}, "no debe inventar un año ni usar el activo"
+    finally:
+        d = SessionLocal()
+        try:
+            c = d.query(M.Curso).get(CURSO_A2)
+            c.ano_escolar_id = original
+            d.commit()
+        finally:
+            d.close()
 
 
 @test("§C5 el mapeo de OTRO TENANT no entra")

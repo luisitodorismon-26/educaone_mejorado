@@ -3834,15 +3834,17 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
                 planes.append((codigo, None))
                 continue
 
-            asig = db.query(Asignatura).filter(Asignatura.id == asignatura_id).first()
+            # La consulta nace ACOTADA al colegio del curso, así que un id de
+            # otro tenant es indistinguible de uno inexistente: las dos ramas
+            # eran dos respuestas distintas y eso bastaba para enumerar qué ids
+            # existen en otros colegios. Ahora ambas caen en el mismo 404, con
+            # el mismo cuerpo. Es el mismo criterio que `get_tenant_or_404`.
+            asig = db.query(Asignatura).filter(
+                Asignatura.id == asignatura_id,
+                Asignatura.colegio_id == curso.colegio_id,
+            ).first()
             if asig is None:
-                return JSONResponse({'error': f'La asignatura {asignatura_id} no existe.'},
-                                    status_code=400)
-            if asig.colegio_id != curso.colegio_id:
-                # Mismo texto y mismo código para un id inexistente y para uno de
-                # otro colegio: la respuesta no debe revelar qué ids existen.
-                return JSONResponse({'error': 'La asignatura pertenece a otro colegio.'},
-                                    status_code=400)
+                return JSONResponse({'error': 'Asignatura no encontrada'}, status_code=404)
             if asig.activo is False:
                 return JSONResponse({
                     'error': f'La asignatura {asig.nombre!r} está inactiva y no puede '
@@ -15615,7 +15617,26 @@ def _cargar_salida_optativa_registro(db, current_user, curso, estudiantes_db):
     if not resueltos:
         return {}
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    # EL AÑO ES EL DEL CURSO, no el activo del colegio. Un Registro de un curso
+    # histórico tiene que imprimir las notas de SU año; leer el año activo le
+    # metería las de otro. `Curso.ano_escolar_id` es la fuente de verdad que ya
+    # usan `salida_optativa_service.ano_de_curso` y el propio mapeo, que es
+    # NOT NULL en esa columna.
+    #
+    # Se resuelve tenant-safe. Si el año del curso no existe o es de otro
+    # colegio NO se cae al año activo: se devuelve {} y se deja rastro. Preferir
+    # una página en blanco antes que una página con notas del año equivocado.
+    ano_id = getattr(curso, 'ano_escolar_id', None)
+    if ano_id is None:
+        logger.warning("Curso %s tiene Salida Optativa pero no tiene año escolar; "
+                       "no se resuelven sus componentes.", curso.id)
+        return {}
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter(
+        AnoEscolar.id == ano_id).first()
+    if ano is None:
+        logger.warning("El año escolar %s del curso %s no existe o no es de este "
+                       "colegio; no se resuelve su Salida Optativa.", ano_id, curso.id)
+        return {}
     ids_est = [e.id for e in estudiantes_db]
 
     extras_idx = {}

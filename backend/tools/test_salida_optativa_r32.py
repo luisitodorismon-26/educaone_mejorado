@@ -331,15 +331,22 @@ def _():
     assert mapeos(C4_A) == {}, "ninguna validación fallida debe haber escrito"
 
 
-@test("§12 una asignatura de otro colegio se rechaza (y no filtra ids)")
+@test("§12 una asignatura de otro colegio se rechaza igual que una inexistente")
 def _():
     put(C4_A, DIR_A, salida_optativa_codigo="HLM")
-    r = put(C4_A, DIR_A, componentes={HLM_LE_4: A_B_LIT})
-    assert r.status_code == 400, r.text[:250]
-    assert "otro colegio" in r.json()["error"], r.json()
-    # un id inexistente da un mensaje distinto pero tampoco escribe
-    assert put(C4_A, DIR_A, componentes={HLM_LE_4: 999999}).status_code == 400
-    # una asignatura INACTIVA del propio colegio tampoco sirve
+    ajena = put(C4_A, DIR_A, componentes={HLM_LE_4: A_B_LIT})
+    inexistente = put(C4_A, DIR_A, componentes={HLM_LE_4: 999999})
+    # INDISTINGUIBLES: si la respuesta variara, bastaría para enumerar qué ids
+    # existen en otros colegios.
+    assert ajena.status_code == 404, ajena.text[:250]
+    assert inexistente.status_code == ajena.status_code, (inexistente.status_code,
+                                                          ajena.status_code)
+    assert inexistente.json() == ajena.json(), (inexistente.json(), ajena.json())
+    # y el cuerpo no menciona el id ni el colegio
+    cuerpo = ajena.text
+    assert str(A_B_LIT) not in cuerpo and "colegio" not in cuerpo.lower(), cuerpo[:250]
+    # una asignatura INACTIVA del propio colegio tampoco sirve (su mensaje sí
+    # puede ser específico: es dato del propio tenant, no filtra nada ajeno)
     r = put(C4_A, DIR_A, componentes={HLM_LE_4: A_INACTIVA})
     assert r.status_code == 400 and "inactiva" in r.json()["error"], r.text[:250]
     assert mapeos(C4_A) == {}
