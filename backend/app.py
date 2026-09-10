@@ -55,7 +55,7 @@ from models import (
     HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
     ItemCompletivo, Notificacion,
     AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
-    AlertaAtendida, PushSubscription, init_db
+    AlertaAtendida, PushSubscription, CursoComponenteOptativo, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -3659,6 +3659,350 @@ async def delete_curso(id, request: Request, db: Session = Depends(get_db), curr
     db.commit()
     cache_clear(f'cursos:{current_user.colegio_id}')
     return {'message': 'Curso eliminado'}
+
+
+# ============== SALIDA OPTATIVA (R3.2) ==============
+# La configuración vive donde ya se configura el curso, no en una pantalla
+# nueva del menú: es un atributo del curso, igual que su tanda o su aula.
+#
+# Todo lo que estos endpoints validan sale de `salida_optativa_service` (R3.1).
+# No se reimplementa aquí ninguna regla del catálogo: si mañana cambia el
+# catálogo MINERD, cambia en un solo sitio.
+
+
+def _salida_optativa_estado(db, curso):
+    """
+    Estado completo de la Salida Optativa de un curso, para pintar la sección.
+
+    Incluye siempre el catálogo, de modo que el frontend no necesite una copia
+    propia de las 4 salidas ni de los nombres oficiales de los componentes.
+    """
+    import salidas_optativas as _cat
+    import salida_optativa_service as _svc
+    from salida_optativa_historia import historia_academica
+
+    grado_numero = _svc.grado_numero_de_curso(curso)
+    aplica = _cat.grado_admite_salida(grado_numero)
+    salida = getattr(curso, 'salida_optativa_codigo', None)
+
+    componentes = []
+    for item in _svc.resolver_componentes(db, curso):
+        comp = item['componente']
+        asig_id = item['asignatura_id']
+        asig = db.query(Asignatura).filter(Asignatura.id == asig_id).first() if asig_id else None
+        componentes.append({
+            'componente_codigo': comp.codigo,
+            'nombre_oficial': comp.nombre_oficial,
+            'slot': comp.slot,
+            'horas_semana': comp.horas_semana,
+            'asignatura_id': asig_id,
+            'asignatura_nombre': asig.nombre if asig else None,
+            # Se informa para que la UI pueda deshabilitar el selector ANTES de
+            # que Dirección intente un cambio que el servidor va a rechazar.
+            'tiene_historia': bool(historia_academica(db, curso, asig_id)),
+        })
+
+    faltantes = [c['componente_codigo'] for c in componentes if c['asignatura_id'] is None]
+    return {
+        'curso_id': curso.id,
+        'ano_escolar_id': getattr(curso, 'ano_escolar_id', None),
+        'grado_numero': grado_numero,
+        'aplica': aplica,
+        'salida_optativa_codigo': salida,
+        'salida_optativa_nombre': _cat.nombre_salida(salida),
+        'salidas_disponibles': [{'codigo': c, 'nombre': n}
+                                for c, n in sorted(_cat.SALIDAS.items())],
+        'componentes': componentes,
+        'faltantes': faltantes,
+        # `configurada` exige salida elegida Y todos los componentes vinculados.
+        # Es lo que R3.3 necesita para no imprimir una página a medias.
+        'configurada': bool(salida) and not faltantes and aplica,
+    }
+
+
+@app.get("/api/cursos/{id}/salida-optativa")
+async def get_salida_optativa(id, request: Request, db: Session = Depends(get_db),
+                              current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Configuración de Salida Optativa del curso, más el catálogo oficial."""
+    curso = get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    return _salida_optativa_estado(db, curso)
+
+
+@app.put("/api/cursos/{id}/salida-optativa")
+async def guardar_salida_optativa(id, request: Request, db: Session = Depends(get_db),
+                                  current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Guarda la salida y sus mapeos de componentes de forma ATÓMICA.
+
+    Body:
+        {"salida_optativa_codigo": "HLM"|null,
+         "componentes": {"HLM-LE-4": 12, "HLM-IN-4": 15}}
+
+    `componentes` ausente = no tocar los mapeos. Un componente con valor `null`
+    pide retirar ese vínculo.
+
+    ZERO DATA LOSS (R3.2 §7-§8): antes de cambiar la salida o de reescribir un
+    mapeo se comprueba si la asignatura saliente tiene historia académica en
+    este curso. Si la tiene, se responde 409 y NO se toca absolutamente nada —
+    ni el mapeo, ni la asignatura, ni las notas. Nunca hay cascade delete y
+    nunca se mueven datos de una asignatura a otra.
+    """
+    import salidas_optativas as _cat
+    import salida_optativa_service as _svc
+    from salida_optativa_historia import (MENSAJE_BLOQUEO, historia_academica,
+                                          mapeos_con_historia, resumen_historia)
+
+    curso = get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({'error': 'Body inválido'}, status_code=400)
+
+    grado_numero = _svc.grado_numero_de_curso(curso)
+    if not _cat.grado_admite_salida(grado_numero):
+        return JSONResponse({
+            'error': 'Este curso no tiene Salida Optativa: solo existe en la '
+                     'Modalidad Académica de 4to a 6to de Secundaria.'
+        }, status_code=400)
+
+    ok, err = _svc.validar_ano_para_curso(db, curso)
+    if not ok:
+        return JSONResponse({'error': err}, status_code=400)
+
+    salida_actual = getattr(curso, 'salida_optativa_codigo', None)
+    cambia_salida = 'salida_optativa_codigo' in data
+    salida_nueva = data.get('salida_optativa_codigo') if cambia_salida else salida_actual
+    if isinstance(salida_nueva, str) and not salida_nueva.strip():
+        salida_nueva = None
+
+    ok, err = _svc.validar_salida_para_curso(curso, salida_nueva)
+    if not ok:
+        return JSONResponse({'error': err}, status_code=400)
+
+    existentes = db.query(CursoComponenteOptativo).filter(
+        CursoComponenteOptativo.curso_id == curso.id,
+        CursoComponenteOptativo.colegio_id == curso.colegio_id,
+        CursoComponenteOptativo.ano_escolar_id == curso.ano_escolar_id,
+        CursoComponenteOptativo.activo == True,          # noqa: E712
+    ).all()
+    por_codigo = {m.componente_codigo: m for m in existentes}
+
+    # --- GUARDA 1: cambiar de salida invalida TODOS los mapeos actuales ---
+    if salida_nueva != salida_actual and existentes:
+        bloqueados = mapeos_con_historia(db, curso, existentes)
+        if bloqueados:
+            return JSONResponse({
+                'error': MENSAJE_BLOQUEO,
+                'motivo': 'historia_academica',
+                'componentes_bloqueados': [{
+                    'componente_codigo': b['componente_codigo'],
+                    'asignatura_id': b['asignatura_id'],
+                    'detalle': resumen_historia(b['evidencias']),
+                } for b in bloqueados],
+            }, status_code=409)
+
+    componentes = data.get('componentes')
+    if componentes is not None and not isinstance(componentes, dict):
+        return JSONResponse({'error': "'componentes' debe ser un objeto "
+                                      "{componente_codigo: asignatura_id}"}, status_code=400)
+
+    # --- Validación COMPLETA antes de escribir una sola fila ---
+    # Se valida contra la salida NUEVA, no contra la que había: guardar salida y
+    # componentes es una sola operación y debe validarse como tal.
+    planes = []
+    if componentes:
+        if salida_nueva is None:
+            return JSONResponse({
+                'error': 'No se pueden asignar componentes sin una Salida Optativa elegida.'
+            }, status_code=400)
+        for codigo, asignatura_id in componentes.items():
+            if not _cat.componente_pertenece(codigo, salida_nueva, grado_numero):
+                comp = _cat.componente(codigo)
+                if comp is None:
+                    return JSONResponse({
+                        'error': f'Componente optativo desconocido: {codigo!r}.'
+                    }, status_code=400)
+                return JSONResponse({
+                    'error': f'El componente {codigo!r} ({comp.nombre_oficial}) pertenece a '
+                             f'la salida {comp.salida} de {comp.grado}to y no puede usarse '
+                             f'en un curso de {grado_numero}to configurado como {salida_nueva}.'
+                }, status_code=400)
+
+            if asignatura_id is None:
+                planes.append((codigo, None))
+                continue
+
+            # La consulta nace ACOTADA al colegio del curso, así que un id de
+            # otro tenant es indistinguible de uno inexistente: las dos ramas
+            # eran dos respuestas distintas y eso bastaba para enumerar qué ids
+            # existen en otros colegios. Ahora ambas caen en el mismo 404, con
+            # el mismo cuerpo. Es el mismo criterio que `get_tenant_or_404`.
+            asig = db.query(Asignatura).filter(
+                Asignatura.id == asignatura_id,
+                Asignatura.colegio_id == curso.colegio_id,
+            ).first()
+            if asig is None:
+                return JSONResponse({'error': 'Asignatura no encontrada'}, status_code=404)
+            if asig.activo is False:
+                return JSONResponse({
+                    'error': f'La asignatura {asig.nombre!r} está inactiva y no puede '
+                             f'representar un componente optativo.'
+                }, status_code=400)
+            planes.append((codigo, asignatura_id))
+
+        # Una asignatura no puede representar dos componentes del mismo curso.
+        # La UniqueConstraint lo garantiza al final, pero un 400 explicado es
+        # mejor que un IntegrityError.
+        elegidas = [a for _, a in planes if a is not None]
+        if len(set(elegidas)) != len(elegidas):
+            return JSONResponse({
+                'error': 'Una misma asignatura no puede representar dos componentes '
+                         'del mismo curso.'
+            }, status_code=400)
+
+    # --- GUARDA 2: reescribir o retirar un mapeo con historia ---
+    for codigo, asignatura_id in planes:
+        actual = por_codigo.get(codigo)
+        if actual is None or actual.asignatura_id == asignatura_id:
+            continue        # alta nueva, o idempotente: no se pierde nada
+        ev = historia_academica(db, curso, actual.asignatura_id)
+        if ev:
+            return JSONResponse({
+                'error': MENSAJE_BLOQUEO,
+                'motivo': 'historia_academica',
+                'componentes_bloqueados': [{
+                    'componente_codigo': codigo,
+                    'asignatura_id': actual.asignatura_id,
+                    'detalle': resumen_historia(ev),
+                }],
+            }, status_code=409)
+
+    # --- GUARDA 3: la asignatura elegida no puede estar ya en OTRO componente ---
+    # `uq_curso_componente_asignatura` lo impide a nivel de tabla; comprobarlo
+    # aquí convierte un IntegrityError en un 400 que explica qué pasa. Solo
+    # aplica si la salida NO cambia: si cambia, los mapeos viejos se retiran.
+    if salida_nueva == salida_actual:
+        pedidos = {c for c, _ in planes}
+        for codigo, asignatura_id in planes:
+            if asignatura_id is None:
+                continue
+            for m in existentes:
+                if (m.componente_codigo != codigo
+                        and m.componente_codigo not in pedidos
+                        and m.asignatura_id == asignatura_id):
+                    return JSONResponse({
+                        'error': 'Una misma asignatura no puede representar dos '
+                                 'componentes del mismo curso. Ya está asignada a '
+                                 f'{m.componente_codigo}.'
+                    }, status_code=400)
+
+    # --- ESCRITURA (ya todo validado) ---
+    curso.salida_optativa_codigo = salida_nueva
+
+    # Cambiar de salida deja los mapeos viejos sin componente al que pertenecer.
+    # Solo se llega aquí si NINGUNO tenía historia, así que retirarlos no pierde
+    # ningún dato académico: se retira la RELACIÓN (R3.2 §8), nunca la Asignatura
+    # ni ninguna nota.
+    #
+    # Se BORRA la fila en vez de marcarla `activo=False` porque las dos
+    # UniqueConstraint de R3.1 —(curso, año, componente) y (curso, año,
+    # asignatura)— no incluyen `activo`: una fila desactivada seguiría ocupando
+    # su hueco e impediría volver a usar esa asignatura o ese componente. El
+    # rastro del cambio queda en `log_auditoria`, que es donde va la historia de
+    # configuración; aquí solo vive el estado vigente.
+    #
+    # PRIMERO todas las bajas y un flush, DESPUÉS las altas. El unit of work de
+    # SQLAlchemy emite los INSERT antes que los DELETE dentro de un mismo flush,
+    # así que sin este corte una asignatura que se mueve de componente chocaría
+    # contra `uq_curso_componente_asignatura` con su propia fila saliente.
+    hay_bajas = False
+    if salida_nueva != salida_actual:
+        for m in existentes:
+            db.delete(m)
+            hay_bajas = True
+        por_codigo = {}
+    for codigo, asignatura_id in planes:
+        if asignatura_id is None and por_codigo.get(codigo) is not None:
+            db.delete(por_codigo.pop(codigo))
+            hay_bajas = True
+    if hay_bajas:
+        db.flush()
+
+    for codigo, asignatura_id in planes:
+        if asignatura_id is None:
+            continue
+        actual = por_codigo.get(codigo)
+        if actual is not None:
+            actual.asignatura_id = asignatura_id
+            actual.activo = True
+            db.flush()          # la reasignación también compite por la unicidad
+            continue
+        mapeo, err = _svc.construir_mapeo(db, curso, codigo, asignatura_id)
+        if err:
+            db.rollback()
+            return JSONResponse({'error': err}, status_code=400)
+        db.add(mapeo)
+
+    db.commit()
+    log_auditoria(db, 'actualizar', 'cursos', curso.id, None,
+                  {'salida_optativa_codigo': salida_nueva,
+                   'componentes': componentes}, user=current_user, request=request)
+    cache_clear(f'cursos:{current_user.colegio_id}')
+    db.refresh(curso)
+    return _salida_optativa_estado(db, curso)
+
+
+@app.delete("/api/cursos/{id}/salida-optativa/componentes/{componente_codigo}")
+async def quitar_componente_optativo(id, componente_codigo, request: Request,
+                                     db: Session = Depends(get_db),
+                                     current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Retira el vínculo componente -> asignatura. Nunca borra la Asignatura.
+
+    Misma protección que el guardado: si esa asignatura tiene historia académica
+    en este curso, 409 y no se toca nada.
+    """
+    from salida_optativa_historia import (MENSAJE_BLOQUEO_MAPEO, historia_academica,
+                                          resumen_historia)
+
+    curso = get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    mapeo = db.query(CursoComponenteOptativo).filter(
+        CursoComponenteOptativo.curso_id == curso.id,
+        CursoComponenteOptativo.colegio_id == curso.colegio_id,
+        CursoComponenteOptativo.ano_escolar_id == curso.ano_escolar_id,
+        CursoComponenteOptativo.componente_codigo == componente_codigo,
+        CursoComponenteOptativo.activo == True,          # noqa: E712
+    ).first()
+    if mapeo is None:
+        return JSONResponse({'error': 'Ese componente no está vinculado en este curso.'},
+                            status_code=404)
+
+    ev = historia_academica(db, curso, mapeo.asignatura_id)
+    if ev:
+        return JSONResponse({
+            'error': MENSAJE_BLOQUEO_MAPEO,
+            'motivo': 'historia_academica',
+            'componentes_bloqueados': [{
+                'componente_codigo': componente_codigo,
+                'asignatura_id': mapeo.asignatura_id,
+                'detalle': resumen_historia(ev),
+            }],
+        }, status_code=409)
+
+    # Se retira la RELACIÓN (R3.2 §8). La Asignatura y toda su historia quedan
+    # intactas. Se borra la fila en vez de desactivarla por la misma razón que
+    # en el guardado: las UniqueConstraint de R3.1 no miran `activo`, y una fila
+    # zombi bloquearía volver a vincular ese componente.
+    db.delete(mapeo)
+    db.commit()
+    log_auditoria(db, 'actualizar', 'cursos', curso.id, None,
+                  {'quitar_componente': componente_codigo}, user=current_user, request=request)
+    cache_clear(f'cursos:{current_user.colegio_id}')
+    db.refresh(curso)
+    return _salida_optativa_estado(db, curso)
+
 
 # ============== USUARIOS ==============
 
@@ -15000,13 +15344,19 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             db, current_user, curso, grado_numero)
     except EspecificacionCurricularConflicto as _exc:
         return _respuesta_conflicto_espec(_exc)
-    
+
+    # R3.3 — Salida Optativa, indexada por SLOT. Un curso sin salida configurada
+    # devuelve {} y el Registro se comporta EXACTAMENTE como antes de R3.3.
+    salida_optativa_data = _cargar_salida_optativa_registro(
+        db, current_user, curso, estudiantes_db[:90])
+
     # === 3. GENERAR PDF ===
     try:
         pdf_bytes = generar_registro_desde_sistema(
             colegio_info, curso_info, ano_escolar,
             estudiantes_raw, asignaturas_data, grado_numero,
             especificacion_data=especificacion_data,
+            salida_optativa_data=salida_optativa_data or None,
         )
         
         filename = f"Registro_Escolar_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
@@ -15217,6 +15567,272 @@ def _respuesta_conflicto_espec(exc):
     return None
 
 
+
+
+def _serial_evaluacion_extra(_ev):
+    """dict plano y serializable (sin ORM, sin sesión) para el threadpool."""
+    if _ev is None:
+        return None
+    return {
+        'cf_original': _ev.cf_original,
+        'cec': _ev.cec,
+        'completiva_final': _ev.completiva_final,
+        'ceex': _ev.ceex,
+        'extraordinaria_final': _ev.extraordinaria_final,
+        'ce': _ev.ce,
+        'especial_final': _ev.especial_final,
+        'condicion_final': _ev.condicion_final,
+        'nota_final': _ev.nota_final,
+        'fase_pendiente': _ev.fase_pendiente(),
+    }
+
+
+def _cargar_salida_optativa_registro(db, current_user, curso, estudiantes_db):
+    """
+    Notas de los componentes de Salida Optativa, indexadas por SLOT.
+
+    R3.3 — LA ÚNICA CONFIGURACIÓN ADMITIDA
+    --------------------------------------
+    La cadena es `Curso.salida_optativa_codigo` -> `CursoComponenteOptativo` ->
+    `Asignatura`. NO se resuelve por nombre: da igual cómo se llame la materia
+    del colegio, y una materia extra del boletín que nadie vinculó NO entra.
+
+    Devuelve `{slot: {'docente': str, 'calificaciones': {idx_est: {...}}}}`, la
+    MISMA forma que una asignatura normal, para que el generador aplique la
+    misma cascada de completiva/extraordinaria y el mismo redondeo. Un
+    componente sin asignatura vinculada NO aparece en el dict: su página queda
+    idéntica al template en vez de rellenarse con ceros o nombres inventados.
+    """
+    import salida_optativa_service as _svc
+
+    if curso is None or not getattr(curso, 'salida_optativa_codigo', None):
+        return {}
+
+    try:
+        resueltos = _svc.resolver_componentes(db, curso)
+    except ValueError as e:
+        # Incoherencia de año: nunca se imprime configuración de otro año.
+        logger.error("Salida Optativa no resuelta para curso %s: %s", curso.id, e)
+        return {}
+    if not resueltos:
+        return {}
+
+    # EL AÑO ES EL DEL CURSO, no el activo del colegio. Un Registro de un curso
+    # histórico tiene que imprimir las notas de SU año; leer el año activo le
+    # metería las de otro. `Curso.ano_escolar_id` es la fuente de verdad que ya
+    # usan `salida_optativa_service.ano_de_curso` y el propio mapeo, que es
+    # NOT NULL en esa columna.
+    #
+    # Se resuelve tenant-safe. Si el año del curso no existe o es de otro
+    # colegio NO se cae al año activo: se devuelve {} y se deja rastro. Preferir
+    # una página en blanco antes que una página con notas del año equivocado.
+    ano_id = getattr(curso, 'ano_escolar_id', None)
+    if ano_id is None:
+        logger.warning("Curso %s tiene Salida Optativa pero no tiene año escolar; "
+                       "no se resuelven sus componentes.", curso.id)
+        return {}
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter(
+        AnoEscolar.id == ano_id).first()
+    if ano is None:
+        logger.warning("El año escolar %s del curso %s no existe o no es de este "
+                       "colegio; no se resuelve su Salida Optativa.", ano_id, curso.id)
+        return {}
+    ids_est = [e.id for e in estudiantes_db]
+
+    extras_idx = {}
+    if ano is not None and ids_est:
+        for ev in tenant_filter(
+            db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria, current_user
+        ).filter(
+            EvaluacionExtraSecundaria.ano_escolar_id == ano.id,
+            EvaluacionExtraSecundaria.estudiante_id.in_(ids_est),
+        ).all():
+            extras_idx[(ev.estudiante_id, ev.asignatura_id)] = ev
+
+    docentes = {}
+    for ap in tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, activo=True).order_by(AsignacionProfesor.id).all():
+        docentes.setdefault(ap.asignatura_id, ap)
+
+    salida = {}
+    for item in resueltos:
+        asig_id = item['asignatura_id']
+        if asig_id is None:
+            continue                      # componente sin vincular: no se inventa
+        # `tenant_filter` es la barrera: una asignatura de otro colegio no se
+        # resuelve aunque su id estuviera en la tabla.
+        asig = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter(
+            Asignatura.id == asig_id).first()
+        if asig is None:
+            logger.warning("Componente %s del curso %s apunta a la asignatura %s, que no "
+                           "es de este colegio; se omite.",
+                           item['componente'].codigo, curso.id, asig_id)
+            continue
+
+        califs = _calificaciones_de_asignatura(
+            db, current_user, asig, estudiantes_db, ano, extras_idx,
+            _serial_evaluacion_extra)
+        if not califs:
+            continue                      # sin notas: la página queda como el template
+
+        ap = docentes.get(asig.id)
+        salida[item['slot']] = {
+            'docente': ap.profesor.nombre_completo if (ap and ap.profesor) else '',
+            'calificaciones': califs,
+        }
+    return salida
+
+
+def _calificaciones_de_asignatura(db, current_user, asignatura, estudiantes_db,
+                                 _ano_registro, _extras_idx, _serial_ev):
+    """
+    Notas de UNA asignatura para el Registro de Secundaria, por índice de
+    estudiante.
+
+    R3.3 — EXTRAÍDO SIN CAMBIOS de `_cargar_datos_asignaturas_secundaria`.
+    Lo consumen ahora DOS llamadores: las asignaturas MINERD normales y los
+    componentes de Salida Optativa. Es una extracción deliberada: la Salida
+    Optativa debe leer las MISMAS fuentes y aplicar las MISMAS fórmulas que
+    una materia normal (`calcular_pc_periodo`, `_calcular_cf_secundaria`, la
+    cascada de `EvaluacionExtraSecundaria`). Duplicar este bloque habría
+    creado una segunda verdad para las mismas notas.
+    """
+    calificaciones = {}
+    if asignatura is None:
+        return {}
+    # v2.19.6: UNA consulta por asignatura para todo el curso. Antes era
+    # una por estudiante: con 38 estudiantes y 13 asignaturas eran ~500
+    # viajes a la base. En Render la base es un host aparte, así que cada
+    # viaje cuesta latencia de red y se sumaban segundos enteros.
+    # `.setdefault` conserva el criterio del `.first()` anterior
+    # (quedarse con la primera fila), ahora de forma determinista.
+    _por_estudiante = {}
+    for _c in tenant_filter(db.query(Calificacion), Calificacion, current_user).filter(
+        Calificacion.asignatura_id == asignatura.id,
+        Calificacion.estudiante_id.in_([e.id for e in estudiantes_db]),
+    ).order_by(Calificacion.id).all():
+        _por_estudiante.setdefault(_c.estudiante_id, _c)
+
+    # v2.19.7: la secundaria REAL no escribe en `Calificacion` sino en
+    # `CalificacionSecundaria`, una fila por competencia (1-4). El
+    # Registro leía solo la tabla legacy —vacía en producción— y por eso
+    # las páginas de notas salían en blanco aunque el profesor tuviera
+    # todo cargado. Acá se leen las competencias del curso en UNA
+    # consulta y se calculan PC y CF con las MISMAS funciones que ya usa
+    # el boletín: CalificacionSecundaria.calcular_pc_periodo y
+    # _calcular_cf_secundaria. No hay fórmula nueva.
+    _competencias_por_est = {}
+    if _ano_registro is not None:
+        for _cs in tenant_filter(
+            db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
+        ).filter(
+            CalificacionSecundaria.asignatura_id == asignatura.id,
+            CalificacionSecundaria.ano_escolar_id == _ano_registro.id,
+            CalificacionSecundaria.estudiante_id.in_([e.id for e in estudiantes_db]),
+        ).all():
+            _competencias_por_est.setdefault(_cs.estudiante_id, []).append(_cs)
+
+    for idx, est in enumerate(estudiantes_db):
+        comps = _competencias_por_est.get(est.id)
+        if comps:
+            # PC del período = promedio de las 4 competencias. Devuelve
+            # None si falta alguna: un estudiante incompleto queda en
+            # blanco, nunca con un promedio inventado.
+            pc1, pc2, pc3, pc4 = (
+                CalificacionSecundaria.calcular_pc_periodo(comps, p) for p in (1, 2, 3, 4)
+            )
+            cf, _literal, cf_exacto = _calcular_cf_secundaria(
+                db, est.id, asignatura.id,
+                _ano_registro.id if _ano_registro else None,
+                con_exacto=True,
+                competencias=comps,
+            )
+            # v2.19.7 (2): las competencias NO se colapsan antes de
+            # llegar al generador. El spread del Registro tiene CUATRO
+            # bloques de detalle P1/RP1..P4/RP4 —uno por competencia— y
+            # además el bloque resumen. Antes solo se enviaban los
+            # promedios, así que los cuatro bloques de detalle salían
+            # vacíos teniendo el dato cargado.
+            detalle = {}
+            for _c in comps:
+                num = _c.competencia_numero
+                if not num:
+                    continue
+                detalle[num] = {
+                    'p1': _c.p1, 'rp1': _c.rp1,
+                    'p2': _c.p2, 'rp2': _c.rp2,
+                    'p3': _c.p3, 'rp3': _c.rp3,
+                    'p4': _c.p4, 'rp4': _c.rp4,
+                }
+
+            # v2.19.7 (3): el bloque "Promedio de Competencias
+            # Específicas" del template rotula sus columnas
+            # "PC1: Competencia 1" … "PC4: Competencia 4", así que cada
+            # columna es el promedio FINAL de esa competencia a lo largo
+            # de P1-P4 — no el promedio de las cuatro competencias en un
+            # período. Se usa el método del propio modelo, que aplica
+            # valor_periodo() (max(P, RP)) y devuelve None si falta
+            # algún período.
+            promedios_competencia = {
+                _c.competencia_numero: _c.calcular_promedio_competencia()
+                for _c in comps if _c.competencia_numero
+            }
+
+            calificaciones[idx] = {
+                # Notas por competencia y período, tal como están en la
+                # base. Un valor NULL queda NULL: no se inventa nada.
+                'competencias': detalle,
+                # Lo que va al bloque resumen del Registro.
+                'promedios_competencia': promedios_competencia,
+                # Los rpN de primer nivel pertenecen al modelo legacy
+                # `Calificacion` (una recuperación por período, sin
+                # competencia). En secundaria la recuperación vive
+                # DENTRO de cada competencia, en `competencias[n]`.
+                'rp1': None, 'rp2': None, 'rp3': None, 'rp4': None,
+                # pc1..pc4 son los promedios POR PERÍODO. El Registro ya
+                # no los imprime (ver promedios_competencia), pero son
+                # la base del CF oficial y los consume el boletín, así
+                # que se conservan.
+                'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
+                'cf': cf,
+                # v2.20.1-B2: CF exacta (para % de completiva/extraordinaria)
+                # y cascada de evaluaciones extra, ya serializadas.
+                'cf_exacto': cf_exacto,
+                'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
+            }
+            continue
+
+        calif = _por_estudiante.get(est.id)
+        if calif:
+            # PC: usar valor persistido; si está NULL, recalcular con la lógica
+            # oficial del modelo (que retorna None si faltan parciales).
+            pc1 = calif.pc1 if calif.pc1 is not None else calif.calcular_pc(1)
+            pc2 = calif.pc2 if calif.pc2 is not None else calif.calcular_pc(2)
+            pc3 = calif.pc3 if calif.pc3 is not None else calif.calcular_pc(3)
+            pc4 = calif.pc4 if calif.pc4 is not None else calif.calcular_pc(4)
+            
+            # CF: usar valor persistido; si está NULL, recalcular sólo si los
+            # 4 PC están completos (calcular_cf retorna None en caso contrario).
+            cf = calif.cf
+            if cf is None and all(p is not None for p in (pc1, pc2, pc3, pc4)):
+                cf = round((pc1 + pc2 + pc3 + pc4) / 4, 2)
+            
+            calificaciones[idx] = {
+                'rp1': calif.rp1,
+                'rp2': calif.rp2,
+                'rp3': calif.rp3,
+                'rp4': calif.rp4,
+                'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
+                'cf': cf,
+                # v2.20.1-B2: el modelo legacy Calificacion no guarda CF
+                # exacta; el % usa la misma CF. La cascada extra vive solo
+                # en EvaluacionExtraSecundaria (puede o no existir).
+                'cf_exacto': cf,
+                'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
+            }
+    return calificaciones
+
 def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, grado_numero, estudiantes_db):
     """
     Helper: carga asignaturas, docentes, calificaciones y asistencia
@@ -15288,22 +15904,9 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
     # no vacío, esa función corta la generación con 409 en vez de imprimirlo
     # como si fuera un indicador oficial.
 
-    def _serial_ev(_ev):
-        """dict plano y serializable (sin ORM, sin sesión) para el threadpool."""
-        if _ev is None:
-            return None
-        return {
-            'cf_original': _ev.cf_original,
-            'cec': _ev.cec,
-            'completiva_final': _ev.completiva_final,
-            'ceex': _ev.ceex,
-            'extraordinaria_final': _ev.extraordinaria_final,
-            'ce': _ev.ce,
-            'especial_final': _ev.especial_final,
-            'condicion_final': _ev.condicion_final,
-            'nota_final': _ev.nota_final,
-            'fase_pendiente': _ev.fase_pendiente(),
-        }
+    # R3.3: el cuerpo vive ahora en `_serial_evaluacion_extra`, a nivel de
+    # módulo, para que el loader de Salida Optativa serialice EXACTAMENTE igual.
+    _serial_ev = _serial_evaluacion_extra
 
     # v2.19.6: una sola consulta en vez de una por asignatura del colegio.
     asigs_con_asignacion = {
@@ -15374,138 +15977,9 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         # CF aparece SOLO cuando los 4 PC están completos.
         # Confiamos en la lógica de Calificacion.calcular_pc / calcular_cf del modelo,
         # que retorna None si faltan datos (no hay fallbacks que inventen promedios).
-        calificaciones = {}
-        if asignatura:
-            # v2.19.6: UNA consulta por asignatura para todo el curso. Antes era
-            # una por estudiante: con 38 estudiantes y 13 asignaturas eran ~500
-            # viajes a la base. En Render la base es un host aparte, así que cada
-            # viaje cuesta latencia de red y se sumaban segundos enteros.
-            # `.setdefault` conserva el criterio del `.first()` anterior
-            # (quedarse con la primera fila), ahora de forma determinista.
-            _por_estudiante = {}
-            for _c in tenant_filter(db.query(Calificacion), Calificacion, current_user).filter(
-                Calificacion.asignatura_id == asignatura.id,
-                Calificacion.estudiante_id.in_([e.id for e in estudiantes_db]),
-            ).order_by(Calificacion.id).all():
-                _por_estudiante.setdefault(_c.estudiante_id, _c)
-
-            # v2.19.7: la secundaria REAL no escribe en `Calificacion` sino en
-            # `CalificacionSecundaria`, una fila por competencia (1-4). El
-            # Registro leía solo la tabla legacy —vacía en producción— y por eso
-            # las páginas de notas salían en blanco aunque el profesor tuviera
-            # todo cargado. Acá se leen las competencias del curso en UNA
-            # consulta y se calculan PC y CF con las MISMAS funciones que ya usa
-            # el boletín: CalificacionSecundaria.calcular_pc_periodo y
-            # _calcular_cf_secundaria. No hay fórmula nueva.
-            _competencias_por_est = {}
-            if _ano_registro is not None:
-                for _cs in tenant_filter(
-                    db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-                ).filter(
-                    CalificacionSecundaria.asignatura_id == asignatura.id,
-                    CalificacionSecundaria.ano_escolar_id == _ano_registro.id,
-                    CalificacionSecundaria.estudiante_id.in_([e.id for e in estudiantes_db]),
-                ).all():
-                    _competencias_por_est.setdefault(_cs.estudiante_id, []).append(_cs)
-
-            for idx, est in enumerate(estudiantes_db):
-                comps = _competencias_por_est.get(est.id)
-                if comps:
-                    # PC del período = promedio de las 4 competencias. Devuelve
-                    # None si falta alguna: un estudiante incompleto queda en
-                    # blanco, nunca con un promedio inventado.
-                    pc1, pc2, pc3, pc4 = (
-                        CalificacionSecundaria.calcular_pc_periodo(comps, p) for p in (1, 2, 3, 4)
-                    )
-                    cf, _literal, cf_exacto = _calcular_cf_secundaria(
-                        db, est.id, asignatura.id,
-                        _ano_registro.id if _ano_registro else None,
-                        con_exacto=True,
-                        competencias=comps,
-                    )
-                    # v2.19.7 (2): las competencias NO se colapsan antes de
-                    # llegar al generador. El spread del Registro tiene CUATRO
-                    # bloques de detalle P1/RP1..P4/RP4 —uno por competencia— y
-                    # además el bloque resumen. Antes solo se enviaban los
-                    # promedios, así que los cuatro bloques de detalle salían
-                    # vacíos teniendo el dato cargado.
-                    detalle = {}
-                    for _c in comps:
-                        num = _c.competencia_numero
-                        if not num:
-                            continue
-                        detalle[num] = {
-                            'p1': _c.p1, 'rp1': _c.rp1,
-                            'p2': _c.p2, 'rp2': _c.rp2,
-                            'p3': _c.p3, 'rp3': _c.rp3,
-                            'p4': _c.p4, 'rp4': _c.rp4,
-                        }
-
-                    # v2.19.7 (3): el bloque "Promedio de Competencias
-                    # Específicas" del template rotula sus columnas
-                    # "PC1: Competencia 1" … "PC4: Competencia 4", así que cada
-                    # columna es el promedio FINAL de esa competencia a lo largo
-                    # de P1-P4 — no el promedio de las cuatro competencias en un
-                    # período. Se usa el método del propio modelo, que aplica
-                    # valor_periodo() (max(P, RP)) y devuelve None si falta
-                    # algún período.
-                    promedios_competencia = {
-                        _c.competencia_numero: _c.calcular_promedio_competencia()
-                        for _c in comps if _c.competencia_numero
-                    }
-
-                    calificaciones[idx] = {
-                        # Notas por competencia y período, tal como están en la
-                        # base. Un valor NULL queda NULL: no se inventa nada.
-                        'competencias': detalle,
-                        # Lo que va al bloque resumen del Registro.
-                        'promedios_competencia': promedios_competencia,
-                        # Los rpN de primer nivel pertenecen al modelo legacy
-                        # `Calificacion` (una recuperación por período, sin
-                        # competencia). En secundaria la recuperación vive
-                        # DENTRO de cada competencia, en `competencias[n]`.
-                        'rp1': None, 'rp2': None, 'rp3': None, 'rp4': None,
-                        # pc1..pc4 son los promedios POR PERÍODO. El Registro ya
-                        # no los imprime (ver promedios_competencia), pero son
-                        # la base del CF oficial y los consume el boletín, así
-                        # que se conservan.
-                        'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
-                        'cf': cf,
-                        # v2.20.1-B2: CF exacta (para % de completiva/extraordinaria)
-                        # y cascada de evaluaciones extra, ya serializadas.
-                        'cf_exacto': cf_exacto,
-                        'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
-                    }
-                    continue
-
-                calif = _por_estudiante.get(est.id)
-                if calif:
-                    # PC: usar valor persistido; si está NULL, recalcular con la lógica
-                    # oficial del modelo (que retorna None si faltan parciales).
-                    pc1 = calif.pc1 if calif.pc1 is not None else calif.calcular_pc(1)
-                    pc2 = calif.pc2 if calif.pc2 is not None else calif.calcular_pc(2)
-                    pc3 = calif.pc3 if calif.pc3 is not None else calif.calcular_pc(3)
-                    pc4 = calif.pc4 if calif.pc4 is not None else calif.calcular_pc(4)
-                    
-                    # CF: usar valor persistido; si está NULL, recalcular sólo si los
-                    # 4 PC están completos (calcular_cf retorna None en caso contrario).
-                    cf = calif.cf
-                    if cf is None and all(p is not None for p in (pc1, pc2, pc3, pc4)):
-                        cf = round((pc1 + pc2 + pc3 + pc4) / 4, 2)
-                    
-                    calificaciones[idx] = {
-                        'rp1': calif.rp1,
-                        'rp2': calif.rp2,
-                        'rp3': calif.rp3,
-                        'rp4': calif.rp4,
-                        'pc1': pc1, 'pc2': pc2, 'pc3': pc3, 'pc4': pc4,
-                        'cf': cf,
-                        # v2.20.1-B2: el modelo legacy Calificacion no guarda CF
-                        # exacta; el % usa la misma CF. La cascada extra vive solo
-                        # en EvaluacionExtraSecundaria (puede o no existir).
-                        'cf_exacto': cf,
-                        'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
-                    }
+        calificaciones = _calificaciones_de_asignatura(
+            db, current_user, asignatura, estudiantes_db,
+            _ano_registro, _extras_idx, _serial_ev)
         
         # Asistencia por materia
         asistencias_por_est = {}
