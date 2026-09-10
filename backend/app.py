@@ -8424,8 +8424,21 @@ async def get_dashboard_profesor(db: Session = Depends(get_db), current_user: Us
         'tipo_bloque': h.tipo_bloque
     } for h in horarios_hoy]
     
-    # Cursos asignados - mostrar TODAS las asignaciones (curso + asignatura)
-    asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(profesor_id=current_user.id, activo=True).all()
+    # Cursos asignados: el trabajo VIGENTE del profesor (curso + asignatura).
+    #
+    # R3.4 §4: acotado al AÑO ESCOLAR ACTIVO. `activo` de la asignación y del
+    # curso no basta: al cerrar un año sus cursos y asignaciones siguen en la
+    # base, y sin este filtro el profesor vería como trabajo actual lo que dio
+    # el año pasado. Nada se borra ni se desactiva —el histórico sigue intacto
+    # para cierre de año y consultas—, solo queda fuera de la vista de trabajo.
+    import salida_optativa_docente as _doc_niveles
+    _cursos_vigentes = _doc_niveles.cursos_vigentes_de_profesor(
+        db, current_user.id, current_user.colegio_id)
+    asignaciones = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(profesor_id=current_user.id, activo=True).filter(
+        AsignacionProfesor.curso_id.in_(_cursos_vigentes)
+    ).all() if _cursos_vigentes else []
     # v2.13.28: contar estudiantes por curso en UNA query (en vez de una por curso)
     from sqlalchemy import func as _func
     curso_ids_asig = list({a.curso_id for a in asignaciones})
@@ -8442,7 +8455,6 @@ async def get_dashboard_profesor(db: Session = Depends(get_db), current_user: Us
     # el frontend para calificar sigue siendo `asignatura_id`, igual que en una
     # materia normal. Así no hace falta una pantalla de calificaciones aparte.
     import salidas_optativas as _cat_opt
-    import salida_optativa_docente as _doc_niveles
     _comp_por_clave = {}
     if asignaciones:
         for _m in tenant_filter(db.query(CursoComponenteOptativo),

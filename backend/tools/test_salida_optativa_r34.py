@@ -102,8 +102,10 @@ def test(nombre):
 # --------------------------------------------------------------------------
 COL_A, COL_B = 1, 2
 ANO_A, ANO_B = 1, 2
+ANO_VIEJO = 3                    # año CERRADO del colegio A (activo=False)
 G4, G4PRIM, G4B = 4, 40, 104
 C4_A, C4_OTRO, CPRIM, C4_B = 14, 15, 16, 20
+CPRIM_VIEJO = 17                 # curso de Primaria del año cerrado, activo=True
 
 A_LENGUA, A_MUSICA, A_MAT = 101, 102, 103          # colegio A
 A_B_LENGUA = 201                                    # colegio B
@@ -129,6 +131,9 @@ def _seed():
                            activo=True, dias_trabajados="{}"))
         d.add(M.AnoEscolar(id=ANO_B, colegio_id=COL_B, nombre="2025-2026",
                            activo=True, dias_trabajados="{}"))
+        # Año CERRADO del colegio A. Sus cursos siguen existiendo y activos.
+        d.add(M.AnoEscolar(id=ANO_VIEJO, colegio_id=COL_A, nombre="2024-2025",
+                           activo=False, dias_trabajados="{}"))
         d.add(M.Grado(id=G4, colegio_id=COL_A, nombre="4to Secundaria",
                       nivel="secundaria", orden=4))
         d.add(M.Grado(id=G4PRIM, colegio_id=COL_A, nombre="4to Primaria",
@@ -143,6 +148,10 @@ def _seed():
                       ano_escolar_id=ANO_A, activo=True))
         d.add(M.Curso(id=C4_B, colegio_id=COL_B, nombre="A", grado_id=G4B,
                       ano_escolar_id=ANO_B, activo=True))
+        # Curso de Primaria del año cerrado. `activo=True` A PROPÓSITO: demuestra
+        # que `Curso.activo` por sí solo NO alcanza para acotar el trabajo actual.
+        d.add(M.Curso(id=CPRIM_VIEJO, colegio_id=COL_A, nombre="A", grado_id=G4PRIM,
+                      ano_escolar_id=ANO_VIEJO, activo=True))
         # TRONCAL: tiene area_curricular_codigo -> NO puede representar un componente
         d.add(M.Asignatura(id=A_LENGUA, colegio_id=COL_A, nombre="Lengua Española",
                            codigo="LE", area="Lenguas", area_curricular_codigo="LE",
@@ -981,6 +990,230 @@ def _():
     assert "if (pid) soloProfes[cod] = pid;" not in src, \
         "no debe descartar los null: haria imposible retirar al profesor"
     assert "?? null" in src and "enviaProfes" in src, "debe enviar el null explicito"
+
+
+# ===========================================================================
+# BLOQUE E — TRONCAL PROTEGIDA Y AÑO ESCOLAR VIGENTE (último fix pre-PR)
+# ===========================================================================
+
+def _mapear_directo(curso_id, codigo, asignatura_id, ano=None):
+    """Crea un mapeo saltándose la API, para reproducir estado legacy de R3.2."""
+    d = SessionLocal()
+    try:
+        d.add(M.CursoComponenteOptativo(
+            colegio_id=COL_A, curso_id=curso_id, ano_escolar_id=ano or ANO_A,
+            componente_codigo=codigo, asignatura_id=asignatura_id, activo=True))
+        d.commit()
+    finally:
+        d.close()
+
+
+def _limpiar_optativa(curso_id):
+    """Deja el curso sin salida ni mapeos, sin pasar por las guardas."""
+    d = SessionLocal()
+    try:
+        for m in d.query(M.CursoComponenteOptativo).filter(
+                M.CursoComponenteOptativo.curso_id == curso_id).all():
+            d.delete(m)
+        c = d.query(M.Curso).get(curso_id)
+        c.salida_optativa_codigo = None
+        d.commit()
+    finally:
+        d.close()
+
+
+@test("§E1 §1: cambiar de Salida sobre un mapeo LEGACY no toca al profesor de la troncal")
+def _():
+    # Estado que R3.2 permitía: el componente apunta a Lengua Española, que es
+    # troncal (area_curricular_codigo='LE') y tiene su propio profesor.
+    _limpiar_optativa(C4_OTRO)
+    d = SessionLocal()
+    try:
+        c = d.query(M.Curso).get(C4_OTRO)
+        c.salida_optativa_codigo = "HLM"
+        d.commit()
+        # asignación NORMAL del profesor de Lengua en ese curso
+        d.add(M.AsignacionProfesor(id=920, colegio_id=COL_A, profesor_id=U_PROF,
+                                   curso_id=C4_OTRO, asignatura_id=A_LENGUA,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.commit()
+    finally:
+        d.close()
+    _mapear_directo(C4_OTRO, HLM_LE_4, A_LENGUA)
+    assert _aps_activas(C4_OTRO, A_LENGUA), "precondicion: Lengua asignada"
+    # sin historia en ESE curso, para que el cambio esté permitido
+    assert not _aps_activas(C4_OTRO, A_LENGUA)[0] is None
+
+    r = put(C4_OTRO, DIR_A, salida_optativa_codigo="CYT")
+    assert r.status_code == 200, r.text[:300]
+    assert mapeo_de(C4_OTRO, HLM_LE_4) is None, "el mapeo debe retirarse"
+    activas = _aps_activas(C4_OTRO, A_LENGUA)
+    assert len(activas) == 1 and activas[0].id == 920, \
+        "la asignacion de la TRONCAL debe seguir activa: el profesor sigue dando Lengua"
+    d = SessionLocal()
+    try:
+        leng = d.query(M.Asignatura).get(A_LENGUA)
+        assert leng is not None and leng.activo is not False
+        assert leng.area_curricular_codigo == "LE"
+    finally:
+        d.close()
+    assert nota(EST_1, A_LENGUA) == 90.0, "las notas de la troncal intactas"
+
+
+@test("§E2 §1: DELETE de un componente LEGACY tampoco toca al profesor de la troncal")
+def _():
+    _limpiar_optativa(C4_OTRO)
+    d = SessionLocal()
+    try:
+        c = d.query(M.Curso).get(C4_OTRO)
+        c.salida_optativa_codigo = "HLM"
+        d.commit()
+    finally:
+        d.close()
+    _mapear_directo(C4_OTRO, HLM_LE_4, A_LENGUA)
+    assert _aps_activas(C4_OTRO, A_LENGUA), "precondicion: Lengua asignada"
+
+    r = client.delete(f"/api/cursos/{C4_OTRO}/salida-optativa/componentes/{HLM_LE_4}",
+                      headers=auth(DIR_A))
+    assert r.status_code == 200, r.text[:300]
+    assert mapeo_de(C4_OTRO, HLM_LE_4) is None
+    activas = _aps_activas(C4_OTRO, A_LENGUA)
+    assert len(activas) == 1 and activas[0].id == 920, \
+        "la asignacion de la TRONCAL debe seguir activa"
+    assert nota(EST_1, A_LENGUA) == 90.0
+
+
+@test("§E3 §1: una identidad DEDICADA sí deja su asignación inactiva al retirarse")
+def _():
+    # contraparte de §E1/§E2: lo que sí debe limpiarse
+    _limpiar_optativa(C4_OTRO)
+    r = put(C4_OTRO, DIR_A, salida_optativa_codigo="HLM", profesores={HLM_LE_4: U_PROF2})
+    assert r.status_code == 200, r.text[:300]
+    m = mapeo_de(C4_OTRO, HLM_LE_4)
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asignatura).get(m.asignatura_id).area_curricular_codigo is None
+    finally:
+        d.close()
+    assert _aps_activas(C4_OTRO, m.asignatura_id), "precondicion"
+    r = client.delete(f"/api/cursos/{C4_OTRO}/salida-optativa/componentes/{HLM_LE_4}",
+                      headers=auth(DIR_A))
+    assert r.status_code == 200, r.text[:300]
+    assert _aps_activas(C4_OTRO, m.asignatura_id) == [], \
+        "la identidad dedicada sí debe quedar sin responsable"
+    assert _aps_todas(C4_OTRO, m.asignatura_id), "no se borra"
+    # y la troncal del mismo curso sigue intacta
+    assert len(_aps_activas(C4_OTRO, A_LENGUA)) == 1
+
+
+@test("§E4 §3: el sidebar solo cuenta el AÑO VIGENTE, no un año cerrado")
+def _():
+    # prof_sin no tiene nada. Se le da una asignación de PRIMARIA en el año
+    # CERRADO, sobre un curso que sigue activo: si `Curso.activo` bastara,
+    # primaria saldría True.
+    d = SessionLocal()
+    try:
+        d.add(M.AsignacionProfesor(id=930, colegio_id=COL_A, profesor_id=U_PROF_SIN,
+                                   curso_id=CPRIM_VIEJO, asignatura_id=A_MUSICA,
+                                   ano_escolar_id=ANO_VIEJO, activo=True))
+        # y una de SECUNDARIA en el año vigente
+        d.add(M.AsignacionProfesor(id=931, colegio_id=COL_A, profesor_id=U_PROF_SIN,
+                                   curso_id=C4_A, asignatura_id=A_MAT,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.commit()
+        assert d.query(M.Curso).get(CPRIM_VIEJO).activo is True, "el curso viejo sigue activo"
+    finally:
+        d.close()
+    try:
+        assert niveles("prof_sin") == {"primaria": False, "secundaria": True}, \
+            "un curso de un anio cerrado no debe aportar nivel"
+
+        # al añadir Primaria EN EL AÑO VIGENTE, ambos pasan a True
+        d = SessionLocal()
+        try:
+            d.add(M.AsignacionProfesor(id=932, colegio_id=COL_A, profesor_id=U_PROF_SIN,
+                                       curso_id=CPRIM, asignatura_id=A_MUSICA,
+                                       ano_escolar_id=ANO_A, activo=True))
+            d.commit()
+        finally:
+            d.close()
+        assert niveles("prof_sin") == {"primaria": True, "secundaria": True}
+    finally:
+        d = SessionLocal()
+        try:
+            for i in (930, 931, 932):
+                f = d.query(M.AsignacionProfesor).get(i)
+                if f:
+                    d.delete(f)
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("§E5 §4: el dashboard tampoco lista los cursos de un año cerrado")
+def _():
+    d = SessionLocal()
+    try:
+        d.add(M.AsignacionProfesor(id=940, colegio_id=COL_A, profesor_id=U_PROF_SIN,
+                                   curso_id=CPRIM_VIEJO, asignatura_id=A_MUSICA,
+                                   ano_escolar_id=ANO_VIEJO, activo=True))
+        d.add(M.AsignacionProfesor(id=941, colegio_id=COL_A, profesor_id=U_PROF_SIN,
+                                   curso_id=C4_A, asignatura_id=A_MAT,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.commit()
+    finally:
+        d.close()
+    try:
+        tok = login("prof_sin")
+        filas = client.get("/api/dashboard/profesor",
+                           headers=auth(tok)).json()["cursos_asignados"]
+        cursos = {f["curso_id"] for f in filas}
+        assert CPRIM_VIEJO not in cursos, \
+            "el curso del anio cerrado NO debe aparecer como trabajo vigente"
+        assert C4_A in cursos, cursos
+        # y las filas historicas NO se borran ni se desactivan
+        d = SessionLocal()
+        try:
+            hist = d.query(M.AsignacionProfesor).get(940)
+            assert hist is not None and hist.activo is True, \
+                "el historico se conserva intacto, solo queda fuera de la vista"
+        finally:
+            d.close()
+    finally:
+        d = SessionLocal()
+        try:
+            for i in (940, 941):
+                f = d.query(M.AsignacionProfesor).get(i)
+                if f:
+                    d.delete(f)
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("§E6 §3: sin año escolar activo, fail-safe en False (no se inventa uno)")
+def _():
+    d = SessionLocal()
+    try:
+        d.query(M.AnoEscolar).get(ANO_A).activo = False
+        d.commit()
+    finally:
+        d.close()
+    try:
+        assert niveles("prof_a") == {"primaria": False, "secundaria": False}, \
+            "sin anio activo no se puede confirmar ningun nivel"
+        tok = login("prof_a")
+        filas = client.get("/api/dashboard/profesor",
+                           headers=auth(tok)).json()["cursos_asignados"]
+        assert filas == [], filas
+    finally:
+        d = SessionLocal()
+        try:
+            d.query(M.AnoEscolar).get(ANO_A).activo = True
+            d.commit()
+        finally:
+            d.close()
+    assert niveles("prof_a")["secundaria"] is True, "se restituye"
 
 
 @test("§ZZ ZERO DATA LOSS: sge.db e INITIAL_CREDENTIALS.txt intactos")

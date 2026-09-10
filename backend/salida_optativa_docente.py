@@ -256,11 +256,32 @@ def retirar_responsabilidad(db, curso, asignatura_id) -> int:
     Asignatura y ninguna calificación. Y se llama ÚNICAMENTE cuando el cambio de
     mapeo ya está autorizado; si la guarda de historia devolvió 409, no se toca
     nada, porque el mapeo sigue en pie.
+
+    LA TRONCAL NO SE TOCA (R3.4 §1). Si el mapeo apuntaba a una asignatura con
+    `area_curricular_codigo` —el caso legacy de R3.2, "Apreciación Literaria"
+    vinculada a "Lengua Española"— esa asignación docente NO es del componente:
+    es la del profesor de Lengua, que sigue dando Lengua. Desactivarla lo
+    dejaría sin su propia materia. En ese caso se retira solo la relación
+    `CursoComponenteOptativo` y la asignación troncal queda intacta.
     """
-    from models import AsignacionProfesor
+    from models import AsignacionProfesor, Asignatura
 
     if asignatura_id is None:
         return 0
+
+    asig = db.query(Asignatura).filter(
+        Asignatura.id == asignatura_id,
+        Asignatura.colegio_id == curso.colegio_id,
+    ).first()
+    if not es_identidad_independiente(asig):
+        logger.info(
+            "R3.4: el mapeo optativo retirado del curso %s apuntaba a la troncal %s "
+            "(bloque %s). Su asignación docente NO se toca: pertenece a la materia "
+            "troncal, no al componente.",
+            curso.id, asignatura_id,
+            getattr(asig, 'area_curricular_codigo', None))
+        return 0
+
     n = 0
     for ap in db.query(AsignacionProfesor).filter(
         AsignacionProfesor.curso_id == curso.id,
@@ -301,6 +322,53 @@ def asignaturas_optativas_del_colegio(db, colegio_id) -> set:
     ).distinct().all() if r[0] is not None}
 
 
+def ano_activo_de_colegio(db, colegio_id):
+    """
+    Año escolar vigente del colegio, tenant-safe. `None` si no hay ninguno.
+
+    R3.4 §3 — Se resuelve en un solo sitio para que el sidebar y el dashboard
+    compartan exactamente el mismo contexto de trabajo.
+    """
+    from models import AnoEscolar
+
+    return db.query(AnoEscolar).filter(
+        AnoEscolar.colegio_id == colegio_id,
+        AnoEscolar.activo == True,                      # noqa: E712
+    ).first()
+
+
+def cursos_vigentes_de_profesor(db, profesor_id, colegio_id) -> set:
+    """
+    Ids de curso en los que el profesor trabaja EN EL AÑO VIGENTE.
+
+    R3.4 §3-§4 — `AsignacionProfesor.activo` y `Curso.activo` no bastan: al
+    cerrar un año escolar sus cursos y asignaciones siguen existiendo, y sin
+    filtrar por año el profesor seguiría viendo como trabajo actual lo que dio
+    el año pasado.
+
+    La autoridad es `Curso.ano_escolar_id`, no `AsignacionProfesor.ano_escolar_id`:
+    esa columna es nullable y hay filas antiguas sin año, mientras que el curso
+    siempre pertenece a un año concreto (EducaOne crea una fila `Curso` nueva por
+    año escolar).
+
+    Sin año activo devuelve conjunto vacío: no se inventa ninguno.
+    """
+    from models import AsignacionProfesor, Curso
+
+    ano = ano_activo_de_colegio(db, colegio_id)
+    if ano is None:
+        return set()
+    return {r[0] for r in db.query(AsignacionProfesor.curso_id)
+            .join(Curso, Curso.id == AsignacionProfesor.curso_id)
+            .filter(AsignacionProfesor.profesor_id == profesor_id,
+                    AsignacionProfesor.activo == True,          # noqa: E712
+                    AsignacionProfesor.colegio_id == colegio_id,
+                    Curso.colegio_id == colegio_id,
+                    Curso.activo == True,                       # noqa: E712
+                    Curso.ano_escolar_id == ano.id)
+            .distinct().all()}
+
+
 def niveles_asignados_de_profesor(db, profesor_id, colegio_id) -> dict:
     """
     ¿En qué niveles da clases realmente este profesor? -> {'primaria', 'secundaria'}.
@@ -311,22 +379,25 @@ def niveles_asignados_de_profesor(db, profesor_id, colegio_id) -> dict:
     división principal, no lo que imparte: un profesor de Secundaria veía
     "Recuperaciones (Primaria)", que no puede usar.
 
-    La verdad son sus ASIGNACIONES ACTIVAS: asignación activa -> curso activo ->
-    `Grado.nivel`. Se calcula en el servidor para que el frontend no reimplemente
-    ninguna heurística de grados ni adivine por el texto del nombre.
+    La verdad son sus ASIGNACIONES ACTIVAS DEL AÑO VIGENTE: asignación activa ->
+    curso activo del año activo -> `Grado.nivel`. Se calcula en el servidor para
+    que el frontend no reimplemente ninguna heurística de grados ni adivine por
+    el texto del nombre.
     """
-    from models import AsignacionProfesor, Curso, Grado
+    from models import Curso, Grado
 
     niveles = {'primaria': False, 'secundaria': False}
+    # Solo los cursos del AÑO VIGENTE: el sidebar describe lo que el profesor
+    # imparte ahora, no lo que impartió en un año ya cerrado. Sin año activo se
+    # devuelve todo en False (fail-safe): no se le ofrece una función de un
+    # nivel que no se puede confirmar.
+    cursos = cursos_vigentes_de_profesor(db, profesor_id, colegio_id)
+    if not cursos:
+        return niveles
     filas = (db.query(Grado.nivel)
-             .select_from(AsignacionProfesor)
-             .join(Curso, Curso.id == AsignacionProfesor.curso_id)
+             .select_from(Curso)
              .join(Grado, Grado.id == Curso.grado_id)
-             .filter(AsignacionProfesor.profesor_id == profesor_id,
-                     AsignacionProfesor.activo == True,          # noqa: E712
-                     AsignacionProfesor.colegio_id == colegio_id,
-                     Curso.colegio_id == colegio_id,
-                     Curso.activo == True)                       # noqa: E712
+             .filter(Curso.id.in_(cursos))
              .distinct().all())
     for (nivel,) in filas:
         n = (nivel or '').strip().lower()
