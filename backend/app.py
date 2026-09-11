@@ -5653,6 +5653,82 @@ def _conflicto_clase(db, *, colegio_id, dia, hora_inicio, hora_fin,
     return None
 
 
+def _exige_asignacion_activa(db, *, colegio_id, profesor_id, curso_id, asignatura_id):
+    """P0 — un bloque de clase debe corresponder a una asignacion REAL del docente.
+
+    Devuelve un JSONResponse 409 si NO existe una `AsignacionProfesor` activa que
+    coincida EXACTAMENTE en las cuatro dimensiones:
+
+        colegio_id + profesor_id + curso_id + asignatura_id
+
+    Devuelve None si la asignacion existe.
+
+    POR QUE LAS CUATRO, Y POR QUE NO BASTA profesor + curso
+    ------------------------------------------------------
+    Un profesor puede impartir VARIAS asignaturas en el MISMO curso. En
+    produccion, el profesor 4 tiene activas a la vez Ingles y Frances en 1ro
+    Secundaria A. Con la identidad `(profesor_id, curso_id)` las dos materias son
+    indistinguibles y cualquier resolucion por `.first()` devuelve una de las dos
+    al azar. La identidad correcta de una clase es
+    `profesor + curso + asignatura`, y este guard la exige.
+
+    QUE PROBLEMA REAL CIERRA
+    ------------------------
+    Hasta 8823421 `POST`/`PUT /api/horarios` solo validaban tenant de profesor,
+    curso y asignatura: nada impedia colocar a un docente a impartir una materia
+    que no tiene asignada. Asi acabaron en la base 5 bloques activos de un
+    profesor en cursos donde no tiene ninguna asignacion.
+
+    Es el mismo criterio que `_guard_asistencia` (R3.4.1) aplica a la escritura
+    de asistencia, y se expresa igual para que ambos envejezcan juntos.
+
+    NO sustituye a `_conflicto_clase`: son comprobaciones independientes y ambas
+    siguen ejecutandose. Esta valida QUE se imparte; aquella, CUANDO.
+    """
+    existe = db.query(AsignacionProfesor.id).filter(
+        AsignacionProfesor.colegio_id == colegio_id,
+        AsignacionProfesor.profesor_id == profesor_id,
+        AsignacionProfesor.curso_id == curso_id,
+        AsignacionProfesor.asignatura_id == asignatura_id,
+        AsignacionProfesor.activo == True,  # noqa: E712
+    ).first()
+    if existe is not None:
+        return None
+
+    # Mensaje util para Direccion: distingue "no da esa materia aqui" de
+    # "no da nada en este curso", que son dos errores distintos al planificar.
+    _otras = db.query(Asignatura.nombre).join(
+        AsignacionProfesor, AsignacionProfesor.asignatura_id == Asignatura.id
+    ).filter(
+        AsignacionProfesor.colegio_id == colegio_id,
+        AsignacionProfesor.profesor_id == profesor_id,
+        AsignacionProfesor.curso_id == curso_id,
+        AsignacionProfesor.activo == True,  # noqa: E712
+    ).order_by(Asignatura.nombre).all()
+
+    # Nombres solo para el mensaje: ya vienen validados por tenant en el endpoint.
+    _profesor = db.query(Usuario).filter(
+        Usuario.id == profesor_id, Usuario.colegio_id == colegio_id).first()
+    _curso = db.query(Curso).filter(
+        Curso.id == curso_id, Curso.colegio_id == colegio_id).first()
+    _asignatura = db.query(Asignatura).filter(
+        Asignatura.id == asignatura_id, Asignatura.colegio_id == colegio_id).first()
+    _prof_txt = _profesor.nombre_completo if _profesor is not None else f'El profesor {profesor_id}'
+    _curso_txt = _curso.nombre_completo if _curso is not None else f'el curso {curso_id}'
+    _asig_txt = _asignatura.nombre if _asignatura is not None else f'la asignatura {asignatura_id}'
+    if _otras:
+        _lista = ', '.join(n for (n,) in _otras)
+        _detalle = f'En ese curso tiene asignada(s): {_lista}.'
+    else:
+        _detalle = 'No tiene ninguna asignatura asignada en ese curso.'
+
+    return JSONResponse({
+        'error': (f'{_prof_txt} no tiene asignada "{_asig_txt}" en {_curso_txt}. '
+                  f'{_detalle} '
+                  f'Asigne primero la materia al docente en Asignaciones.')
+    }, status_code=409)
+
+
 @app.post("/api/horarios")
 async def crear_horario(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Crear horario. Valida que curso, asignatura y profesor pertenezcan al colegio del caller."""
@@ -5694,6 +5770,15 @@ async def crear_horario(request: Request, background_tasks: BackgroundTasks, db:
         assert_nivel_curso_activo(db, current_user, curso.id)
         curso_id = curso.id
         asignatura_id = asignatura.id
+
+        # P0 - la clase debe corresponder a una asignacion activa del docente
+        # (profesor + curso + asignatura, no solo profesor + curso).
+        _sin_asig = _exige_asignacion_activa(
+            db, colegio_id=current_user.colegio_id,
+            profesor_id=profesor.id, curso_id=curso.id, asignatura_id=asignatura.id,
+        )
+        if _sin_asig is not None:
+            return _sin_asig
 
         # v2.19.8.1 — no permitir clases superpuestas (mismo profesor o mismo curso).
         _conf = _conflicto_clase(
@@ -5798,6 +5883,20 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
         horario.hora_fin = _validar_hora(data['hora_fin'], 'hora_fin')
     if horario.hora_inicio >= horario.hora_fin:
         return JSONResponse({'error': 'hora_fin debe ser mayor que hora_inicio'}, status_code=400)
+
+    # P0 - el ESTADO RESULTANTE de la edicion debe seguir correspondiendo a una
+    # asignacion activa del docente. Se valida despues de aplicar los cambios
+    # (y antes del commit) porque cualquiera de las tres patas —profesor, curso
+    # o asignatura— pudo moverse en este mismo PUT.
+    if horario.tipo_bloque == 'clase' and horario.curso_id is not None             and horario.asignatura_id is not None:
+        _sin_asig = _exige_asignacion_activa(
+            db, colegio_id=current_user.colegio_id,
+            profesor_id=horario.profesor_id, curso_id=horario.curso_id,
+            asignatura_id=horario.asignatura_id,
+        )
+        if _sin_asig is not None:
+            db.rollback()  # descartar los cambios pendientes: nada existente se toca
+            return _sin_asig
 
     # v2.19.8.1 — mismas validaciones de solapamiento que al crear, excluyendo
     # el propio horario (editar sin cambiar la hora NO choca consigo mismo).
@@ -9067,35 +9166,42 @@ async def get_mensajes_no_leidos(request: Request, db: Session = Depends(get_db)
 # ============== REPORTES DE CONDUCTA ==============
 
 @app.get("/api/reportes")
-async def get_reportes(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Obtener reportes de conducta con todos los campos v2.11"""
+async def get_reportes(request: Request, db: Session = Depends(get_db),
+                       current_user: Usuario = Depends(
+                           RolesRequired('profesor', 'direccion', 'coordinador'))):
+    """
+    Listado de reportes de conducta.
+
+    POLITICA DE VISIBILIDAD (P0 — definida por Direccion, 2026-09-11)
+    -----------------------------------------------------------------
+      profesor      -> SOLO los reportes que el mismo creo
+      direccion     -> todos los del colegio
+      coordinacion  -> todos los del colegio
+      secretaria    -> SIN listado general de reportes disciplinarios
+      psicologia    -> SIN listado general; sus intervenciones llegan por los
+                       flujos/casos de Psicologia, no por esta lista
+
+    POR QUE CAMBIA
+    --------------
+    Hasta 8823421 el profesor veia, ademas de los suyos, los reportes de
+    CUALQUIER estudiante de sus cursos —incluidos los redactados por otros
+    profesores—, con titulo y descripcion completos y el telefono del contacto
+    familiar. En produccion eso significaba que un profesor sin un solo reporte
+    propio leia 18 reportes ajenos de 3 autores distintos, mientras su propio
+    Dashboard (que ya aplicaba la regla estricta) mostraba 0.
+
+    Secretaria y psicologia entraban aqui por `get_current_user`, sin ningun
+    filtro de rol, y veian el colegio entero.
+
+    Las acciones de gestion (/responder, /confirmar-padre, /enviar-padres,
+    /historial-envios) NO se tocan: psicologia las conserva para operar desde
+    sus casos. El PDF propio del profesor y POST /api/reportes tampoco cambian.
+    """
     q = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user)
-    
-    # Profesor: solo sus propios reportes (los que él creó)
-    # + reportes de estudiantes de sus cursos asignados (puede ver para contexto)
+
     if current_user.role == 'profesor':
-        # IDs de cursos donde está asignado
-        cursos_asignados = db.query(AsignacionProfesor.curso_id).filter_by(
-            profesor_id=current_user.id
-        ).distinct().all()
-        cursos_ids = [c[0] for c in cursos_asignados]
-        if cursos_ids:
-            # Estudiantes de esos cursos (usando select() en lugar de subquery()
-            # para evitar warning de SQLAlchemy con .in_() y reflejar el patrón
-            # moderno).
-            from sqlalchemy import select, or_
-            estudiantes_ids_select = select(Estudiante.id).where(
-                Estudiante.curso_id.in_(cursos_ids),
-                Estudiante.colegio_id == current_user.colegio_id,
-            )
-            q = q.filter(or_(
-                ReporteConducta.reportado_por == current_user.id,
-                ReporteConducta.estudiante_id.in_(estudiantes_ids_select),
-            ))
-        else:
-            # Sin asignaciones: solo los reportes que él creó
-            q = q.filter(ReporteConducta.reportado_por == current_user.id)
-    
+        q = q.filter(ReporteConducta.reportado_por == current_user.id)
+
     q = q.order_by(ReporteConducta.fecha.desc())
     # v2.13.30: paginación opcional (sin ?page devuelve todo, retrocompatible)
     _pag = paginar_query(q, request)
