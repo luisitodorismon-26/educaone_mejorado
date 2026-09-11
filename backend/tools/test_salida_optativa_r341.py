@@ -1047,6 +1047,135 @@ def _():
     assert b["componente_codigo"] == HLM_LE_4, b
 
 
+# ===========================================================================
+# BLOQUE G — AUTORIZACIÓN DE ESCRITURA DE ASISTENCIA (hardening pre-PR)
+# ===========================================================================
+
+CURSO_B_R341 = 70          # curso del MISMO colegio donde prof_x NO da clases
+EST_B_R341 = 71
+
+
+def _seed_curso_b():
+    """Otro curso del colegio A, sin ninguna asignación de prof_x."""
+    d = SessionLocal()
+    try:
+        if d.query(M.Curso).get(CURSO_B_R341) is not None:
+            return
+        d.add(M.Curso(id=CURSO_B_R341, colegio_id=COL_A, nombre="B", grado_id=G4,
+                      ano_escolar_id=ANO_A, activo=True))
+        d.add(M.Estudiante(id=EST_B_R341, colegio_id=COL_A, nombre="EstB",
+                           apellido="T", curso_id=CURSO_B_R341, activo=True,
+                           no_lista=1))
+        d.commit()
+    finally:
+        d.close()
+
+
+@test("§G1 §1-§2: un estudiante de OTRO curso no se autoriza con un curso propio")
+def _():
+    _seed_curso_b()
+    antes = _n_asistencias(estudiante_id=EST_B_R341)
+    # prof_x SÍ tiene (C4_A, Lengua); el estudiante pertenece a CURSO_B_R341.
+    # Sin la comprobación de coherencia, la guarda autorizaría por C4_A.
+    r = client.post("/api/asistencia", json={
+        "estudiante_id": EST_B_R341,
+        "curso_id": C4_A,                 # curso del profesor, NO del estudiante
+        "asignatura_id": A_LENGUA,
+        "fecha": date(2026, 3, 19).isoformat(),
+        "estado": "presente",
+    }, headers=auth(PROF))
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "no pertenece al curso" in r.json()["error"], r.json()
+    assert _n_asistencias(estudiante_id=EST_B_R341) == antes == 0, "cero escrituras"
+
+
+@test("§G2 §1: sin curso_id, el curso canónico es el REAL del estudiante")
+def _():
+    _seed_curso_b()
+    antes = _n_asistencias(estudiante_id=EST_B_R341)
+    # prof_x no está asignado a CURSO_B_R341 -> 403, no 200
+    r = client.post("/api/asistencia", json={
+        "estudiante_id": EST_B_R341, "asignatura_id": A_LENGUA,
+        "fecha": date(2026, 3, 19).isoformat(), "estado": "presente",
+    }, headers=auth(PROF))
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert _n_asistencias(estudiante_id=EST_B_R341) == antes
+
+
+@test("§G3 §5A: Dirección NO puede registrar asistencia")
+def _():
+    antes = _n_asistencias(estudiante_id=EST_1)
+    r = client.post("/api/asistencia", json={
+        "estudiante_id": EST_1, "curso_id": C4_A, "asignatura_id": A_LENGUA,
+        "fecha": date(2026, 3, 19).isoformat(), "estado": "ausente",
+    }, headers=auth(DIR_A))
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert r.json()["error"] == ("Solo los profesores pueden registrar o "
+                                 "modificar asistencia."), r.json()
+    assert _n_asistencias(estudiante_id=EST_1) == antes, "cero escrituras"
+
+
+@test("§G4 §5B: Dirección NO puede registrar asistencia MASIVA")
+def _():
+    f = date(2026, 3, 30)          # lunes
+    antes = _n_asistencias(fecha=f)
+    r = client.post("/api/asistencia/masivo", json={
+        "curso_id": C4_A, "asignatura_id": A_LENGUA, "fecha": f.isoformat(),
+        "asistencias": [{"estudiante_id": EST_1, "estado": "presente"},
+                        {"estudiante_id": EST_2, "estado": "ausente"}],
+    }, headers=auth(DIR_A))
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert _n_asistencias(fecha=f) == antes == 0, "cero escrituras"
+
+
+@test("§G5 §5C: Dirección NO puede borrar asistencia; la marca permanece")
+def _():
+    opt = id_optativa()
+    f = date(2026, 3, 31)          # martes
+    marcar(PROF, EST_1, opt, "ausente", fecha=f)
+    assert asistencia_de(EST_1, opt, f) == "ausente"
+    r = client.delete(
+        "/api/asistencia/%d?fecha=2026-03-31&asignatura_id=%d" % (EST_1, opt),
+        headers=auth(DIR_A))
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert asistencia_de(EST_1, opt, f) == "ausente", "la marca debe permanecer"
+
+
+@test("§G6 §5D-§5E: el profesor legítimo sigue pudiendo registrar y borrar")
+def _():
+    opt = id_optativa()
+    f = date(2026, 4, 1)           # miércoles
+    r = marcar(PROF, EST_1, opt, "presente", fecha=f)
+    assert r.status_code in (200, 201), (r.status_code, r.text[:250])
+    assert asistencia_de(EST_1, opt, f) == "presente"
+    r = client.delete(
+        "/api/asistencia/%d?fecha=2026-04-01&asignatura_id=%d" % (EST_1, opt),
+        headers=auth(PROF))
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert asistencia_de(EST_1, opt, f) is None
+
+
+@test("§G7 §5F: la LECTURA de Dirección no cambia")
+def _():
+    r = client.get("/api/asistencia?curso_id=%d&fecha=2026-03-02" % C4_A,
+                   headers=auth(DIR_A))
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    r = client.get("/api/asistencia/curso/%d" % C4_A, headers=auth(DIR_A))
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    r = client.get("/api/asistencia/resumen/%d" % C4_A, headers=auth(DIR_A))
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+
+
+@test("§G8 la escritura sigue exigiendo asignación, no solo el rol profesor")
+def _():
+    opt = id_optativa()
+    # prof_y no tiene NINGUNA asignación en C4_A en este punto
+    antes = asistencia_de(EST_2, opt)
+    r = marcar(PROF2, EST_2, opt, "ausente")
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert asistencia_de(EST_2, opt) == antes
+
+
 @test("§ZZ ZERO DATA LOSS: sge.db, credenciales y notas intactas")
 def _():
     ahora_sge = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

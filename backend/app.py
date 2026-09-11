@@ -10084,14 +10084,44 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
     """
     from registro_validator import _normalizar_nivel
 
+    # R3.4.1 §3 — ESCRITURA SOLO DEL PROFESOR. La UI ya lo dice desde siempre
+    # (`puedeEditar = esProfesor`) y las 20 escrituras de asistencia del corpus
+    # de tests usan token de profesor; el backend, en cambio, dejaba entrar a
+    # cualquier rol autenticado. Se alinea con la UI. Los GET de asistencia NO
+    # se tocan: quién CONSULTA sigue exactamente igual.
+    if current_user.role != 'profesor':
+        return None, JSONResponse({
+            'error': 'Solo los profesores pueden registrar o modificar asistencia.'
+        }, status_code=403)
+
+    # R3.4.1 §1 — COHERENCIA ESTUDIANTE <-> CURSO. `curso_id` llega del cliente
+    # y no puede ser la autoridad cuando hay un estudiante: sin esta comprobacion
+    # se podia pedir autorizacion con un curso donde el profesor SI esta asignado
+    # mientras el estudiante pertenece a otro. El curso canonico es siempre el
+    # curso REAL del estudiante.
+    est = None
+    if estudiante_id:
+        est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
+            id=estudiante_id).first()
+        if est is None:
+            return None, JSONResponse({'error': 'Estudiante no encontrado'},
+                                      status_code=404)
+
     curso = None
     if curso_id:
         curso = tenant_filter(db.query(Curso), Curso, current_user).filter_by(
             id=curso_id).first()
-    if curso is None and estudiante_id:
-        est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-            id=estudiante_id).first()
-        if est is not None and est.curso_id:
+        if curso is None:
+            return None, JSONResponse({'error': 'Curso no encontrado'},
+                                      status_code=404)
+
+    if est is not None:
+        if curso is not None and est.curso_id != curso.id:
+            return None, JSONResponse(
+                {'error': 'El estudiante no pertenece al curso indicado'},
+                status_code=400)
+        # el curso del estudiante manda, venga o no `curso_id` en el request
+        if est.curso_id:
             curso = tenant_filter(db.query(Curso), Curso, current_user).filter_by(
                 id=est.curso_id).first()
 
@@ -10112,7 +10142,9 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
             {'error': 'En Secundaria debe seleccionar una asignatura.'},
             status_code=400)
 
-    if current_user.role == 'profesor' and curso is not None:
+    # El rol ya esta acotado a profesor arriba; aqui se exige ademas la
+    # asignacion ACTIVA sobre (curso, asignatura): no basta con el rol.
+    if curso is not None:
         q = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor,
                           current_user).filter_by(
             profesor_id=current_user.id, curso_id=curso.id, activo=True)
