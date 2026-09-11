@@ -357,13 +357,56 @@ def resolver_componentes(db, curso, ano_escolar_id: Optional[int] = None) -> Lis
             continue
         por_codigo[f.componente_codigo] = f
 
+    # R3.4.1-hotfix — UN MAPEO A UNA TRONCAL NO ES UNA IDENTIDAD OPTATIVA.
+    #
+    # R3.2 permitia vincular un componente a CUALQUIER asignatura, incluida una
+    # troncal del Registro. En produccion quedaron mapeos asi: HCS-LE-4 apunta a
+    # "Lengua Española" (area_curricular_codigo='LE'). Leer ese mapeo tal cual
+    # hace que las notas y la asistencia de Lengua se consuman como si fueran del
+    # componente optativo: acabarian impresas en la pagina 212 del Registro y en
+    # el bloque de asistencia 56-60, y el dashboard reetiqueta la troncal con el
+    # nombre del componente y Lengua desaparece de Calificaciones.
+    #
+    # Para LECTURA ese mapeo se considera PENDIENTE DE CONVERSION: se conserva el
+    # componente y su slot —la geometria del Registro no cambia— pero NO se
+    # expone el `asignatura_id` de la troncal como identidad optativa. El bloque
+    # se queda sin datos, que es lo correcto: esas notas son de la troncal.
+    #
+    # Esto NO altera el mapeo ni la asignatura ni ninguna nota. Y NO afecta a la
+    # conversion explicita: `resolver_identidad_calificable` lee la fila
+    # `CursoComponenteOptativo` directamente, no a traves de esta funcion, asi
+    # que Direccion sigue pudiendo convertirlo a identidad dedicada.
+    from models import Asignatura
+
     salida = []
     for comp in esperados:
         fila = por_codigo.get(comp.codigo)
+        asignatura_id = fila.asignatura_id if fila else None
+        legacy_troncal_id = None
+        if asignatura_id is not None:
+            asig = db.query(Asignatura).filter(
+                Asignatura.id == asignatura_id,
+                Asignatura.colegio_id == colegio_curso,
+            ).first()
+            if asig is not None and asig.area_curricular_codigo is not None:
+                logger.warning(
+                    "Mapeo optativo %s del curso %s apunta a la asignatura troncal %s "
+                    "(%r, bloque %s). Se trata como PENDIENTE DE CONVERSION: no se "
+                    "expone como identidad optativa y su bloque queda sin datos. "
+                    "Configure el profesor responsable del componente para darle "
+                    "identidad propia.",
+                    fila.id, curso.id, asig.id, asig.nombre,
+                    asig.area_curricular_codigo)
+                legacy_troncal_id = asig.id
+                asignatura_id = None
         salida.append({
             'componente': comp,
             'slot': comp.slot,
-            'asignatura_id': fila.asignatura_id if fila else None,
+            'asignatura_id': asignatura_id,
             'mapeo_id': fila.id if fila else None,
+            # Para que la pantalla de Direccion pueda explicar POR QUE aparece
+            # sin vincular en vez de mostrarlo como un hueco silencioso.
+            'pendiente_conversion': legacy_troncal_id is not None,
+            'asignatura_troncal_id': legacy_troncal_id,
         })
     return salida

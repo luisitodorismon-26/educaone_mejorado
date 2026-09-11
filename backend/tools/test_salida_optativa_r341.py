@@ -1176,6 +1176,369 @@ def _():
     assert asistencia_de(EST_2, opt) == antes
 
 
+# ===========================================================================
+# BLOQUE H — HOTFIX: MAPEO LEGACY A UNA TRONCAL (caso REAL de producción)
+# ===========================================================================
+#
+# Reproduce el estado encontrado en producción con `main=4efe8fb`:
+#
+#   curso 4to Secundaria, salida HCS
+#   CursoComponenteOptativo HCS-LE-4 -> Lengua Española   (area_curricular='LE')
+#   CursoComponenteOptativo HCS-CS-4 -> Ciencias Sociales (area_curricular='CS')
+#   el profesor tiene UNA sola asignación activa por materia troncal
+#
+# Nadie pasó nunca por Configuración → Cursos → Salida Optativa, así que la
+# conversión de R3.4 jamás se disparó y el mapeo legacy de R3.2 sigue vivo.
+
+CURSO_HCS = 80
+EST_HCS = 81
+A_CSOC = 82                      # Ciencias Sociales, troncal CS
+U_PROF_HCS = 83
+HCS_LE_4, HCS_CS_4 = "HCS-LE-4", "HCS-CS-4"
+
+
+def _seed_legacy_hcs():
+    """El estado EXACTO de producción: mapeos apuntando a troncales."""
+    d = SessionLocal()
+    try:
+        if d.query(M.Curso).get(CURSO_HCS) is not None:
+            return
+        d.add(M.Curso(id=CURSO_HCS, colegio_id=COL_A, nombre="A", grado_id=G4,
+                      ano_escolar_id=ANO_A, activo=True,
+                      salida_optativa_codigo="HCS"))
+        d.add(M.Asignatura(id=A_CSOC, colegio_id=COL_A, nombre="Ciencias Sociales",
+                           codigo="CS", area="Ciencias Sociales",
+                           area_curricular_codigo="CS", activo=True))
+        u = M.Usuario(id=U_PROF_HCS, username="prof_hcs", nombre="prof_hcs",
+                      apellido="T", role="profesor", colegio_id=COL_A)
+        u.set_password(PWD)
+        d.add(u)
+        d.add(M.Estudiante(id=EST_HCS, colegio_id=COL_A, nombre="EstHCS",
+                           apellido="T", curso_id=CURSO_HCS, activo=True, no_lista=1))
+        # el profesor imparte las DOS troncales en ese curso
+        d.add(M.AsignacionProfesor(id=880, colegio_id=COL_A, profesor_id=U_PROF_HCS,
+                                   curso_id=CURSO_HCS, asignatura_id=A_LENGUA,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.add(M.AsignacionProfesor(id=881, colegio_id=COL_A, profesor_id=U_PROF_HCS,
+                                   curso_id=CURSO_HCS, asignatura_id=A_CSOC,
+                                   ano_escolar_id=ANO_A, activo=True))
+        # MAPEOS LEGACY: apuntan a las troncales, como en producción
+        d.add(M.CursoComponenteOptativo(
+            colegio_id=COL_A, curso_id=CURSO_HCS, ano_escolar_id=ANO_A,
+            componente_codigo=HCS_LE_4, asignatura_id=A_LENGUA, activo=True))
+        d.add(M.CursoComponenteOptativo(
+            colegio_id=COL_A, curso_id=CURSO_HCS, ano_escolar_id=ANO_A,
+            componente_codigo=HCS_CS_4, asignatura_id=A_CSOC, activo=True))
+        d.commit()
+    finally:
+        d.close()
+
+
+@test("§H1 el escenario legacy REAL queda reproducido")
+def _():
+    _seed_legacy_hcs()
+    d = SessionLocal()
+    try:
+        m = d.query(M.CursoComponenteOptativo).filter(
+            M.CursoComponenteOptativo.curso_id == CURSO_HCS,
+            M.CursoComponenteOptativo.componente_codigo == HCS_LE_4).first()
+        assert m.asignatura_id == A_LENGUA, m.asignatura_id
+        assert d.query(M.Asignatura).get(A_LENGUA).area_curricular_codigo == "LE"
+        assert d.query(M.Asignatura).get(A_CSOC).area_curricular_codigo == "CS"
+    finally:
+        d.close()
+
+
+@test("§H2 §5.1: el dashboard conserva Lengua como TRONCAL, no como optativa")
+def _():
+    _seed_legacy_hcs()
+    tok = login("prof_hcs")
+    filas = client.get("/api/dashboard/profesor",
+                       headers=auth(tok)).json()["cursos_asignados"]
+    delc = [f for f in filas if f["curso_id"] == CURSO_HCS]
+    por_id = {f["asignatura_id"]: f for f in delc}
+    assert A_LENGUA in por_id, delc
+    leng = por_id[A_LENGUA]
+    assert leng["asignatura"] == "Lengua Española", leng
+    assert leng["es_salida_optativa"] is False, leng
+    assert leng["componente_codigo"] is None, leng
+    assert leng["componente_nombre"] is None, leng
+    # lo mismo para Ciencias Sociales
+    cs = por_id[A_CSOC]
+    assert cs["asignatura"] == "Ciencias Sociales" and cs["es_salida_optativa"] is False, cs
+    # y NO se inventa una fila para el componente
+    assert len(delc) == 2, delc
+    assert not any(f["es_salida_optativa"] for f in delc), delc
+
+
+@test("§H3 §5.2: el resolutor NO devuelve la troncal como identidad optativa")
+def _():
+    _seed_legacy_hcs()
+    import salida_optativa_service as _svc
+    d = SessionLocal()
+    try:
+        curso = d.query(M.Curso).get(CURSO_HCS)
+        res = _svc.resolver_componentes(d, curso)
+    finally:
+        d.close()
+    por_cod = {r['componente'].codigo: r for r in res}
+    assert HCS_LE_4 in por_cod and HCS_CS_4 in por_cod, list(por_cod)
+    for cod, esperado in ((HCS_LE_4, A_LENGUA), (HCS_CS_4, A_CSOC)):
+        r = por_cod[cod]
+        assert r['asignatura_id'] is None, (cod, r['asignatura_id'])
+        assert r['pendiente_conversion'] is True, r
+        assert r['asignatura_troncal_id'] == esperado, r
+        # la geometría se conserva: el componente y su slot siguen ahí
+        assert r['slot'] == CAT.componente(cod).slot, r
+
+
+@test("§H4 §5.3: el Registro NO consume las notas de Lengua como optativas")
+def _():
+    _seed_legacy_hcs()
+    from app import _cargar_salida_optativa_registro
+    notas_completas(EST_HCS, A_LENGUA, 91.0)
+    notas_completas(EST_HCS, A_CSOC, 88.0)
+    d = SessionLocal()
+    try:
+        user = d.query(M.Usuario).get(U_DIR_A)
+        curso = d.query(M.Curso).get(CURSO_HCS)
+        ests = d.query(M.Estudiante).filter(M.Estudiante.curso_id == CURSO_HCS).all()
+        res = _cargar_salida_optativa_registro(d, user, curso, ests)
+    finally:
+        d.close()
+    assert res == {}, ("el bloque optativo debe quedar sin datos; llegó %r" % res)
+    # y las notas de la troncal siguen intactas
+    assert leer_nota(EST_HCS, A_LENGUA) == 91.0
+    assert leer_nota(EST_HCS, A_CSOC) == 88.0
+
+
+@test("§H5 §5.4: la asistencia optativa NO consume la asistencia de Lengua")
+def _():
+    _seed_legacy_hcs()
+    from app import _cargar_salida_optativa_asistencia
+    d = SessionLocal()
+    try:
+        for dia in (3, 4, 5):
+            d.add(M.Asistencia(colegio_id=COL_A, estudiante_id=EST_HCS,
+                               curso_id=CURSO_HCS, asignatura_id=A_LENGUA,
+                               fecha=date(2026, 3, dia), estado="ausente"))
+        d.commit()
+        user = d.query(M.Usuario).get(U_DIR_A)
+        curso = d.query(M.Curso).get(CURSO_HCS)
+        ests = d.query(M.Estudiante).filter(M.Estudiante.curso_id == CURSO_HCS).all()
+        res = _cargar_salida_optativa_asistencia(d, user, curso, ests)
+    finally:
+        d.close()
+    assert res == {}, ("la asistencia optativa debe quedar vacía; llegó %r" % res)
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asistencia).filter(
+            M.Asistencia.asignatura_id == A_LENGUA,
+            M.Asistencia.curso_id == CURSO_HCS).count() == 3, "la troncal intacta"
+    finally:
+        d.close()
+
+
+@test("§H6 §5.5: un mapeo DEDICADO normal sigue funcionando igual")
+def _():
+    # el curso canónico C4_A ya tiene identidad dedicada desde §A2
+    import salida_optativa_service as _svc
+    opt = id_optativa()
+    d = SessionLocal()
+    try:
+        curso = d.query(M.Curso).get(C4_A)
+        res = _svc.resolver_componentes(d, curso)
+    finally:
+        d.close()
+    por_cod = {r['componente'].codigo: r for r in res}
+    r = por_cod[HLM_LE_4]
+    assert r['asignatura_id'] == opt, r
+    assert r['pendiente_conversion'] is False, r
+    assert r['asignatura_troncal_id'] is None, r
+
+
+@test("§H7 §5.6: la conversión explícita sigue creando identidad y conserva Lengua")
+def _():
+    _seed_legacy_hcs()
+    antes_leng = leer_nota(EST_HCS, A_LENGUA)
+    r = client.put(f"/api/cursos/{CURSO_HCS}/salida-optativa",
+                   json={"profesores": {HCS_LE_4: U_PROF_HCS}}, headers=auth(DIR_A))
+    assert r.status_code == 200, r.text[:300]
+    m = mapeo(HCS_LE_4, CURSO_HCS)
+    assert m is not None and m.asignatura_id != A_LENGUA, "debe repuntar"
+    d = SessionLocal()
+    try:
+        nueva = d.query(M.Asignatura).get(m.asignatura_id)
+        assert nueva.nombre == CAT.componente(HCS_LE_4).nombre_oficial, nueva.nombre
+        assert nueva.area_curricular_codigo is None, nueva.area_curricular_codigo
+        # LENGUA INTACTA: identidad, bloque, notas y asignación docente
+        leng = d.query(M.Asignatura).get(A_LENGUA)
+        assert leng.area_curricular_codigo == "LE" and leng.activo is not False
+        activas = d.query(M.AsignacionProfesor).filter(
+            M.AsignacionProfesor.curso_id == CURSO_HCS,
+            M.AsignacionProfesor.asignatura_id == A_LENGUA,
+            M.AsignacionProfesor.activo == True).all()          # noqa: E712
+        assert len(activas) == 1, activas
+    finally:
+        d.close()
+    assert leer_nota(EST_HCS, A_LENGUA) == antes_leng, "las notas de Lengua intactas"
+
+
+@test("§H8 §5.9: volver a guardar NO crea una segunda Apreciación")
+def _():
+    m0 = mapeo(HCS_LE_4, CURSO_HCS)
+    d = SessionLocal()
+    try:
+        n0 = d.query(M.Asignatura).count()
+    finally:
+        d.close()
+    for _ in range(3):
+        r = client.put(f"/api/cursos/{CURSO_HCS}/salida-optativa",
+                       json={"profesores": {HCS_LE_4: U_PROF_HCS}}, headers=auth(DIR_A))
+        assert r.status_code == 200, r.text[:250]
+    m1 = mapeo(HCS_LE_4, CURSO_HCS)
+    assert m1.asignatura_id == m0.asignatura_id, "debe REUTILIZAR la dedicada"
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asignatura).count() == n0, "no debe crear otra Asignatura"
+    finally:
+        d.close()
+
+
+@test("§H9 tras convertir, el dashboard devuelve AMBAS exactamente una vez")
+def _():
+    opt_hcs = mapeo(HCS_LE_4, CURSO_HCS).asignatura_id
+    tok = login("prof_hcs")
+    filas = client.get("/api/dashboard/profesor",
+                       headers=auth(tok)).json()["cursos_asignados"]
+    delc = [f for f in filas if f["curso_id"] == CURSO_HCS]
+    ids = [f["asignatura_id"] for f in delc]
+    assert ids.count(A_LENGUA) == 1, ids
+    assert ids.count(opt_hcs) == 1, ids
+    assert A_LENGUA != opt_hcs
+    por_id = {f["asignatura_id"]: f for f in delc}
+    assert por_id[A_LENGUA]["es_salida_optativa"] is False
+    assert por_id[opt_hcs]["es_salida_optativa"] is True
+    assert por_id[opt_hcs]["componente_nombre"] == \
+        CAT.componente(HCS_LE_4).nombre_oficial
+    assert por_id[opt_hcs]["salida_codigo"] == "HCS"
+
+
+@test("§H10 §criterio 3-5: notas, recuperación y asistencia siguen independientes")
+def _():
+    opt_hcs = mapeo(HCS_LE_4, CURSO_HCS).asignatura_id
+    notas_completas(EST_HCS, opt_hcs, 70.0)
+    assert leer_nota(EST_HCS, A_LENGUA) == 91.0, "Lengua no cambia"
+    assert leer_nota(EST_HCS, opt_hcs) == 70.0
+    d = SessionLocal()
+    try:
+        d.add(M.EvaluacionExtraSecundaria(
+            colegio_id=COL_A, estudiante_id=EST_HCS, asignatura_id=opt_hcs,
+            ano_escolar_id=ANO_A, cf_original=70.0, cec=80.0))
+        d.add(M.Asistencia(colegio_id=COL_A, estudiante_id=EST_HCS,
+                           curso_id=CURSO_HCS, asignatura_id=opt_hcs,
+                           fecha=date(2026, 3, 6), estado="ausente"))
+        d.commit()
+        ex_leng = d.query(M.EvaluacionExtraSecundaria).filter(
+            M.EvaluacionExtraSecundaria.asignatura_id == A_LENGUA).count()
+        asis_leng = d.query(M.Asistencia).filter(
+            M.Asistencia.asignatura_id == A_LENGUA,
+            M.Asistencia.curso_id == CURSO_HCS).count()
+        asis_opt = d.query(M.Asistencia).filter(
+            M.Asistencia.asignatura_id == opt_hcs,
+            M.Asistencia.curso_id == CURSO_HCS).count()
+    finally:
+        d.close()
+    assert ex_leng == 0, "la recuperación es SOLO de la optativa"
+    assert asis_leng == 3 and asis_opt == 1, (asis_leng, asis_opt)
+
+
+@test("§H11 §criterio 6: el Registro coloca cada materia en SU bloque")
+def _():
+    from app import _cargar_salida_optativa_registro, _cargar_datos_asignaturas_secundaria
+    opt_hcs = mapeo(HCS_LE_4, CURSO_HCS).asignatura_id
+    d = SessionLocal()
+    try:
+        user = d.query(M.Usuario).get(U_DIR_A)
+        curso = d.query(M.Curso).get(CURSO_HCS)
+        ests = d.query(M.Estudiante).filter(M.Estudiante.curso_id == CURSO_HCS).all()
+        res_opt = _cargar_salida_optativa_registro(d, user, curso, ests)
+        datos = _cargar_datos_asignaturas_secundaria(d, user, CURSO_HCS, 4, ests)
+    finally:
+        d.close()
+    slot = CAT.componente(HCS_LE_4).slot
+    assert slot in res_opt, res_opt
+    cf_opt = res_opt[slot]["calificaciones"][0].get("cf")
+    assert cf_opt is not None and abs(cf_opt - 70.0) < 0.01, cf_opt
+    # el bloque optativo NO lleva el 91 de Lengua
+    assert abs(cf_opt - 91.0) > 0.01, "el bloque optativo no puede llevar Lengua"
+    # y la troncal resuelve a Lengua Española
+    leng = datos.get("Lengua Española", {})
+    assert leng.get("docente") not in (None, "Sin asignar"), leng.get("docente")
+
+
+@test("§H12 §criterio 7-8: boletín y notas por período conservan AMBAS identidades")
+def _():
+    from app import _construir_datos_boletin_secundaria
+    opt_hcs = mapeo(HCS_LE_4, CURSO_HCS).asignatura_id
+    d = SessionLocal()
+    try:
+        user = d.query(M.Usuario).get(U_DIR_A)
+        est = d.query(M.Estudiante).get(EST_HCS)
+        curso = d.query(M.Curso).get(CURSO_HCS)
+        ano = d.query(M.AnoEscolar).get(ANO_A)
+        datos = _construir_datos_boletin_secundaria(d, est, curso, user, ano)
+    finally:
+        d.close()
+    txt = str(datos)
+    # las dos aparecen y con valores distintos; Lengua NO es sustituida
+    assert "91" in txt and "70" in txt, txt[:400]
+    claves = [str(k) for k in datos]
+    assert len(claves) == len(set(claves)), claves
+    # el reporte por período distingue las dos identidades
+    r = client.get(f"/api/boletines/estudiante/{EST_HCS}", headers=auth(DIR_A))
+    assert r.status_code == 200, (r.status_code, r.text[:200])
+    assert "Lengua" in r.text, r.text[:300]
+    assert CAT.componente(HCS_LE_4).nombre_oficial[:15] in r.text, r.text[:400]
+
+
+# --- FRONTEND: selector de Calificaciones (§5.7-§5.10) --------------------
+
+def _leer(rel):
+    ruta = os.path.join(_FRONT, rel)
+    assert os.path.exists(ruta), ruta
+    with open(ruta, encoding="utf-8") as f:
+        return f.read()
+
+
+@test("§H13 §5.7: sin curso el selector va vacío y deshabilitado")
+def _():
+    src = _leer(os.path.join("pages", "academico", "AcademicoPage.tsx"))
+    assert "(!cursoId ? [] :" in src, "sin curso la lista debe ser []"
+    assert 'disabled={esProfesor && !cursoId}' in src, "el selector debe deshabilitarse"
+    assert "Seleccione primero un curso" in src, "placeholder explícito"
+
+
+@test("§H14 §5.8-§5.9: cambiar de curso limpia asignatura y lo cargado")
+def _():
+    src = _leer(os.path.join("pages", "academico", "AcademicoPage.tsx"))
+    assert "const cambiarCurso" in src, "debe existir un reset explícito"
+    i = src.index("const cambiarCurso")
+    cuerpo = src[i:i + 400]
+    for esperado in ("setAsignaturaId(null)", "setCalificaciones([])", "setEditadas({})"):
+        assert esperado in cuerpo, (esperado, cuerpo[:250])
+    # y el onChange del curso lo usa
+    assert "onChange={(e) => cambiarCurso(" in src, src[:0]
+
+
+@test("§H15 §5.10: no hay dedupe global entre cursos")
+def _():
+    src = _leer(os.path.join("pages", "academico", "AcademicoPage.tsx"))
+    assert "asignaturasUnicas" not in src, "no debe deduplicar globalmente"
+    assert "curso_id === cursoId" in src, "debe filtrar por curso"
+    assert "asignaturasPorCurso" in src, "una fila por (curso, asignatura)"
+
+
 @test("§ZZ ZERO DATA LOSS: sge.db, credenciales y notas intactas")
 def _():
     ahora_sge = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
