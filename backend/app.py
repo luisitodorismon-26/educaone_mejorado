@@ -10139,17 +10139,28 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     if _guard:
         return _guard
 
-    # v2.17 (hermano del bug 11): el PROFESOR solo pasa lista en SUS cursos
+    # v2.17 (hermano del bug 11): el PROFESOR solo pasa lista en SUS cursos.
+    #
+    # R3.4.1 §7: y solo en SUS ASIGNATURAS de ese curso. Antes bastaba con tener
+    # cualquier asignacion en el curso, asi que el profesor de Lengua podia pasar
+    # lista de la Salida Optativa que imparte otro. En Secundaria la asistencia
+    # es por materia, de modo que curso y asignatura forman una sola llave.
     if current_user.role == 'profesor':
         _cid_asist = data.get('curso_id')
         if not _cid_asist and data.get('estudiante_id'):
             _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=data['estudiante_id']).first()
             _cid_asist = _e.curso_id if _e else None
         if _cid_asist:
-            _tiene_a = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-                profesor_id=current_user.id, curso_id=_cid_asist, activo=True).first()
-            if not _tiene_a:
-                return JSONResponse({'error': 'Solo puedes registrar asistencia en tus cursos asignados'}, status_code=403)
+            _q_asig = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+                profesor_id=current_user.id, curso_id=_cid_asist, activo=True)
+            _aid_asist = data.get('asignatura_id')
+            if _aid_asist:
+                _q_asig = _q_asig.filter(AsignacionProfesor.asignatura_id == _aid_asist)
+            if not _q_asig.first():
+                return JSONResponse({
+                    'error': ('Solo puedes registrar asistencia en los cursos y '
+                              'asignaturas que tienes asignados')
+                }, status_code=403)
     
     # Validar estado contra valores permitidos (anteriormente: cualquier string entraba)
     ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
@@ -10481,11 +10492,19 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
             _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=_primer_est).first()
             _cid_lote = _e.curso_id if _e else None
         if _cid_lote:
-            _tiene_a = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-                profesor_id=current_user.id, curso_id=_cid_lote, activo=True
-            ).first()
-            if not _tiene_a:
-                return JSONResponse({'error': 'Solo puedes registrar asistencia en tus cursos asignados'}, status_code=403)
+            # R3.4.1 §7: mismo criterio que el alta individual — curso Y
+            # asignatura. `asignatura_id` ya viene validado por tenant arriba.
+            _q_lote = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+                profesor_id=current_user.id, curso_id=_cid_lote, activo=True)
+            if asignatura_id is not None:
+                _q_lote = _q_lote.filter(
+                    AsignacionProfesor.asignatura_id == getattr(
+                        asignatura_id, 'id', asignatura_id))
+            if not _q_lote.first():
+                return JSONResponse({
+                    'error': ('Solo puedes registrar asistencia en los cursos y '
+                              'asignaturas que tienes asignados')
+                }, status_code=403)
 
     # v2.13.1: Validar día de la semana según configuración del colegio
     dia_semana = fecha.weekday()
