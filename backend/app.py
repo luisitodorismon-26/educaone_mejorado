@@ -15558,6 +15558,12 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     salida_optativa_data = _cargar_salida_optativa_registro(
         db, current_user, curso, estudiantes_db[:90])
 
+    # R3.4.1 — asistencia de los componentes optativos (pgs 56-65 del template).
+    # Mismo criterio: sin salida configurada o sin mapeo devuelve {} y esas
+    # páginas quedan exactamente como las imprime el MINERD.
+    salida_optativa_asistencia = _cargar_salida_optativa_asistencia(
+        db, current_user, curso, estudiantes_db[:90])
+
     # === 3. GENERAR PDF ===
     try:
         pdf_bytes = generar_registro_desde_sistema(
@@ -15565,6 +15571,7 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             estudiantes_raw, asignaturas_data, grado_numero,
             especificacion_data=especificacion_data,
             salida_optativa_data=salida_optativa_data or None,
+            salida_optativa_asistencia=salida_optativa_asistencia or None,
         )
         
         filename = f"Registro_Escolar_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
@@ -16040,6 +16047,87 @@ def _calificaciones_de_asignatura(db, current_user, asignatura, estudiantes_db,
                 'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
             }
     return calificaciones
+
+def _cargar_salida_optativa_asistencia(db: Session, current_user, curso, estudiantes_db):
+    """
+    Asistencia de los componentes de Salida Optativa, indexada por SLOT.
+
+    R3.4.1 §8-§10 — EL TEMPLATE TIENE SITIO PARA ESTO
+    -------------------------------------------------
+    El Registro de 4to-6to trae 10 páginas con el encabezado impreso "SALIDA
+    OPTATIVA ____ ASIGNATURA ____" (pgs 56-65 = 2 componentes × 5 páginas).
+    R3.1 las documentó en `ASISTENCIA_SALIDA_OPTATIVA_CICLO_2` y R3.3 estampó
+    solo las CALIFICACIONES, así que hasta ahora salían siempre vírgenes.
+
+    La cadena es la misma que la de las notas y no se resuelve por nombre:
+
+        Curso.salida_optativa_codigo -> CursoComponenteOptativo
+            -> Asignatura dedicada -> Asistencia.asignatura_id
+
+    Los meses los arma `build_asistencia_registro`, EL MISMO constructor que usa
+    una materia troncal, pasándole el `asignatura_id` del componente. Por eso la
+    asistencia de "Apreciación y Producción Literarias" no puede salir igual a la
+    de "Lengua Española": son dos `asignatura_id` distintos y ninguna se
+    reutiliza como la otra.
+
+    Un componente sin mapeo, o sin asistencia registrada, NO aparece en el dict:
+    su bloque queda idéntico al template en vez de rellenarse con ceros.
+    """
+    from registro_asistencia import build_asistencia_registro
+    import salida_optativa_service as _svc
+
+    if curso is None or not getattr(curso, 'salida_optativa_codigo', None):
+        return {}
+    try:
+        resueltos = _svc.resolver_componentes(db, curso)
+    except ValueError as e:
+        logger.error("Asistencia optativa no resuelta para el curso %s: %s", curso.id, e)
+        return {}
+    if not resueltos:
+        return {}
+
+    docentes = {}
+    for ap in tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, activo=True).order_by(AsignacionProfesor.id).all():
+        docentes.setdefault(ap.asignatura_id, ap)
+
+    # El template tiene 2 bloques de 5 páginas, y una salida aporta 1 o 2
+    # componentes. El bloque es la POSICIÓN del componente dentro de los que su
+    # salida define, ordenados por slot —no el orden de los que traen datos—,
+    # así que un componente conserva su bloque aunque el otro se quede vacío.
+    bloque_de_slot = {c.slot: i for i, c in enumerate(_svc.componentes_esperados(curso))}
+
+    salida = {}
+    for item in resueltos:
+        asig_id = item['asignatura_id']
+        if asig_id is None:
+            continue                      # sin vincular: no se inventa nada
+        # `tenant_filter` es la barrera: una asignatura de otro colegio no se
+        # resuelve aunque su id estuviera en la tabla.
+        asig = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter(
+            Asignatura.id == asig_id).first()
+        if asig is None:
+            logger.warning("Componente %s del curso %s apunta a la asignatura %s, que "
+                           "no es de este colegio; se omite su asistencia.",
+                           item['componente'].codigo, curso.id, asig_id)
+            continue
+        meses = build_asistencia_registro(db, curso.id, asignatura_id=asig.id,
+                                          estudiantes=estudiantes_db)
+        if not meses:
+            continue                      # sin asistencia: página como el template
+        bloque = bloque_de_slot.get(item['slot'])
+        if bloque is None:
+            continue
+        ap = docentes.get(asig.id)
+        salida[bloque] = {
+            'componente_codigo': item['componente'].codigo,
+            'slot': item['slot'],
+            'docente': ap.profesor.nombre_completo if (ap and ap.profesor) else '',
+            'meses': meses,
+        }
+    return salida
+
 
 def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, grado_numero, estudiantes_db):
     """
