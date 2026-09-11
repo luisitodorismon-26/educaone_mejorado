@@ -151,6 +151,19 @@ with client:
         client.post('/api/asignaciones', json={'profesor_id': prof, 'curso_id': cp, 'asignatura_id': asig}, headers=auth(tok))
         client.post('/api/asignaciones', json={'profesor_id': prof, 'curso_id': cs, 'asignatura_id': asig}, headers=auth(tok))
 
+        # P0 — un bloque de clase exige AsignacionProfesor activa que coincida en
+        # profesor + curso + asignatura. Esta suite mide SOLAPAMIENTO, no permisos:
+        # para que siga midiendo eso, profX y profY quedan asignados a los tres
+        # cursos. Antes no lo estaban y los horarios se creaban igual, que es
+        # justamente el agujero que el guard cierra.
+        for _p in (profX, profY):
+            for _c in (cp, cs, cpH):
+                client.post('/api/asignaciones',
+                            json={'profesor_id': _p, 'curso_id': _c, 'asignatura_id': asig},
+                            headers=auth(tok))
+        # el profesor mixto tambien da clase en cpH en alguna prueba
+        client.post('/api/asignaciones', json={'profesor_id': prof, 'curso_id': cpH, 'asignatura_id': asig}, headers=auth(tok))
+
         return dict(cp=cp, cs=cs, cpH=cpH, prof=prof, profX=profX, profY=profY, asig=asig, tok=tok)
 
     A = montar(DIR_A, 'a', 'direccion')
