@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { FileBarChart, Download, Search, ChevronDown, ChevronUp, LayoutGrid, List, Users, User } from 'lucide-react';
 import { Select, Button, Alert } from '../../components/ui';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Curso { id: number; nombre_completo: string; grado?: string; nombre?: string; tanda?: string; }
 
@@ -179,7 +180,7 @@ export const CalificacionesGeneralPage = () => {
 
       <div className="bg-white rounded-xl border shadow-sm p-4">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-          <Select label="Curso" value={cursoId.toString()} onChange={e => setCursoId(Number(e.target.value))} options={cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))} placeholder="Seleccionar curso" />
+          <Select label="Curso" value={cursoId.toString()} onChange={e => setCursoId(Number(e.target.value))} options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))} placeholder="Seleccionar curso" />
           <Select label="Periodo" value={periodo.toString()} onChange={e => setPeriodo(Number(e.target.value))} options={periodoOpts} />
           <div className="flex items-end"><Button onClick={cargar} disabled={!cursoId} loading={loading} icon={<Search size={18} />} className="w-full">Ver Notas</Button></div>
         </div>

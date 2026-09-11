@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { Modal, Button, Input, Select, Alert } from '../../components/ui';
 import { SalidaOptativaSection } from './SalidaOptativaSection';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface ConfigColegio {
   nombre: string;
@@ -1222,7 +1223,7 @@ export const ConfiguracionPage = () => {
       </Modal>
 
       {/* Modal Curso */}
-      <Modal isOpen={showModal && modalType === 'curso'} onClose={() => setShowModal(false)} title={editingItem ? 'Editar Curso' : 'Nuevo Curso'} size="md"
+      <Modal isOpen={showModal && modalType === 'curso'} onClose={() => setShowModal(false)} title={editingItem ? `Editar Curso — ${labelCurso(editingItem)}` : 'Nuevo Curso'} size="md"
         footer={<><Button variant="secondary" onClick={() => setShowModal(false)}>Cancelar</Button><Button onClick={saveCurso} loading={saving}>{editingItem ? 'Guardar' : 'Crear'}</Button></>}>
         <div className="space-y-4">
           <Select label="Grado *" value={cursoForm.grado_id} onChange={e => setCursoForm({ ...cursoForm, grado_id: parseInt(e.target.value) })} options={grados.map(g => ({ value: g.id, label: g.nombre }))} placeholder="Seleccionar grado" />
@@ -1235,7 +1236,8 @@ export const ConfiguracionPage = () => {
               y su grado), así que solo aparece al EDITAR. La propia sección se
               oculta sola si el grado no es 4to-6to de Secundaria. */}
           {editingItem && (
-            <SalidaOptativaSection cursoId={editingItem.id} asignaturas={asignaturas} />
+            <SalidaOptativaSection cursoId={editingItem.id} curso={editingItem}
+                                   asignaturas={asignaturas} />
           )}
         </div>
       </Modal>

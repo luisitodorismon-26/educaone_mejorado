@@ -1539,6 +1539,191 @@ def _():
     assert "asignaturasPorCurso" in src, "una fila por (curso, asignatura)"
 
 
+# ===========================================================================
+# BLOQUE I — UX MULTI-TANDA: la etiqueta de curso nunca pierde la tanda
+# ===========================================================================
+#
+# EducaOne es multi-tanda: el mismo grado existe legítimamente en Matutina y en
+# Vespertina y son cursos distintos. En producción, curso 4 (4to Sec · Matutina,
+# 26 estudiantes) y curso 16 (4to Sec · Vespertina) se mostraban con la MISMA
+# cadena porque los selectores hacían:
+#
+#     c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo
+#
+# y, como `grado` siempre viene, `nombre_completo` —que sí trae la tanda— no se
+# usaba jamás. De ahí que una configuración pudiera aterrizar en el curso que no
+# era.
+#
+# NOTA SOBRE EL MÉTODO: el repo no tiene runner de JS (ni vitest ni jest) y no se
+# añade uno aquí. Para no probar una copia del código, se ejecuta el FUENTE REAL
+# de `labelCurso.ts` con Node, quitando solo las anotaciones de tipo.
+
+_LABEL_TS = os.path.join(_FRONT, "utils", "labelCurso.ts")
+
+
+def _ejecutar_label_curso(casos):
+    """Corre el labelCurso.ts REAL con Node y devuelve las etiquetas."""
+    import json
+    import re as _re
+    import shutil
+    import subprocess
+    import tempfile as _tf
+
+    node = shutil.which("node")
+    if not node:
+        return None                      # sin Node: el llamador lo reporta
+
+    src = open(_LABEL_TS, encoding="utf-8").read()
+    # TS -> JS: se quitan interfaces, export type-only y anotaciones de tipo.
+    src = _re.sub(r"export interface [\s\S]*?\n}\n", "", src)
+    src = src.replace("export const", "const").replace("export function", "function")
+    src = _re.sub(r"export default .*?;", "", src)
+    src = src.replace(
+        "function labelCurso(curso: CursoEtiquetable | null | undefined): string {",
+        "function labelCurso(curso) {")
+    assert "function labelCurso(curso) {" in src, "no se pudo desanotar labelCurso"
+
+    runner = src + "\nconsole.log(JSON.stringify(%s.map(labelCurso)));\n" % json.dumps(casos)
+    d = _tf.mkdtemp(prefix="eo_label_")
+    try:
+        f = os.path.join(d, "label.mjs")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(runner)
+        out = subprocess.run([node, f], capture_output=True, text=True,
+                             encoding="utf-8", timeout=120)
+        assert out.returncode == 0, out.stderr[:400]
+        return json.loads(out.stdout.strip().splitlines()[-1])
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+@test("§I1 el caso REAL de producción: curso 4 y curso 16 con etiquetas distintas")
+def _():
+    # Las dos filas tal como las devuelve GET /api/cursos en producción.
+    curso4 = {"id": 4, "grado": "4to Secundaria", "nombre": "", "tanda": "Matutina",
+              "nombre_completo": "4to Secundaria  - Matutina"}
+    curso16 = {"id": 16, "grado": "4to Secundaria", "nombre": "", "tanda": "Vespertina",
+               "nombre_completo": "4to Secundaria  - Vespertina"}
+    res = _ejecutar_label_curso([curso4, curso16])
+    if res is None:
+        print("    (node no disponible: se omite la ejecución)")
+        return
+    assert res[0] == "4to Secundaria · Matutina", res[0]
+    assert res[1] == "4to Secundaria · Vespertina", res[1]
+    assert res[0] != res[1], "los dos 4to DEBEN ser distinguibles"
+
+
+@test("§I2 con sección: 'Grado Sección · Tanda'")
+def _():
+    res = _ejecutar_label_curso([
+        {"id": 1, "grado": "4to Secundaria", "nombre": "A", "tanda": "Matutina"},
+        {"id": 2, "grado": "1ro Primaria", "nombre": "B", "tanda": "Vespertina"},
+    ])
+    if res is None:
+        return
+    assert res[0] == "4to Secundaria A · Matutina", res[0]
+    assert res[1] == "1ro Primaria B · Vespertina", res[1]
+
+
+@test("§I3 sin tanda en el payload se usa nombre_completo, que puede traerla")
+def _():
+    res = _ejecutar_label_curso([
+        {"id": 3, "grado": "5to Secundaria", "nombre": "A", "tanda": None,
+         "nombre_completo": "5to Secundaria A - Matutina"},
+        {"id": 4, "grado": "6to Secundaria", "nombre": "A"},
+        {"id": 5},
+        {},
+    ])
+    if res is None:
+        return
+    assert res[0] == "5to Secundaria A - Matutina", res[0]
+    assert res[1] == "6to Secundaria A", res[1]
+    assert res[2] == "Curso 5", res[2]
+    # nunca una etiqueta vacía, que dejaría una opción muda en el selector
+    assert all(x.strip() for x in res), res
+
+
+@test("§I4 ya no queda ningún selector que descarte la tanda")
+def _():
+    import re as _re
+    patron = _re.compile(r"c\.grado \? `\$\{c\.grado\} \$\{c\.nombre\}`")
+    restos = []
+    for raiz, _dirs, ficheros in os.walk(_FRONT):
+        if "node_modules" in raiz:
+            continue
+        for f in ficheros:
+            if not f.endswith((".tsx", ".ts")):
+                continue
+            ruta = os.path.join(raiz, f)
+            # `labelCurso.ts` CITA el patron roto en su docstring, a proposito,
+            # para explicar que vino a sustituir. No es un sitio que lo use.
+            if os.path.basename(ruta) == "labelCurso.ts":
+                continue
+            with open(ruta, encoding="utf-8") as fh:
+                texto = fh.read()
+            for n, linea in enumerate(texto.splitlines(), 1):
+                if patron.search(linea):
+                    restos.append("%s:%d" % (os.path.relpath(ruta, _FRONT), n))
+    assert not restos, "quedan sitios que pierden la tanda: %s" % restos
+
+
+@test("§I5 las páginas prioritarias usan el helper único")
+def _():
+    prioritarias = [
+        os.path.join("pages", "academico", "AcademicoPage.tsx"),
+        os.path.join("pages", "asistencia", "AsistenciaPage.tsx"),
+        os.path.join("pages", "asignaciones", "AsignacionesPage.tsx"),
+        os.path.join("pages", "horarios", "HorariosPage.tsx"),
+        os.path.join("pages", "registro-escolar", "RegistroEscolarPage.tsx"),
+        os.path.join("pages", "boletines", "BoletinesPage.tsx"),
+        os.path.join("pages", "configuracion", "ConfiguracionPage.tsx"),
+    ]
+    for rel in prioritarias:
+        src = _leer(rel)
+        assert "labelCurso" in src, rel
+
+
+@test("§I6 Configuración → Editar Curso identifica el curso y su tanda")
+def _():
+    src = _leer(os.path.join("pages", "configuracion", "ConfiguracionPage.tsx"))
+    assert "`Editar Curso — ${labelCurso(editingItem)}`" in src, \
+        "el modal debe decir QUÉ curso se edita"
+    # y la sección de Salida Optativa recibe el curso para rotularse
+    assert "curso={editingItem}" in src, src[:0]
+
+
+@test("§I7 la sección de Salida Optativa muestra la identidad del curso")
+def _():
+    src = _leer(os.path.join("pages", "configuracion", "SalidaOptativaSection.tsx"))
+    assert "labelCurso(curso)" in src, "debe rotular el curso que configura"
+    assert "curso?: CursoEtiquetable" in src, "el curso llega como prop opcional"
+    # la identidad sigue siendo cursoId: el curso es solo para mostrar
+    assert "cursoId: number;" in src, src[:0]
+
+
+@test("§I8 se conserva el agrupado por tanda donde ya existía")
+def _():
+    for rel in (os.path.join("pages", "academico", "AcademicoPage.tsx"),
+                os.path.join("pages", "boletines", "BoletinesPage.tsx"),
+                os.path.join("pages", "estudiantes", "EstudiantesPage.tsx")):
+        src = _leer(rel)
+        assert "group: c.tanda" in src, rel
+
+
+@test("§I9 el helper no cambia identidades ni deduplica")
+def _():
+    src = open(_LABEL_TS, encoding="utf-8").read()
+    # No toca datos ni identidades: sin red, sin deduplicar cursos, sin escribir
+    # `curso_id`. (`[grado, seccion].filter(Boolean)` es filtrado de cadenas
+    # vacias dentro de la propia etiqueta, no de cursos.)
+    for prohibido in ("fetch(", "api.", "dedup", "new Set(", "curso_id =",
+                      "cursos.filter", "useState", "useEffect"):
+        assert prohibido not in src, prohibido
+    # es una funcion pura de presentacion
+    assert "export function labelCurso" in src
+
+
 @test("§ZZ ZERO DATA LOSS: sge.db, credenciales y notas intactas")
 def _():
     ahora_sge = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

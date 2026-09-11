@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { ClipboardList, Save, Settings, ChevronDown, ChevronUp, Check } from 'lucide-react';
 import { Select, Button, Alert, Spinner } from '../../components/ui';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Curso { id: number; nombre_completo: string; }
 interface Asignatura { id: number; nombre: string; }
@@ -217,10 +218,10 @@ export const EvalInternaPage = () => {
                 return tandas.length > 1 ? tandas.map(tanda => (
                   <optgroup key={tanda} label={tanda}>
                     {cursosUnicos.filter((c: any) => (c.tanda || 'Sin tanda') === tanda).map((c: any) => (
-                      <option key={c.id} value={c.id}>{c.grado ? `${c.grado} ${c.nombre}` : c.nombre}</option>
+                      <option key={c.id} value={c.id}>{labelCurso(c)}</option>
                     ))}
                   </optgroup>
-                )) : cursosUnicos.map((c: any) => <option key={c.id} value={c.id}>{c.grado ? `${c.grado} ${c.nombre}` : c.nombre}</option>);
+                )) : cursosUnicos.map((c: any) => <option key={c.id} value={c.id}>{labelCurso(c)}</option>);
               })()}
             </select>
           </div>

@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { Printer, Plus, Trash2, Clock, Settings, Coffee, Sun, Moon, Edit2 } from 'lucide-react';
 import { Modal, Button, Select, Input, Alert } from '../../components/ui';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Horario {
   id: number;
@@ -550,7 +551,7 @@ export const HorariosPage = () => {
               return tandas.map(tanda => (
                 <optgroup key={tanda} label={tanda}>
                   {filtrados.filter(c => (c.tanda || 'Sin tanda') === tanda).map(c => (
-                    <option key={c.id} value={c.id}>{c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo}</option>
+                    <option key={c.id} value={c.id}>{labelCurso(c)}</option>
                   ))}
                 </optgroup>
               ));
@@ -728,7 +729,7 @@ export const HorariosPage = () => {
                 onChange={e => setForm({ ...form, curso_id: parseInt(e.target.value) })}
                 options={[
                   { value: 0, label: '-- Seleccionar curso --' },
-                  ...cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))
+                  ...cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))
                 ]}
               />
               <Select

@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { Modal, Button, Select, Input, Alert } from '../../components/ui';
 import { exportarCSV } from '../../utils/exportarCSV';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Reporte {
   id: number;
@@ -508,7 +509,7 @@ export const ReportesPage = () => {
                   "1ro Primaria A - Matutina". */}
               {cursos.map(c => (
                 <option key={c.id} value={c.id}>
-                  {c.nombre_completo || (c.grado ? `${c.grado} ${c.nombre}` : c.nombre)}
+                  {c.nombre_completo || (labelCurso(c))}
                 </option>
               ))}
             </select>
@@ -609,7 +610,7 @@ export const ReportesPage = () => {
             label="Curso"
             value={form.curso_filter || ''}
             onChange={e => setForm({ ...form, curso_filter: e.target.value, estudiante_id: 0 })}
-            options={cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+            options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
             placeholder="Filtrar por curso"
           />
           <Select

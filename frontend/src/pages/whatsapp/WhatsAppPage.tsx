@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { Card, Button, Select, Input, Textarea, Badge, Alert, Modal, Spinner } from '../../components/ui';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Plantilla {
   id: number;
@@ -230,7 +231,7 @@ export const WhatsAppPage = () => {
                 label="Curso"
                 value={cursoId}
                 onChange={e => setCursoId(parseInt(e.target.value))}
-                options={cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+                options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
                 placeholder="Seleccionar curso"
               />
 

@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { FileText, Download, Printer, Search, Users, GraduationCap, Calendar } from 'lucide-react';
 import { Select, Button, Spinner, Alert } from '../../components/ui';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Curso {
   id: number;
@@ -270,7 +271,7 @@ export const BoletinesPage = () => {
             label="Curso"
             value={cursoId?.toString() || ''}
             onChange={(e) => setCursoId(e.target.value ? parseInt(e.target.value) : null)}
-            options={cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+            options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
             placeholder="Seleccione curso"
           />
           <Select

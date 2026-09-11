@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { Button, Alert } from '../../components/ui';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Curso {
   id: number;
@@ -180,19 +181,19 @@ export const AsignacionesPage = () => {
             {cursos.filter(c => c.tanda?.includes('Matutina')).length > 0 && (
               <optgroup label="☀️ Tanda Matutina">
                 {cursos.filter(c => c.tanda?.includes('Matutina')).map(c => (
-                  <option key={c.id} value={c.id}>{c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo}</option>
+                  <option key={c.id} value={c.id}>{labelCurso(c)}</option>
                 ))}
               </optgroup>
             )}
             {cursos.filter(c => c.tanda?.includes('Vespertina')).length > 0 && (
               <optgroup label="🌙 Tanda Vespertina">
                 {cursos.filter(c => c.tanda?.includes('Vespertina')).map(c => (
-                  <option key={c.id} value={c.id}>{c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo}</option>
+                  <option key={c.id} value={c.id}>{labelCurso(c)}</option>
                 ))}
               </optgroup>
             )}
             {cursos.filter(c => !c.tanda).map(c => (
-              <option key={c.id} value={c.id}>{c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo}</option>
+              <option key={c.id} value={c.id}>{labelCurso(c)}</option>
             ))}
           </select>
         </div>
