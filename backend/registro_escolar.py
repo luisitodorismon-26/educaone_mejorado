@@ -170,6 +170,24 @@ ASISTENCIA_MAPA_SECUNDARIA = [
 # listas para llenar a mano) en vez de estampar marcas descuadradas.
 ASISTENCIA_LAYOUT_SIN_CALIBRAR: set = set()
 
+# Encabezado impreso de las páginas de asistencia de Salida Optativa. Medido
+# sobre los tres templates con pymupdf: el rótulo es un único span
+# "SALIDA OPTATIVA ______ ASIGNATURA ______" en x0=74.77..548.20, y0=51.41,
+# y1=65.86, size 11, IDÉNTICO en las 10 páginas y en 4to, 5to y 6to.
+#
+#   "SALIDA OPTATIVA" termina en x=178.09 -> su hueco va de 178.09 a 329.89
+#   "ASIGNATURA"      termina en x=406.30 -> su hueco va de 406.30 a 548.20
+#
+# El campo DOCENTE de estas páginas es el mismo de la rejilla normal (y0=86.40)
+# y ya lo estampa `draw_asistencia`, así que aquí no se duplica.
+ASISTENCIA_SALIDA_OPTATIVA_HEADER = {
+    "y_plumber": 63.5,            # línea base, dentro de y0=51.41..y1=65.86
+    "salida_x": 182.0,            # justo después de "SALIDA OPTATIVA "
+    "salida_max_width": 144.0,    # hasta donde empieza "ASIGNATURA"
+    "asignatura_x": 410.0,        # justo después de "ASIGNATURA "
+    "asignatura_max_width": 136.0,
+}
+
 # Bloque de asistencia de la SALIDA OPTATIVA (solo 4to-6to): 10 páginas con el
 # encabezado impreso "SALIDA OPTATIVA ____ ASIGNATURA ____", es decir 2
 # componentes × 5 páginas. Un estudiante cursa como máximo 2 componentes, así
@@ -2008,9 +2026,22 @@ def generar_registro_escolar(
                     "Asistencia de Salida Optativa: bloque %s fuera de las %d hojas "
                     "oficiales; no se estampa.", bloque_idx, len(bloques))
                 continue
-            meses = (salida_optativa_asistencia[bloque_idx] or {}).get("meses") or []
-            if not any(meses):
-                continue          # sin un solo mes con datos: página virgen
+            datos_bloque = salida_optativa_asistencia[bloque_idx] or {}
+            meses = datos_bloque.get("meses") or []
+            # ROTULADO (R3.4.1 §4-§5). El template deja en blanco "SALIDA
+            # OPTATIVA ____ ASIGNATURA ____", así que la rejilla sola no dice a
+            # qué materia pertenece. Los nombres vienen del CATÁLOGO y del
+            # mapping explícito, nunca de una búsqueda por nombre.
+            #
+            # Se rotula aunque todavía no haya ni una asistencia: un componente
+            # configurado ya ocupa ese espacio del Registro y conviene que la
+            # hoja lo identifique. Rotular NO rellena días ni inventa marcas —
+            # la rejilla sigue vacía, tal como la imprime el MINERD.
+            rotulo_salida = (datos_bloque.get("salida_nombre") or "").strip()
+            rotulo_asig = (datos_bloque.get("componente_nombre") or "").strip()
+            if not any(meses) and not (rotulo_salida or rotulo_asig):
+                continue
+            _hdr = ASISTENCIA_SALIDA_OPTATIVA_HEADER
             for pg_offset, pagina in enumerate(bloques[bloque_idx]):
                 pg_idx = pagina - 1
                 if pg_idx >= total_pages:
@@ -2020,13 +2051,23 @@ def generar_registro_escolar(
                 has_data = False
                 buf = io.BytesIO()
                 c_asist = canvas.Canvas(buf, pagesize=letter)
+                # El rótulo va en TODAS las páginas del bloque: cada hoja del
+                # Registro tiene que poder leerse por separado.
+                if rotulo_salida:
+                    _draw_text(c_asist, _hdr["salida_x"], _y(_hdr["y_plumber"]),
+                               rotulo_salida, size=FONT_SIZE_NOTA,
+                               max_width=_hdr["salida_max_width"])
+                if rotulo_asig:
+                    _draw_text(c_asist, _hdr["asignatura_x"], _y(_hdr["y_plumber"]),
+                               rotulo_asig, size=FONT_SIZE_NOTA,
+                               max_width=_hdr["asignatura_max_width"])
                 if mes_izq_idx < len(meses) and meses[mes_izq_idx]:
                     draw_asistencia(c_asist, meses[mes_izq_idx], es_mes_derecho=False)
                     has_data = True
                 if mes_der_idx < len(meses) and meses[mes_der_idx]:
                     draw_asistencia(c_asist, meses[mes_der_idx], es_mes_derecho=True)
                     has_data = True
-                if has_data:
+                if has_data or rotulo_salida or rotulo_asig:
                     c_asist.showPage()
                     c_asist.save()
                     buf.seek(0)

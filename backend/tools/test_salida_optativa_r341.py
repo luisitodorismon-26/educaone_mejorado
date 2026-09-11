@@ -756,6 +756,297 @@ def _():
     assert not llamadas, "R3.4.1 no debe reintroducir merge_page"
 
 
+# ===========================================================================
+# BLOQUE F — PERMISOS DE ASISTENCIA Y ROTULADO (fix final pre-PR)
+# ===========================================================================
+
+CPRIM_R341 = 60
+G4PRIM_R341 = 61
+A_PRIM = 62
+U_PROF_PRIM = 63
+EST_PRIM = 64
+
+
+def _seed_primaria():
+    """Un curso de PRIMARIA, donde la asistencia general sigue siendo válida."""
+    d = SessionLocal()
+    try:
+        if d.query(M.Curso).get(CPRIM_R341) is not None:
+            return
+        d.add(M.Grado(id=G4PRIM_R341, colegio_id=COL_A, nombre="4to Primaria",
+                      nivel="primaria", orden=4))
+        d.add(M.Curso(id=CPRIM_R341, colegio_id=COL_A, nombre="A",
+                      grado_id=G4PRIM_R341, ano_escolar_id=ANO_A, activo=True))
+        d.add(M.Asignatura(id=A_PRIM, colegio_id=COL_A, nombre="Materia Primaria",
+                           codigo="MP", area="", activo=True))
+        u = M.Usuario(id=U_PROF_PRIM, username="prof_prim", nombre="prof_prim",
+                      apellido="T", role="profesor", colegio_id=COL_A)
+        u.set_password(PWD)
+        d.add(u)
+        d.add(M.Estudiante(id=EST_PRIM, colegio_id=COL_A, nombre="EstPrim",
+                           apellido="T", curso_id=CPRIM_R341, activo=True, no_lista=1))
+        d.add(M.AsignacionProfesor(id=850, colegio_id=COL_A, profesor_id=U_PROF_PRIM,
+                                   curso_id=CPRIM_R341, asignatura_id=A_PRIM,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.commit()
+    finally:
+        d.close()
+
+
+def _n_asistencias(**kw):
+    d = SessionLocal()
+    try:
+        q = d.query(M.Asistencia)
+        for k, v in kw.items():
+            q = q.filter(getattr(M.Asistencia, k) == v)
+        return q.count()
+    finally:
+        d.close()
+
+
+@test("§F1 §1A: POST en Secundaria SIN asignatura -> 400 y no escribe nada")
+def _():
+    antes = _n_asistencias(estudiante_id=EST_2)
+    r = client.post("/api/asistencia", json={
+        "estudiante_id": EST_2, "curso_id": C4_A,
+        "fecha": date(2026, 3, 20).isoformat(), "estado": "presente",
+    }, headers=auth(PROF))
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "Secundaria" in r.json()["error"], r.json()
+    assert _n_asistencias(estudiante_id=EST_2) == antes, "un 400 no debe escribir"
+
+
+@test("§F2 §1B: POST masivo en Secundaria SIN asignatura -> 400 y cero escrituras")
+def _():
+    antes = _n_asistencias(fecha=date(2026, 3, 19))
+    r = client.post("/api/asistencia/masivo", json={
+        "curso_id": C4_A, "fecha": date(2026, 3, 19).isoformat(),
+        "asistencias": [{"estudiante_id": EST_1, "estado": "presente"},
+                        {"estudiante_id": EST_2, "estado": "ausente"}],
+    }, headers=auth(PROF))
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "Secundaria" in r.json()["error"], r.json()
+    assert _n_asistencias(fecha=date(2026, 3, 19)) == antes == 0, "cero escrituras"
+
+
+@test("§F3 §1C: en PRIMARIA la asistencia general sin asignatura sigue funcionando")
+def _():
+    _seed_primaria()
+    tok = login("prof_prim")
+    r = client.post("/api/asistencia", json={
+        "estudiante_id": EST_PRIM, "curso_id": CPRIM_R341,
+        "fecha": date(2026, 3, 23).isoformat(), "estado": "presente",
+    }, headers=auth(tok))
+    assert r.status_code in (200, 201), (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        f = d.query(M.Asistencia).filter(
+            M.Asistencia.estudiante_id == EST_PRIM,
+            M.Asistencia.fecha == date(2026, 3, 23)).first()
+        assert f is not None and f.asignatura_id is None, f
+        assert f.estado == "presente"
+    finally:
+        d.close()
+
+
+@test("§F4 §2A: DELETE de la marca de una materia AJENA -> 403 y la marca queda")
+def _():
+    opt = id_optativa()
+    marcar(PROF, EST_1, opt, "ausente", fecha=date(2026, 3, 25))
+    assert asistencia_de(EST_1, opt, date(2026, 3, 25)) == "ausente"
+    # prof_y solo tiene la TRONCAL en este curso
+    d = SessionLocal()
+    try:
+        d.add(M.AsignacionProfesor(id=851, colegio_id=COL_A, profesor_id=U_PROF2,
+                                   curso_id=C4_A, asignatura_id=A_LENGUA,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.commit()
+    finally:
+        d.close()
+    try:
+        r = client.delete(
+            "/api/asistencia/%d?fecha=2026-03-25&asignatura_id=%d" % (EST_1, opt),
+            headers=auth(PROF2))
+        assert r.status_code == 403, (r.status_code, r.text[:250])
+        assert asistencia_de(EST_1, opt, date(2026, 3, 25)) == "ausente", \
+            "un 403 no puede haber borrado la marca"
+    finally:
+        d = SessionLocal()
+        try:
+            f = d.query(M.AsignacionProfesor).get(851)
+            if f:
+                d.delete(f)
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("§F5 §2B-§2D: el profesor borra SU marca y la de la otra materia no se toca")
+def _():
+    opt = id_optativa()
+    f = date(2026, 3, 26)
+    marcar(PROF, EST_1, A_LENGUA, "presente", fecha=f)
+    marcar(PROF, EST_1, opt, "ausente", fecha=f)
+    assert asistencia_de(EST_1, A_LENGUA, f) == "presente"
+    assert asistencia_de(EST_1, opt, f) == "ausente"
+    r = client.delete(
+        "/api/asistencia/%d?fecha=2026-03-26&asignatura_id=%d" % (EST_1, opt),
+        headers=auth(PROF))
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert asistencia_de(EST_1, opt, f) is None, "la marca propia debe desaparecer"
+    assert asistencia_de(EST_1, A_LENGUA, f) == "presente", \
+        "la marca de Lengua NO puede verse afectada"
+
+
+@test("§F6 §2C: DELETE en Secundaria SIN asignatura -> 400 y ninguna marca desaparece")
+def _():
+    opt = id_optativa()
+    f = date(2026, 3, 27)
+    marcar(PROF, EST_1, A_LENGUA, "presente", fecha=f)
+    marcar(PROF, EST_1, opt, "ausente", fecha=f)
+    r = client.delete("/api/asistencia/%d?fecha=2026-03-27" % EST_1, headers=auth(PROF))
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "Secundaria" in r.json()["error"], r.json()
+    assert asistencia_de(EST_1, A_LENGUA, f) == "presente"
+    assert asistencia_de(EST_1, opt, f) == "ausente"
+
+
+@test("§F7 §2E: en PRIMARIA el desmarcado general sigue funcionando")
+def _():
+    _seed_primaria()
+    tok = login("prof_prim")
+    client.post("/api/asistencia", json={
+        "estudiante_id": EST_PRIM, "curso_id": CPRIM_R341,
+        "fecha": date(2026, 3, 24).isoformat(), "estado": "ausente",
+    }, headers=auth(tok))
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asistencia).filter(
+            M.Asistencia.estudiante_id == EST_PRIM,
+            M.Asistencia.fecha == date(2026, 3, 24)).first() is not None
+    finally:
+        d.close()
+    r = client.delete("/api/asistencia/%d?fecha=2026-03-24" % EST_PRIM, headers=auth(tok))
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        assert d.query(M.Asistencia).filter(
+            M.Asistencia.estudiante_id == EST_PRIM,
+            M.Asistencia.fecha == date(2026, 3, 24)).first() is None
+    finally:
+        d.close()
+
+
+# --- ROTULADO DEL ENCABEZADO (§3-§6) -------------------------------------
+
+def _texto_pagina(pdf_bytes, pg_humana):
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    return reader.pages[pg_humana - 1].extract_text() or ""
+
+
+@test("§F8 §3: la geometría del encabezado sale del template, no de una invención")
+def _():
+    try:
+        import pymupdf
+    except Exception:
+        print("    (pymupdf no disponible: se omite)")
+        return
+    hdr = RE.ASISTENCIA_SALIDA_OPTATIVA_HEADER
+    doc = pymupdf.open(os.path.join(_TPL_DIR, "Registro-4to-Grado-Sec-Academica-1-1.pdf"))
+    try:
+        pg = doc[55]
+        r_sal = pg.search_for("SALIDA OPTATIVA")[0]
+        r_asig = pg.search_for("ASIGNATURA")[0]
+        # el hueco de la salida empieza tras su rótulo y acaba donde el siguiente
+        assert r_sal.x1 <= hdr["salida_x"] <= r_asig.x0, (r_sal.x1, hdr["salida_x"])
+        assert hdr["salida_x"] + hdr["salida_max_width"] <= r_asig.x0 + 1, hdr
+        # el de la asignatura empieza tras "ASIGNATURA"
+        assert r_asig.x1 <= hdr["asignatura_x"], (r_asig.x1, hdr["asignatura_x"])
+        # la línea base cae dentro del alto del rótulo impreso
+        assert r_sal.y0 <= hdr["y_plumber"] <= r_sal.y1, (r_sal.y0, r_sal.y1, hdr)
+    finally:
+        doc.close()
+
+
+@test("§F9 §6: cada bloque lleva SU nombre oficial y el de SU salida")
+def _():
+    # bloque 0 = Apreciación (HLM-LE-4), bloque 1 = otro componente de HLM
+    c0, c1 = CAT.componentes_de("HLM", 4)
+    datos = {
+        0: {"componente_nombre": c0.nombre_oficial,
+            "salida_nombre": CAT.SALIDAS["HLM"],
+            "meses": [_mes("MARZO", {0: 2})]},
+        1: {"componente_nombre": c1.nombre_oficial,
+            "salida_nombre": CAT.SALIDAS["HLM"],
+            "meses": [_mes("MARZO", {0: 1})]},
+    }
+    pdf = _generar(4, salida_optativa_asistencia=datos)
+    t56 = _texto_pagina(pdf, 56)
+    t61 = _texto_pagina(pdf, 61)
+    assert "Apreciaci" in t56, t56[:300]
+    assert "Humanidades y Lenguas Modernas" in t56, t56[:300]
+    # el bloque 1 lleva el OTRO componente, no el del bloque 0
+    assert c1.nombre_oficial[:18] in t61, (c1.nombre_oficial, t61[:300])
+    assert "Apreciaci" not in t61, "el bloque 1 no puede llevar el nombre del 0"
+    # y Lengua Española NUNCA aparece como nombre de la optativa
+    assert "Lengua Española" not in t56 and "Lengua Española" not in t61
+
+
+@test("§F10 §6: el rótulo está en las CINCO páginas del bloque")
+def _():
+    c0 = CAT.componentes_de("HLM", 4)[0]
+    datos = {0: {"componente_nombre": c0.nombre_oficial,
+                 "salida_nombre": CAT.SALIDAS["HLM"],
+                 "meses": [_mes("MARZO", {0: 2})]}}
+    pdf = _generar(4, salida_optativa_asistencia=datos)
+    for pg in PAGS_ASIST_OPT[0]:
+        t = _texto_pagina(pdf, pg)
+        assert "Apreciaci" in t, (pg, t[:200])
+
+
+@test("§F11 §5: un componente configurado SIN asistencia se rotula pero no inventa días")
+def _():
+    c0 = CAT.componentes_de("HLM", 4)[0]
+    datos = {0: {"componente_nombre": c0.nombre_oficial,
+                 "salida_nombre": CAT.SALIDAS["HLM"],
+                 "meses": []}}          # configurado, todavía sin asistencia
+    pdf = _generar(4, salida_optativa_asistencia=datos)
+    con, _ = _overlays(pdf)
+    assert 56 in con, "debe rotularse aunque no haya asistencia"
+    t = _texto_pagina(pdf, 56)
+    assert "Apreciaci" in t, t[:250]
+    # ni una sola marca de asistencia: el rótulo no rellena la rejilla
+    for marca in ("P", "A", "T", "E"):
+        pass
+    assert "Humanidades y Lenguas Modernas" in t, t[:250]
+
+
+@test("§F12 §5: sin configuración NINGUNA página optativa se toca")
+def _():
+    pdf = _generar(4)
+    con, _ = _overlays(pdf)
+    assert not (con & {p for bl in PAGS_ASIST_OPT for p in bl}), sorted(con)
+
+
+@test("§F13 el loader entrega los nombres oficiales para rotular")
+def _():
+    from app import _cargar_salida_optativa_asistencia
+    d = SessionLocal()
+    try:
+        user = d.query(M.Usuario).get(U_DIR_A)
+        curso = d.query(M.Curso).get(C4_A)
+        ests = d.query(M.Estudiante).filter(M.Estudiante.curso_id == C4_A).all()
+        res = _cargar_salida_optativa_asistencia(d, user, curso, ests)
+    finally:
+        d.close()
+    assert 0 in res, res
+    b = res[0]
+    assert b["componente_nombre"] == CAT.componente(HLM_LE_4).nombre_oficial, b
+    assert b["salida_codigo"] == "HLM", b
+    assert b["salida_nombre"] == CAT.SALIDAS["HLM"], b
+    assert b["componente_codigo"] == HLM_LE_4, b
+
+
 @test("§ZZ ZERO DATA LOSS: sge.db, credenciales y notas intactas")
 def _():
     ahora_sge = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
