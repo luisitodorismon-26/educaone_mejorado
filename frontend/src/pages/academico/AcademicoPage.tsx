@@ -139,18 +139,37 @@ export const AcademicoPage = () => {
 
   // R3.4: materias del CURSO seleccionado. Para dirección/coordinación no hay
   // asignaciones por curso, así que se mantiene el listado completo del colegio.
-  const asignaturasDelCurso = (!esProfesor || !cursoId)
+  //
+  // R3.4.1-hotfix: para el PROFESOR, sin curso elegido la lista va VACÍA. Antes
+  // caía al listado global y mostraba una entrada por cada (curso, asignatura),
+  // de modo que aparecían varias "Lengua Española" y varias "Apreciación" sin
+  // forma de saber a qué curso pertenecía cada una. La materia solo tiene
+  // sentido dentro de un curso.
+  const asignaturasDelCurso = !esProfesor
     ? asignaturas
-    : asignaturas.filter(a => a.curso_id === cursoId);
+    : (!cursoId ? [] : asignaturas.filter(a => a.curso_id === cursoId));
 
-  // Si la asignatura elegida no pertenece al curso actual, se limpia: nunca debe
-  // quedar seleccionada una materia de otro curso.
+  // Red de seguridad: si la asignatura elegida no pertenece al curso actual, se
+  // limpia. NO basta por sí sola —una misma asignatura_id puede existir en los
+  // dos cursos, y entonces este efecto no la detecta—, por eso el `onChange` del
+  // curso resetea explícitamente. Se conserva como segunda barrera.
   useEffect(() => {
     if (!cursoId || !asignaturaId) return;
     if (!asignaturasDelCurso.some(a => a.id === asignaturaId)) {
       setAsignaturaId(null);
     }
   }, [cursoId, asignaturaId, asignaturas]);
+
+  // R3.4.1-hotfix: cambiar de curso SIEMPRE reinicia la selección y lo cargado.
+  // Si Lengua es `asignatura_id=1` tanto en 4to como en 5to, el efecto de arriba
+  // no limpia nada —el id sigue existiendo en el curso nuevo— y la pantalla
+  // quedaría mostrando las notas del curso anterior bajo el curso nuevo.
+  const cambiarCurso = (nuevoCursoId: number | null) => {
+    setCursoId(nuevoCursoId);
+    setAsignaturaId(null);
+    setCalificaciones([]);
+    setEditadas({});
+  };
 
   const cargarDatos = async () => {
     try {
@@ -678,13 +697,14 @@ export const AcademicoPage = () => {
           <Select
             label="Curso"
             value={cursoId?.toString() || ''}
-            onChange={(e) => setCursoId(e.target.value ? parseInt(e.target.value) : null)}
+            onChange={(e) => cambiarCurso(e.target.value ? parseInt(e.target.value) : null)}
             options={(nivelFiltro === 'todos' ? cursos : cursos.filter(c => (c.nivel || 'secundaria') === nivelFiltro)).map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
             placeholder="Seleccione un curso"
           />
           <Select
             label="Asignatura"
             value={asignaturaId?.toString() || ''}
+            disabled={esProfesor && !cursoId}
             onChange={(e) => setAsignaturaId(e.target.value ? parseInt(e.target.value) : null)}
             options={asignaturasDelCurso.map(a => ({
               value: a.id,
@@ -694,7 +714,9 @@ export const AcademicoPage = () => {
                 ? `${a.componente_nombre || a.nombre} — Salida Optativa${a.salida_nombre ? ` · ${a.salida_nombre}` : ''}`
                 : a.nombre,
             }))}
-            placeholder="Seleccione una asignatura"
+            placeholder={esProfesor && !cursoId
+              ? "Seleccione primero un curso"
+              : "Seleccione una asignatura"}
           />
         </div>
       </div>

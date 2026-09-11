@@ -8486,6 +8486,21 @@ async def get_dashboard_profesor(db: Session = Depends(get_db), current_user: Us
             'salida_nombre': None,
         }
         _m = _comp_por_clave.get((a.curso_id, a.asignatura_id))
+        # R3.4.1-hotfix: un mapeo LEGACY que apunta a una troncal NO convierte a
+        # esa troncal en el componente optativo. En produccion HCS-LE-4 apunta a
+        # "Lengua Española": sin esta guarda el profesor veia su unica fila de
+        # Lengua reetiquetada como "Apreciación y Producción Literarias" y Lengua
+        # desaparecia del selector de Calificaciones. La troncal conserva su
+        # nombre y el componente queda como no configurado; no se inventa una
+        # fila para el componente ni se toca el mapeo.
+        if _m is not None and getattr(
+                a.asignatura, 'area_curricular_codigo', None) is not None:
+            logger.warning(
+                "Dashboard: el componente %s del curso %s apunta a la troncal %s "
+                "(%r). Se muestra como materia troncal, no como Salida Optativa.",
+                _m.componente_codigo, a.curso_id, a.asignatura_id,
+                getattr(a.asignatura, 'nombre', None))
+            _m = None
         if _m is not None:
             _comp = _cat_opt.componente(_m.componente_codigo)
             _sal = _salida_por_curso.get(a.curso_id)
