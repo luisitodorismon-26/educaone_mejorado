@@ -5828,6 +5828,11 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
     """Editar un horario existente. Valida tenant del horario y de los nuevos FK."""
     # Validar que el horario sea del colegio del caller
     horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+
+    # Identidad academica ANTES de tocar nada: profesor + curso + asignatura.
+    # Se compara al final para exigir asignacion SOLO si la edicion la cambia.
+    # Mover un bloque de dia, hora o aula no es cambiar que se imparte.
+    _identidad_antes = (horario.profesor_id, horario.curso_id, horario.asignatura_id)
     
     try:
         data = await request.json()
@@ -5884,11 +5889,25 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
     if horario.hora_inicio >= horario.hora_fin:
         return JSONResponse({'error': 'hora_fin debe ser mayor que hora_inicio'}, status_code=400)
 
-    # P0 - el ESTADO RESULTANTE de la edicion debe seguir correspondiendo a una
-    # asignacion activa del docente. Se valida despues de aplicar los cambios
-    # (y antes del commit) porque cualquiera de las tres patas —profesor, curso
-    # o asignatura— pudo moverse en este mismo PUT.
-    if horario.tipo_bloque == 'clase' and horario.curso_id is not None             and horario.asignatura_id is not None:
+    # P0 - si la edicion CAMBIA la identidad academica del bloque, el estado
+    # resultante debe corresponder a una asignacion activa del docente. Se
+    # valida despues de aplicar los cambios (y antes del commit) porque
+    # cualquiera de las tres patas pudo moverse en este mismo PUT.
+    #
+    # SOLO SI CAMBIA. Un bloque legacy sin asignacion que lo respalde sigue
+    # siendo editable en dia, hora y aula: son justo las correcciones que
+    # Direccion necesita hacer sobre esas filas, y bloquearlas dejaria el
+    # horario congelado hasta rehacer las asignaciones. Lo que no puede es
+    # empeorar: mover el bloque a otro profesor, otro curso u otra materia
+    # exige que la nueva combinacion exista.
+    #
+    # El chequeo de solapamiento, en cambio, se ejecuta SIEMPRE: cambiar la
+    # hora si puede crear un choque nuevo.
+    _identidad_ahora = (horario.profesor_id, horario.curso_id, horario.asignatura_id)
+    if (_identidad_ahora != _identidad_antes
+            and horario.tipo_bloque == 'clase'
+            and horario.curso_id is not None
+            and horario.asignatura_id is not None):
         _sin_asig = _exige_asignacion_activa(
             db, colegio_id=current_user.colegio_id,
             profesor_id=horario.profesor_id, curso_id=horario.curso_id,
@@ -9324,9 +9343,21 @@ async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db:
     estudiante = get_tenant_or_404(db, Estudiante, data['estudiante_id'], current_user, name='estudiante')
     
     # Profesor: solo puede reportar a estudiantes de cursos donde tiene asignación
+    # ACTIVA y del MISMO colegio.
+    #
+    # P0 — antes la consulta no filtraba por `activo` ni pasaba por tenant_filter:
+    # una asignación ya retirada seguía autorizando a levantar reportes sobre los
+    # estudiantes de ese curso. El alcance es a nivel de CURSO y así se queda: un
+    # profesor puede reportar la conducta de cualquier estudiante al que da clase,
+    # sin importar en cuál de sus materias ocurrió. La identidad por asignatura
+    # rige lo académico —notas, asistencia, horario—, no la disciplina.
     if current_user.role == 'profesor':
-        tiene_asig = db.query(AsignacionProfesor).filter_by(
-            profesor_id=current_user.id, curso_id=estudiante.curso_id
+        tiene_asig = tenant_filter(
+            db.query(AsignacionProfesor), AsignacionProfesor, current_user
+        ).filter_by(
+            profesor_id=current_user.id,
+            curso_id=estudiante.curso_id,
+            activo=True,
         ).first()
         if not tiene_asig:
             return JSONResponse(

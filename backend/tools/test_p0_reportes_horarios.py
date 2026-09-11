@@ -475,6 +475,176 @@ def _():
         d.close()
 
 
+# ===========================================================================
+# BLOQUE C — ALCANCE DEL HOTFIX P0
+#
+# Solo lo admitido en el hotfix: la edicion de horarios legacy y el endurecido
+# de POST /api/reportes. El guard del DELETE de asignaciones y la reescritura
+# del guardado masivo quedan FUERA por decision de Direccion y tienen fase
+# propia; sus pruebas no viven aqui.
+# ===========================================================================
+
+@test("§C1 un bloque SIN asignacion (legacy) sigue siendo editable en dia/hora/aula")
+def _():
+    # El caso real: 5 bloques de Musica activos en cursos donde el docente no
+    # tiene asignacion. Direccion tiene que poder seguir moviendolos de hora
+    # mientras se completan las asignaciones; bloquearlo congelaria el horario.
+    d = SessionLocal()
+    try:
+        legacy = M.Horario(colegio_id=COL_A, profesor_id=U_P1, curso_id=C_COMP,
+                           asignatura_id=A_SOCIALES,  # P1 NO tiene Sociales
+                           dia="Jueves", hora_inicio="07:40", hora_fin="08:15",
+                           tipo_bloque="clase", activo=True)
+        d.add(legacy)
+        d.commit()
+        hid = legacy.id
+    finally:
+        d.close()
+    r = client.put(f"/api/horarios/{hid}",
+                   json={"dia": "Jueves", "hora_inicio": "10:00",
+                         "hora_fin": "10:45", "aula": "B-2"},
+                   headers=auth(TOK["dir"]))
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        h = d.query(M.Horario).get(hid)
+        assert h.hora_inicio == "10:00" and h.aula == "B-2", (h.hora_inicio, h.aula)
+        assert h.asignatura_id == A_SOCIALES, "la identidad no debia moverse"
+    finally:
+        d.close()
+
+
+@test("§C2 ...pero ese mismo bloque legacy NO puede cambiar de materia")
+def _():
+    d = SessionLocal()
+    try:
+        h = d.query(M.Horario).filter_by(profesor_id=U_P1, curso_id=C_COMP,
+                                         asignatura_id=A_SOCIALES).first()
+        assert h is not None, "precondicion: el bloque legacy de C1"
+        hid = h.id
+    finally:
+        d.close()
+    r = client.put(f"/api/horarios/{hid}", json={"asignatura_id": A_INGLES},
+                   headers=auth(TOK["dir"]))
+    assert r.status_code == 409, (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        assert d.query(M.Horario).get(hid).asignatura_id == A_SOCIALES
+    finally:
+        d.close()
+
+
+@test("§C3 un PUT que solo mueve la hora SIGUE detectando solapamiento")
+def _():
+    a = _crear("dir", asignatura_id=A_FRANCES, hora_inicio="18:00", hora_fin="18:45")
+    assert a.status_code == 201, a.text[:200]
+    b = _crear("dir", asignatura_id=A_FRANCES, hora_inicio="19:00", hora_fin="19:45")
+    assert b.status_code == 201, b.text[:200]
+    # mover el segundo encima del primero: identidad intacta, pero choca
+    p = client.put(f"/api/horarios/{b.json()['id']}",
+                   json={"hora_inicio": "18:00", "hora_fin": "18:45"},
+                   headers=auth(TOK["dir"]))
+    assert p.status_code == 409, (p.status_code, p.text[:250])
+    assert "Conflicto de horario" in p.json().get("error", ""), p.json()
+
+
+@test("§C4 POST /api/reportes: una asignacion INACTIVA ya no autoriza")
+def _():
+    d = SessionLocal()
+    try:
+        d.add(M.AsignacionProfesor(id=91, colegio_id=COL_A, profesor_id=U_P1,
+                                   curso_id=C_OTRO, asignatura_id=A_LENGUA,
+                                   ano_escolar_id=COL_A, activo=False))
+        d.commit()
+    finally:
+        d.close()
+    try:
+        r = client.post("/api/reportes", headers=auth(TOK["p1"]), json={
+            "estudiante_id": EST_OTRO, "titulo": "NO_DEBE_CREARSE",
+            "descripcion": "asignacion retirada", "tipo": "conducta",
+            "gravedad": "leve", "fecha": "2026-03-09"})
+        assert r.status_code == 403, (r.status_code, r.text[:250])
+        dd = SessionLocal()
+        try:
+            assert dd.query(M.ReporteConducta).filter_by(
+                titulo="NO_DEBE_CREARSE").count() == 0, "no debe quedar fila"
+        finally:
+            dd.close()
+    finally:
+        d = SessionLocal()
+        try:
+            f = d.query(M.AsignacionProfesor).get(91)
+            if f:
+                d.delete(f)
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("§C5 POST /api/reportes: con asignacion ACTIVA sigue funcionando")
+def _():
+    r = client.post("/api/reportes", headers=auth(TOK["p1"]), json={
+        "estudiante_id": EST_COMP, "titulo": "SI_DEBE_CREARSE",
+        "descripcion": "curso propio", "tipo": "conducta",
+        "gravedad": "leve", "fecha": "2026-03-10"})
+    assert r.status_code in (200, 201), (r.status_code, r.text[:250])
+
+
+@test("§C6 el alcance del reporte sigue siendo por CURSO, no por asignatura")
+def _():
+    # P2 da Ciencias Sociales en el curso compartido: debe poder reportar a un
+    # estudiante de ese curso aunque la incidencia no sea de su materia. La
+    # disciplina es del curso; la identidad por asignatura rige lo academico.
+    r = client.post("/api/reportes", headers=auth(TOK["p2"]), json={
+        "estudiante_id": EST_COMP, "titulo": "DE_P2_OTRA_MATERIA",
+        "descripcion": "conducta en el pasillo", "tipo": "conducta",
+        "gravedad": "leve", "fecha": "2026-03-11"})
+    assert r.status_code in (200, 201), (r.status_code, r.text[:250])
+
+
+@test("§C7 POST /api/reportes: curso SIN ninguna asignacion -> 403")
+def _():
+    # P1 solo da Lengua en el curso compartido; EST_OTRO es de otro curso donde
+    # no tiene ni ha tenido nada.
+    r = client.post("/api/reportes", headers=auth(TOK["p1"]), json={
+        "estudiante_id": EST_OTRO, "titulo": "CURSO_AJENO",
+        "descripcion": "no da clase ahi", "tipo": "conducta",
+        "gravedad": "leve", "fecha": "2026-03-12"})
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        assert d.query(M.ReporteConducta).filter_by(titulo="CURSO_AJENO").count() == 0
+    finally:
+        d.close()
+
+
+@test("§C8 POST /api/reportes: cross-tenant no crea nada ni revela existencia")
+def _():
+    antes = None
+    d = SessionLocal()
+    try:
+        antes = d.query(M.ReporteConducta).count()
+    finally:
+        d.close()
+    r_ajeno = client.post("/api/reportes", headers=auth(TOK["p1"]), json={
+        "estudiante_id": EST_B, "titulo": "CROSS_TENANT",
+        "descripcion": "estudiante de otro colegio", "tipo": "conducta",
+        "gravedad": "leve", "fecha": "2026-03-13"})
+    r_inexistente = client.post("/api/reportes", headers=auth(TOK["p1"]), json={
+        "estudiante_id": 999999, "titulo": "INEXISTENTE",
+        "descripcion": "no existe", "tipo": "conducta",
+        "gravedad": "leve", "fecha": "2026-03-13"})
+    assert r_ajeno.status_code == 404, (r_ajeno.status_code, r_ajeno.text[:200])
+    # mismo codigo que para un id inexistente: no se revela que el otro existe
+    assert r_ajeno.status_code == r_inexistente.status_code
+    d = SessionLocal()
+    try:
+        assert d.query(M.ReporteConducta).count() == antes, "no debe crearse nada"
+        assert d.query(M.ReporteConducta).filter_by(titulo="CROSS_TENANT").count() == 0
+    finally:
+        d.close()
+
+
 @test("§ZZ sge.db del repo intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
