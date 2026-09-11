@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { Brain, AlertCircle, Eye, Clock, CheckCircle, MessageSquare } from 'lucide-react';
 import { Modal, Button, Select, Textarea, Alert, Spinner } from '../../components/ui';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Caso {
   id: number;
@@ -297,7 +298,7 @@ export const PsicologiaPage = () => {
             label="Curso"
             value={form.curso_filter || ''}
             onChange={e => setForm({...form, curso_filter: e.target.value, estudiante_id: 0})}
-            options={cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+            options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
             placeholder="Filtrar por curso"
           />
           <Select

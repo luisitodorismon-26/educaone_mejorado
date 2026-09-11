@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { Button, Select, Alert } from '../../components/ui';
+import { labelCurso, CursoEtiquetable } from '../../utils/labelCurso';
 
 /**
  * R3.2 — Salida Optativa de un curso de 4to-6to de Secundaria.
@@ -53,8 +54,12 @@ interface Asignatura {
   nombre: string;
 }
 
-export const SalidaOptativaSection = ({ cursoId, asignaturas }: {
+export const SalidaOptativaSection = ({ cursoId, curso, asignaturas }: {
   cursoId: number;
+  // Solo para rotular. La identidad sigue siendo `cursoId`: en multi-tanda el
+  // mismo grado existe en Matutina y Vespertina, y la pantalla tiene que decir
+  // cuál de los dos se está configurando.
+  curso?: CursoEtiquetable;
   asignaturas: Asignatura[];
 }) => {
   const [estado, setEstado] = useState<SalidaEstado | null>(null);
@@ -173,6 +178,11 @@ export const SalidaOptativaSection = ({ cursoId, asignaturas }: {
   return (
     <div className="border-t pt-4 mt-2">
       <h4 className="font-semibold text-gray-800 mb-1">Salida Optativa — Modalidad Académica</h4>
+      {curso && (
+        <p className="text-xs font-medium text-gray-700 mb-1">
+          {labelCurso(curso)}
+        </p>
+      )}
       <p className="text-xs text-gray-500 mb-3">
         Solo para {estado.grado_numero}to de Secundaria. Elige el profesor responsable de
         cada componente oficial: se califica aparte de la materia troncal.

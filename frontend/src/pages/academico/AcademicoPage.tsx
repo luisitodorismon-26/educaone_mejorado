@@ -7,6 +7,7 @@ import { AcademicoPrimariaPage } from './AcademicoPrimariaPage';
 import { AcademicoSecundariaPage } from './AcademicoSecundariaPage';
 import { NivelTabs } from '../../components/NivelTabs';
 import { useNivelesActivos, Nivel } from '../../hooks/useNivelesActivos';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Curso {
   id: number;
@@ -698,7 +699,7 @@ export const AcademicoPage = () => {
             label="Curso"
             value={cursoId?.toString() || ''}
             onChange={(e) => cambiarCurso(e.target.value ? parseInt(e.target.value) : null)}
-            options={(nivelFiltro === 'todos' ? cursos : cursos.filter(c => (c.nivel || 'secundaria') === nivelFiltro)).map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+            options={(nivelFiltro === 'todos' ? cursos : cursos.filter(c => (c.nivel || 'secundaria') === nivelFiltro)).map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
             placeholder="Seleccione un curso"
           />
           <Select

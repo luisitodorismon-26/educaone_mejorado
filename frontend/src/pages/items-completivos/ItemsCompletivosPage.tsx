@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { Modal, Input, Select, Button, Alert, Spinner } from '../../components/ui';
 import { ClipboardCheck, Plus, Edit2, Trash2 } from 'lucide-react';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface ItemCompletivo {
   id: number;
@@ -192,7 +193,7 @@ export const ItemsCompletivosPage = () => {
           onChange={e => setFiltroCurso(e.target.value ? parseInt(e.target.value) : '')}
           options={[{ value: '', label: 'Todos los cursos' }, ...cursos.map(c => ({
             value: c.id,
-            label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo,
+            label: labelCurso(c),
           }))]}
         />
         <Select
@@ -316,7 +317,7 @@ export const ItemsCompletivosPage = () => {
                   { value: 0, label: 'Seleccionar curso' },
                   ...cursos.map(c => ({
                     value: c.id,
-                    label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo,
+                    label: labelCurso(c),
                   })),
                 ]}
               />

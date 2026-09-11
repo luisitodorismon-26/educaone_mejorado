@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface ValidationResult {
   valid: boolean;
@@ -289,7 +290,7 @@ export const RegistroEscolarPage = () => {
                       .filter((c) => (c.tanda || 'Sin tanda') === t)
                       .map((c) => (
                         <option key={c.id} value={c.id}>
-                          {c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo}
+                          {labelCurso(c)}
                         </option>
                       ))}
                   </optgroup>

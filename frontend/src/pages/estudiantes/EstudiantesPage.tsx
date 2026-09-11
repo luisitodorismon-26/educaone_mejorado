@@ -8,6 +8,7 @@ import { NivelTabs } from '../../components/NivelTabs';
 import { useNivelesActivos, Nivel } from '../../hooks/useNivelesActivos';
 import { filterByNivel } from '../../hooks/useFiltroCascada';
 import { EstudianteKPIs } from './EstudianteKPIs';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Estudiante {
   id: number;
@@ -606,7 +607,7 @@ export const EstudiantesPage = () => {
                 label="Curso"
                 value={filtros.curso_id}
                 onChange={e => setFiltros({ ...filtros, curso_id: e.target.value })}
-                options={(nivelFiltro === 'todos' ? cursos : cursos.filter(c => (c.nivel || 'secundaria') === nivelFiltro)).map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+                options={(nivelFiltro === 'todos' ? cursos : cursos.filter(c => (c.nivel || 'secundaria') === nivelFiltro)).map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
                 placeholder="Todos los cursos"
               />
               <Select
@@ -718,7 +719,7 @@ export const EstudiantesPage = () => {
             <div className="p-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
               <Select label="Curso" value={form.curso_id}
                 onChange={e => setForm({ ...form, curso_id: parseInt(e.target.value) })}
-                options={cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+                options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
                 placeholder="Seleccionar curso" />
               <Input label="No. lista" type="number" value={form.no_lista}
                 onChange={e => setForm({ ...form, no_lista: parseInt(e.target.value) || 0 })} />
@@ -1052,7 +1053,7 @@ export const EstudiantesPage = () => {
             label="Curso destino *"
             value={importCursoId}
             onChange={e => setImportCursoId(parseInt(e.target.value) || '')}
-            options={cursos.map(c => ({ value: c.id, label: c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo, group: c.tanda || 'Sin tanda' }))}
+            options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
             placeholder="Seleccionar curso"
           />
           

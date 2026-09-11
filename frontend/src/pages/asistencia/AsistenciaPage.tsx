@@ -3,6 +3,7 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { NivelTabs } from '../../components/NivelTabs';
 import { useNivelesActivos, Nivel } from '../../hooks/useNivelesActivos';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Estudiante {
   id: number;
@@ -297,7 +298,7 @@ export const AsistenciaPage = () => {
                 return tandas.map(tanda => (
                   <optgroup key={tanda} label={tanda}>
                     {cursosFilt.filter(c => (c.tanda || 'Sin tanda') === tanda).map(c => (
-                      <option key={c.id} value={c.id}>{c.grado ? `${c.grado} ${c.nombre}` : c.nombre_completo}</option>
+                      <option key={c.id} value={c.id}>{labelCurso(c)}</option>
                     ))}
                   </optgroup>
                 ));
