@@ -22,6 +22,14 @@ interface Curso {
 interface Asignatura {
   id: number;
   nombre: string;
+  // R3.4: curso en el que el profesor tiene ESTA asignatura asignada. El
+  // selector se filtra por el curso elegido, no globalmente.
+  curso_id?: number;
+  // R3.4: metadatos de Salida Optativa. La identidad para calificar sigue
+  // siendo `id`; esto solo sirve para rotular. Nunca se resuelve por nombre.
+  es_salida_optativa?: boolean;
+  componente_nombre?: string | null;
+  salida_nombre?: string | null;
 }
 
 interface Calificacion {
@@ -129,6 +137,21 @@ export const AcademicoPage = () => {
     }
   }, [cursoId, asignaturaId]);
 
+  // R3.4: materias del CURSO seleccionado. Para dirección/coordinación no hay
+  // asignaciones por curso, así que se mantiene el listado completo del colegio.
+  const asignaturasDelCurso = (!esProfesor || !cursoId)
+    ? asignaturas
+    : asignaturas.filter(a => a.curso_id === cursoId);
+
+  // Si la asignatura elegida no pertenece al curso actual, se limpia: nunca debe
+  // quedar seleccionada una materia de otro curso.
+  useEffect(() => {
+    if (!cursoId || !asignaturaId) return;
+    if (!asignaturasDelCurso.some(a => a.id === asignaturaId)) {
+      setAsignaturaId(null);
+    }
+  }, [cursoId, asignaturaId, asignaturas]);
+
   const cargarDatos = async () => {
     try {
       // Siempre cargar cursos completos para tener grado y tanda
@@ -141,13 +164,19 @@ export const AcademicoPage = () => {
         const cursosProfesor = cursosRes.data.filter((c: any) => cursosAsignadosIds.has(c.id));
         setCursos(cursosProfesor);
         
-        const asignaturasUnicas = res.data.cursos_asignados.reduce((acc: Asignatura[], curr: any) => {
-          if (!acc.find(a => a.id === curr.asignatura_id)) {
-            acc.push({ id: curr.asignatura_id, nombre: curr.asignatura });
-          }
-          return acc;
-        }, []);
-        setAsignaturas(asignaturasUnicas);
+        // R3.4: se conserva UNA fila por (curso, asignatura). Antes se
+        // deduplicaba por asignatura_id para todos los cursos del profesor, así
+        // que al elegir un curso podían ofrecerse materias que el profesor da
+        // en OTRO curso. El filtrado real ocurre en `asignaturasDelCurso`.
+        const asignaturasPorCurso: Asignatura[] = res.data.cursos_asignados.map((c: any) => ({
+          id: c.asignatura_id,
+          nombre: c.asignatura,
+          curso_id: c.curso_id,
+          es_salida_optativa: !!c.es_salida_optativa,
+          componente_nombre: c.componente_nombre ?? null,
+          salida_nombre: c.salida_nombre ?? null,
+        }));
+        setAsignaturas(asignaturasPorCurso);
       } else {
         setCursos(cursosRes.data);
         const asignaturasRes = await api.get('/asignaturas');
@@ -657,7 +686,14 @@ export const AcademicoPage = () => {
             label="Asignatura"
             value={asignaturaId?.toString() || ''}
             onChange={(e) => setAsignaturaId(e.target.value ? parseInt(e.target.value) : null)}
-            options={asignaturas.map(a => ({ value: a.id, label: a.nombre }))}
+            options={asignaturasDelCurso.map(a => ({
+              value: a.id,
+              // La optativa se distingue por su rótulo oficial, en el MISMO
+              // selector y con la misma pantalla de Calificaciones.
+              label: a.es_salida_optativa
+                ? `${a.componente_nombre || a.nombre} — Salida Optativa${a.salida_nombre ? ` · ${a.salida_nombre}` : ''}`
+                : a.nombre,
+            }))}
             placeholder="Seleccione una asignatura"
           />
         </div>

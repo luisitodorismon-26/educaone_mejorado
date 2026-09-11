@@ -72,6 +72,10 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   const [isSidebarOpen, setSidebarOpen] = useState(true);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [modulosConfig, setModulosConfig] = useState<any>(null);
+  // R3.4 §17: niveles REALES del profesor, calculados por el backend a partir
+  // de sus asignaciones activas. `null` = todavía no se sabe.
+  const [nivelesProfesor, setNivelesProfesor] =
+    useState<{ primaria: boolean; secundaria: boolean } | null>(null);
   const [notificaciones, setNotificaciones] = useState<any[]>([]);
   // v2.15 F1: switch de división (solo dirección). La elección vive en
   // localStorage y el interceptor de api.ts la manda en cada petición.
@@ -122,6 +126,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
       loadConfig();
       loadNotificaciones();
       loadModulosConfig();
+      loadNivelesProfesor();
       const interval = setInterval(loadNotificaciones, 30000);
       return () => clearInterval(interval);
     } else {
@@ -142,6 +147,20 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
       setConfig(res.data);
     } catch (e) {
       console.error('Error cargando config:', e);
+    }
+  };
+
+  // R3.4: fuente ÚNICA de los niveles del profesor. No se infiere en el
+  // frontend a partir del nombre de los grados: lo resuelve el backend con
+  // Grado.nivel. Si la llamada falla se deja en null (fail-safe: no se le
+  // ofrece al profesor una función de un nivel que quizá no imparte).
+  const loadNivelesProfesor = async () => {
+    if (user?.role !== 'profesor') return;
+    try {
+      const res = await api.get('/dashboard/profesor');
+      setNivelesProfesor(res.data?.niveles_asignados ?? null);
+    } catch (e) {
+      setNivelesProfesor(null);
     }
   };
 
@@ -311,8 +330,27 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
   const filteredNavItems = NAV_ITEMS.filter(item => {
     if (!user || !item.roles.includes(user.role)) return false;
 
-    // v2.15: items exclusivos de una división se ocultan bajo el lente contrario
-    if (item.nivel && lenteNivelMenu && item.nivel !== lenteNivelMenu) return false;
+    // R3.4 §1 — PARA EL PROFESOR, la ÚNICA fuente de los items específicos de
+    // nivel son sus ASIGNACIONES ACTIVAS. `nivel_asignado` NO participa: es a
+    // lo sumo su división principal, y un profesor con nivel_asignado
+    // "secundaria" que además da clases en Primaria perdía los items de
+    // Primaria que sí puede usar. Por eso este bloque va ANTES del lente de
+    // división y hace `return` en los dos sentidos, sin caer nunca en él.
+    //
+    // FAIL-SAFE: mientras `nivelesProfesor` es null (cargando, o la llamada
+    // falló) los items específicos de nivel NO se muestran. Es preferible que
+    // aparezcan un instante después a ofrecerle una función de un nivel que
+    // quizá no imparte. Los items sin `nivel` no se ven afectados.
+    if (user.role === 'profesor') {
+      if (item.nivel) {
+        if (!nivelesProfesor) return false;
+        if (!nivelesProfesor[item.nivel]) return false;
+      }
+    } else if (item.nivel && lenteNivelMenu && item.nivel !== lenteNivelMenu) {
+      // v2.15: para los demás roles sigue mandando el lente de división.
+      // Dirección, coordinación, psicología y secretaría no cambian en R3.4.
+      return false;
+    }
 
     // Verificar si el módulo está habilitado
     if (item.modulo && modulosConfig) {
