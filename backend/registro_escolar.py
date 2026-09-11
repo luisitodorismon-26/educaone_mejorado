@@ -170,6 +170,24 @@ ASISTENCIA_MAPA_SECUNDARIA = [
 # listas para llenar a mano) en vez de estampar marcas descuadradas.
 ASISTENCIA_LAYOUT_SIN_CALIBRAR: set = set()
 
+# Encabezado impreso de las páginas de asistencia de Salida Optativa. Medido
+# sobre los tres templates con pymupdf: el rótulo es un único span
+# "SALIDA OPTATIVA ______ ASIGNATURA ______" en x0=74.77..548.20, y0=51.41,
+# y1=65.86, size 11, IDÉNTICO en las 10 páginas y en 4to, 5to y 6to.
+#
+#   "SALIDA OPTATIVA" termina en x=178.09 -> su hueco va de 178.09 a 329.89
+#   "ASIGNATURA"      termina en x=406.30 -> su hueco va de 406.30 a 548.20
+#
+# El campo DOCENTE de estas páginas es el mismo de la rejilla normal (y0=86.40)
+# y ya lo estampa `draw_asistencia`, así que aquí no se duplica.
+ASISTENCIA_SALIDA_OPTATIVA_HEADER = {
+    "y_plumber": 63.5,            # línea base, dentro de y0=51.41..y1=65.86
+    "salida_x": 182.0,            # justo después de "SALIDA OPTATIVA "
+    "salida_max_width": 144.0,    # hasta donde empieza "ASIGNATURA"
+    "asignatura_x": 410.0,        # justo después de "ASIGNATURA "
+    "asignatura_max_width": 136.0,
+}
+
 # Bloque de asistencia de la SALIDA OPTATIVA (solo 4to-6to): 10 páginas con el
 # encabezado impreso "SALIDA OPTATIVA ____ ASIGNATURA ____", es decir 2
 # componentes × 5 páginas. Un estudiante cursa como máximo 2 componentes, así
@@ -1810,6 +1828,7 @@ def generar_registro_escolar(
     especificacion_data: Optional[Dict] = None,
     completiva_data: Optional[Dict] = None,
     salida_optativa_data: Optional[Dict] = None,
+    salida_optativa_asistencia: Optional[Dict] = None,
     promocion_data: Optional[List[Dict]] = None,
     estadisticas_data: Optional[Dict] = None,
     template_dir: Optional[str] = None,
@@ -1980,7 +1999,80 @@ def generar_registro_escolar(
                     c_asist.save()
                     buf.seek(0)
                     overlays[pg_idx] = buf
-    
+
+    # --- ASISTENCIA DE SALIDA OPTATIVA (R3.4.1, solo 4to-6to) ---
+    # El template trae 10 páginas con el encabezado impreso "SALIDA OPTATIVA
+    # ____ ASIGNATURA ____": 2 componentes × 5 páginas, porque un estudiante
+    # cursa como máximo 2 componentes. R3.1 las documentó en
+    # ASISTENCIA_SALIDA_OPTATIVA_CICLO_2 y las dejó para el render de la Salida
+    # Optativa; hasta R3.4.1 salían siempre vírgenes.
+    #
+    # Llega desde app.py ya resuelta por `CursoComponenteOptativo` e indexada por
+    # SLOT, igual que `salida_optativa_data`. Los datos son los del
+    # `asignatura_id` del componente, NUNCA los de la troncal.
+    #
+    # La clave es el ÍNDICE DE BLOQUE (0 o 1), que app.py deriva de la posición
+    # del componente dentro de los que define su salida. Así un componente
+    # conserva su bloque aunque el otro no tenga datos.
+    #
+    # Misma rejilla y mismo `draw_asistencia` del layout "2meses" de las
+    # materias normales: ninguna geometría nueva.
+    if salida_optativa_asistencia and config.get("ciclo") == 2:
+        bloques = ASISTENCIA_SALIDA_OPTATIVA_CICLO_2
+        for bloque_idx in sorted(k for k in salida_optativa_asistencia
+                                 if isinstance(k, int)):
+            if not (0 <= bloque_idx < len(bloques)):
+                logger.warning(
+                    "Asistencia de Salida Optativa: bloque %s fuera de las %d hojas "
+                    "oficiales; no se estampa.", bloque_idx, len(bloques))
+                continue
+            datos_bloque = salida_optativa_asistencia[bloque_idx] or {}
+            meses = datos_bloque.get("meses") or []
+            # ROTULADO (R3.4.1 §4-§5). El template deja en blanco "SALIDA
+            # OPTATIVA ____ ASIGNATURA ____", así que la rejilla sola no dice a
+            # qué materia pertenece. Los nombres vienen del CATÁLOGO y del
+            # mapping explícito, nunca de una búsqueda por nombre.
+            #
+            # Se rotula aunque todavía no haya ni una asistencia: un componente
+            # configurado ya ocupa ese espacio del Registro y conviene que la
+            # hoja lo identifique. Rotular NO rellena días ni inventa marcas —
+            # la rejilla sigue vacía, tal como la imprime el MINERD.
+            rotulo_salida = (datos_bloque.get("salida_nombre") or "").strip()
+            rotulo_asig = (datos_bloque.get("componente_nombre") or "").strip()
+            if not any(meses) and not (rotulo_salida or rotulo_asig):
+                continue
+            _hdr = ASISTENCIA_SALIDA_OPTATIVA_HEADER
+            for pg_offset, pagina in enumerate(bloques[bloque_idx]):
+                pg_idx = pagina - 1
+                if pg_idx >= total_pages:
+                    break
+                mes_izq_idx = pg_offset * 2
+                mes_der_idx = pg_offset * 2 + 1
+                has_data = False
+                buf = io.BytesIO()
+                c_asist = canvas.Canvas(buf, pagesize=letter)
+                # El rótulo va en TODAS las páginas del bloque: cada hoja del
+                # Registro tiene que poder leerse por separado.
+                if rotulo_salida:
+                    _draw_text(c_asist, _hdr["salida_x"], _y(_hdr["y_plumber"]),
+                               rotulo_salida, size=FONT_SIZE_NOTA,
+                               max_width=_hdr["salida_max_width"])
+                if rotulo_asig:
+                    _draw_text(c_asist, _hdr["asignatura_x"], _y(_hdr["y_plumber"]),
+                               rotulo_asig, size=FONT_SIZE_NOTA,
+                               max_width=_hdr["asignatura_max_width"])
+                if mes_izq_idx < len(meses) and meses[mes_izq_idx]:
+                    draw_asistencia(c_asist, meses[mes_izq_idx], es_mes_derecho=False)
+                    has_data = True
+                if mes_der_idx < len(meses) and meses[mes_der_idx]:
+                    draw_asistencia(c_asist, meses[mes_der_idx], es_mes_derecho=True)
+                    has_data = True
+                if has_data or rotulo_salida or rotulo_asig:
+                    c_asist.showPage()
+                    c_asist.save()
+                    buf.seek(0)
+                    overlays[pg_idx] = buf
+
     # --- CALIFICACIONES DE RENDIMIENTO (P1-P4, PC por período) ---
     if calificaciones_data:
         calif_inicio = config.get("calificaciones_inicio", 131) - 1  # 0-indexed
@@ -2533,7 +2625,8 @@ def _calcular_edad(fecha_nacimiento) -> int:
 
 def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudiantes,
                                    asignaturas_data, grado_numero, marca_borrador=False,
-                                   especificacion_data=None, salida_optativa_data=None):
+                                   especificacion_data=None, salida_optativa_data=None,
+                                   salida_optativa_asistencia=None):
     """
     Wrapper que traduce datos de app.py al formato del generador de registro.
     
@@ -2812,6 +2905,10 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         completiva_data=completiva_data if completiva_data else None,
         # R3.3: indexada por SLOT del catálogo oficial, igual que especificacion_data.
         salida_optativa_data=salida_optativa_filas or None,
+        # R3.4.1: asistencia de los componentes, también por SLOT. Llega ya
+        # construida con `build_asistencia_registro`, el mismo constructor de las
+        # materias normales, así que no hay una segunda forma de contar faltas.
+        salida_optativa_asistencia=salida_optativa_asistencia or None,
         promocion_data=promocion_data if any(p for p in promocion_data) else None,
         marca_borrador=marca_borrador,
     )

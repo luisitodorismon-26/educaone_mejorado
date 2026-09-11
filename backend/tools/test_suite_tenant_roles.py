@@ -353,7 +353,22 @@ with client:
             'estudiante_id': B['est'], 'asignatura_id': A['asig'],
             'fecha':'2024-09-02', 'estado':'presente',
         }, headers=auth(PROF_A_TOKEN))
-        assert r.status_code == 403, f"esperaba 403 (cross-tenant), obtuvo {r.status_code}: {r.text}"
+        # R3.4.1: pasa de 403 a 404. La guarda de asistencia resuelve ahora el
+        # estudiante con `tenant_filter`, asi que uno de otro colegio NO se
+        # encuentra y la respuesta no revela que exista en otra parte. Es la
+        # misma convencion que ya usaba A12 para calificaciones cross-tenant y
+        # la de `get_tenant_or_404` en todo el backend; asistencia era el caso
+        # atipico. La propiedad que prueba este test no cambia: la escritura
+        # sigue bloqueada, y ahora se afirma sobre la BASE, no solo por codigo.
+        assert r.status_code == 404, f"esperaba 404 (cross-tenant), obtuvo {r.status_code}: {r.text}"
+        from models import Asistencia as _Asis
+        from database import SessionLocal as _SL_a13
+        _d = _SL_a13()
+        try:
+            assert _d.query(_Asis).filter(
+                _Asis.estudiante_id == B['est']).count() == 0,                 "no debe existir ninguna marca del estudiante ajeno"
+        finally:
+            _d.close()
     
     @test("A14. Director A NO puede editar curso de B")
     def t():

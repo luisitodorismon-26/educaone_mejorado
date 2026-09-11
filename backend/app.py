@@ -10058,6 +10058,107 @@ async def marcar_comunicado_leido(id, request: Request, db: Session = Depends(ge
 
 # ============== ASISTENCIA ==============
 
+
+def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
+                      asignatura_id=None):
+    """
+    Autorizacion comun de escritura de asistencia. Devuelve `(ctx, error)`.
+
+    R3.4.1 §1-§2 — NIVEL Y ASIGNATURA SON PARTE DE LA LLAVE
+    -------------------------------------------------------
+    En PRIMARIA la asistencia es del curso: `asignatura_id` puede ser NULL y ese
+    sigue siendo el comportamiento de siempre.
+
+    En SECUNDARIA la asistencia es POR MATERIA, asi que `asignatura_id` es
+    OBLIGATORIO. Sin el, "la asistencia del estudiante en esta fecha" no
+    identifica una sola fila: con Salida Optativa el mismo estudiante puede
+    tener el mismo dia una marca en Lengua Espanola y otra en "Apreciacion y
+    Produccion Literarias", y operar sin asignatura toca la que salga primero.
+
+    El nivel se resuelve SIEMPRE en el servidor por Estudiante -> Curso ->
+    Grado.nivel; nunca se acepta del cliente.
+
+    Y el profesor debe tener asignacion ACTIVA sobre (curso, asignatura): no
+    basta con dar clases en ese curso. Dirección y coordinación conservan su
+    política; aquí no ganan ni pierden permisos.
+    """
+    from registro_validator import _normalizar_nivel
+
+    # R3.4.1 §3 — ESCRITURA SOLO DEL PROFESOR. La UI ya lo dice desde siempre
+    # (`puedeEditar = esProfesor`) y las 20 escrituras de asistencia del corpus
+    # de tests usan token de profesor; el backend, en cambio, dejaba entrar a
+    # cualquier rol autenticado. Se alinea con la UI. Los GET de asistencia NO
+    # se tocan: quién CONSULTA sigue exactamente igual.
+    if current_user.role != 'profesor':
+        return None, JSONResponse({
+            'error': 'Solo los profesores pueden registrar o modificar asistencia.'
+        }, status_code=403)
+
+    # R3.4.1 §1 — COHERENCIA ESTUDIANTE <-> CURSO. `curso_id` llega del cliente
+    # y no puede ser la autoridad cuando hay un estudiante: sin esta comprobacion
+    # se podia pedir autorizacion con un curso donde el profesor SI esta asignado
+    # mientras el estudiante pertenece a otro. El curso canonico es siempre el
+    # curso REAL del estudiante.
+    est = None
+    if estudiante_id:
+        est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
+            id=estudiante_id).first()
+        if est is None:
+            return None, JSONResponse({'error': 'Estudiante no encontrado'},
+                                      status_code=404)
+
+    curso = None
+    if curso_id:
+        curso = tenant_filter(db.query(Curso), Curso, current_user).filter_by(
+            id=curso_id).first()
+        if curso is None:
+            return None, JSONResponse({'error': 'Curso no encontrado'},
+                                      status_code=404)
+
+    if est is not None:
+        if curso is not None and est.curso_id != curso.id:
+            return None, JSONResponse(
+                {'error': 'El estudiante no pertenece al curso indicado'},
+                status_code=400)
+        # el curso del estudiante manda, venga o no `curso_id` en el request
+        if est.curso_id:
+            curso = tenant_filter(db.query(Curso), Curso, current_user).filter_by(
+                id=est.curso_id).first()
+
+    nivel = ''
+    if curso is not None and curso.grado is not None:
+        nivel = _normalizar_nivel(getattr(curso.grado, 'nivel', None))
+
+    asignatura = None
+    if asignatura_id:
+        asignatura = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(
+            id=int(asignatura_id)).first()
+        if asignatura is None:
+            return None, JSONResponse({'error': 'Asignatura no encontrada'},
+                                      status_code=404)
+
+    if nivel == 'secundaria' and asignatura is None:
+        return None, JSONResponse(
+            {'error': 'En Secundaria debe seleccionar una asignatura.'},
+            status_code=400)
+
+    # El rol ya esta acotado a profesor arriba; aqui se exige ademas la
+    # asignacion ACTIVA sobre (curso, asignatura): no basta con el rol.
+    if curso is not None:
+        q = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor,
+                          current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso.id, activo=True)
+        if asignatura is not None:
+            q = q.filter(AsignacionProfesor.asignatura_id == asignatura.id)
+        if not q.first():
+            return None, JSONResponse({
+                'error': ('Solo puedes registrar asistencia en los cursos y '
+                          'asignaturas que tienes asignados')
+            }, status_code=403)
+
+    return {'curso': curso, 'nivel': nivel, 'asignatura': asignatura}, None
+
+
 @app.get("/api/asistencia")
 async def get_asistencia(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Obtener registro de asistencia. Valida tenant del curso y de la asignatura."""
@@ -10139,17 +10240,19 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     if _guard:
         return _guard
 
-    # v2.17 (hermano del bug 11): el PROFESOR solo pasa lista en SUS cursos
-    if current_user.role == 'profesor':
-        _cid_asist = data.get('curso_id')
-        if not _cid_asist and data.get('estudiante_id'):
-            _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=data['estudiante_id']).first()
-            _cid_asist = _e.curso_id if _e else None
-        if _cid_asist:
-            _tiene_a = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-                profesor_id=current_user.id, curso_id=_cid_asist, activo=True).first()
-            if not _tiene_a:
-                return JSONResponse({'error': 'Solo puedes registrar asistencia en tus cursos asignados'}, status_code=403)
+    # v2.17 (hermano del bug 11): el PROFESOR solo pasa lista en SUS cursos.
+    #
+    # R3.4.1 §7: y solo en SUS ASIGNATURAS de ese curso. Antes bastaba con tener
+    # cualquier asignacion en el curso, asi que el profesor de Lengua podia pasar
+    # lista de la Salida Optativa que imparte otro. En Secundaria la asistencia
+    # es por materia, de modo que curso y asignatura forman una sola llave.
+    _ctx, _err = _guard_asistencia(
+        db, current_user,
+        estudiante_id=data.get('estudiante_id'),
+        curso_id=data.get('curso_id'),
+        asignatura_id=data.get('asignatura_id'))
+    if _err:
+        return _err
     
     # Validar estado contra valores permitidos (anteriormente: cualquier string entraba)
     ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
@@ -10286,12 +10389,26 @@ async def desmarcar_asistencia(estudiante_id, request: Request, db: Session = De
             status_code=400
         )
     
+    # R3.4.1 §2: este endpoint no verificaba NADA — cualquier usuario del tenant
+    # podia borrar cualquier marca, y sin `asignatura_id` borraba la primera fila
+    # que apareciera. En Secundaria eso significa que un profesor podia eliminar
+    # sin querer la marca de otra materia del mismo estudiante y la misma fecha.
+    # Misma guarda que el alta: nivel, asignatura obligatoria en Secundaria y
+    # asignacion activa sobre (curso, asignatura).
+    _ctx_del, _err_del = _guard_asistencia(
+        db, current_user, estudiante_id=int(estudiante_id),
+        asignatura_id=asignatura_id)
+    if _err_del:
+        return _err_del
+
     query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
         estudiante_id=int(estudiante_id), fecha=fecha
     )
     if asignatura_id:
+        # En Secundaria la guarda de arriba ya exige que venga; aqui se usa para
+        # que el borrado sea EXACTO y no alcance a la marca de otra materia.
         query = query.filter_by(asignatura_id=int(asignatura_id))
-    
+
     asistencia = query.first()
     if asistencia:
         db.delete(asistencia)
@@ -10474,18 +10591,15 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     if _guard:
         return _guard
 
-    # v2.17: el PROFESOR solo pasa lista en SUS cursos (lote)
-    if current_user.role == 'profesor':
-        _cid_lote = curso_id
-        if not _cid_lote and _primer_est:
-            _e = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=_primer_est).first()
-            _cid_lote = _e.curso_id if _e else None
-        if _cid_lote:
-            _tiene_a = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-                profesor_id=current_user.id, curso_id=_cid_lote, activo=True
-            ).first()
-            if not _tiene_a:
-                return JSONResponse({'error': 'Solo puedes registrar asistencia en tus cursos asignados'}, status_code=403)
+    # v2.17 + R3.4.1 §1: el profesor solo pasa lista en SUS cursos y SUS
+    # asignaturas, y en Secundaria la asignatura es obligatoria. Misma guarda
+    # que el alta individual, para que el lote no sea una puerta mas floja.
+    # `asignatura_id` ya viene resuelto y validado por tenant mas arriba.
+    _ctx_lote, _err_lote = _guard_asistencia(
+        db, current_user, estudiante_id=_primer_est, curso_id=curso_id,
+        asignatura_id=getattr(asignatura_id, 'id', asignatura_id))
+    if _err_lote:
+        return _err_lote
 
     # v2.13.1: Validar día de la semana según configuración del colegio
     dia_semana = fecha.weekday()
@@ -15539,6 +15653,12 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     salida_optativa_data = _cargar_salida_optativa_registro(
         db, current_user, curso, estudiantes_db[:90])
 
+    # R3.4.1 — asistencia de los componentes optativos (pgs 56-65 del template).
+    # Mismo criterio: sin salida configurada o sin mapeo devuelve {} y esas
+    # páginas quedan exactamente como las imprime el MINERD.
+    salida_optativa_asistencia = _cargar_salida_optativa_asistencia(
+        db, current_user, curso, estudiantes_db[:90])
+
     # === 3. GENERAR PDF ===
     try:
         pdf_bytes = generar_registro_desde_sistema(
@@ -15546,6 +15666,7 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             estudiantes_raw, asignaturas_data, grado_numero,
             especificacion_data=especificacion_data,
             salida_optativa_data=salida_optativa_data or None,
+            salida_optativa_asistencia=salida_optativa_asistencia or None,
         )
         
         filename = f"Registro_Escolar_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
@@ -16021,6 +16142,95 @@ def _calificaciones_de_asignatura(db, current_user, asignatura, estudiantes_db,
                 'evaluacion_extra': _serial_ev(_extras_idx.get((est.id, asignatura.id))),
             }
     return calificaciones
+
+def _cargar_salida_optativa_asistencia(db: Session, current_user, curso, estudiantes_db):
+    """
+    Asistencia de los componentes de Salida Optativa, indexada por SLOT.
+
+    R3.4.1 §8-§10 — EL TEMPLATE TIENE SITIO PARA ESTO
+    -------------------------------------------------
+    El Registro de 4to-6to trae 10 páginas con el encabezado impreso "SALIDA
+    OPTATIVA ____ ASIGNATURA ____" (pgs 56-65 = 2 componentes × 5 páginas).
+    R3.1 las documentó en `ASISTENCIA_SALIDA_OPTATIVA_CICLO_2` y R3.3 estampó
+    solo las CALIFICACIONES, así que hasta ahora salían siempre vírgenes.
+
+    La cadena es la misma que la de las notas y no se resuelve por nombre:
+
+        Curso.salida_optativa_codigo -> CursoComponenteOptativo
+            -> Asignatura dedicada -> Asistencia.asignatura_id
+
+    Los meses los arma `build_asistencia_registro`, EL MISMO constructor que usa
+    una materia troncal, pasándole el `asignatura_id` del componente. Por eso la
+    asistencia de "Apreciación y Producción Literarias" no puede salir igual a la
+    de "Lengua Española": son dos `asignatura_id` distintos y ninguna se
+    reutiliza como la otra.
+
+    Un componente sin mapeo, o sin asistencia registrada, NO aparece en el dict:
+    su bloque queda idéntico al template en vez de rellenarse con ceros.
+    """
+    from registro_asistencia import build_asistencia_registro
+    import salida_optativa_service as _svc
+    import salidas_optativas as _cat_sal
+
+    if curso is None or not getattr(curso, 'salida_optativa_codigo', None):
+        return {}
+    try:
+        resueltos = _svc.resolver_componentes(db, curso)
+    except ValueError as e:
+        logger.error("Asistencia optativa no resuelta para el curso %s: %s", curso.id, e)
+        return {}
+    if not resueltos:
+        return {}
+
+    docentes = {}
+    for ap in tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, activo=True).order_by(AsignacionProfesor.id).all():
+        docentes.setdefault(ap.asignatura_id, ap)
+
+    # El template tiene 2 bloques de 5 páginas, y una salida aporta 1 o 2
+    # componentes. El bloque es la POSICIÓN del componente dentro de los que su
+    # salida define, ordenados por slot —no el orden de los que traen datos—,
+    # así que un componente conserva su bloque aunque el otro se quede vacío.
+    bloque_de_slot = {c.slot: i for i, c in enumerate(_svc.componentes_esperados(curso))}
+
+    salida = {}
+    for item in resueltos:
+        asig_id = item['asignatura_id']
+        if asig_id is None:
+            continue                      # sin vincular: no se inventa nada
+        # `tenant_filter` es la barrera: una asignatura de otro colegio no se
+        # resuelve aunque su id estuviera en la tabla.
+        asig = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter(
+            Asignatura.id == asig_id).first()
+        if asig is None:
+            logger.warning("Componente %s del curso %s apunta a la asignatura %s, que "
+                           "no es de este colegio; se omite su asistencia.",
+                           item['componente'].codigo, curso.id, asig_id)
+            continue
+        meses = build_asistencia_registro(db, curso.id, asignatura_id=asig.id,
+                                          estudiantes=estudiantes_db)
+        bloque = bloque_de_slot.get(item['slot'])
+        if bloque is None:
+            continue
+        ap = docentes.get(asig.id)
+        comp = item['componente']
+        # R3.4.1 §5: un componente CONFIGURADO entra aunque todavia no tenga ni
+        # una asistencia. Sus dias siguen vacios —no se rellena nada—, pero su
+        # bloque queda ROTULADO con la salida y la asignatura, que es lo que el
+        # template pide en "SALIDA OPTATIVA ____ ASIGNATURA ____". Sin mapeo
+        # valido no se llega hasta aqui, asi que esas paginas siguen intactas.
+        salida[bloque] = {
+            'componente_codigo': comp.codigo,
+            'componente_nombre': comp.nombre_oficial,
+            'salida_codigo': curso.salida_optativa_codigo,
+            'salida_nombre': _cat_sal.nombre_salida(curso.salida_optativa_codigo),
+            'slot': item['slot'],
+            'docente': ap.profesor.nombre_completo if (ap and ap.profesor) else '',
+            'meses': meses or [],
+        }
+    return salida
+
 
 def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, grado_numero, estudiantes_db):
     """
