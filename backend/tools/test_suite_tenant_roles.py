@@ -2222,30 +2222,48 @@ with client:
             assert x.get('estudiante_curso_id') not in cursos_a, \
                 'estudiante_curso_id expuso un curso del otro colegio'
 
-    @test("U5. El alcance por rol de /api/reportes no cambió")
+    @test("U5. /api/reportes aplica la politica de visibilidad P0 por rol")
     def t():
+        """
+        POLITICA P0 (definida por Direccion el 2026-09-11), que SUSTITUYE al
+        alcance anterior que comprobaba esta misma prueba:
+
+            profesor      -> SOLO los reportes que el mismo creo
+            direccion     -> todos los del colegio
+            coordinacion  -> todos los del colegio
+            secretaria    -> SIN listado general (antes: 200 con todo el colegio)
+            psicologia    -> SIN listado general; opera desde sus casos
+
+        Esta prueba afirmaba antes que "secretaria debe seguir leyendo
+        reportes". Era el comportamiento heredado, no una decision: el listado
+        entrega titulo y descripcion completos de la incidencia mas el telefono
+        del contacto familiar. Direccion lo retiro expresamente.
+        """
         reportes_dir = client.get('/api/reportes', headers=auth(DIR_A_TOKEN)).json()
         ids_dir = {x['id'] for x in reportes_dir}
 
-        # Profesor: ve el reporte que él creó sobre un estudiante de su curso.
+        # Profesor: SOLO lo suyo. Nada de colegas, ni siquiera de su propio curso.
         reportes_prof = client.get('/api/reportes', headers=auth(PROF_A_TOKEN)).json()
         ids_prof = {x['id'] for x in reportes_prof}
-        assert ids_prof, 'el profesor debe ver los reportes que él levantó'
-        assert ids_prof <= ids_dir, \
-            'el profesor nunca debe ver más reportes que Dirección'
+        assert ids_prof, 'el profesor debe ver los reportes que el levanto'
+        assert ids_prof <= ids_dir, (
+            'el profesor nunca debe ver mas reportes que Direccion')
+        prof_id = client.get('/api/auth/me', headers=auth(PROF_A_TOKEN)).json()['id']
         for x in reportes_prof:
-            assert 'estudiante_curso_id' in x, \
-                'el campo nuevo debe estar también para el profesor'
+            assert x.get('reportado_por_id') == prof_id, (
+                'P0: el profesor no puede ver reportes de otro autor')
+            assert 'estudiante_curso_id' in x, (
+                'el campo nuevo debe estar tambien para el profesor')
 
         # Profesor del OTRO colegio: nada.
         reportes_prof_b = client.get('/api/reportes', headers=auth(PROF_B_TOKEN)).json()
-        assert not ({x['id'] for x in reportes_prof_b} & ids_dir), \
-            'el profesor del colegio B no debe ver reportes del colegio A'
+        assert not ({x['id'] for x in reportes_prof_b} & ids_dir), (
+            'el profesor del colegio B no debe ver reportes del colegio A')
 
-        # Secretaría de A: conserva su lectura de colegio (comportamiento previo).
+        # Secretaria: fuera del listado general de reportes disciplinarios.
         r = client.get('/api/reportes', headers=auth(SEC_A_TOKEN))
-        assert r.status_code == 200, \
-            f'secretaría debe seguir leyendo reportes: {r.status_code}'
+        assert r.status_code == 403, (
+            f'P0: secretaria no debe listar reportes disciplinarios: {r.status_code}')
 
     # ─────────────────────────────────────────────────────────────
     # SECCIÓN T — v2.19.3-C (mensajes internos con Notificacion + Push)

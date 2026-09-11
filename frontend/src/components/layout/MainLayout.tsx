@@ -272,7 +272,9 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     { path: '/estudiantes', label: 'Estudiantes', icon: GraduationCap, roles: ['direccion', 'coordinador', 'profesor', 'secretaria'], section: 'Personas' },
     { path: '/eval-interna', label: 'Eval. de Estudiantes', icon: ClipboardCheck, roles: ['direccion', 'coordinador', 'profesor'], modulo: 'eval_interna', section: 'Personas' },
     { path: '/psicologia', label: 'Psicología', icon: Brain, roles: ['direccion', 'coordinador', 'profesor', 'psicologia'], modulo: 'psicologia', section: 'Personas' },
-    { path: '/reportes', label: 'Reportes Conducta', icon: FileBarChart, roles: ['direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'], modulo: 'reportes_conducta', section: 'Personas' },
+    // P0: secretaria y psicologia salen del listado general de reportes
+    // disciplinarios. Psicologia opera sus intervenciones desde /psicologia.
+    { path: '/reportes', label: 'Reportes Conducta', icon: FileBarChart, roles: ['direccion', 'coordinador', 'profesor'], modulo: 'reportes_conducta', section: 'Personas' },
 
     // ─── PLANIFICACIÓN ───
     { path: '/horarios', label: 'Horarios', icon: Clock, roles: ['direccion', 'coordinador', 'profesor'], section: 'Planificación' },

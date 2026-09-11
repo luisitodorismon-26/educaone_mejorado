@@ -113,7 +113,7 @@ export const AppRouter = () => {
         } />
         
         <Route path="/reportes" element={
-          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria']}><MainLayout><ReportesPage /></MainLayout></ProtectedRoute>
+          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><ReportesPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/psicologia" element={
