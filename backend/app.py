@@ -14600,65 +14600,510 @@ async def cargar_feriados_rd(request: Request, db: Session = Depends(get_db), cu
 
 # ============== ASIGNACIONES POR CURSO ==============
 
+def _identidades_optativas_del_colegio(db, colegio_id):
+    """Mapa asignatura_id -> (curso_id, componente_codigo) de las identidades
+    DEDICADAS de Salida Optativa que hoy estan mapeadas y activas.
+
+    Solo entran las que son identidad independiente: un mapeo LEGACY que apunta
+    a una troncal —HCS-LE-5 del curso 5 apunta a "Lengua Española"— no convierte
+    a esa troncal en una identidad dedicada, y Lengua debe seguir siendo
+    administrable con normalidad desde Asignaciones.
+
+    Se reutiliza `es_identidad_independiente` de R3.4 en lugar de reescribir la
+    regla, para que ambas envejezcan juntas.
+    """
+    import salida_optativa_docente as _doc
+
+    mapeos = db.query(CursoComponenteOptativo).filter(
+        CursoComponenteOptativo.colegio_id == colegio_id,
+        CursoComponenteOptativo.activo == True,  # noqa: E712
+    ).all()
+    if not mapeos:
+        return {}
+    asigs = {
+        a.id: a for a in db.query(Asignatura).filter(
+            Asignatura.colegio_id == colegio_id,
+            Asignatura.id.in_({m.asignatura_id for m in mapeos})).all()
+    }
+    return {
+        m.asignatura_id: (m.curso_id, m.componente_codigo)
+        for m in mapeos
+        if _doc.es_identidad_independiente(asigs.get(m.asignatura_id))
+    }
+
+
 @app.get("/api/cursos/{curso_id}/asignaciones")
 async def get_asignaciones_curso(curso_id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Obtener asignaciones de un curso (qué profesor da cada materia)"""
+    """Obtener asignaciones de un curso (qué profesor da cada materia).
+
+    SALIDA OPTATIVA — QUÉ SE MUESTRA Y QUÉ NO
+    -----------------------------------------
+    Esta pantalla listaba TODAS las asignaturas activas del colegio. Con R3.4 eso
+    se volvió una trampa: cada curso con Salida Optativa tiene identidades
+    DEDICADAS, y dos tandas pueden tener dos identidades distintas con el MISMO
+    nombre visible —"Apreciación y Producción Literarias" existe como id 19 en la
+    Vespertina y como id 21 en la Matutina—. En el formulario de un curso
+    aparecían las dos filas, con el mismo texto y sin nada que las distinguiera:
+    rellenar la equivocada asignaba la identidad de la otra tanda.
+
+    Ahora las identidades dedicadas de OTRO curso no se listan. La identidad se
+    decide por el mapeo persistido, nunca por el nombre.
+
+    La identidad dedicada del PROPIO curso sí se muestra —Dirección necesita ver
+    quién la imparte— pero marcada como no editable: se administra desde Salida
+    Optativa. El backend lo impone igualmente en el POST; esto es solo para que
+    la pantalla no ofrezca algo que va a rechazarse.
+
+    Una troncal alcanzada por un mapeo legacy NO se oculta ni se bloquea.
+    """
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(activo=True).order_by(Asignatura.nombre).all()
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso_id, activo=True).all()
-    
+
+    dedicadas = _identidades_optativas_del_colegio(db, current_user.colegio_id)
+
     # Crear mapa de asignatura -> profesor
     mapa = {a.asignatura_id: a for a in asignaciones}
-    
+
     resultado = []
     for asig in asignaturas:
+        _due = dedicadas.get(asig.id)
+        if _due is not None and _due[0] != curso.id:
+            continue          # identidad dedicada de OTRO curso/tanda
         asignacion = mapa.get(asig.id)
-        resultado.append({
+        fila = {
             'asignatura_id': asig.id,
             'asignatura': asig.nombre,
             'profesor_id': asignacion.profesor_id if asignacion else None,
             'profesor': asignacion.profesor.nombre_completo if asignacion and asignacion.profesor else None,
             'es_titular': asignacion.es_titular if asignacion else False
-        })
-    
+        }
+        if _due is not None:
+            fila['gestionado_por'] = 'salida_optativa'
+            fila['componente_codigo'] = _due[1]
+            fila['editable'] = False
+        resultado.append(fila)
+
     return {
         'curso': curso.nombre_completo,
         'curso_id': curso_id,
         'asignaciones': resultado
     }
 
+
+def _relacion_administrada_por_optativa(db, *, colegio_id, curso_id, asignatura_id):
+    """PROVENANCE: ¿esta relación (curso, asignatura) la administra Salida Optativa?
+
+    Devuelve el `CursoComponenteOptativo` activo que la respalda, o None.
+
+    POR QUE NO BASTA `area_curricular_codigo IS NULL`
+    ------------------------------------------------
+    Esa columna dice si una asignatura ocupa uno de los 9 bloques troncales del
+    Registro, no de dónde salió la ASIGNACIÓN DOCENTE. Muchas asignaturas
+    legítimamente manuales podrían tenerla nula, y basar en ella una protección
+    sería una heurística, no una prueba.
+
+    La prueba real ya existe y es la que usan R3.4 y el dashboard: la RELACIÓN
+    PERSISTIDA `CursoComponenteOptativo`, que dice literalmente "en este curso,
+    el componente X lo implementa la asignatura Y". Si hay un mapeo ACTIVO para
+    (curso, asignatura), esa pareja la administra la pantalla de Salida
+    Optativa, no ésta.
+
+    A eso se le añade el guard del hotfix R3.4.1: en producción existen mapeos
+    LEGACY que apuntan a una troncal —HCS-LE-5 del curso 5 apunta a "Lengua
+    Española"—. Esa asignación docente NO es del componente: es la del profesor
+    de Lengua, que sigue dando Lengua. Protegerla aquí sería impedir que
+    Dirección gestione a su profesor de Lengua. Por eso se exige, además del
+    mapeo, que la asignatura sea una identidad independiente.
+
+    Se reutiliza `es_identidad_independiente` de R3.4 en vez de reescribir la
+    regla, para que ambas envejezcan juntas.
+    """
+    import salida_optativa_docente as _doc
+
+    mapeo = db.query(CursoComponenteOptativo).filter(
+        CursoComponenteOptativo.colegio_id == colegio_id,
+        CursoComponenteOptativo.curso_id == curso_id,
+        CursoComponenteOptativo.asignatura_id == asignatura_id,
+        CursoComponenteOptativo.activo == True,  # noqa: E712
+    ).first()
+    if mapeo is None:
+        return None
+
+    asignatura = db.query(Asignatura).filter(
+        Asignatura.id == asignatura_id,
+        Asignatura.colegio_id == colegio_id,
+    ).first()
+    if not _doc.es_identidad_independiente(asignatura):
+        # Mapeo legacy sobre una troncal: la asignación es de la materia
+        # troncal y Dirección la gestiona con normalidad desde esta pantalla.
+        return None
+    return mapeo
+
+
 @app.post("/api/cursos/{curso_id}/asignaciones")
 async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Guardar todas las asignaciones de un curso de una vez"""
+    """Guardar las asignaciones de un curso.
+
+    RECONCILIA, NO REEMPLAZA (Fase 1)
+    ---------------------------------
+    Hasta 5733ec6 este endpoint desactivaba TODAS las asignaciones activas del
+    curso con un UPDATE masivo y creaba filas nuevas para las enviadas. Como la
+    pantalla envía siempre la tabla completa, guardar sin cambiar nada
+    desactivaba diez filas y creaba otras diez equivalentes. En producción eso
+    dejó 85 filas inactivas de 147: cada guardado añadía una generación.
+
+    Ahora se compara el estado deseado con el actual y solo se toca la
+    diferencia. La identidad de una asignación es exacta:
+
+        colegio_id + curso_id + profesor_id + asignatura_id
+
+    - ya existe igual        -> NO se toca (ni UPDATE ni INSERT ni id nuevo)
+    - alta nueva             -> se reactiva la fila inactiva equivalente si la
+                                hay (conservando su id), o se crea una
+    - baja                   -> se DESACTIVA; nunca se borra
+
+    POR QUE IMPORTA EL ID, SI NINGUNA FK LO REFERENCIA
+    --------------------------------------------------
+    Ninguna tabla apunta a `asignaciones_profesor.id`: notas, asistencia,
+    horarios y evaluaciones extra resuelven por (profesor, curso, asignatura).
+    Rotar el id no rompía integridad referencial. Lo que rompía era la
+    trazabilidad —no se puede seguir "la misma" asignación en el tiempo— y la
+    idempotencia, y con ella la confianza de Dirección en pulsar Guardar.
+
+    DOS PROTECCIONES QUE ANTES NO EXISTÍAN
+    --------------------------------------
+    1. SALIDA OPTATIVA. Una relación administrada por Salida Optativa (mapeo
+       `CursoComponenteOptativo` activo + identidad independiente) no se da de
+       baja desde aquí: se conserva y se informa. Se gestiona en su pantalla.
+    2. HORARIOS. Una baja que dejaría bloques de clase ACTIVOS sin la
+       asignación que los respalda aborta el guardado ENTERO con 409, sin
+       escribir una sola fila. Solo cuenta lo que la edición EMPEORA: un bloque
+       que ya estaba huérfano no bloquea nada, porque si lo hiciera Dirección no
+       podría tocar las asignaciones de los cursos que intenta arreglar.
+
+    Las notas y la asistencia no son motivo de bloqueo —sobreviven a la baja,
+    porque cuelgan de `asignatura_id` y no de la asignación— pero se informan en
+    la respuesta para que Dirección sepa qué está retirando.
+    """
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    data = await request.json()
-    asignaciones_data = data.get('asignaciones', [])
-    
-    # Desactivar asignaciones anteriores de este curso
-    tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso_id, activo=True).update({'activo': False})
-    
-    # v2.14.1 BUGFIX (bug 14): el lote creaba asignaciones SIN ano_escolar_id
-    # (quedaba NULL), a diferencia del endpoint individual. Ahora se setea.
-    _ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    creadas = 0
-    for asig in asignaciones_data:
-        if asig.get('profesor_id'):  # Solo si tiene profesor asignado
-            nueva = AsignacionProfesor(
-                profesor_id=asig['profesor_id'],
-                curso_id=curso_id,
-                asignatura_id=asig['asignatura_id'],
-                ano_escolar_id=_ano_activo.id if _ano_activo else None,
-                es_titular=asig.get('es_titular', False),
-                activo=True,
-                colegio_id=current_user.colegio_id
-            )
-            db.add(nueva)
-            creadas += 1
-    
+    assert_nivel_curso_activo(db, current_user, curso.id)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido (se espera JSON)'}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({'error': 'Body debe ser un objeto JSON'}, status_code=400)
+    filas = data.get('asignaciones')
+    if not isinstance(filas, list):
+        return JSONResponse({'error': "Se espera 'asignaciones' como lista"}, status_code=400)
+
+    # ── 1. Normalizar y VALIDAR el payload ────────────────────────────────
+    # Antes no se validaba nada: un profesor_id de otro colegio entraba tal
+    # cual, un usuario con rol secretaría quedaba como docente, y una fila sin
+    # asignatura_id reventaba con 500.
+    deseado = {}          # asignatura_id -> {'profesor_id', 'es_titular'}
+    for i, fila in enumerate(filas):
+        if not isinstance(fila, dict):
+            return JSONResponse(
+                {'error': f'asignaciones[{i}] debe ser un objeto'}, status_code=400)
+        asignatura_id = fila.get('asignatura_id')
+        if asignatura_id is None:
+            return JSONResponse(
+                {'error': f'asignaciones[{i}] no trae asignatura_id'}, status_code=400)
+        try:
+            asignatura_id = int(asignatura_id)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {'error': f'asignaciones[{i}].asignatura_id no es un id válido'},
+                status_code=400)
+
+        profesor_id = fila.get('profesor_id')
+        if not profesor_id:
+            continue          # materia sin docente: no genera relación
+        try:
+            profesor_id = int(profesor_id)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {'error': f'asignaciones[{i}].profesor_id no es un id válido'},
+                status_code=400)
+
+        previo = deseado.get(asignatura_id)
+        if previo is not None and previo['profesor_id'] != profesor_id:
+            # La pantalla muestra UNA fila por asignatura, así que dos docentes
+            # para la misma materia no se pueden representar ni deshacer luego.
+            # Se rechaza de forma determinista en vez de quedarse con el último.
+            asig = db.query(Asignatura).filter(
+                Asignatura.id == asignatura_id,
+                Asignatura.colegio_id == current_user.colegio_id).first()
+            return JSONResponse({
+                'error': (f'El payload trae dos docentes distintos para '
+                          f'"{asig.nombre if asig else asignatura_id}". Esta pantalla '
+                          f'admite un docente por asignatura; use Asignaciones '
+                          f'individuales si el curso necesita dos.')
+            }, status_code=400)
+        deseado[asignatura_id] = {
+            'profesor_id': profesor_id,
+            'es_titular': bool(fila.get('es_titular', False)),
+        }
+
+    # Tenant + rol, con el mismo criterio que el endpoint individual.
+    for asignatura_id, info in deseado.items():
+        get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+        profesor = get_tenant_or_404(db, Usuario, info['profesor_id'], current_user,
+                                     name='profesor')
+        if profesor.role != 'profesor':
+            return JSONResponse(
+                {'error': f'{profesor.nombre_completo} no tiene rol profesor'},
+                status_code=400)
+        if not profesor.activo:
+            return JSONResponse(
+                {'error': f'{profesor.nombre_completo} está inactivo'}, status_code=400)
+
+    # ── 1b. SALIDA OPTATIVA: esta pantalla no la administra ───────────────
+    # Dos vias distintas, las dos cerradas aqui y no solo en el frontend:
+    #
+    #   a) una identidad DEDICADA de OTRO curso/tanda no puede entrar. Dos
+    #      tandas pueden tener dos identidades con el MISMO nombre visible
+    #      ("Apreciación y Producción Literarias" es id 19 en una y 21 en otra);
+    #      la identidad se decide por el mapeo persistido, jamas por el nombre.
+    #
+    #   b) la identidad dedicada del PROPIO curso no cambia de docente desde
+    #      aqui. Se administra en Salida Optativa, que es donde R3.4 mantiene
+    #      la coherencia entre componente, asignatura y responsable.
+    #
+    # Una troncal alcanzada por un mapeo LEGACY no entra en ninguna de las dos:
+    # `_identidades_optativas_del_colegio` ya exige identidad independiente.
+    _dedicadas = _identidades_optativas_del_colegio(db, current_user.colegio_id)
+    if _dedicadas:
+        _actual_por_asig = {
+            a.asignatura_id: a for a in tenant_filter(
+                db.query(AsignacionProfesor), AsignacionProfesor, current_user
+            ).filter_by(curso_id=curso.id, activo=True).all()
+        }
+        for asignatura_id, info in deseado.items():
+            _due = _dedicadas.get(asignatura_id)
+            if _due is None:
+                continue
+            _asig = db.query(Asignatura).filter(
+                Asignatura.id == asignatura_id,
+                Asignatura.colegio_id == current_user.colegio_id).first()
+            _nombre = _asig.nombre if _asig else asignatura_id
+            if _due[0] != curso.id:
+                _otro = db.query(Curso).filter(
+                    Curso.id == _due[0],
+                    Curso.colegio_id == current_user.colegio_id).first()
+                return JSONResponse({
+                    'error': (f'"{_nombre}" es una materia de Salida Optativa de '
+                              f'{_otro.nombre_completo if _otro else "otro curso"} '
+                              f'({_due[1]}). No puede asignarse desde '
+                              f'{curso.nombre_completo}. Cada curso tiene su propia '
+                              f'identidad aunque el nombre coincida.')
+                }, status_code=400)
+            _vigente = _actual_por_asig.get(asignatura_id)
+            if _vigente is None or _vigente.profesor_id != info['profesor_id']:
+                return JSONResponse({
+                    'error': (f'"{_nombre}" es un componente de Salida Optativa de '
+                              f'este curso ({_due[1]}). Su docente se cambia desde '
+                              f'Salida Optativa, no desde Asignaciones.')
+                }, status_code=400)
+
+    # ── 2. Estado actual del curso ────────────────────────────────────────
+    actuales = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id).all()
+    activas = {(a.profesor_id, a.asignatura_id): a for a in actuales if a.activo}
+    inactivas = {}
+    for a in actuales:
+        if not a.activo:
+            inactivas.setdefault((a.profesor_id, a.asignatura_id), a)
+
+    quiere = {(v['profesor_id'], k): v for k, v in deseado.items()}
+
+    # ── 3. Bajas: proteger Salida Optativa y horarios vivos ───────────────
+    bajas, protegidas_optativa, romperian_horario = [], [], []
+    for clave, fila in activas.items():
+        if clave in quiere:
+            continue
+        prof_id, asig_id = clave
+        mapeo = _relacion_administrada_por_optativa(
+            db, colegio_id=current_user.colegio_id, curso_id=curso.id,
+            asignatura_id=asig_id)
+        if mapeo is not None:
+            protegidas_optativa.append((fila, mapeo))
+            continue
+        bloques = db.query(Horario).filter(
+            Horario.colegio_id == current_user.colegio_id,
+            Horario.curso_id == curso.id,
+            Horario.profesor_id == prof_id,
+            Horario.asignatura_id == asig_id,
+            Horario.tipo_bloque == 'clase',
+            Horario.activo == True,  # noqa: E712
+        ).order_by(Horario.dia, Horario.hora_inicio).all()
+        if bloques:
+            romperian_horario.append((fila, bloques))
+            continue
+        bajas.append(fila)
+
+    if romperian_horario:
+        # Nada escrito todavía: se aborta el guardado ENTERO.
+        _det, _ids, _docentes = [], [], []
+        for fila, bloques in romperian_horario:
+            _asig = db.query(Asignatura).filter(
+                Asignatura.id == fila.asignatura_id,
+                Asignatura.colegio_id == current_user.colegio_id).first()
+            _prof = db.query(Usuario).filter(
+                Usuario.id == fila.profesor_id,
+                Usuario.colegio_id == current_user.colegio_id).first()
+            _nom = _prof.nombre_completo if _prof else f'El profesor {fila.profesor_id}'
+            if _nom not in _docentes:
+                _docentes.append(_nom)
+            for h in bloques[:6]:
+                _det.append(f'{_prof.nombre_completo if _prof else fila.profesor_id} — '
+                            f'{_asig.nombre if _asig else fila.asignatura_id} '
+                            f'({h.dia} {h.hora_inicio}-{h.hora_fin})')
+            _ids.extend(h.id for h in bloques)
+        # El texto importa tanto como el codigo. La version anterior decia
+        # "retire primero esos bloques en Horarios", y eso empujaba a Direccion
+        # a la unica accion que Horarios ofrece: Eliminar, que borra la fila
+        # fisicamente. No existe ningun flujo institucional de "retirar
+        # horario". El camino real cuando el docente deja el centro es
+        # Usuarios -> Reemplazar Profesor, que transfiere asignaciones y
+        # horarios conservando su id y sin tocar el historial academico.
+        return JSONResponse({
+            'error': (f'No se guardó nada. {", ".join(_docentes)} todavía tiene '
+                      f'{len(_ids)} bloque(s) activos en el horario de '
+                      f'{curso.nombre_completo}. '
+                      f'Si deja definitivamente el centro, use '
+                      f'Usuarios → Reemplazar Profesor: transfiere sus '
+                      f'asignaciones y sus horarios al nuevo docente sin perder '
+                      f'el historial académico.'),
+            'horarios': _ids,
+            'bloques': _det,
+        }, status_code=409)
+
+    # ── 3b. TITULAR: un curso, un profesor titular ────────────────────────
+    # La unicidad es por PROFESOR dentro del CURSO, no por fila: si un docente
+    # imparte varias asignaturas aqui y varias de sus filas van marcadas,
+    # conceptualmente sigue habiendo UN titular. Lo que no puede quedar son dos
+    # profesor_id distintos como titulares del mismo curso.
+    #
+    # El alcance es SOLO este curso. Un profesor puede ser titular de 2do y de
+    # 5to a la vez, y guardar 2do jamas le quita la titularidad de 5to: nada
+    # aqui consulta ni escribe fuera de `curso.id`.
+    #
+    # Se valida el ESTADO RESULTANTE —lo que pide el payload mas las filas de
+    # Salida Optativa que se conservan— y ANTES de escribir nada.
+    _titulares = {info['profesor_id'] for info in quiere.values() if info['es_titular']}
+    _titulares |= {f.profesor_id for f, _m in protegidas_optativa if f.es_titular}
+    if len(_titulares) > 1:
+        _nombres = [
+            (u.nombre_completo if u else str(i)) for i, u in (
+                (i, db.query(Usuario).filter(
+                    Usuario.id == i,
+                    Usuario.colegio_id == current_user.colegio_id).first())
+                for i in sorted(_titulares))
+        ]
+        return JSONResponse({
+            'error': (f'{curso.nombre_completo} quedaria con {len(_titulares)} '
+                      f'profesores titulares: {", ".join(_nombres)}. Un curso solo '
+                      f'puede tener un titular. (Un mismo profesor si puede ser '
+                      f'titular de varios cursos.)'),
+            'titulares': sorted(_titulares),
+        }, status_code=400)
+
+    # ── 4. Aplicar SOLO la diferencia ─────────────────────────────────────
+    ano_activo = tenant_filter(
+        db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    sin_cambio, creadas, reactivadas, titular_ajustado = 0, 0, 0, 0
+
+    for clave, info in quiere.items():
+        fila = activas.get(clave)
+        if fila is not None:
+            # Ya existe idéntica: NO se toca el id ni se recrea. El único campo
+            # editable desde la pantalla es es_titular.
+            if bool(fila.es_titular) != info['es_titular']:
+                fila.es_titular = info['es_titular']
+                titular_ajustado += 1
+            else:
+                sin_cambio += 1
+            continue
+        revivible = inactivas.get(clave)
+        if revivible is not None:
+            # Reactivar conserva el id y con él la historia de esa relación.
+            revivible.activo = True
+            revivible.es_titular = info['es_titular']
+            if ano_activo is not None:
+                revivible.ano_escolar_id = ano_activo.id
+            reactivadas += 1
+            continue
+        db.add(AsignacionProfesor(
+            colegio_id=current_user.colegio_id,
+            profesor_id=clave[0],
+            curso_id=curso.id,
+            asignatura_id=clave[1],
+            ano_escolar_id=ano_activo.id if ano_activo else None,
+            es_titular=info['es_titular'],
+            activo=True,
+        ))
+        creadas += 1
+
+    # Bajas: desactivar, jamás borrar. Se informa de lo académico que queda.
+    notas_afectadas, asistencias_afectadas = 0, 0
+    for fila in bajas:
+        notas_afectadas += db.query(CalificacionSecundaria).filter(
+            CalificacionSecundaria.colegio_id == current_user.colegio_id,
+            CalificacionSecundaria.asignatura_id == fila.asignatura_id,
+        ).count()
+        asistencias_afectadas += db.query(Asistencia).filter(
+            Asistencia.colegio_id == current_user.colegio_id,
+            Asistencia.curso_id == curso.id,
+            Asistencia.asignatura_id == fila.asignatura_id,
+        ).count()
+        fila.activo = False
+
     db.commit()
-    log_auditoria(db, 'ASIGNAR_PROFESORES', 'cursos', curso_id, user=current_user, request=request)
-    
-    return {'message': f'{creadas} asignaciones guardadas para {curso.nombre_completo}'}
+    log_auditoria(db, 'ASIGNAR_PROFESORES', 'cursos', curso_id, user=current_user,
+                  request=request)
+    db.commit()
+    cache_clear_tenant(current_user.colegio_id)
+
+    _tocado = creadas + reactivadas + len(bajas) + titular_ajustado
+    if _tocado == 0:
+        _msg = f'Sin cambios en {curso.nombre_completo}'
+    else:
+        _partes = []
+        if creadas:
+            _partes.append(f'{creadas} nueva(s)')
+        if reactivadas:
+            _partes.append(f'{reactivadas} reactivada(s)')
+        if titular_ajustado:
+            _partes.append(f'{titular_ajustado} cambio(s) de titular')
+        if bajas:
+            _partes.append(f'{len(bajas)} retirada(s)')
+        _msg = f'{curso.nombre_completo}: ' + ', '.join(_partes)
+    if protegidas_optativa:
+        _msg += (f'. {len(protegidas_optativa)} asignación(es) de Salida Optativa '
+                 f'se conservan: se gestionan desde Salida Optativa.')
+
+    return {
+        'message': _msg,
+        'sin_cambio': sin_cambio,
+        'creadas': creadas,
+        'reactivadas': reactivadas,
+        'retiradas': len(bajas),
+        'titular_ajustado': titular_ajustado,
+        'protegidas_salida_optativa': [
+            {'asignacion_id': f.id, 'asignatura_id': f.asignatura_id,
+             'componente_codigo': m.componente_codigo}
+            for f, m in protegidas_optativa
+        ],
+        'historico_conservado': {
+            'calificaciones': notas_afectadas,
+            'asistencias': asistencias_afectadas,
+        },
+    }
 
 
 # ============== IMPRESIONES PDF (v2.11) ==============
