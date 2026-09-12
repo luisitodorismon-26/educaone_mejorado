@@ -4860,54 +4860,78 @@ async def get_estudiantes_retirados(request: Request, db: Session = Depends(get_
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=False).all()
     return [e.to_dict() for e in estudiantes]
 
+# ─────────────────────────────────────────────────────────────────────────
+# P0.1 — EL BORRADO FISICO DE EXPEDIENTES QUEDA DESHABILITADO
+#
+# Direccion retira a un estudiante con soft-delete —`activo=False`,
+# `condicion='retirado'`, fecha, motivo, quien lo retiro y auditoria— y puede
+# reactivarlo. Ese flujo es el correcto y no se toca.
+#
+# Lo que se cierra es el borrado FISICO que habia despues, en la pestana
+# Retirados. La auditoria de P0 midio lo que hacia de verdad:
+#
+#   * 12 modelos referencian `estudiante_id`; el purgado contemplaba 6. Los
+#     otros 6 incluyen los modelos de calificacion VIGENTES
+#     (CalificacionSecundaria, CalificacionPrimaria, EvaluacionExtraSecundaria,
+#     RecuperacionPrimaria) y los dos historiales de comunicacion con la
+#     familia.
+#
+#   * Las 12 FK son NO ACTION, asi que NO dejaba huerfanos: ante un expediente
+#     real fallaba con IntegrityError y revertia la transaccion entera. Para
+#     Direccion eso era un 500 sin explicacion.
+#
+#   * Pero cuando la historia del retirado vivia SOLO en las 6 tablas que si
+#     contemplaba, tenia EXITO: en la simulacion borro 40 registros de
+#     asistencia, un caso de psicologia, el historial academico y la evaluacion
+#     interna. Permanente, sin papelera y sin forma de deshacerlo.
+#
+#   * El endpoint masivo hacia lo mismo con todos los `activo=False` del
+#     colegio a la vez.
+#
+# POR QUE NO SE "COMPLETA" EL PURGADO
+# -----------------------------------
+# Anadir los 6 modelos que faltaban convertiria un endpoint que hoy FALLA ante
+# un expediente real en uno que lo BORRA entero, notas vigentes incluidas. Seria
+# el cambio mas destructivo posible presentado como arreglo.
+#
+# POR QUE NO SE MUEVE A SUPERADMIN
+# --------------------------------
+# Eso mueve el riesgo, no lo quita: superadmin tiene menos contexto que
+# Direccion para decidir que expediente puede desaparecer.
+#
+# LAS RUTAS SE CONSERVAN
+# ----------------------
+# Responden 403 sin tocar la base, en vez de desaparecer: un cliente antiguo
+# recibe un error claro y no un 404 que parezca un fallo de red. El rechazo
+# ocurre ANTES de cualquier consulta, DELETE, UPDATE, flush o commit — ni
+# siquiera se mira si el estudiante existe, para que no haya ninguna ruta por la
+# que se escriba algo.
+#
+# PENDIENTE, FUERA DE ESTE PARCHE
+# -------------------------------
+# `GET /api/estudiantes/retirados` filtra solo por `activo=False`, y el cierre
+# de ano deja a los egresados con `activo=False`. Un egresado puede terminar
+# listado como "retirado". Se documenta como fase propia —"Separacion funcional
+# Retirado vs Egresado"— y aqui no se toca Promocion ni Cierre de Ano.
+_PURGA_DESHABILITADA = {
+    'error': ('El borrado permanente de expedientes está deshabilitado para '
+              'preservar el historial académico del colegio. Un estudiante que '
+              'deja el centro se retira, y su expediente se conserva: use '
+              'Retirar o Reactivar.')
+}
+
+
 @app.delete("/api/estudiantes/retirados/eliminar-todos")
 async def eliminar_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Eliminar permanentemente TODOS los estudiantes retirados y sus datos relacionados"""
-    retirados = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=False).all()
-    if not retirados:
-        return {'message': 'No hay estudiantes retirados', 'eliminados': 0}
-    
-    ids = [e.id for e in retirados]
-    
-    # Borrar datos relacionados
-    for model in [Calificacion, Asistencia, ReporteConducta, CasoPsicologia, 
-                  HistorialAcademico, EvalInternaEstudiante]:
-        db.query(model).filter(model.estudiante_id.in_(ids)).delete(synchronize_session=False)
-    
-    # Borrar estudiantes
-    count = len(ids)
-    for est in retirados:
-        db.delete(est)
-    
-    db.commit()
-    
-    log_auditoria(db, 'ELIMINAR_RETIRADOS', 'estudiantes', None, None,
-                  {'cantidad': count, 'ids': ids}, user=current_user, request=request)
-    db.commit()  # v2.13.5: persistir log
-    
-    return {'message': f'{count} estudiantes retirados eliminados permanentemente', 'eliminados': count}
+    """DESHABILITADO — ver `_PURGA_DESHABILITADA`. No escribe nada."""
+    return JSONResponse(_PURGA_DESHABILITADA, status_code=403)
+
 
 @app.delete("/api/estudiantes/retirados/{id}")
 async def eliminar_retirado(id: int, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Eliminar permanentemente UN estudiante retirado y sus datos relacionados"""
-    est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(id=id, activo=False).first()
-    if not est:
-        return JSONResponse({'error': 'Estudiante retirado no encontrado'}, status_code=404)
-    
-    nombre = est.nombre_completo
-    
-    for model in [Calificacion, Asistencia, ReporteConducta, CasoPsicologia,
-                  HistorialAcademico, EvalInternaEstudiante]:
-        db.query(model).filter(model.estudiante_id == id).delete(synchronize_session=False)
-    
-    db.delete(est)
-    db.commit()
-    
-    log_auditoria(db, 'ELIMINAR_RETIRADO', 'estudiantes', id, None,
-                  {'nombre': nombre}, user=current_user, request=request)
-    db.commit()  # v2.13.5: persistir log
-    
-    return {'message': f'Estudiante {nombre} eliminado permanentemente'}
+    """DESHABILITADO — ver `_PURGA_DESHABILITADA`. No escribe nada."""
+    return JSONResponse(_PURGA_DESHABILITADA, status_code=403)
+
 
 @app.get("/api/estudiantes/{id}")
 async def get_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):

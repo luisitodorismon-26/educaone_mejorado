@@ -522,26 +522,8 @@ export const EstudiantesPage = () => {
           <div className="p-4 bg-red-50 border-b border-red-200 flex items-center justify-between">
             <div>
               <h2 className="font-semibold text-red-800">Estudiantes Retirados</h2>
-              <p className="text-sm text-red-600">Estos estudiantes han sido marcados como retirados y no aparecen en las listas de clases.</p>
+              <p className="text-sm text-red-600">Estos estudiantes han sido marcados como retirados y no aparecen en las listas de clases. Su expediente se conserva: puede reactivarlos en cualquier momento.</p>
             </div>
-            {estudiantesRetirados.length > 0 && (
-              <button
-                onClick={async () => {
-                  if (!confirm(`¿Eliminar PERMANENTEMENTE los ${estudiantesRetirados.length} estudiantes retirados y todos sus datos? Esta acción NO se puede deshacer.`)) return;
-                  if (!confirm('¿Está completamente seguro? Se borrarán calificaciones, asistencia y todo registro de estos estudiantes.')) return;
-                  try {
-                    const res = await api.delete('/estudiantes/retirados/eliminar-todos');
-                    setMessage({ type: 'success', text: res.data.message });
-                    setEstudiantesRetirados([]);
-                  } catch (e: any) {
-                    setMessage({ type: 'error', text: e.response?.data?.error || 'Error al eliminar' });
-                  }
-                }}
-                className="px-3 py-2 bg-red-700 text-white text-sm rounded hover:bg-red-800"
-              >
-                🗑️ Eliminar todos
-              </button>
-            )}
           </div>
           {estudiantesRetirados.length > 0 ? (
             <div className="overflow-x-auto">
@@ -570,21 +552,6 @@ export const EstudiantesPage = () => {
                           className="px-3 py-1 bg-emerald-600 text-white text-sm rounded hover:bg-emerald-700"
                         >
                           🔄 Reactivar
-                        </button>
-                        <button
-                          onClick={async () => {
-                            if (!confirm(`¿Eliminar PERMANENTEMENTE a ${est.nombre_completo}? Se borrarán todas sus calificaciones y asistencia.`)) return;
-                            try {
-                              const res = await api.delete(`/estudiantes/retirados/${est.id}`);
-                              setMessage({ type: 'success', text: res.data.message });
-                              setEstudiantesRetirados(prev => prev.filter(e => e.id !== est.id));
-                            } catch (e: any) {
-                              setMessage({ type: 'error', text: e.response?.data?.error || 'Error al eliminar' });
-                            }
-                          }}
-                          className="px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700"
-                        >
-                          🗑️ Eliminar
                         </button>
                       </td>
                     </tr>
