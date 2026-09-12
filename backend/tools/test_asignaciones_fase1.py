@@ -540,6 +540,94 @@ def _():
         "el 409 dejo rastro en la base"
 
 
+@test("§16c El 409 no borra ni desactiva nada: ni el horario ni la asignacion")
+def _():
+    d = SessionLocal()
+    try:
+        h = d.query(M.Horario).filter_by(
+            curso_id=CUR_SEC, profesor_id=U_P4, asignatura_id=A_FRANCES,
+            activo=True).first()
+        assert h is not None, "precondicion: el bloque de §16 sigue vivo"
+        hid, horarios_antes = h.id, d.query(M.Horario).count()
+    finally:
+        d.close()
+    r = guardar(CUR_SEC, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P2, "asignatura_id": A_SOCIALES},
+        {"profesor_id": U_P4, "asignatura_id": A_INGLES},
+        {"profesor_id": U_P2, "asignatura_id": A_MUSICA},
+    ])
+    assert r.status_code == 409, (r.status_code, r.text[:300])
+    d = SessionLocal()
+    try:
+        assert d.query(M.Horario).count() == horarios_antes, "el 409 BORRO horarios"
+        hh = d.query(M.Horario).get(hid)
+        assert hh is not None, "el 409 borro el bloque"
+        assert hh.activo is True, "el 409 desactivo el bloque"
+        assert hh.profesor_id == U_P4, "el 409 cambio el docente del bloque"
+        asig = d.query(M.AsignacionProfesor).filter_by(
+            curso_id=CUR_SEC, profesor_id=U_P4, asignatura_id=A_FRANCES).one()
+        assert asig.activo is True, "el 409 desactivo la asignacion"
+    finally:
+        d.close()
+
+
+@test("§16d El mensaje del 409 orienta al flujo REAL, no a borrar horarios")
+def _():
+    # El texto anterior decia "retire primero esos bloques en Horarios". No
+    # existe ningun flujo institucional de retirar un horario: lo unico que la
+    # pantalla ofrece es Eliminar, que borra la fila. El mensaje empujaba justo
+    # a la accion destructiva.
+    #
+    # El camino real cuando el docente deja el centro es
+    # Usuarios -> Reemplazar Profesor, que transfiere asignaciones y horarios
+    # conservando su id y sin tocar el historial academico.
+    r = guardar(CUR_SEC, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P2, "asignatura_id": A_SOCIALES},
+        {"profesor_id": U_P4, "asignatura_id": A_INGLES},
+        {"profesor_id": U_P2, "asignatura_id": A_MUSICA},
+    ])
+    assert r.status_code == 409, r.status_code
+    msg = r.json().get("error", "")
+
+    # NO debe empujar a acciones destructivas ni inexistentes
+    for prohibido in ("retire", "retirar", "elimine", "eliminar", "borre",
+                      "borrar", "tipo_bloque", "libre"):
+        assert prohibido not in msg.lower(), (
+            "el mensaje sugiere %r: %s" % (prohibido, msg))
+
+    # SI debe orientar al flujo que existe de verdad
+    assert "Reemplazar Profesor" in msg, msg
+    assert "Usuarios" in msg, msg
+    assert "historial" in msg.lower(), msg
+    # y describir la situacion: quien, cuantos bloques y en que curso
+    assert "bloque" in msg.lower(), msg
+    assert "P4 T" in msg, msg
+
+
+@test("§16e Tras el 409, guardar sigue funcionando y es idempotente")
+def _():
+    payload = [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P2, "asignatura_id": A_SOCIALES},
+        {"profesor_id": U_P4, "asignatura_id": A_INGLES},
+        {"profesor_id": U_P4, "asignatura_id": A_FRANCES},
+        {"profesor_id": U_P2, "asignatura_id": A_MUSICA},
+    ]
+    # el 409 no dejo la base en un estado raro: este guardado se aplica bien
+    r = guardar(CUR_SEC, payload)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    # y el SIGUIENTE, identico, no mueve absolutamente nada
+    antes = foto(CUR_SEC)
+    r2 = guardar(CUR_SEC, payload)
+    assert r2.status_code == 200, (r2.status_code, r2.text[:250])
+    j2 = r2.json()
+    assert j2["creadas"] == 0 and j2["reactivadas"] == 0 and j2["retiradas"] == 0, j2
+    assert j2["sin_cambio"] == 5, j2
+    assert foto(CUR_SEC) == antes, "un guardado sin cambios movio algo"
+
+
 @test("§16b Un bloque YA huerfano no bloquea: solo se mira lo que se empeora")
 def _():
     d = SessionLocal()

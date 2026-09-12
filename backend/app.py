@@ -14948,7 +14948,7 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
 
     if romperian_horario:
         # Nada escrito todavía: se aborta el guardado ENTERO.
-        _det, _ids = [], []
+        _det, _ids, _docentes = [], [], []
         for fila, bloques in romperian_horario:
             _asig = db.query(Asignatura).filter(
                 Asignatura.id == fila.asignatura_id,
@@ -14956,16 +14956,29 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
             _prof = db.query(Usuario).filter(
                 Usuario.id == fila.profesor_id,
                 Usuario.colegio_id == current_user.colegio_id).first()
+            _nom = _prof.nombre_completo if _prof else f'El profesor {fila.profesor_id}'
+            if _nom not in _docentes:
+                _docentes.append(_nom)
             for h in bloques[:6]:
                 _det.append(f'{_prof.nombre_completo if _prof else fila.profesor_id} — '
                             f'{_asig.nombre if _asig else fila.asignatura_id} '
                             f'({h.dia} {h.hora_inicio}-{h.hora_fin})')
             _ids.extend(h.id for h in bloques)
+        # El texto importa tanto como el codigo. La version anterior decia
+        # "retire primero esos bloques en Horarios", y eso empujaba a Direccion
+        # a la unica accion que Horarios ofrece: Eliminar, que borra la fila
+        # fisicamente. No existe ningun flujo institucional de "retirar
+        # horario". El camino real cuando el docente deja el centro es
+        # Usuarios -> Reemplazar Profesor, que transfiere asignaciones y
+        # horarios conservando su id y sin tocar el historial academico.
         return JSONResponse({
-            'error': (f'No se guardó nada. {len(_ids)} bloque(s) del horario de '
-                      f'{curso.nombre_completo} quedarían sin docente asignado. '
-                      f'Mantenga esas asignaciones, o retire primero esos bloques '
-                      f'en Horarios.'),
+            'error': (f'No se guardó nada. {", ".join(_docentes)} todavía tiene '
+                      f'{len(_ids)} bloque(s) activos en el horario de '
+                      f'{curso.nombre_completo}. '
+                      f'Si deja definitivamente el centro, use '
+                      f'Usuarios → Reemplazar Profesor: transfiere sus '
+                      f'asignaciones y sus horarios al nuevo docente sin perder '
+                      f'el historial académico.'),
             'horarios': _ids,
             'bloques': _det,
         }, status_code=409)
