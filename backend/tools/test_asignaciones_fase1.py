@@ -737,6 +737,315 @@ def _():
         d.close()
 
 
+# ===========================================================================
+# BLOQUE T — TITULAR: un curso, un profesor titular
+#
+# La unicidad es por PROFESOR dentro del CURSO, no por fila. Y el alcance es
+# solo el curso que se guarda: un profesor puede ser titular de varios cursos.
+# ===========================================================================
+CUR_T2, CUR_T5 = 14, 15          # "2do" y "5to", para el caso institucional
+
+
+def _montar_titulares():
+    """Dos cursos con el mismo profesor titular en ambos."""
+    d = SessionLocal()
+    try:
+        for cur, nom in ((CUR_T2, "2do"), (CUR_T5, "5to")):
+            if d.query(M.Curso).get(cur) is None:
+                d.add(M.Curso(id=cur, colegio_id=COL_A, nombre=nom, grado_id=G_SEC,
+                              ano_escolar_id=ANO_A, activo=True))
+        d.query(M.AsignacionProfesor).filter(
+            M.AsignacionProfesor.curso_id.in_([CUR_T2, CUR_T5])).delete(
+                synchronize_session=False)
+        # U_P1 titular de los DOS cursos; U_P2 imparte otra materia en el 2do
+        d.add(M.AsignacionProfesor(id=101, colegio_id=COL_A, profesor_id=U_P1,
+                                   curso_id=CUR_T2, asignatura_id=A_LENGUA,
+                                   ano_escolar_id=ANO_A, activo=True, es_titular=True))
+        d.add(M.AsignacionProfesor(id=102, colegio_id=COL_A, profesor_id=U_P1,
+                                   curso_id=CUR_T5, asignatura_id=A_LENGUA,
+                                   ano_escolar_id=ANO_A, activo=True, es_titular=True))
+        d.add(M.AsignacionProfesor(id=103, colegio_id=COL_A, profesor_id=U_P2,
+                                   curso_id=CUR_T2, asignatura_id=A_SOCIALES,
+                                   ano_escolar_id=ANO_A, activo=True, es_titular=False))
+        d.commit()
+    finally:
+        d.close()
+
+
+def _titulares_de(curso):
+    d = SessionLocal()
+    try:
+        return {a.profesor_id for a in d.query(M.AsignacionProfesor).filter_by(
+            curso_id=curso, activo=True, es_titular=True).all()}
+    finally:
+        d.close()
+
+
+@test("§T1 Un MISMO profesor puede ser titular de VARIOS cursos")
+def _():
+    _montar_titulares()
+    assert _titulares_de(CUR_T2) == {U_P1}, _titulares_de(CUR_T2)
+    assert _titulares_de(CUR_T5) == {U_P1}, _titulares_de(CUR_T5)
+    # reafirmarlo guardando el 5to no rompe nada
+    r = guardar(CUR_T5, [{"profesor_id": U_P1, "asignatura_id": A_LENGUA,
+                          "es_titular": True}])
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _titulares_de(CUR_T2) == {U_P1} and _titulares_de(CUR_T5) == {U_P1}
+
+
+@test("§T2 Cambiar el titular de un curso NO afecta al otro")
+def _():
+    _montar_titulares()
+    # el 2do pasa a U_P2; U_P1 deja de ser titular SOLO ahi
+    r = guardar(CUR_T2, [
+        {"profesor_id": U_P2, "asignatura_id": A_SOCIALES, "es_titular": True},
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": False},
+    ])
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _titulares_de(CUR_T2) == {U_P2}, _titulares_de(CUR_T2)
+    assert _titulares_de(CUR_T5) == {U_P1}, \
+        "guardar el 2do le quito la titularidad del 5to"
+
+
+@test("§T3 El MISMO profesor con VARIAS materias titular=True: permitido")
+def _():
+    _montar_titulares()
+    r = guardar(CUR_T2, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P1, "asignatura_id": A_SOCIALES, "es_titular": True},
+    ])
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        filas = d.query(M.AsignacionProfesor).filter_by(
+            curso_id=CUR_T2, activo=True, es_titular=True).all()
+        assert len(filas) == 2, "deben quedar las dos filas marcadas"
+        assert {f.profesor_id for f in filas} == {U_P1}, \
+            "sigue habiendo UN solo profesor titular"
+    finally:
+        d.close()
+
+
+@test("§T4 DOS profesores distintos titular=True en el mismo curso: 400")
+def _():
+    _montar_titulares()
+    r = guardar(CUR_T2, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P2, "asignatura_id": A_SOCIALES, "es_titular": True},
+    ])
+    assert r.status_code == 400, (r.status_code, r.text[:300])
+    cuerpo = r.json()
+    assert "un titular" in cuerpo.get("error", ""), cuerpo
+    assert sorted(cuerpo.get("titulares", [])) == sorted([U_P1, U_P2]), cuerpo
+
+
+@test("§T5 Ese rechazo deja CERO cambios, tambien en el otro curso")
+def _():
+    _montar_titulares()
+    antes_t2, antes_t5 = foto(CUR_T2), foto(CUR_T5)
+    antes_tot = total_filas()
+    r = guardar(CUR_T2, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P2, "asignatura_id": A_SOCIALES, "es_titular": True},
+    ])
+    assert r.status_code == 400, r.status_code
+    assert foto(CUR_T2) == antes_t2, "el rechazo modifico el curso guardado"
+    assert foto(CUR_T5) == antes_t5, "el rechazo toco OTRO curso"
+    assert total_filas() == antes_tot
+
+
+@test("§T6 Guardar sin cambios deja la titularidad intacta")
+def _():
+    _montar_titulares()
+    antes = foto(CUR_T2)
+    r = guardar(CUR_T2, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P2, "asignatura_id": A_SOCIALES, "es_titular": False},
+    ])
+    assert r.status_code == 200, r.text[:250]
+    assert r.json()["titular_ajustado"] == 0, r.json()
+    assert foto(CUR_T2) == antes
+
+
+# ===========================================================================
+# BLOQUE S — SALIDA OPTATIVA: identidad por mapeo, nunca por nombre
+# ===========================================================================
+CUR_VESP = 16                    # misma grada, OTRA tanda
+A_OPT_VESP = 22                  # MISMO nombre visible que A_OPTATIVA (21)
+
+
+def _montar_optativas():
+    """Dos tandas con identidades dedicadas distintas y el MISMO nombre."""
+    d = SessionLocal()
+    try:
+        if d.query(M.Curso).get(CUR_VESP) is None:
+            d.add(M.Curso(id=CUR_VESP, colegio_id=COL_A, nombre="A", grado_id=G_SEC,
+                          ano_escolar_id=ANO_A, activo=True))
+        if d.query(M.Asignatura).get(A_OPT_VESP) is None:
+            d.add(M.Asignatura(id=A_OPT_VESP, colegio_id=COL_A,
+                               nombre="Apreciación y Producción Literarias",
+                               codigo="HCS-LE-4", area="X",
+                               area_curricular_codigo=None, activo=True))
+        d.query(M.CursoComponenteOptativo).filter_by(curso_id=CUR_VESP).delete(
+            synchronize_session=False)
+        d.add(M.CursoComponenteOptativo(
+            id=3, colegio_id=COL_A, curso_id=CUR_VESP, ano_escolar_id=ANO_A,
+            componente_codigo="HCS-LE-4", asignatura_id=A_OPT_VESP, activo=True))
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_VESP).delete(
+            synchronize_session=False)
+        d.add(M.AsignacionProfesor(id=110, colegio_id=COL_A, profesor_id=U_P2,
+                                   curso_id=CUR_VESP, asignatura_id=A_OPT_VESP,
+                                   ano_escolar_id=ANO_A, activo=True))
+        # y el curso Matutino conserva su identidad 21 con U_P1
+        d.query(M.AsignacionProfesor).filter_by(
+            curso_id=CUR_OPT, asignatura_id=A_OPTATIVA).delete(
+                synchronize_session=False)
+        d.add(M.AsignacionProfesor(id=111, colegio_id=COL_A, profesor_id=U_P1,
+                                   curso_id=CUR_OPT, asignatura_id=A_OPTATIVA,
+                                   ano_escolar_id=ANO_A, activo=True))
+        d.commit()
+    finally:
+        d.close()
+
+
+@test("§S1 Dos tandas con identidades dedicadas del MISMO nombre coexisten")
+def _():
+    _montar_optativas()
+    d = SessionLocal()
+    try:
+        a1 = d.query(M.Asignatura).get(A_OPTATIVA)
+        a2 = d.query(M.Asignatura).get(A_OPT_VESP)
+        assert a1.nombre == a2.nombre, "el fixture debe usar el MISMO nombre"
+        assert a1.id != a2.id
+        assert a1.area_curricular_codigo is None and a2.area_curricular_codigo is None
+    finally:
+        d.close()
+
+
+@test("§S2 El GET de un curso NO lista la identidad dedicada del otro")
+def _():
+    _montar_optativas()
+    r = client.get(f"/api/cursos/{CUR_OPT}/asignaciones", headers=TOK["dir"])
+    assert r.status_code == 200, r.status_code
+    ids = {f["asignatura_id"] for f in r.json()["asignaciones"]}
+    assert A_OPTATIVA in ids, "debe verse la identidad PROPIA"
+    assert A_OPT_VESP not in ids, "se cuela la identidad de la otra tanda"
+    r2 = client.get(f"/api/cursos/{CUR_VESP}/asignaciones", headers=TOK["dir"])
+    ids2 = {f["asignatura_id"] for f in r2.json()["asignaciones"]}
+    assert A_OPT_VESP in ids2 and A_OPTATIVA not in ids2, ids2
+    # la propia va marcada como no editable
+    propia = [f for f in r.json()["asignaciones"] if f["asignatura_id"] == A_OPTATIVA][0]
+    assert propia.get("editable") is False, propia
+    assert propia.get("gestionado_por") == "salida_optativa", propia
+
+
+@test("§S3 Matutino NO puede crear la identidad dedicada de Vespertino: 400")
+def _():
+    _montar_optativas()
+    antes, antes_tot = foto(CUR_OPT), total_filas()
+    r = guardar(CUR_OPT, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P1, "asignatura_id": A_OPTATIVA},
+        {"profesor_id": U_P1, "asignatura_id": A_OPT_VESP},
+    ])
+    assert r.status_code == 400, (r.status_code, r.text[:300])
+    assert "Salida Optativa" in r.json().get("error", ""), r.json()
+    assert foto(CUR_OPT) == antes and total_filas() == antes_tot
+
+
+@test("§S4 Vespertino NO puede crear la identidad dedicada de Matutino: 400")
+def _():
+    _montar_optativas()
+    antes, antes_tot = foto(CUR_VESP), total_filas()
+    r = guardar(CUR_VESP, [
+        {"profesor_id": U_P2, "asignatura_id": A_OPT_VESP},
+        {"profesor_id": U_P2, "asignatura_id": A_OPTATIVA},
+    ])
+    assert r.status_code == 400, (r.status_code, r.text[:300])
+    assert foto(CUR_VESP) == antes and total_filas() == antes_tot
+
+
+@test("§S5 El docente de una optativa NO se cambia desde el endpoint generico")
+def _():
+    _montar_optativas()
+    antes, antes_tot = foto(CUR_OPT), total_filas()
+    r = guardar(CUR_OPT, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True},
+        {"profesor_id": U_P2, "asignatura_id": A_OPTATIVA},   # cambio de docente
+    ])
+    assert r.status_code == 400, (r.status_code, r.text[:300])
+    assert "Salida Optativa" in r.json().get("error", ""), r.json()
+    assert foto(CUR_OPT) == antes and total_filas() == antes_tot
+    d = SessionLocal()
+    try:
+        assert d.query(M.AsignacionProfesor).get(111).profesor_id == U_P1
+    finally:
+        d.close()
+
+
+@test("§S6 Omitir la optativa del payload generico CONSERVA su asignacion")
+def _():
+    _montar_optativas()
+    r = guardar(CUR_OPT, [
+        {"profesor_id": U_P1, "asignatura_id": A_LENGUA, "es_titular": True}])
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    j = r.json()
+    assert j["retiradas"] == 0, j
+    assert len(j["protegidas_salida_optativa"]) == 1, j
+    d = SessionLocal()
+    try:
+        assert d.query(M.AsignacionProfesor).get(111).activo is True
+    finally:
+        d.close()
+
+
+@test("§S7 Un mapeo LEGACY sobre una troncal NO bloquea la troncal")
+def _():
+    _montar_optativas()
+    # (CUR_OPT, A_LENGUA) tiene mapeo activo HCS-CS-4, pero Lengua es troncal.
+    # Debe verse en el GET, ser editable y poder cambiar de docente.
+    r = client.get(f"/api/cursos/{CUR_OPT}/asignaciones", headers=TOK["dir"])
+    lengua = [f for f in r.json()["asignaciones"] if f["asignatura_id"] == A_LENGUA]
+    assert lengua, "Lengua desaparecio del formulario"
+    assert lengua[0].get("editable") is not False, lengua[0]
+    assert "gestionado_por" not in lengua[0], lengua[0]
+    r = guardar(CUR_OPT, [
+        {"profesor_id": U_P2, "asignatura_id": A_LENGUA, "es_titular": True}])
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    j = r.json()
+    # alta del nuevo docente (creada O reactivada si ya existia inactiva) + baja
+    assert j["creadas"] + j["reactivadas"] == 1 and j["retiradas"] == 1, j
+    d = SessionLocal()
+    try:
+        assert d.query(M.AsignacionProfesor).filter_by(
+            curso_id=CUR_OPT, asignatura_id=A_LENGUA, activo=True
+        ).one().profesor_id == U_P2, "Lengua no cambio de docente"
+    finally:
+        d.close()
+    d = SessionLocal()
+    try:
+        assert d.query(M.AsignacionProfesor).get(111).activo is True, \
+            "la optativa real debe seguir protegida"
+    finally:
+        d.close()
+
+
+@test("§S8 Todos los rechazos de optativa dejan cero cambios")
+def _():
+    _montar_optativas()
+    antes_opt, antes_vesp = foto(CUR_OPT), foto(CUR_VESP)
+    antes_tot = total_filas()
+    for curso, payload in (
+            (CUR_OPT, [{"profesor_id": U_P1, "asignatura_id": A_OPT_VESP}]),
+            (CUR_VESP, [{"profesor_id": U_P2, "asignatura_id": A_OPTATIVA}]),
+            (CUR_OPT, [{"profesor_id": U_P2, "asignatura_id": A_OPTATIVA}])):
+        r = guardar(curso, payload)
+        assert r.status_code == 400, (curso, r.status_code, r.text[:200])
+    assert foto(CUR_OPT) == antes_opt, "cambio el curso matutino"
+    assert foto(CUR_VESP) == antes_vesp, "cambio el curso vespertino"
+    assert total_filas() == antes_tot
+
+
 @test("§ZZ sge.db del repo intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

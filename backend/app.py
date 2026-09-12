@@ -14600,32 +14600,96 @@ async def cargar_feriados_rd(request: Request, db: Session = Depends(get_db), cu
 
 # ============== ASIGNACIONES POR CURSO ==============
 
+def _identidades_optativas_del_colegio(db, colegio_id):
+    """Mapa asignatura_id -> (curso_id, componente_codigo) de las identidades
+    DEDICADAS de Salida Optativa que hoy estan mapeadas y activas.
+
+    Solo entran las que son identidad independiente: un mapeo LEGACY que apunta
+    a una troncal —HCS-LE-5 del curso 5 apunta a "Lengua Española"— no convierte
+    a esa troncal en una identidad dedicada, y Lengua debe seguir siendo
+    administrable con normalidad desde Asignaciones.
+
+    Se reutiliza `es_identidad_independiente` de R3.4 en lugar de reescribir la
+    regla, para que ambas envejezcan juntas.
+    """
+    import salida_optativa_docente as _doc
+
+    mapeos = db.query(CursoComponenteOptativo).filter(
+        CursoComponenteOptativo.colegio_id == colegio_id,
+        CursoComponenteOptativo.activo == True,  # noqa: E712
+    ).all()
+    if not mapeos:
+        return {}
+    asigs = {
+        a.id: a for a in db.query(Asignatura).filter(
+            Asignatura.colegio_id == colegio_id,
+            Asignatura.id.in_({m.asignatura_id for m in mapeos})).all()
+    }
+    return {
+        m.asignatura_id: (m.curso_id, m.componente_codigo)
+        for m in mapeos
+        if _doc.es_identidad_independiente(asigs.get(m.asignatura_id))
+    }
+
+
 @app.get("/api/cursos/{curso_id}/asignaciones")
 async def get_asignaciones_curso(curso_id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
-    """Obtener asignaciones de un curso (qué profesor da cada materia)"""
+    """Obtener asignaciones de un curso (qué profesor da cada materia).
+
+    SALIDA OPTATIVA — QUÉ SE MUESTRA Y QUÉ NO
+    -----------------------------------------
+    Esta pantalla listaba TODAS las asignaturas activas del colegio. Con R3.4 eso
+    se volvió una trampa: cada curso con Salida Optativa tiene identidades
+    DEDICADAS, y dos tandas pueden tener dos identidades distintas con el MISMO
+    nombre visible —"Apreciación y Producción Literarias" existe como id 19 en la
+    Vespertina y como id 21 en la Matutina—. En el formulario de un curso
+    aparecían las dos filas, con el mismo texto y sin nada que las distinguiera:
+    rellenar la equivocada asignaba la identidad de la otra tanda.
+
+    Ahora las identidades dedicadas de OTRO curso no se listan. La identidad se
+    decide por el mapeo persistido, nunca por el nombre.
+
+    La identidad dedicada del PROPIO curso sí se muestra —Dirección necesita ver
+    quién la imparte— pero marcada como no editable: se administra desde Salida
+    Optativa. El backend lo impone igualmente en el POST; esto es solo para que
+    la pantalla no ofrezca algo que va a rechazarse.
+
+    Una troncal alcanzada por un mapeo legacy NO se oculta ni se bloquea.
+    """
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(activo=True).order_by(Asignatura.nombre).all()
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso_id, activo=True).all()
-    
+
+    dedicadas = _identidades_optativas_del_colegio(db, current_user.colegio_id)
+
     # Crear mapa de asignatura -> profesor
     mapa = {a.asignatura_id: a for a in asignaciones}
-    
+
     resultado = []
     for asig in asignaturas:
+        _due = dedicadas.get(asig.id)
+        if _due is not None and _due[0] != curso.id:
+            continue          # identidad dedicada de OTRO curso/tanda
         asignacion = mapa.get(asig.id)
-        resultado.append({
+        fila = {
             'asignatura_id': asig.id,
             'asignatura': asig.nombre,
             'profesor_id': asignacion.profesor_id if asignacion else None,
             'profesor': asignacion.profesor.nombre_completo if asignacion and asignacion.profesor else None,
             'es_titular': asignacion.es_titular if asignacion else False
-        })
-    
+        }
+        if _due is not None:
+            fila['gestionado_por'] = 'salida_optativa'
+            fila['componente_codigo'] = _due[1]
+            fila['editable'] = False
+        resultado.append(fila)
+
     return {
         'curso': curso.nombre_completo,
         'curso_id': curso_id,
         'asignaciones': resultado
     }
+
 
 def _relacion_administrada_por_optativa(db, *, colegio_id, curso_id, asignatura_id):
     """PROVENANCE: ¿esta relación (curso, asignatura) la administra Salida Optativa?
@@ -14797,6 +14861,54 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
             return JSONResponse(
                 {'error': f'{profesor.nombre_completo} está inactivo'}, status_code=400)
 
+    # ── 1b. SALIDA OPTATIVA: esta pantalla no la administra ───────────────
+    # Dos vias distintas, las dos cerradas aqui y no solo en el frontend:
+    #
+    #   a) una identidad DEDICADA de OTRO curso/tanda no puede entrar. Dos
+    #      tandas pueden tener dos identidades con el MISMO nombre visible
+    #      ("Apreciación y Producción Literarias" es id 19 en una y 21 en otra);
+    #      la identidad se decide por el mapeo persistido, jamas por el nombre.
+    #
+    #   b) la identidad dedicada del PROPIO curso no cambia de docente desde
+    #      aqui. Se administra en Salida Optativa, que es donde R3.4 mantiene
+    #      la coherencia entre componente, asignatura y responsable.
+    #
+    # Una troncal alcanzada por un mapeo LEGACY no entra en ninguna de las dos:
+    # `_identidades_optativas_del_colegio` ya exige identidad independiente.
+    _dedicadas = _identidades_optativas_del_colegio(db, current_user.colegio_id)
+    if _dedicadas:
+        _actual_por_asig = {
+            a.asignatura_id: a for a in tenant_filter(
+                db.query(AsignacionProfesor), AsignacionProfesor, current_user
+            ).filter_by(curso_id=curso.id, activo=True).all()
+        }
+        for asignatura_id, info in deseado.items():
+            _due = _dedicadas.get(asignatura_id)
+            if _due is None:
+                continue
+            _asig = db.query(Asignatura).filter(
+                Asignatura.id == asignatura_id,
+                Asignatura.colegio_id == current_user.colegio_id).first()
+            _nombre = _asig.nombre if _asig else asignatura_id
+            if _due[0] != curso.id:
+                _otro = db.query(Curso).filter(
+                    Curso.id == _due[0],
+                    Curso.colegio_id == current_user.colegio_id).first()
+                return JSONResponse({
+                    'error': (f'"{_nombre}" es una materia de Salida Optativa de '
+                              f'{_otro.nombre_completo if _otro else "otro curso"} '
+                              f'({_due[1]}). No puede asignarse desde '
+                              f'{curso.nombre_completo}. Cada curso tiene su propia '
+                              f'identidad aunque el nombre coincida.')
+                }, status_code=400)
+            _vigente = _actual_por_asig.get(asignatura_id)
+            if _vigente is None or _vigente.profesor_id != info['profesor_id']:
+                return JSONResponse({
+                    'error': (f'"{_nombre}" es un componente de Salida Optativa de '
+                              f'este curso ({_due[1]}). Su docente se cambia desde '
+                              f'Salida Optativa, no desde Asignaciones.')
+                }, status_code=400)
+
     # ── 2. Estado actual del curso ────────────────────────────────────────
     actuales = tenant_filter(
         db.query(AsignacionProfesor), AsignacionProfesor, current_user
@@ -14857,6 +14969,36 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
             'horarios': _ids,
             'bloques': _det,
         }, status_code=409)
+
+    # ── 3b. TITULAR: un curso, un profesor titular ────────────────────────
+    # La unicidad es por PROFESOR dentro del CURSO, no por fila: si un docente
+    # imparte varias asignaturas aqui y varias de sus filas van marcadas,
+    # conceptualmente sigue habiendo UN titular. Lo que no puede quedar son dos
+    # profesor_id distintos como titulares del mismo curso.
+    #
+    # El alcance es SOLO este curso. Un profesor puede ser titular de 2do y de
+    # 5to a la vez, y guardar 2do jamas le quita la titularidad de 5to: nada
+    # aqui consulta ni escribe fuera de `curso.id`.
+    #
+    # Se valida el ESTADO RESULTANTE —lo que pide el payload mas las filas de
+    # Salida Optativa que se conservan— y ANTES de escribir nada.
+    _titulares = {info['profesor_id'] for info in quiere.values() if info['es_titular']}
+    _titulares |= {f.profesor_id for f, _m in protegidas_optativa if f.es_titular}
+    if len(_titulares) > 1:
+        _nombres = [
+            (u.nombre_completo if u else str(i)) for i, u in (
+                (i, db.query(Usuario).filter(
+                    Usuario.id == i,
+                    Usuario.colegio_id == current_user.colegio_id).first())
+                for i in sorted(_titulares))
+        ]
+        return JSONResponse({
+            'error': (f'{curso.nombre_completo} quedaria con {len(_titulares)} '
+                      f'profesores titulares: {", ".join(_nombres)}. Un curso solo '
+                      f'puede tener un titular. (Un mismo profesor si puede ser '
+                      f'titular de varios cursos.)'),
+            'titulares': sorted(_titulares),
+        }, status_code=400)
 
     # ── 4. Aplicar SOLO la diferencia ─────────────────────────────────────
     ano_activo = tenant_filter(

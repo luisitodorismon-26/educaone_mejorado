@@ -23,6 +23,16 @@ interface AsignacionCurso {
   profesor_id: number | null;
   profesor: string | null;
   es_titular: boolean;
+  /**
+   * Salida Optativa: el backend marca así las identidades dedicadas de ESTE
+   * curso. Se muestran —Dirección necesita ver quién las imparte— pero no se
+   * editan aquí: se administran desde Salida Optativa, y el backend rechaza el
+   * cambio igualmente. Las identidades dedicadas de OTRO curso ni siquiera
+   * llegan en la respuesta.
+   */
+  gestionado_por?: 'salida_optativa';
+  componente_codigo?: string;
+  editable?: boolean;
 }
 
 // v2.14.1: áreas oficiales del Nivel Primario (espejo del normalizador del
@@ -254,7 +264,11 @@ export const AsignacionesPage = () => {
                     <select
                       value={a.profesor_id || ''}
                       onChange={e => handleProfesorChange(a.asignatura_id, parseInt(e.target.value))}
-                      className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500"
+                      disabled={a.editable === false}
+                      title={a.editable === false
+                        ? 'Materia de Salida Optativa: se administra desde Salida Optativa'
+                        : undefined}
+                      className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:text-gray-500"
                     >
                       <option value="">-- Sin asignar --</option>
                       {profesores.map(p => (
@@ -267,7 +281,7 @@ export const AsignacionesPage = () => {
                       type="checkbox"
                       checked={a.es_titular}
                       onChange={e => handleTitularChange(a.asignatura_id, e.target.checked)}
-                      disabled={!a.profesor_id}
+                      disabled={!a.profesor_id || a.editable === false}
                       className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
                     />
                   </td>
