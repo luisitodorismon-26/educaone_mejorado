@@ -12078,6 +12078,14 @@ async def guardar_recuperacion_primaria(
     ).first()
     if not _tiene_rec:
         return JSONResponse({'error': 'No tienes asignada esta asignatura en el curso del estudiante.'}, status_code=403)
+    # Un estudiante retirado no recibe notas nuevas. Sus marcas previas se
+    # conservan; si Direccion quiere modificarlas, primero lo reactiva. Era la
+    # unica escritura academica que no lo comprobaba: las de calificaciones de
+    # primaria, de secundaria y de evaluacion extra ya lo hacen.
+    if not _est_rec.activo:
+        return JSONResponse(
+            {'error': 'Estudiante retirado: no se pueden registrar recuperaciones'},
+            status_code=403)
     if tipo not in ('final', 'especial'):
         return JSONResponse({'error': "El tipo debe ser 'final' o 'especial'"}, status_code=400)
 
