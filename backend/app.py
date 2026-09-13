@@ -55,7 +55,8 @@ from models import (
     HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
     ItemCompletivo, Notificacion,
     AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
-    AlertaAtendida, PushSubscription, CursoComponenteOptativo, init_db
+    AlertaAtendida, PushSubscription, CursoComponenteOptativo,
+    SesionNoImpartida, MOTIVOS_SESION_NO_IMPARTIDA, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -10518,6 +10519,16 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
             db, Asignatura, asignatura_id, current_user, name='asignatura'
         ).id
     
+    # S1 §7: esta clase no puede estar declarada NO IMPARTIDA en esta fecha.
+    # Nota: NO se consulta DiaNoLaborable aqui. Un feriado del calendario del
+    # centro sigue sin impedir pasar lista; solo lo impide la declaracion
+    # explicita del profesor sobre ESTA clase.
+    _s1 = _bloqueo_por_sesion_no_impartida(
+        db, colegio_id=estudiante.colegio_id, curso_id=estudiante.curso_id,
+        asignatura_id=asignatura_id, fecha=fecha)
+    if _s1:
+        return _s1
+
     # Buscar asistencia existente (por estudiante, fecha Y asignatura)
     query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
         estudiante_id=data['estudiante_id'],
@@ -10823,6 +10834,17 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     if primer_est and primer_est.curso_id:
         assert_nivel_curso_activo(db, current_user, primer_est.curso_id)
 
+    # S1 §7, igual que el alta individual. Se comprueba ANTES de escribir nada,
+    # para que el lote no entre a medias. El curso canonico es el del lote si
+    # vino, y si no el de los estudiantes, ya validados como del mismo curso.
+    _curso_s1 = curso.id if curso is not None else (
+        primer_est.curso_id if primer_est is not None else None)
+    _s1_lote = _bloqueo_por_sesion_no_impartida(
+        db, colegio_id=current_user.colegio_id, curso_id=_curso_s1,
+        asignatura_id=asignatura_id, fecha=fecha)
+    if _s1_lote:
+        return _s1_lote
+
     for item in asistencias:
         estudiante, estado_item = estudiantes_lote[int(item['estudiante_id'])]
         query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
@@ -10853,6 +10875,354 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     cache_clear(f'stats:{current_user.colegio_id}')
     cache_clear(f'dash_all:{current_user.id}')
     return {'message': 'Asistencia registrada'}
+
+
+# ============== SESIÓN NO IMPARTIDA (S1) ==============
+#
+# Una clase PROGRAMADA que no se dio, y por qué. En el Registro Escolar en papel
+# el maestro conserva la fecha en su columna y escribe la razón; esto es lo que
+# guarda esa razón. Ver `SesionNoImpartida` en models.py.
+#
+# S1 §3 — LOS FERIADOS NO SE CONECTAN SOLOS. `DiaNoLaborable` sigue siendo
+# información del calendario del centro y NO bloquea pasar asistencia: los
+# feriados precargados pueden no corresponder con lo que pasó de verdad, y
+# obligar por ellos impediría pasar lista un día en que sí hubo clase. Si un
+# feriado dejó sin clase a un curso, el profesor lo registra aquí con motivo
+# FERIADO, igual que cualquier otro motivo.
+
+_DIAS_SEMANA_S1 = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes',
+                   'Sábado', 'Domingo']
+
+
+def _sesion_no_impartida_vigente(db, *, colegio_id, curso_id, asignatura_id, fecha):
+    """La justificación ACTIVA de esa clase en esa fecha, o None."""
+    if not (colegio_id and curso_id and asignatura_id and fecha):
+        return None
+    return db.query(SesionNoImpartida).filter(
+        SesionNoImpartida.colegio_id == colegio_id,
+        SesionNoImpartida.curso_id == curso_id,
+        SesionNoImpartida.asignatura_id == asignatura_id,
+        SesionNoImpartida.fecha == fecha,
+        SesionNoImpartida.activo == True,  # noqa: E712
+    ).first()
+
+
+def _bloqueo_por_sesion_no_impartida(db, *, colegio_id, curso_id, asignatura_id, fecha):
+    """
+    S1 §7, dirección B: no se pasa lista de una clase declarada no impartida.
+
+    Devuelve un JSONResponse 409 o None. La salida del conflicto es retirar la
+    justificación, no borrarla por detrás: quien declaró que no hubo clase debe
+    ser quien se desdiga.
+
+    En Primaria `asignatura_id` es NULL y esta función no aplica; S1 es de
+    Secundaria, donde la asistencia es por materia.
+    """
+    sesion = _sesion_no_impartida_vigente(
+        db, colegio_id=colegio_id, curso_id=curso_id,
+        asignatura_id=asignatura_id, fecha=fecha)
+    if sesion is None:
+        return None
+    return JSONResponse({
+        'error': ('Esta clase está registrada como NO IMPARTIDA el '
+                  f'{fecha.isoformat()} ({sesion.motivo_nombre}). '
+                  'No se puede pasar lista.'),
+        'sesion_no_impartida_id': sesion.id,
+        'motivo_codigo': sesion.motivo_codigo,
+        'motivo': sesion.motivo_nombre,
+        'hint': ('Si sí hubo clase ese día, retire primero la justificación '
+                 'desde el botón "No hubo clase" de esa fecha.'),
+    }, status_code=409)
+
+
+@app.get("/api/sesiones-no-impartidas/motivos")
+async def get_motivos_sesion_no_impartida(
+        request: Request,
+        current_user: Usuario = Depends(get_current_user)):
+    """Catálogo cerrado de motivos. La UI no inventa opciones."""
+    return [{'codigo': c, 'nombre': v['nombre'], 'etiqueta': v['etiqueta'],
+             'requiere_detalle': c == 'OTRO'}
+            for c, v in MOTIVOS_SESION_NO_IMPARTIDA.items()]
+
+
+@app.get("/api/sesiones-no-impartidas")
+async def get_sesiones_no_impartidas(
+        request: Request, db: Session = Depends(get_db),
+        current_user: Usuario = Depends(
+            RolesRequired('profesor', 'direccion', 'coordinador'))):
+    """
+    Justificaciones de un curso/asignatura en un rango de fechas.
+
+    El profesor ve las de SUS clases —mismo criterio de aislamiento que los
+    reportes de conducta—; dirección y coordinación ven las del colegio.
+    """
+    q = tenant_filter(db.query(SesionNoImpartida), SesionNoImpartida, current_user)
+    if current_user.role == 'profesor':
+        q = q.filter(SesionNoImpartida.profesor_id == current_user.id)
+
+    for campo, columna in (('curso_id', SesionNoImpartida.curso_id),
+                           ('asignatura_id', SesionNoImpartida.asignatura_id)):
+        crudo = request.query_params.get(campo)
+        if crudo:
+            try:
+                q = q.filter(columna == int(crudo))
+            except (TypeError, ValueError):
+                return JSONResponse({'error': f'{campo} inválido: {crudo!r}'},
+                                    status_code=400)
+
+    for campo, op in (('desde', SesionNoImpartida.fecha.__ge__),
+                      ('hasta', SesionNoImpartida.fecha.__le__)):
+        crudo = request.query_params.get(campo)
+        if crudo:
+            try:
+                q = q.filter(op(datetime.strptime(crudo, '%Y-%m-%d').date()))
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {'error': f'{campo} inválida: {crudo!r}. Formato esperado: YYYY-MM-DD'},
+                    status_code=400)
+
+    if request.query_params.get('incluir_retiradas') not in ('1', 'true', 'True'):
+        q = q.filter(SesionNoImpartida.activo == True)  # noqa: E712
+
+    return [s.to_dict()
+            for s in q.order_by(SesionNoImpartida.fecha.desc()).limit(500).all()]
+
+
+@app.post("/api/sesiones-no-impartidas")
+async def crear_sesion_no_impartida(
+        request: Request, db: Session = Depends(get_db),
+        current_user: Usuario = Depends(get_current_user)):
+    """
+    El profesor declara que una sesión programada no se impartió.
+
+    S1 §5 — SE VALIDA QUE LA SESIÓN EXISTA Y SEA SUYA. `horario_id` no es una FK
+    destructiva, así que la coherencia se comprueba aquí y se congela en los
+    snapshots: mismo colegio, el bloque existe, y su profesor, curso, asignatura
+    y día coinciden con lo que se está declarando. Sin esto, `horario_id` sería
+    un número que nadie garantiza.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido (se espera JSON)'}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({'error': 'Body debe ser un objeto JSON'}, status_code=400)
+
+    curso_id = data.get('curso_id')
+    asignatura_id = data.get('asignatura_id')
+    if not curso_id or not asignatura_id:
+        return JSONResponse(
+            {'error': 'curso_id y asignatura_id son requeridos'}, status_code=400)
+
+    motivo_codigo = (data.get('motivo_codigo') or '').strip().upper()
+    if motivo_codigo not in MOTIVOS_SESION_NO_IMPARTIDA:
+        return JSONResponse({
+            'error': f'motivo_codigo inválido: {data.get("motivo_codigo")!r}',
+            'validos': sorted(MOTIVOS_SESION_NO_IMPARTIDA),
+        }, status_code=400)
+    motivo_detalle = (data.get('motivo_detalle') or '').strip() or None
+    # "OTRO" sin explicación deja el Registro sin información: la etiqueta
+    # impresa diría OTRO y no habría nada más en ningún lado.
+    if motivo_codigo == 'OTRO' and not motivo_detalle:
+        return JSONResponse(
+            {'error': 'Con motivo OTRO debe escribir el detalle.'}, status_code=400)
+    if motivo_detalle and len(motivo_detalle) > 255:
+        motivo_detalle = motivo_detalle[:255]
+
+    fecha_str = data.get('fecha') or today_rd().isoformat()
+    try:
+        fecha = datetime.strptime(fecha_str, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return JSONResponse(
+            {'error': f"fecha inválida: {fecha_str!r}. Formato esperado: YYYY-MM-DD"},
+            status_code=400)
+    # Mismo rango que la asistencia: no se justifica el futuro, y una fecha de
+    # hace cinco años es un error de captura. La tolerancia de un día absorbe la
+    # diferencia de huso entre el navegador y el servidor.
+    hoy = today_rd()
+    if (fecha - hoy).days > 1:
+        return JSONResponse(
+            {'error': f'No se puede justificar una fecha futura ({fecha.isoformat()})'},
+            status_code=400)
+    if (hoy - fecha).days > 365 * 5:
+        return JSONResponse(
+            {'error': f'La fecha es demasiado antigua ({fecha.isoformat()}).'},
+            status_code=400)
+
+    # Misma autorización que pasar lista: rol profesor, curso y asignatura del
+    # colegio, y AsignacionProfesor ACTIVA sobre (curso, asignatura). Quien no
+    # puede pasar lista de una clase tampoco puede declarar que no la dio.
+    _ctx, _err = _guard_asistencia(db, current_user, curso_id=curso_id,
+                                   asignatura_id=asignatura_id)
+    if _err:
+        return _err
+    curso, asignatura = _ctx['curso'], _ctx['asignatura']
+    if _ctx['nivel'] != 'secundaria':
+        return JSONResponse({
+            'error': ('Por ahora solo Secundaria registra sesiones no impartidas. '
+                      'En Primaria la asistencia es del curso, no de la materia.'),
+        }, status_code=400)
+
+    _guard_div = validar_nivel_escritura(db, current_user, curso_id=curso.id)
+    if _guard_div:
+        return _guard_div
+
+    # --- el bloque programado -------------------------------------------------
+    dia_nombre = _DIAS_SEMANA_S1[fecha.weekday()]
+    bloques = tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.profesor_id == current_user.id,
+        Horario.curso_id == curso.id,
+        Horario.asignatura_id == asignatura.id,
+        Horario.dia == dia_nombre,
+        Horario.activo == True,  # noqa: E712
+        or_(Horario.tipo_bloque == 'clase', Horario.tipo_bloque.is_(None)),
+    ).order_by(Horario.hora_inicio).all()
+
+    horario = None
+    if data.get('horario_id'):
+        try:
+            pedido = int(data['horario_id'])
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'horario_id inválido'}, status_code=400)
+        horario = next((b for b in bloques if b.id == pedido), None)
+        if horario is None:
+            # Puede no existir, ser de otro colegio, o existir y no ser suyo /
+            # no ser de esta clase / no caer ese día. Todas son la misma cosa
+            # desde fuera: ese bloque no es la sesión que se está declarando.
+            return JSONResponse({
+                'error': ('El bloque de horario indicado no corresponde a esta clase '
+                          f'en {dia_nombre.lower()}.'),
+                'horario_id': pedido,
+                'bloques_validos': [{'id': b.id, 'hora_inicio': b.hora_inicio,
+                                     'hora_fin': b.hora_fin} for b in bloques],
+            }, status_code=409)
+    elif len(bloques) == 1:
+        horario = bloques[0]
+    elif len(bloques) > 1:
+        # Dos bloques de la misma materia ese día: el profesor elige cuál. La
+        # fecha se justifica una sola vez, pero el snapshot debe decir cuál era.
+        return JSONResponse({
+            'error': f'Hay {len(bloques)} bloques de esta clase en {dia_nombre.lower()}. '
+                     'Indique cuál con horario_id.',
+            'bloques_validos': [{'id': b.id, 'hora_inicio': b.hora_inicio,
+                                 'hora_fin': b.hora_fin} for b in bloques],
+        }, status_code=400)
+
+    if horario is None:
+        return JSONResponse({
+            'error': (f'Esta clase no tiene sesión programada los {dia_nombre.lower()}. '
+                      'Solo se justifica una sesión que estaba prevista.'),
+            'fecha': fecha.isoformat(),
+            'dia': dia_nombre,
+        }, status_code=409)
+
+    # --- S1 §7, dirección A: no conviven con asistencia ----------------------
+    marcas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+        Asistencia.curso_id == curso.id,
+        Asistencia.asignatura_id == asignatura.id,
+        Asistencia.fecha == fecha,
+    ).count()
+    if marcas:
+        return JSONResponse({
+            'error': (f'Esta clase ya tiene {marcas} marca(s) de asistencia el '
+                      f'{fecha.isoformat()}. Una sesión no puede estar impartida y '
+                      'no impartida a la vez.'),
+            'asistencias': marcas,
+            'hint': 'Si la clase no se dio, elimine primero esas marcas de asistencia.',
+        }, status_code=409)
+
+    # --- alta o reactivación --------------------------------------------------
+    # Una justificación retirada se REACTIVA en lugar de insertarse de nuevo: la
+    # llave única es (colegio, fecha, curso, asignatura) y un INSERT chocaría con
+    # la fila retirada. Mismo patrón que la reconciliación de asignaciones.
+    sesion = db.query(SesionNoImpartida).filter(
+        SesionNoImpartida.colegio_id == curso.colegio_id,
+        SesionNoImpartida.curso_id == curso.id,
+        SesionNoImpartida.asignatura_id == asignatura.id,
+        SesionNoImpartida.fecha == fecha,
+    ).first()
+    reactivada = False
+    if sesion is not None and sesion.activo:
+        return JSONResponse({
+            'error': (f'Esta clase ya está justificada el {fecha.isoformat()} '
+                      f'({sesion.motivo_nombre}).'),
+            'sesion_no_impartida_id': sesion.id,
+            'hint': 'Retire la justificación existente si quiere cambiar el motivo.',
+        }, status_code=409)
+    if sesion is None:
+        sesion = SesionNoImpartida(colegio_id=curso.colegio_id, fecha=fecha,
+                                   curso_id=curso.id, asignatura_id=asignatura.id)
+        db.add(sesion)
+    else:
+        reactivada = True
+        sesion.retirado_por = None
+        sesion.fecha_retiro = None
+
+    sesion.profesor_id = current_user.id
+    sesion.horario_id = horario.id
+    sesion.dia_semana_snapshot = horario.dia
+    sesion.hora_inicio_snapshot = horario.hora_inicio
+    sesion.hora_fin_snapshot = horario.hora_fin
+    sesion.motivo_codigo = motivo_codigo
+    sesion.motivo_detalle = motivo_detalle
+    sesion.registrado_por = current_user.id
+    sesion.fecha_registro = now_rd()
+    sesion.activo = True
+
+    db.add(LogAuditoria(
+        colegio_id=curso.colegio_id, usuario_id=current_user.id,
+        accion='sesion_no_impartida_registrada', entidad='SesionNoImpartida',
+        detalles=(f'{fecha.isoformat()} curso={curso.id} asignatura={asignatura.id} '
+                  f'motivo={motivo_codigo}')))
+    db.commit()
+    cache_clear_tenant(curso.colegio_id)
+    return {'message': 'Sesión registrada como no impartida',
+            'reactivada': reactivada, 'sesion': sesion.to_dict()}
+
+
+@app.delete("/api/sesiones-no-impartidas/{sesion_id}")
+async def retirar_sesion_no_impartida(
+        sesion_id: int, request: Request, db: Session = Depends(get_db),
+        current_user: Usuario = Depends(
+            RolesRequired('profesor', 'direccion'))):
+    """
+    Retira una justificación: la clase vuelve a poder recibir asistencia.
+
+    No borra la fila. La justificación existió, alguien la puso y alguien la
+    quitó, y el Registro de auditoría tiene que poder decir eso.
+    """
+    sesion = get_tenant_or_404(db, SesionNoImpartida, sesion_id, current_user,
+                               name='sesionnoimpartida')
+    # El profesor solo retira las suyas, y solo mientras siga siendo el profesor
+    # de esa clase. Dirección puede retirar cualquiera de su colegio.
+    if current_user.role == 'profesor':
+        if sesion.profesor_id != current_user.id:
+            raise HTTPException(status_code=404, detail='sesionnoimpartida no encontrada')
+        tiene = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor,
+                              current_user).filter_by(
+            profesor_id=current_user.id, curso_id=sesion.curso_id,
+            asignatura_id=sesion.asignatura_id, activo=True).first()
+        if not tiene:
+            return JSONResponse({
+                'error': 'Ya no tiene asignada esta clase. Pida a Dirección que la retire.'
+            }, status_code=403)
+
+    if not sesion.activo:
+        return {'message': 'La justificación ya estaba retirada',
+                'sesion': sesion.to_dict()}
+
+    sesion.activo = False
+    sesion.retirado_por = current_user.id
+    sesion.fecha_retiro = now_rd()
+    db.add(LogAuditoria(
+        colegio_id=sesion.colegio_id, usuario_id=current_user.id,
+        accion='sesion_no_impartida_retirada', entidad='SesionNoImpartida',
+        entidad_id=sesion.id,
+        detalles=(f'{sesion.fecha.isoformat() if sesion.fecha else "?"} '
+                  f'curso={sesion.curso_id} asignatura={sesion.asignatura_id}')))
+    db.commit()
+    cache_clear_tenant(sesion.colegio_id)
+    return {'message': 'Justificación retirada', 'sesion': sesion.to_dict()}
 
 
 # ============== HISTORIAL DE COMUNICACIONES A PADRES ==============
