@@ -11264,7 +11264,16 @@ async def registrar_comunicacion_padres(request: Request, db: Session = Depends(
 @app.get("/api/comunicacion-padres/estudiante/{estudiante_id}")
 async def get_historial_comunicaciones(estudiante_id, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Obtener historial de comunicaciones de un estudiante"""
-    
+    # Lo que el centro le dijo a una familia —incluidas las comunicaciones de
+    # psicologia y direccion— no es de cualquier profesor: solo de los suyos.
+    # Direccion, coordinacion y psicologia no se ven afectados por esta guarda.
+    _est_com = get_tenant_or_404(db, Estudiante, estudiante_id, current_user,
+                                 name='estudiante')
+    _guard_com = guard_profesor_curso(db, current_user, _est_com.curso_id,
+                                      que='ese historial de comunicaciones')
+    if _guard_com:
+        return _guard_com
+
     comunicaciones = tenant_filter(db.query(HistorialComunicacionPadres), HistorialComunicacionPadres, current_user).filter_by(
         estudiante_id=estudiante_id
     ).order_by(HistorialComunicacionPadres.fecha_envio.desc()).all()
@@ -13021,7 +13030,14 @@ async def get_progreso_estudiante(id, db: Session = Depends(get_db), current_use
 async def get_historial_estudiante(id, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Historial completo del estudiante: académico, conducta, asistencia, psicología"""
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
-    
+
+    # Este endpoint devuelve datos personales y de contacto de la familia ademas
+    # del expediente academico; un profesor solo lo ve de sus cursos asignados.
+    _guard_hist = guard_profesor_curso(db, current_user, estudiante.curso_id,
+                                       que='ese historial')
+    if _guard_hist:
+        return _guard_hist
+
     # === DATOS PERSONALES ===
     datos_personales = {
         'id': estudiante.id,
@@ -13244,6 +13260,14 @@ async def get_reporte_notas_periodo(estudiante_id, periodo, db: Session = Depend
         return JSONResponse({'error': 'Período inválido'}, status_code=400)
     
     estudiante = get_tenant_or_404(db, Estudiante, estudiante_id, current_user, name='estudiante')
+
+    # Un profesor solo consulta las notas de sus cursos asignados. Misma guarda
+    # que el boletin hermano, que ya la lleva desde v2.19.3-A.
+    _guard_notas = guard_profesor_curso(db, current_user, estudiante.curso_id,
+                                        que='ese reporte de notas')
+    if _guard_notas:
+        return _guard_notas
+
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano_escolar = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     
@@ -14078,6 +14102,15 @@ async def get_calificaciones_por_materia(request: Request, db: Session = Depends
         return JSONResponse({'error': 'Curso requerido'}, status_code=400)
     
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+
+    # `curso_id` llega del cliente: sin esta guarda, un profesor podia pedir
+    # cualquier curso del colegio y recibir todas las materias de todos sus
+    # estudiantes, incluidas las que no imparte.
+    _guard_pm = guard_profesor_curso(db, current_user, curso.id,
+                                     que='las notas de ese curso')
+    if _guard_pm:
+        return _guard_pm
+
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso_id, activo=True).order_by(Estudiante.no_lista).all()
     asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(activo=True).all()
     
@@ -14181,7 +14214,15 @@ async def get_calificaciones_por_periodo(request: Request, db: Session = Depends
         return JSONResponse({'error': 'Curso requerido'}, status_code=400)
     if periodo < 1 or periodo > 4:
         return JSONResponse({'error': 'Período inválido'}, status_code=400)
-    
+
+    # Igual que `/por-materia`: el curso lo elige el cliente, asi que se
+    # comprueba que sea del profesor antes de devolver el curso entero.
+    curso_pp = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    _guard_pp = guard_profesor_curso(db, current_user, curso_pp.id,
+                                     que='las notas de ese curso')
+    if _guard_pp:
+        return _guard_pp
+
     return get_calificaciones_periodo(db, current_user, curso_id, periodo)
 
 
