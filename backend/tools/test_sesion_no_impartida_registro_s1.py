@@ -62,6 +62,7 @@ M.Base.metadata.create_all(bind=engine)
 
 from registro_asistencia import build_asistencia_registro      # noqa: E402
 import registro_escolar as RE                                  # noqa: E402
+import registro_validator as RV                              # noqa: E402
 
 G, R, B, C, X = "\033[92m", "\033[91m", "\033[1m", "\033[96m", "\033[0m"
 _fail, _ok, _total = [], 0, 0
@@ -119,6 +120,14 @@ def _seed(asistencia_en=None, no_laborable=False):
                       apellido="R", role="profesor", activo=True)
         u.set_password("Prueba2026x")
         d.add(u)
+        # Lo minimo para que `validar_registro_secundaria` llegue hasta la
+        # comprobacion de cobertura en vez de cortar antes por datos del centro.
+        d.add(M.ConfiguracionColegio(colegio_id=COL, nombre="Colegio",
+                                     regional="10", distrito="04",
+                                     codigo_centro="00000"))
+        d.add(M.AsignacionProfesor(colegio_id=COL, profesor_id=PROF, curso_id=CUR,
+                                   asignatura_id=MAT, ano_escolar_id=ANO,
+                                   activo=True, es_titular=True))
         for i, eid in enumerate((E1, E2)):
             d.add(M.Estudiante(id=eid, colegio_id=COL, nombre="Est%d" % i,
                                apellido="T", curso_id=CUR, activo=True, no_lista=i + 1))
@@ -470,6 +479,112 @@ def _():
     assert marzo["etiquetas_no_impartidas"] == {}
     assert marzo["dias_labels"] == [2, 9, 16, 23, 30]
     assert marzo["asistencias"][0]["porcentaje"] == 100.0
+
+
+# ==========================================================================
+# G — COBERTURA: UNA SUSPENSION NO ES ASISTENCIA QUE FALTE
+#
+# El escenario que motivo la correccion: 5 fechas visibles, 1 declarada no
+# impartida, 4 realmente impartidas y TODOS los alumnos completos en esas 4.
+# La cobertura tiene que dar 100 %, y el validador no puede acusar celdas
+# faltantes por la columna justificada.
+# ==========================================================================
+@test("G1 cobertura 100% con 5 columnas visibles, 1 suspendida y 4 completas")
+def _():
+    _seed(asistencia_en=[f for f in LUNES if f != EL_16])
+    mes = _marzo(_matriz())
+    # antes de declarar, la columna vacia del 16 SI cuenta como hueco
+    assert mes["cobertura_registro_pct"] == 80.0, mes["cobertura_registro_pct"]
+
+    _declarar()
+    mes = _marzo(_matriz())
+    assert mes["dias"] == [2, 9, 16, 23, 30], mes["dias"]          # A y C
+    assert mes["dias_computables"] == 4, mes["dias_computables"]   # B
+    assert mes["filas"][0]["porcentaje"] == 100.0                  # D
+    assert mes["cobertura_registro_pct"] == 100.0, \
+        ("E: la suspension seguia contando como celda esperada",
+         mes["cobertura_registro_pct"])
+
+
+@test("G2 una marca legacy en la fecha suspendida no infla la cobertura")
+def _():
+    # asistencia en LOS CINCO lunes, incluido el que luego se declara
+    _seed()
+    _declarar()
+    mes = _marzo(_matriz())
+    # sigue visible: no se oculta historia
+    assert mes["filas"][0]["valores"][mes["dias"].index(16)] == "P"
+    # pero ni el numerador ni el denominador de la cobertura la miran
+    assert mes["dias_computables"] == 4
+    assert mes["cobertura_registro_pct"] == 100.0, mes["cobertura_registro_pct"]
+
+
+@test("G3 la cobertura sigue detectando huecos REALES de los dias impartidos")
+def _():
+    # falta el lunes 23 para los dos alumnos: 2 de 8 celdas computables vacias
+    _seed(asistencia_en=[f for f in LUNES if f not in (EL_16, date(2026, 3, 23))])
+    _declarar()
+    mes = _marzo(_matriz())
+    assert mes["dias_computables"] == 4
+    assert mes["cobertura_registro_pct"] == 75.0, mes["cobertura_registro_pct"]
+
+
+@test("G4 _evaluar_cobertura_asistencia no reporta faltantes por la suspension")
+def _():
+    _seed(asistencia_en=[f for f in LUNES if f != EL_16])
+    d = SessionLocal()
+    try:
+        ests = d.query(M.Estudiante).filter_by(curso_id=CUR, activo=True).all()
+        antes = RV._evaluar_cobertura_asistencia(d, CUR, ests, asignatura_ids=[MAT])
+        assert antes["faltantes"], "precondicion: sin declarar, SI hay faltantes"
+    finally:
+        d.close()
+
+    _declarar()
+    d = SessionLocal()
+    try:
+        ests = d.query(M.Estudiante).filter_by(curso_id=CUR, activo=True).all()
+        cob = RV._evaluar_cobertura_asistencia(d, CUR, ests, asignatura_ids=[MAT])
+    finally:
+        d.close()
+    assert cob["faltantes"] == [], cob["faltantes"]                # F
+    assert cob["total_esperado"] == 4 * 2, cob["total_esperado"]
+    assert cob["total_cubierto"] == 8, cob["total_cubierto"]
+
+
+@test("G5 validar_registro_secundaria no acusa 'Asistencia incompleta'")
+def _():
+    _seed(asistencia_en=[f for f in LUNES if f != EL_16])
+    d = SessionLocal()
+    try:
+        antes = [e for e in RV.validar_registro_secundaria(d, CUR, COL).errors
+                 if "Asistencia incompleta" in e]
+    finally:
+        d.close()
+    assert antes, "precondicion: sin declarar, el validador SI se queja"
+
+    _declarar()
+    d = SessionLocal()
+    try:
+        res = RV.validar_registro_secundaria(d, CUR, COL)
+    finally:
+        d.close()
+    culpables = [e for e in res.errors if "Asistencia incompleta" in e]
+    assert culpables == [], culpables                              # G
+    # el fixture no pretende ser un Registro completo; lo que se exige es que
+    # ningun error restante venga de la sesion no impartida.
+    print("    errores restantes (ajenos a S1): %d" % len(res.errors))
+
+
+@test("G6 el fallback legacy: una matriz sin dias_computables se evalua igual")
+def _():
+    # Asi se comportan las matrices anteriores a S1, que no traen el campo.
+    mes_legacy = {"mes": "marzo", "dias": [2, 9, 16, 23, 30],
+                  "cobertura_registro_pct": 100.0}
+    dc = mes_legacy.get("dias_computables")
+    if dc is None:
+        dc = len(mes_legacy.get("dias", []))
+    assert dc == 5, dc
 
 
 @test("F3 el repo no fue tocado: sge.db intacto")

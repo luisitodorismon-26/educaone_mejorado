@@ -272,9 +272,14 @@ def build_asistencia_registro(
         sesiones_mes = {f.day: sesion for f, sesion in no_impartidas.items()
                         if f.month == mes_num and f.day in set(dias_unicos)}
         dias_no_impartidos = sorted(sesiones_mes)
+        dias_computables = len(dias_unicos) - len(dias_no_impartidos)
 
         filas = []
-        celdas_esperadas = len(dias_unicos) * len(estudiantes)
+        # S1 — LA COBERTURA ES DE LO QUE SE IMPARTIO. Una columna justificada no
+        # tiene que llenarse: contarla como celda esperada haria que el validador
+        # pidiera asistencia de una clase que no se dio, que es justo lo que S1
+        # viene a evitar.
+        celdas_esperadas = dias_computables * len(estudiantes)
         celdas_con_registro = 0
 
         for est in estudiantes:
@@ -285,22 +290,22 @@ def build_asistencia_registro(
             for dia in dias_unicos:
                 codigo = por_mes.get(mes_num, {}).get(dia, {}).get(est.id, '')
                 valores.append(codigo)
-                if codigo:
-                    celdas_con_registro += 1
-                # S1 — UN DIA NO IMPARTIDO NO CUENTA PARA NADIE. No entra en el
-                # numerador ni en el denominador: si no hubo clase, nadie estuvo
-                # presente y nadie falto. El valor de la celda se conserva tal
-                # cual esta en la base —no se oculta nada— pero no se suma.
-                # La escritura de asistencia sobre una sesion declarada ya esta
-                # cerrada en app.py; esto cubre lo que pudiera venir de antes.
+                # S1 — UN DIA NO IMPARTIDO NO CUENTA PARA NADIE. Queda fuera del
+                # numerador, del denominador y de la cobertura: si no hubo clase,
+                # nadie estuvo presente, nadie falto y no hay nada que capturar.
+                # El valor de la celda se conserva tal cual esta en la base —no se
+                # oculta historia— pero no se suma en ningun conteo. La escritura
+                # de asistencia sobre una sesion declarada ya esta cerrada en
+                # app.py; esto cubre lo que pudiera venir de antes.
                 if dia in sesiones_mes:
                     continue
+                if codigo:
+                    celdas_con_registro += 1
                 if codigo == 'P':
                     presentes += 1
                 elif codigo == 'A':
                     ausentes += 1
 
-            dias_computables = len(dias_unicos) - len(dias_no_impartidos)
             porcentaje = round((presentes / dias_computables) * 100, 1) if dias_computables > 0 else 0.0
             filas.append({
                 'no': est_index[est.id],
@@ -322,7 +327,7 @@ def build_asistencia_registro(
             # del PDF depende de el— y `dias_computables` es el denominador del
             # porcentaje. Antes de S1 eran el mismo numero y lo siguen siendo en
             # cuanto no hay ninguna sesion declarada.
-            'dias_computables': len(dias_unicos) - len(dias_no_impartidos),
+            'dias_computables': dias_computables,
             'dias_no_impartidos': dias_no_impartidos,
             'no_impartidas': {
                 dia: {
