@@ -2702,21 +2702,107 @@ async def clonar_cursos_ano(id, request: Request, db: Session = Depends(get_db),
     }
 
 
+# Los campos de fecha que este endpoint acepta. `fecha_inicio` y `fecha_fin`
+# faltaban: la pantalla de Configuración los mostraba y los enviaba, y aquí se
+# descartaban en silencio mientras la respuesta decía "actualizado". Dirección
+# podía corregirlos, ver el mensaje de éxito y no haber cambiado nada.
+_CAMPOS_FECHA_ANO = (
+    'fecha_inicio', 'fecha_fin',
+    'p1_inicio', 'p1_fin', 'p2_inicio', 'p2_fin',
+    'p3_inicio', 'p3_fin', 'p4_inicio', 'p4_fin',
+)
+
+
 @app.put("/api/ano-escolar/{id}")
 async def update_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Edita el año escolar del colegio: nombre, fechas del año y fechas de P1-P4.
+
+    CADA COLEGIO PONE SUS PROPIAS FECHAS. EducaOne es multi-colegio: un centro
+    público puede seguir el calendario del Ministerio y uno privado tener el
+    suyo, así que aquí no se impone ningún calendario ni se comparan las fechas
+    de un colegio con las de otro. Lo único que se exige es coherencia interna:
+    que el año no termine antes de empezar.
+
+    TODO SE VALIDA ANTES DE ESCRIBIR NADA. Un payload con una fecha inválida
+    deja la fila exactamente como estaba, incluidos los campos que sí eran
+    válidos: no hay actualizaciones a medias.
+    """
     ano = get_tenant_or_404(db, AnoEscolar, id, current_user, name='anoescolar')
-    data = await request.json()
-    
-    for campo in ['nombre', 'p1_inicio', 'p1_fin', 'p2_inicio', 'p2_fin',
-                  'p3_inicio', 'p3_fin', 'p4_inicio', 'p4_fin']:
-        if campo in data:
-            if 'inicio' in campo or 'fin' in campo:
-                setattr(ano, campo, datetime.strptime(data[campo], '%Y-%m-%d').date() if data[campo] else None)
-            else:
-                setattr(ano, campo, data[campo])
-    
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido (se espera JSON)'}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({'error': 'Body debe ser un objeto JSON'}, status_code=400)
+
+    # --- 1) parsear, sin tocar el modelo todavía ---------------------------
+    pendientes = {}
+    for campo in _CAMPOS_FECHA_ANO:
+        if campo not in data:
+            continue
+        crudo = data[campo]
+        if crudo in (None, ''):
+            # Se conserva la semántica de siempre: vaciar una fecha es válido y
+            # el modelo las admite NULL. No se inventa ninguna obligatoriedad.
+            pendientes[campo] = None
+            continue
+        try:
+            pendientes[campo] = datetime.strptime(str(crudo), '%Y-%m-%d').date()
+        except (ValueError, TypeError):
+            return JSONResponse({
+                'error': f'{campo} inválida: {crudo!r}. Formato esperado: YYYY-MM-DD',
+            }, status_code=400)
+
+    if 'nombre' in data:
+        nombre = (data['nombre'] or '').strip()
+        if not nombre:
+            return JSONResponse({'error': 'El nombre del año escolar no puede quedar vacío'},
+                                status_code=400)
+        pendientes['nombre'] = nombre
+
+    # --- 2) coherencia del rango, sobre los valores EFECTIVOS ---------------
+    # El body puede traer solo una de las dos fechas; la que no viene es la que
+    # ya está guardada, así que se compara contra ella y no contra None.
+    efectivo_inicio = pendientes.get('fecha_inicio', ano.fecha_inicio)
+    efectivo_fin = pendientes.get('fecha_fin', ano.fecha_fin)
+    if efectivo_inicio and efectivo_fin and efectivo_inicio >= efectivo_fin:
+        return JSONResponse({
+            'error': ('La fecha de inicio debe ser anterior a la de fin '
+                      f'(inicio {efectivo_inicio.isoformat()}, fin {efectivo_fin.isoformat()}).'),
+        }, status_code=400)
+
+    if not pendientes:
+        return {'message': 'Sin cambios', 'ano_escolar_id': ano.id}
+
+    # --- 3) aplicar, ya sin nada que pueda fallar ---------------------------
+    def _valor(v):
+        return v.isoformat() if hasattr(v, 'isoformat') else v
+
+    antes, despues = {}, {}
+    for campo, valor in pendientes.items():
+        actual = getattr(ano, campo, None)
+        if actual == valor:
+            continue                      # no se registra lo que no cambió
+        antes[campo] = _valor(actual)
+        despues[campo] = _valor(valor)
+        setattr(ano, campo, valor)
+
+    if not despues:
+        return {'message': 'Sin cambios', 'ano_escolar_id': ano.id}
+
+    log_auditoria(db, 'ACTUALIZAR_ANO_ESCOLAR', 'ano_escolar', ano.id,
+                  antes, despues, user=current_user, request=request)
     db.commit()
-    return {'message': 'Año escolar actualizado'}
+    # El rango del año alimenta la rejilla del Registro y el denominador de la
+    # asistencia, ambos cacheados por tenant.
+    cache_clear_tenant(ano.colegio_id)
+    cache_clear(f'stats:{ano.colegio_id}')
+    return {
+        'message': 'Año escolar actualizado',
+        'ano_escolar_id': ano.id,
+        'campos_modificados': sorted(despues),
+    }
 
 @app.post("/api/ano-escolar/{id}/cerrar")
 async def cerrar_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
