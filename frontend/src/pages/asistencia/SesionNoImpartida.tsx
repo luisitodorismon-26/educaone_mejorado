@@ -14,6 +14,10 @@ import api from '../../services/api';
  *
  * Solo Secundaria: en Primaria la asistencia es del curso, no de la materia, y
  * no hay una clase concreta que justificar.
+ *
+ * La granularidad es ASIGNATURA + FECHA, no bloque de horario: por eso no hay
+ * selector de bloque y el POST no envía `horario_id`. Si la materia tiene
+ * varias horas ese día, la justificación las cubre todas.
  */
 
 export interface SesionNI {
@@ -91,8 +95,8 @@ export const SesionNoImpartidaPanel = ({
       setDetalle('');
       onCambio();
     } catch (err: any) {
-      // El backend explica el caso concreto: no hay clase programada ese día,
-      // ya existe asistencia, hay dos bloques… Se muestra tal cual.
+      // El backend explica el caso concreto: la materia no toca ese día, o ya
+      // hay asistencia capturada. Se muestra tal cual.
       setError(err.response?.data?.error || 'No se pudo registrar');
     } finally {
       setGuardando(false);
@@ -164,6 +168,12 @@ export const SesionNoImpartidaPanel = ({
   return (
     <div className="bg-white border border-slate-300 rounded-lg p-4 space-y-3">
       <p className="font-medium text-slate-800">¿Por qué no se impartió la clase?</p>
+      {/* La justificación es de la ASIGNATURA en esa FECHA, no de un bloque
+          suelto: si la materia tiene dos horas ese día, cubre las dos. */}
+      <p className="text-xs text-slate-500 -mt-1">
+        Use esta opción solamente si esta asignatura no se impartió en ningún
+        momento de este día.
+      </p>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
         {motivos.map(m => (
           <button

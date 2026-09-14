@@ -587,6 +587,85 @@ def _():
     assert dc == 5, dc
 
 
+# ==========================================================================
+# H — VARIOS BLOQUES LA MISMA FECHA: UNA COLUMNA, UNA ETIQUETA
+#
+# La granularidad de S1 es asignatura + fecha. Que la materia tenga dos horas
+# ese dia no puede producir dos columnas ni dos rotulos en la hoja.
+# ==========================================================================
+def _segundo_bloque_lunes():
+    """Anade a Matematica un SEGUNDO bloque los lunes, como en produccion."""
+    d = SessionLocal()
+    try:
+        d.add(M.Horario(colegio_id=COL, profesor_id=PROF, curso_id=CUR,
+                        asignatura_id=MAT, dia="Lunes", hora_inicio="10:00",
+                        hora_fin="10:45", tipo_bloque="clase", activo=True))
+        d.commit()
+    finally:
+        d.close()
+
+
+@test("H1 con dos bloques el mismo dia, la rejilla sigue teniendo UNA columna")
+def _():
+    _seed(asistencia_en=[f for f in LUNES if f != EL_16])
+    _segundo_bloque_lunes()
+    mes = _marzo(_matriz())
+    assert mes["dias"] == [2, 9, 16, 23, 30], mes["dias"]
+    assert len(mes["dias"]) == len(set(mes["dias"])), "columna duplicada"
+
+
+@test("H2 la justificacion sin horario_id produce UNA sola etiqueta")
+def _():
+    _seed(asistencia_en=[f for f in LUNES if f != EL_16])
+    _segundo_bloque_lunes()
+    # asi la graba el endpoint cuando hay varios bloques: sin procedencia
+    d = SessionLocal()
+    try:
+        d.add(M.SesionNoImpartida(
+            colegio_id=COL, fecha=EL_16, curso_id=CUR, asignatura_id=MAT,
+            profesor_id=PROF, horario_id=None, dia_semana_snapshot="Lunes",
+            hora_inicio_snapshot=None, hora_fin_snapshot=None,
+            motivo_codigo="SUSP_LLUVIA", registrado_por=PROF, activo=True))
+        d.commit()
+    finally:
+        d.close()
+    mes = _marzo(_matriz())
+    assert mes["dias_no_impartidos"] == [16], mes["dias_no_impartidos"]
+    assert list(mes["no_impartidas"]) == [16], list(mes["no_impartidas"])
+    assert mes["no_impartidas"][16]["etiqueta"] == "SUSP. LLUVIA"
+    # y el porcentaje y la cobertura no se enteran de cuantos bloques habia
+    assert mes["dias_computables"] == 4
+    assert mes["filas"][0]["porcentaje"] == 100.0
+    assert mes["cobertura_registro_pct"] == 100.0
+
+
+@test("H3 en el PDF sale UNA etiqueta, en UNA columna")
+def _():
+    _seed(asistencia_en=[f for f in LUNES if f != EL_16])
+    _segundo_bloque_lunes()
+    d = SessionLocal()
+    try:
+        d.add(M.SesionNoImpartida(
+            colegio_id=COL, fecha=EL_16, curso_id=CUR, asignatura_id=MAT,
+            profesor_id=PROF, horario_id=None, dia_semana_snapshot="Lunes",
+            motivo_codigo="REUNION", registrado_por=PROF, activo=True))
+        d.commit()
+    finally:
+        d.close()
+    datos = _traducir(_matriz())
+    marzo = next(m for m in datos["matemática"]["meses"] if m["nombre_mes"] == "marzo")
+    assert marzo["etiquetas_no_impartidas"] == {2: "REUNIÓN"}, \
+        marzo["etiquetas_no_impartidas"]
+    items = _texto_pdf(RE.draw_asistencia, {
+        "nombre_mes": "marzo", "docente": "Franklin R",
+        "dias_labels": marzo["dias_labels"],
+        "etiquetas_no_impartidas": marzo["etiquetas_no_impartidas"],
+        "asistencias": marzo["asistencias"]})
+    girados = [i for i in items if abs(i[3][0]) < 0.1]
+    assert len(girados) == 1, [i[0] for i in girados]
+    assert girados[0][0] == "REUNIÓN", girados[0][0]
+
+
 @test("F3 el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

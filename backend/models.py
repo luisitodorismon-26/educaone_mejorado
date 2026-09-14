@@ -1649,18 +1649,27 @@ class SesionNoImpartida(Base):
     feriados precargados pueden no reflejar lo que pasó operativamente, y
     obligar por ellos impediría pasar lista un día en que sí hubo clase.
 
-    POR QUÉ LOS SNAPSHOTS
-    ---------------------
-    `horario_id` es NULLABLE y sin dependencia destructiva a propósito.
-    `DELETE /api/horarios/{id}` borra físicamente, así que atar la historia a
-    esa fila la haría desaparecer con ella —o impediría a Dirección un flujo que
-    hoy funciona—. Por eso el día y las horas se copian al crear: si el bloque
-    se edita o se borra después, el Registro histórico conserva qué sesión era.
-
     IDENTIDAD
     ---------
-    colegio + fecha + curso + asignatura + horario. La unicidad se apoya en esa
-    combinación para que un mismo bloque no acumule dos justificaciones activas.
+    colegio + fecha + curso + asignatura. Eso es lo que la llave única declara y
+    lo que la fila significa: *esta asignatura no se impartió ese día para este
+    curso*. La granularidad es la misma que ya usan la asistencia de Secundaria
+    —(estudiante, curso, asignatura, fecha)— y el Registro, que tiene UNA
+    columna por fecha. Una suspensión de un bloque suelto dentro de un día con
+    varios no es representable, y queda fuera de S1 a propósito.
+
+    `horario_id` NO forma parte de la identidad
+    -------------------------------------------
+    Es PROCEDENCIA opcional: se guarda cuando al declarar había un único bloque
+    inequívoco, y queda NULL cuando había varios —caso frecuente en producción—
+    en vez de elegir uno arbitrariamente. Por eso es NULLABLE y sin FK:
+    `DELETE /api/horarios/{id}` borra físicamente, así que atar la historia a esa
+    fila la haría desaparecer con ella, o impediría a Dirección un flujo que hoy
+    funciona.
+
+    `dia_semana_snapshot` se guarda siempre; las horas solo acompañan al bloque
+    único. Si el horario cambia o se borra después, el Registro histórico
+    conserva de qué día era la sesión.
     """
     __tablename__ = 'sesiones_no_impartidas'
 

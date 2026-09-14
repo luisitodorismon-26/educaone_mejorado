@@ -10993,13 +10993,27 @@ async def crear_sesion_no_impartida(
         request: Request, db: Session = Depends(get_db),
         current_user: Usuario = Depends(get_current_user)):
     """
-    El profesor declara que una sesión programada no se impartió.
+    El profesor declara que una asignatura no se impartió en una fecha.
 
-    S1 §5 — SE VALIDA QUE LA SESIÓN EXISTA Y SEA SUYA. `horario_id` no es una FK
-    destructiva, así que la coherencia se comprueba aquí y se congela en los
-    snapshots: mismo colegio, el bloque existe, y su profesor, curso, asignatura
-    y día coinciden con lo que se está declarando. Sin esto, `horario_id` sería
-    un número que nadie garantiza.
+    GRANULARIDAD: MATERIA + FECHA
+    -----------------------------
+    "No hubo clase" significa *esta asignatura no se impartió ese día para este
+    curso*, y NO *este bloque de horario concreto no se impartió*. Es la misma
+    granularidad que ya usan la asistencia de Secundaria —(estudiante, curso,
+    asignatura, fecha)— y el Registro, que tiene una columna por fecha.
+
+    Por eso el cuerpo NO lleva `horario_id`: si se envía, se ignora. Una
+    suspensión de un solo bloque de un día con varios queda fuera de S1.
+
+    SE VALIDA QUE LA SESIÓN EXISTA Y SEA SUYA
+    -----------------------------------------
+    Mismo colegio, profesor, curso y asignatura; `AsignacionProfesor` activa
+    exacta; nivel Secundaria; y al menos un `Horario` activo de clase de esa
+    asignatura en el día de la semana de la fecha. Ese último punto es lo que
+    impide justificar un día en que la materia no tocaba.
+
+    `horario_id` se guarda solo como PROCEDENCIA, cuando hay un único bloque
+    inequívoco; con varios queda NULL. No forma parte de la identidad.
     """
     try:
         data = await request.json()
@@ -11078,43 +11092,33 @@ async def crear_sesion_no_impartida(
         or_(Horario.tipo_bloque == 'clase', Horario.tipo_bloque.is_(None)),
     ).order_by(Horario.hora_inicio).all()
 
-    horario = None
-    if data.get('horario_id'):
-        try:
-            pedido = int(data['horario_id'])
-        except (TypeError, ValueError):
-            return JSONResponse({'error': 'horario_id inválido'}, status_code=400)
-        horario = next((b for b in bloques if b.id == pedido), None)
-        if horario is None:
-            # Puede no existir, ser de otro colegio, o existir y no ser suyo /
-            # no ser de esta clase / no caer ese día. Todas son la misma cosa
-            # desde fuera: ese bloque no es la sesión que se está declarando.
-            return JSONResponse({
-                'error': ('El bloque de horario indicado no corresponde a esta clase '
-                          f'en {dia_nombre.lower()}.'),
-                'horario_id': pedido,
-                'bloques_validos': [{'id': b.id, 'hora_inicio': b.hora_inicio,
-                                     'hora_fin': b.hora_fin} for b in bloques],
-            }, status_code=409)
-    elif len(bloques) == 1:
-        horario = bloques[0]
-    elif len(bloques) > 1:
-        # Dos bloques de la misma materia ese día: el profesor elige cuál. La
-        # fecha se justifica una sola vez, pero el snapshot debe decir cuál era.
-        return JSONResponse({
-            'error': f'Hay {len(bloques)} bloques de esta clase en {dia_nombre.lower()}. '
-                     'Indique cuál con horario_id.',
-            'bloques_validos': [{'id': b.id, 'hora_inicio': b.hora_inicio,
-                                 'hora_fin': b.hora_fin} for b in bloques],
-        }, status_code=400)
-
-    if horario is None:
+    if not bloques:
         return JSONResponse({
             'error': (f'Esta clase no tiene sesión programada los {dia_nombre.lower()}. '
                       'Solo se justifica una sesión que estaba prevista.'),
             'fecha': fecha.isoformat(),
             'dia': dia_nombre,
         }, status_code=409)
+
+    # LA GRANULARIDAD ES MATERIA + FECHA, NO BLOQUE.
+    #
+    # Que exista al menos un bloque ya demuestra lo único que hace falta
+    # demostrar: que la materia estaba programada ese día. Cuál de los bloques
+    # fue no cambia lo que se declara, porque en EducaOne la asistencia de
+    # Secundaria es (estudiante, curso, asignatura, fecha) y el Registro tiene
+    # UNA columna por fecha. No existe asistencia por `Horario.id`, así que
+    # tampoco puede existir una suspensión por bloque.
+    #
+    # En producción esto no es un caso raro: 20 de los 49 grupos
+    # (colegio, profesor, curso, asignatura, día) tienen más de un bloque, y
+    # tres de ellos son duplicados exactos —dos filas con la misma hora—, donde
+    # preguntar "¿cuál de los dos?" no tiene ni respuesta distinguible.
+    #
+    # `horario_id` queda como PROCEDENCIA opcional, no como identidad: solo se
+    # guarda cuando hay un único bloque inequívoco. Con varios se deja NULL en
+    # vez de elegir uno arbitrariamente o inventar un rango min/max, para no
+    # fingir una precisión histórica que el modelo académico no tiene.
+    horario = bloques[0] if len(bloques) == 1 else None
 
     # --- S1 §7, dirección A: no conviven con asistencia ----------------------
     marcas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
@@ -11159,10 +11163,10 @@ async def crear_sesion_no_impartida(
         sesion.fecha_retiro = None
 
     sesion.profesor_id = current_user.id
-    sesion.horario_id = horario.id
-    sesion.dia_semana_snapshot = horario.dia
-    sesion.hora_inicio_snapshot = horario.hora_inicio
-    sesion.hora_fin_snapshot = horario.hora_fin
+    sesion.horario_id = horario.id if horario is not None else None
+    sesion.dia_semana_snapshot = dia_nombre
+    sesion.hora_inicio_snapshot = horario.hora_inicio if horario is not None else None
+    sesion.hora_fin_snapshot = horario.hora_fin if horario is not None else None
     sesion.motivo_codigo = motivo_codigo
     sesion.motivo_detalle = motivo_detalle
     sesion.registrado_por = current_user.id

@@ -7,10 +7,17 @@ QUE SE AGREGA
     motivo del catalogo. La fecha conserva su columna en el Registro; la sesion
     no cuenta como asistencia de nadie.
 
+LA GRANULARIDAD
+    ASIGNATURA + FECHA. "No hubo clase" significa que esa materia no se impartio
+    ese dia para ese curso, no que un bloque suelto no se dio. Es la misma
+    granularidad de la asistencia de Secundaria y del Registro. Con varios
+    bloques el mismo dia —20 de 49 grupos en produccion— no se pregunta cual:
+    `horario_id` queda NULL, como procedencia que no existe.
+
 LAS DOS REGLAS QUE ESTA SUITE PROTEGE
-    §5  La sesion tiene que existir y ser suya. `horario_id` no es una FK
-        destructiva, asi que la coherencia se comprueba al crear y se congela en
-        los snapshots: colegio, profesor, curso, asignatura y dia de la semana.
+    §5  La sesion tiene que existir y ser suya: colegio, profesor, curso,
+        asignatura, asignacion activa, nivel, y al menos un bloque de esa materia
+        en el dia de la semana de la fecha.
     §7  Exclusividad en AMBAS direcciones. No se declara no impartida una clase
         que ya tiene asistencia, y no se pasa lista de una clase declarada no
         impartida. La salida del conflicto es retirar la justificacion.
@@ -105,13 +112,14 @@ COL_A, COL_B = 1, 2
 ANO_A, ANO_B = 1, 2
 GRA_SEC, GRA_PRI, GRA_B = 1, 2, 99
 CUR_SEC, CUR_PRI, CUR_B = 10, 11, 20        # 3ro Sec | 4to Pri | curso del colegio B
-MAT, LEN, ING = 1, 2, 3                      # asignaturas del colegio A
+MAT, LEN, ING, SOC = 1, 2, 3, 4              # asignaturas del colegio A
 MAT_B = 90                                   # asignatura del colegio B
 U_PROF, U_PROF2, U_DIR, U_COORD = 31, 32, 34, 35
 U_PROF_B = 81
 E1, E2, E3 = 50, 51, 52                      # estudiantes de CUR_SEC
 E_PRI = 55                                   # estudiante de CUR_PRI
 H_MAT, H_LEN_1, H_LEN_2, H_ING = 701, 702, 703, 704
+H_SOC_1, H_SOC_2 = 705, 706                  # duplicado EXACTO, como en produccion
 
 # Una fecha pasada y MARTES, para que el bloque programado exista de verdad.
 # Se calcula desde hoy para que la suite no caduque.
@@ -156,7 +164,7 @@ def _seed():
         d.add(M.Curso(id=CUR_B, colegio_id=COL_B, nombre="A", grado_id=GRA_B,
                       ano_escolar_id=ANO_B, activo=True))
         for aid, nom, cod in ((MAT, "Matematica", "MAT"), (LEN, "Lengua Espanola", "LE"),
-                              (ING, "Ingles", "LEI")):
+                              (ING, "Ingles", "LEI"), (SOC, "Ciencias Sociales", "CS")):
             d.add(M.Asignatura(id=aid, colegio_id=COL_A, nombre=nom, codigo=cod,
                                area="X", area_curricular_codigo=cod, activo=True))
         d.add(M.Asignatura(id=MAT_B, colegio_id=COL_B, nombre="Matematica",
@@ -183,6 +191,7 @@ def _seed():
         for apid, prof, cur, asig in ((100, U_PROF, CUR_SEC, MAT),
                                       (101, U_PROF, CUR_SEC, LEN),
                                       (102, U_PROF2, CUR_SEC, ING),
+                                      (104, U_PROF, CUR_SEC, SOC),
                                       (103, U_PROF, CUR_PRI, MAT)):
             d.add(M.AsignacionProfesor(id=apid, colegio_id=COL_A, profesor_id=prof,
                                        curso_id=cur, asignatura_id=asig,
@@ -204,6 +213,14 @@ def _seed():
                         curso_id=CUR_SEC, asignatura_id=LEN, dia="Martes",
                         hora_inicio="11:00", hora_fin="11:45",
                         tipo_bloque="clase", activo=True))
+        # Sociales: DOS filas con la MISMA hora. En produccion hay tres grupos asi
+        # (34/35, 55/72, 74/75): preguntar "cual de los dos" no tiene respuesta
+        # distinguible, y es el caso que obliga a no preguntar.
+        for _hid in (H_SOC_1, H_SOC_2):
+            d.add(M.Horario(id=_hid, colegio_id=COL_A, profesor_id=U_PROF,
+                            curso_id=CUR_SEC, asignatura_id=SOC, dia="Martes",
+                            hora_inicio="13:00", hora_fin="13:45",
+                            tipo_bloque="clase", activo=True))
         d.add(M.Horario(id=H_ING, colegio_id=COL_A, profesor_id=U_PROF2,
                         curso_id=CUR_SEC, asignatura_id=ING, dia="Martes",
                         hora_inicio="10:00", hora_fin="10:45",
@@ -337,45 +354,144 @@ def _():
     assert _n_sesiones() == 0
 
 
-@test("C2 horario_id de OTRA asignatura del mismo profesor -> 409")
+@test("C2 A - UN bloque: se crea con horario_id y horas de procedencia")
 def _():
     _seed()
-    r = _crear(H_PROF, horario_id=H_LEN_1)      # bloque de Lengua, declarando Matematica
-    assert r.status_code == 409, (r.status_code, r.text[:300])
-    assert _n_sesiones() == 0
+    r = _crear(H_PROF)                          # Matematica: un solo bloque el martes
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    s = r.json()["sesion"]
+    assert s["horario_id"] == H_MAT, s
+    assert s["dia"] == "Martes"
+    assert s["hora_inicio"] == "08:00" and s["hora_fin"] == "08:45"
+    assert _n_sesiones() == 1
 
 
-@test("C3 horario_id de OTRO profesor -> 409 (aunque el bloque exista y sea del curso)")
+@test("C3 el profesor sin asignacion sigue sin poder, con bloque o sin el")
 def _():
     _seed()
-    r = _crear(H_PROF, asignatura_id=ING, horario_id=H_ING)
-    # prof no tiene asignacion de Ingles: se corta antes, en la autorizacion
+    r = _crear(H_PROF, asignatura_id=ING)
+    # prof no tiene asignacion de Ingles: se corta en la autorizacion
     assert r.status_code == 403, (r.status_code, r.text[:300])
     assert _n_sesiones() == 0
 
 
-@test("C4 horario_id inexistente -> 409, y la respuesta dice cuales SI valen")
+@test("C4 un horario_id enviado por el cliente se IGNORA: no hay suspension por bloque")
 def _():
-    _seed()
-    r = _crear(H_PROF, horario_id=999999)
-    assert r.status_code == 409, (r.status_code, r.text[:300])
-    assert r.json()["bloques_validos"] == [
-        {"id": H_MAT, "hora_inicio": "08:00", "hora_fin": "08:45"}]
-    assert _n_sesiones() == 0
+    # La granularidad es materia + fecha. Un `horario_id` en el cuerpo —de otra
+    # materia, inexistente, o de un bloque concreto— no cambia lo que se declara
+    # ni puede convertirlo en la suspension de un solo bloque.
+    for etiqueta, extra in (("de otra asignatura", {"horario_id": H_LEN_1}),
+                            ("inexistente", {"horario_id": 999999}),
+                            ("basura", {"horario_id": "no-es-id"})):
+        _seed()
+        r = _crear(H_PROF, **extra)
+        assert r.status_code == 200, (etiqueta, r.status_code, r.text[:300])
+        s = r.json()["sesion"]
+        # se resuelve por la clase, no por lo que mando el cliente
+        assert s["horario_id"] == H_MAT, (etiqueta, s["horario_id"])
+        assert s["asignatura_id"] == MAT, etiqueta
+        assert _n_sesiones() == 1, etiqueta
 
-
-@test("C5 dos bloques el mismo dia: no adivina, pide horario_id (400)")
-def _():
+    # El caso que de verdad distingue: un horario_id que SI es uno de los
+    # bloques candidatos de una materia con VARIOS. Si el backend lo respetara,
+    # la fila pasaria a representar ese bloque concreto —una suspension parcial—
+    # en vez de la materia entera, que es justo lo que S1 no representa.
     _seed()
-    r = _crear(H_PROF, asignatura_id=LEN)
-    assert r.status_code == 400, (r.status_code, r.text[:300])
-    ids = [b["id"] for b in r.json()["bloques_validos"]]
-    assert ids == [H_LEN_1, H_LEN_2], ids
-    assert _n_sesiones() == 0
-    # con el bloque indicado, entra
     r = _crear(H_PROF, asignatura_id=LEN, horario_id=H_LEN_2)
     assert r.status_code == 200, (r.status_code, r.text[:300])
-    assert r.json()["sesion"]["hora_inicio"] == "11:00"
+    s = r.json()["sesion"]
+    assert s["horario_id"] is None, (
+        "el horario_id del cliente convirtio esto en una suspension de bloque",
+        s["horario_id"])
+    assert s["hora_inicio"] is None and s["hora_fin"] is None, s
+    assert _n_sesiones() == 1
+
+
+@test("C5 B - DOS bloques con horas distintas: una sola fila, sin horario_id")
+def _():
+    _seed()
+    r = _crear(H_PROF, asignatura_id=LEN)       # Lengua: 09:00 y 11:00 el martes
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    s = r.json()["sesion"]
+    assert _n_sesiones() == 1, "se creo mas de una justificacion"
+    assert s["horario_id"] is None, s["horario_id"]
+    assert s["hora_inicio"] is None and s["hora_fin"] is None, s
+    assert s["dia"] == "Martes", s["dia"]       # el dia SI se conserva
+    assert s["asignatura_id"] == LEN
+    fila = _sesiones()[0]
+    assert fila.horario_id is None and fila.hora_inicio_snapshot is None
+    assert fila.dia_semana_snapshot == "Martes"
+
+
+@test("C5b C - duplicados EXACTOS: tampoco hay que elegir entre ids indistinguibles")
+def _():
+    _seed()
+    r = _crear(H_PROF, asignatura_id=SOC)       # dos filas, ambas 13:00-13:45
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    s = r.json()["sesion"]
+    assert _n_sesiones() == 1
+    assert s["horario_id"] is None, s["horario_id"]
+    assert s["hora_inicio"] is None and s["hora_fin"] is None, s
+    assert s["dia"] == "Martes"
+
+
+@test("C5c D - declarada con varios bloques, no se pasa lista de esa materia")
+def _():
+    _seed()
+    assert _crear(H_PROF, asignatura_id=LEN).status_code == 200
+    r = client.post("/api/asistencia", headers=H_PROF, json={
+        "estudiante_id": E1, "curso_id": CUR_SEC, "asignatura_id": LEN,
+        "fecha": MARTES.isoformat(), "estado": "presente"})
+    assert r.status_code == 409, (r.status_code, r.text[:300])
+    # y el lote tampoco entra a medias
+    r = client.post("/api/asistencia/masivo", headers=H_PROF, json={
+        "curso_id": CUR_SEC, "asignatura_id": LEN, "fecha": MARTES.isoformat(),
+        "asistencias": [{"estudiante_id": E1, "estado": "presente"},
+                        {"estudiante_id": E2, "estado": "ausente"}]})
+    assert r.status_code == 409, (r.status_code, r.text[:300])
+    assert _n_asistencias() == 0
+
+
+@test("C5d E - con asistencia previa de esa materia, no se declara y nada cambia")
+def _():
+    _seed()
+    r = client.post("/api/asistencia", headers=H_PROF, json={
+        "estudiante_id": E1, "curso_id": CUR_SEC, "asignatura_id": LEN,
+        "fecha": MARTES.isoformat(), "estado": "presente"})
+    assert r.status_code == 200, r.text[:300]
+    antes = _n_asistencias()
+    r = _crear(H_PROF, asignatura_id=LEN)
+    assert r.status_code == 409, (r.status_code, r.text[:300])
+    assert r.json()["asistencias"] == 1
+    assert _n_sesiones() == 0
+    assert _n_asistencias() == antes, "se toco la asistencia existente"
+
+
+@test("C5e F - la asistencia de OTRA materia ese dia no estorba")
+def _():
+    _seed()
+    r = client.post("/api/asistencia", headers=H_PROF, json={
+        "estudiante_id": E1, "curso_id": CUR_SEC, "asignatura_id": MAT,
+        "fecha": MARTES.isoformat(), "estado": "presente"})
+    assert r.status_code == 200, r.text[:300]
+    # Lengua (dos bloques) sigue pudiendo declararse
+    assert _crear(H_PROF, asignatura_id=LEN).status_code == 200
+    assert _n_asistencias(asignatura_id=MAT) == 1
+
+
+@test("C5f H - retirar y volver a declarar una materia multibloque no duplica filas")
+def _():
+    _seed()
+    sid = _crear(H_PROF, asignatura_id=LEN).json()["sesion"]["id"]
+    assert client.delete(f"/api/sesiones-no-impartidas/{sid}",
+                         headers=H_PROF).status_code == 200
+    assert _n_sesiones() == 1 and _sesiones()[0].activo is False
+    r = _crear(H_PROF, asignatura_id=LEN, motivo_codigo="REUNION")
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    assert r.json()["reactivada"] is True
+    assert r.json()["sesion"]["id"] == sid
+    assert _n_sesiones() == 1, "aparecio una segunda fila"
+    assert _sesiones()[0].horario_id is None
 
 
 @test("C6 un bloque inactivo ya no es una sesion programada")
