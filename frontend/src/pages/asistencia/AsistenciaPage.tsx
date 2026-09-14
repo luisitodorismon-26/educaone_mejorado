@@ -4,6 +4,7 @@ import api from '../../services/api';
 import { NivelTabs } from '../../components/NivelTabs';
 import { useNivelesActivos, Nivel } from '../../hooks/useNivelesActivos';
 import { labelCurso } from '../../utils/labelCurso';
+import { SesionNoImpartidaPanel, SesionNI } from './SesionNoImpartida';
 
 interface Estudiante {
   id: number;
@@ -43,6 +44,8 @@ export const AsistenciaPage = () => {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [buscarEstudiante, setBuscarEstudiante] = useState('');
+  // S1: la sesion declarada NO impartida de esta clase y fecha, si existe.
+  const [sesionNI, setSesionNI] = useState<SesionNI | null>(null);
   const niveles = useNivelesActivos();
   const [nivelFiltro, setNivelFiltro] = useState<Nivel | 'todos'>('todos');
   // Mantener siempre 'todos' por defecto al cargar — solo cambia si el usuario elige tab
@@ -50,6 +53,10 @@ export const AsistenciaPage = () => {
   // Solo profesores pueden marcar asistencia
   const esProfesor = user?.role === 'profesor';
   const puedeEditar = esProfesor;
+  // S1: mientras la clase este declarada NO impartida, no se pasa lista. El
+  // backend ya lo rechaza; esto evita que el profesor lo descubra a base de
+  // errores. `puedeEditar` NO se toca: el panel de S1 sigue siendo suyo.
+  const puedeMarcar = puedeEditar && !sesionNI;
 
   // Cargar cursos según rol
   useEffect(() => {
@@ -125,10 +132,30 @@ export const AsistenciaPage = () => {
         : `/asistencia/curso/${cursoId}?fecha=${fecha}&asignatura_id=${asignaturaId}`;
       const res = await api.get(url);
       setAsistencias(res.data.asistencias || []);
+
+      // S1: solo Secundaria. Se consulta la misma clase y fecha que se acaba de
+      // cargar; si esta declarada no impartida, los botones de la tabla se
+      // apagan antes de que el profesor toque ninguno.
+      if (!esPrimaria && asignaturaId) {
+        try {
+          const sni = await api.get(
+            `/sesiones-no-impartidas?curso_id=${cursoId}&asignatura_id=${asignaturaId}` +
+            `&desde=${fecha}&hasta=${fecha}`
+          );
+          setSesionNI((sni.data && sni.data[0]) || null);
+        } catch {
+          // Si la consulta falla no se bloquea la pantalla: el backend sigue
+          // siendo quien decide, y responde 409 si la sesion esta declarada.
+          setSesionNI(null);
+        }
+      } else {
+        setSesionNI(null);
+      }
     } catch (err) {
       console.error('Error cargando asistencia:', err);
       setError('Error al cargar asistencia');
       setAsistencias([]);
+      setSesionNI(null);
     } finally {
       setLoading(false);
     }
@@ -137,6 +164,10 @@ export const AsistenciaPage = () => {
   const marcarAsistencia = async (estudianteId: number, estado: string) => {
     if (!puedeEditar) {
       setError('Solo profesores pueden registrar');
+      return;
+    }
+    if (sesionNI) {
+      setError('Esta clase está registrada como no impartida. Retire la justificación si sí hubo clase.');
       return;
     }
     // Secundaria requiere asignatura, primaria no
@@ -195,7 +226,7 @@ export const AsistenciaPage = () => {
   };
 
   const marcarTodos = async (estado: string) => {
-    if (!puedeEditar) return;
+    if (!puedeEditar || sesionNI) return;
     if (!esPrimaria && !asignaturaId) return;
 
     setSaving(true);
@@ -340,7 +371,7 @@ export const AsistenciaPage = () => {
           </div>
 
           <div className="flex items-end gap-2">
-            {cursoId > 0 && (esPrimaria || asignaturaId > 0) && asistencias.length > 0 && puedeEditar && (
+            {cursoId > 0 && (esPrimaria || asignaturaId > 0) && asistencias.length > 0 && puedeMarcar && (
               <button 
                 onClick={() => marcarTodos('presente')}
                 disabled={saving}
@@ -365,6 +396,21 @@ export const AsistenciaPage = () => {
             <p className="text-sm text-gray-600">
               📋 <strong>{asignaturaSeleccionada?.nombre}</strong> — {new Date(fecha + 'T12:00:00').toLocaleDateString('es-DO', { weekday: 'long', day: 'numeric', month: 'long' })}
             </p>
+          </div>
+        )}
+
+        {/* S1 — "No hubo clase". Solo Secundaria: en Primaria la asistencia es
+            del curso y no hay una clase concreta que justificar. */}
+        {cursoId > 0 && !esPrimaria && asignaturaId > 0 && !loading && (
+          <div className="mt-3">
+            <SesionNoImpartidaPanel
+              cursoId={cursoId}
+              asignaturaId={asignaturaId}
+              fecha={fecha}
+              puedeEditar={puedeEditar}
+              sesion={sesionNI}
+              onCambio={cargarAsistencia}
+            />
           </div>
         )}
       </div>
@@ -457,15 +503,17 @@ export const AsistenciaPage = () => {
                         {estados.map(e => (
                           <button
                             key={e.val}
-                            onClick={() => !esRetirado && puedeEditar && marcarAsistencia(a.estudiante.id, e.val)}
-                            disabled={saving || !puedeEditar || esRetirado}
-                            title={esRetirado ? 'Estudiante retirado' : e.label}
+                            onClick={() => !esRetirado && puedeMarcar && marcarAsistencia(a.estudiante.id, e.val)}
+                            disabled={saving || !puedeMarcar || esRetirado}
+                            title={esRetirado ? 'Estudiante retirado'
+                                   : sesionNI ? 'Clase no impartida: ' + sesionNI.motivo
+                                   : e.label}
                             className={`w-8 h-8 sm:w-10 sm:h-10 rounded-lg text-base sm:text-xl transition-all border-2 ${
                               esRetirado
                                 ? 'bg-gray-100 border-gray-200 cursor-not-allowed opacity-40'
                                 : a.asistencia?.estado === e.val
                                   ? `${e.color} text-white border-transparent scale-110 shadow-md`
-                                  : puedeEditar
+                                  : puedeMarcar
                                     ? 'bg-gray-100 border-gray-200 hover:border-gray-400 hover:scale-105'
                                     : 'bg-gray-50 border-gray-100 cursor-not-allowed opacity-60'
                             }`}

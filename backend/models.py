@@ -1606,6 +1606,143 @@ class DiaNoLaborable(Base):
             'recurrente': self.recurrente
         }
 
+# ============== SESIÓN NO IMPARTIDA (S1) ==============
+
+# Catálogo de motivos. Constante del sistema, como `salidas_optativas.py`: la
+# etiqueta que se DIBUJA en el Registro sale siempre de aquí, nunca del texto
+# libre que escriba el profesor. Una columna de 11 pt no admite una explicación.
+MOTIVOS_SESION_NO_IMPARTIDA = {
+    'SUSP_LLUVIA':      {'nombre': 'Suspensión por lluvia',            'etiqueta': 'SUSP. LLUVIA'},
+    'REUNION':          {'nombre': 'Reunión',                          'etiqueta': 'REUNIÓN'},
+    'ACTIVIDAD':        {'nombre': 'Actividad del curso',              'etiqueta': 'ACTIVIDAD'},
+    'ACTIVIDAD_FUERA':  {'nombre': 'Actividad fuera del centro',       'etiqueta': 'ACT. FUERA'},
+    'SUSP_CURSO':       {'nombre': 'Suspensión dispuesta por el centro', 'etiqueta': 'SUSP. CURSO'},
+    'FERIADO':          {'nombre': 'Feriado',                          'etiqueta': 'FERIADO'},
+    'OTRO':             {'nombre': 'Otro motivo justificado',          'etiqueta': 'OTRO'},
+}
+
+
+class SesionNoImpartida(Base):
+    """
+    Una sesión PROGRAMADA que no se impartió, y por qué.
+
+    QUÉ PROBLEMA RESUELVE
+    ---------------------
+    En el Registro Escolar en papel, cuando una clase prevista no se da, el
+    maestro NO deja la columna vacía ni marca ausentes: conserva la fecha en su
+    columna y escribe en ella la razón. Un inspector tiene que poder entender
+    por qué esa fecha no lleva asistencia.
+
+    EducaOne no tenía dónde guardar eso. `Asistencia` es POR ESTUDIANTE: usarla
+    obligaría a crear una fila por alumno para una clase que no ocurrió, y a
+    contaminar todos los conteos. Esta tabla es POR SESIÓN, que es la unidad
+    real del hecho.
+
+    QUÉ NO ES
+    ---------
+    No sustituye a `DiaNoLaborable`, que sigue representando fechas
+    institucionales del colegio (feriados nacionales, Navidad). Son dos niveles
+    distintos: aquel es del calendario del centro; éste es de UNA clase
+    concreta, y puede afectar a un solo curso sin tocar a nadie más.
+
+    En S1 `DiaNoLaborable` NO bloquea automáticamente la asistencia: los
+    feriados precargados pueden no reflejar lo que pasó operativamente, y
+    obligar por ellos impediría pasar lista un día en que sí hubo clase.
+
+    IDENTIDAD
+    ---------
+    colegio + fecha + curso + asignatura. Eso es lo que la llave única declara y
+    lo que la fila significa: *esta asignatura no se impartió ese día para este
+    curso*. La granularidad es la misma que ya usan la asistencia de Secundaria
+    —(estudiante, curso, asignatura, fecha)— y el Registro, que tiene UNA
+    columna por fecha. Una suspensión de un bloque suelto dentro de un día con
+    varios no es representable, y queda fuera de S1 a propósito.
+
+    `horario_id` NO forma parte de la identidad
+    -------------------------------------------
+    Es PROCEDENCIA opcional: se guarda cuando al declarar había un único bloque
+    inequívoco, y queda NULL cuando había varios —caso frecuente en producción—
+    en vez de elegir uno arbitrariamente. Por eso es NULLABLE y sin FK:
+    `DELETE /api/horarios/{id}` borra físicamente, así que atar la historia a esa
+    fila la haría desaparecer con ella, o impediría a Dirección un flujo que hoy
+    funciona.
+
+    `dia_semana_snapshot` se guarda siempre; las horas solo acompañan al bloque
+    único. Si el horario cambia o se borra después, el Registro histórico
+    conserva de qué día era la sesión.
+    """
+    __tablename__ = 'sesiones_no_impartidas'
+
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+
+    fecha = Column(Date, nullable=False, index=True)
+    curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False, index=True)
+    asignatura_id = Column(Integer, ForeignKey('asignaturas.id'), nullable=False, index=True)
+    profesor_id = Column(Integer, ForeignKey('usuarios.id'), nullable=False, index=True)
+
+    # Sin ondelete: se resuelve en aplicación. Ver "POR QUÉ LOS SNAPSHOTS".
+    horario_id = Column(Integer, nullable=True, index=True)
+    dia_semana_snapshot = Column(String(15))
+    hora_inicio_snapshot = Column(String(5))
+    hora_fin_snapshot = Column(String(5))
+
+    motivo_codigo = Column(String(24), nullable=False)
+    motivo_detalle = Column(String(255))
+
+    registrado_por = Column(Integer, ForeignKey('usuarios.id'))
+    fecha_registro = Column(DateTime, default=_now_dr)
+    # Retirar una justificación NO la borra: se desactiva, para que el hecho de
+    # que existió y quién la puso siga en el Registro de auditoría.
+    activo = Column(Boolean, default=True, index=True)
+    retirado_por = Column(Integer, ForeignKey('usuarios.id'))
+    fecha_retiro = Column(DateTime)
+
+    curso = relationship('Curso', foreign_keys=[curso_id])
+    asignatura = relationship('Asignatura', foreign_keys=[asignatura_id])
+    profesor = relationship('Usuario', foreign_keys=[profesor_id])
+
+    __table_args__ = (
+        # El Registro tiene UNA columna por fecha, no una por bloque: si una
+        # asignatura tiene dos bloques el mismo dia, la fecha se justifica una
+        # sola vez. Por eso `horario_id` NO entra en la llave.
+        UniqueConstraint('colegio_id', 'fecha', 'curso_id', 'asignatura_id',
+                         name='uq_sesion_no_impartida'),
+        Index('ix_sesion_no_imp_busqueda', 'colegio_id', 'curso_id',
+              'asignatura_id', 'fecha'),
+    )
+
+    @property
+    def etiqueta(self):
+        """Texto corto que se dibuja en la columna del Registro."""
+        cfg = MOTIVOS_SESION_NO_IMPARTIDA.get(self.motivo_codigo)
+        return cfg['etiqueta'] if cfg else 'NO IMPARTIDA'
+
+    @property
+    def motivo_nombre(self):
+        cfg = MOTIVOS_SESION_NO_IMPARTIDA.get(self.motivo_codigo)
+        return cfg['nombre'] if cfg else self.motivo_codigo
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'fecha': self.fecha.isoformat() if self.fecha else None,
+            'curso_id': self.curso_id,
+            'asignatura_id': self.asignatura_id,
+            'profesor_id': self.profesor_id,
+            'horario_id': self.horario_id,
+            'dia': self.dia_semana_snapshot,
+            'hora_inicio': self.hora_inicio_snapshot,
+            'hora_fin': self.hora_fin_snapshot,
+            'motivo_codigo': self.motivo_codigo,
+            'motivo': self.motivo_nombre,
+            'motivo_detalle': self.motivo_detalle,
+            'etiqueta': self.etiqueta,
+            'registrado_por': self.registrado_por,
+            'fecha_registro': self.fecha_registro.isoformat() if self.fecha_registro else None,
+            'activo': self.activo,
+        }
+
 # ============== AUDITORÍA ==============
 
 class LogAcceso(Base):

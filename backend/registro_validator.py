@@ -125,7 +125,15 @@ def _evaluar_cobertura_asistencia(
             continue
 
         for mes in matriz:
-            esperado = len(mes.get('dias', [])) * len(estudiantes)
+            # S1 — solo se espera asistencia de las sesiones que SI se impartieron.
+            # `dias_computables` son las columnas visibles menos las declaradas no
+            # impartidas; sin este descuento, una suspension correctamente
+            # registrada se reportaba como "Asistencia incompleta". El fallback a
+            # `dias` cubre las matrices anteriores a S1, que no traen el campo.
+            dias_computables = mes.get('dias_computables')
+            if dias_computables is None:
+                dias_computables = len(mes.get('dias', []))
+            esperado = dias_computables * len(estudiantes)
             cobertura_pct = mes.get('cobertura_registro_pct', 0.0)
             cubierto = round((esperado * cobertura_pct) / 100) if esperado else 0
             faltante = max(esperado - cubierto, 0)

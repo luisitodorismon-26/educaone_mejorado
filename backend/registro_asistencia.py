@@ -26,6 +26,7 @@ from models import (
     DiaNoLaborable,
     Estudiante,
     Horario,
+    SesionNoImpartida,
 )
 
 
@@ -101,6 +102,28 @@ def _obtener_dias_horario(
     return {str(h.dia or '').strip() for h in q.all() if str(h.dia or '').strip()}
 
 
+def _sesiones_no_impartidas(
+    db: Session,
+    curso_id: int,
+    asignatura_id: Optional[int] = None,
+) -> Dict:
+    """
+    S1 — las sesiones PROGRAMADAS que no se impartieron, indexadas por fecha.
+
+    Solo aplica con `asignatura_id`: en Primaria la asistencia es del curso y no
+    hay una clase concreta que declarar. Sin asignatura se devuelve vacio y todo
+    lo de abajo se comporta exactamente como antes de S1.
+    """
+    if asignatura_id is None:
+        return {}
+    filas = db.query(SesionNoImpartida).filter(
+        SesionNoImpartida.curso_id == curso_id,
+        SesionNoImpartida.asignatura_id == asignatura_id,
+        SesionNoImpartida.activo == True,  # noqa: E712
+    ).all()
+    return {f.fecha: f for f in filas if f.fecha}
+
+
 def _construir_fechas_esperadas(
     ano: Optional[AnoEscolar],
     dias_horario: Set[str],
@@ -153,6 +176,7 @@ def build_asistencia_registro(
     dias_horario = _obtener_dias_horario(db, curso_id, asignatura_id=asignatura_id)
     dias_no_laborables = _dias_no_laborables_set(db, curso.colegio_id if curso else None, ano)
     fechas_esperadas_por_mes = _construir_fechas_esperadas(ano, dias_horario, dias_no_laborables)
+    no_impartidas = _sesiones_no_impartidas(db, curso_id, asignatura_id=asignatura_id)
 
     q = db.query(Asistencia).filter(
         Asistencia.estudiante_id.in_(est_ids),
@@ -215,6 +239,21 @@ def build_asistencia_registro(
             from datetime import date
             lista.append(date(anio, mes_num, dia))
 
+    # S1 — LA FECHA JUSTIFICADA CONSERVA SU COLUMNA.
+    #
+    # Esto es lo que pide el Registro en papel: el dia en que no se dio la clase
+    # no desaparece de la hoja, se queda en su sitio con el motivo escrito. Sin
+    # este bloque la columna podia perderse por dos vias: si la fecha cae en un
+    # DiaNoLaborable, `_construir_fechas_esperadas` ya la habia descartado; y si
+    # el horario cambio despues, el dia de la semana ya no coincide.
+    #
+    # No se inventa ninguna marca: la columna entra vacia y lo unico que lleva
+    # es la etiqueta del motivo.
+    for _fecha in no_impartidas:
+        _lista = fechas_esperadas_por_mes.setdefault(_fecha.month, [])
+        if _fecha.day not in {f.day for f in _lista}:
+            _lista.append(_fecha)
+
     meses_presentes = sorted(fechas_esperadas_por_mes.keys(), key=_orden_mes)
     dias_trabajados_cfg = ano.get_dias_trabajados() if ano else {}
 
@@ -228,8 +267,19 @@ def build_asistencia_registro(
         dias_con_registro = sorted(por_mes.get(mes_num, {}).keys())
         cfg_mes = dias_trabajados_cfg.get(MES_CLAVE_CORTA.get(mes_num, ''), 0) if dias_trabajados_cfg else 0
 
+        # S1 — los dias de este mes en que la clase no se impartio, por numero
+        # de dia, que es como se indexan las columnas de la hoja.
+        sesiones_mes = {f.day: sesion for f, sesion in no_impartidas.items()
+                        if f.month == mes_num and f.day in set(dias_unicos)}
+        dias_no_impartidos = sorted(sesiones_mes)
+        dias_computables = len(dias_unicos) - len(dias_no_impartidos)
+
         filas = []
-        celdas_esperadas = len(dias_unicos) * len(estudiantes)
+        # S1 — LA COBERTURA ES DE LO QUE SE IMPARTIO. Una columna justificada no
+        # tiene que llenarse: contarla como celda esperada haria que el validador
+        # pidiera asistencia de una clase que no se dio, que es justo lo que S1
+        # viene a evitar.
+        celdas_esperadas = dias_computables * len(estudiantes)
         celdas_con_registro = 0
 
         for est in estudiantes:
@@ -240,6 +290,15 @@ def build_asistencia_registro(
             for dia in dias_unicos:
                 codigo = por_mes.get(mes_num, {}).get(dia, {}).get(est.id, '')
                 valores.append(codigo)
+                # S1 — UN DIA NO IMPARTIDO NO CUENTA PARA NADIE. Queda fuera del
+                # numerador, del denominador y de la cobertura: si no hubo clase,
+                # nadie estuvo presente, nadie falto y no hay nada que capturar.
+                # El valor de la celda se conserva tal cual esta en la base —no se
+                # oculta historia— pero no se suma en ningun conteo. La escritura
+                # de asistencia sobre una sesion declarada ya esta cerrada en
+                # app.py; esto cubre lo que pudiera venir de antes.
+                if dia in sesiones_mes:
+                    continue
                 if codigo:
                     celdas_con_registro += 1
                 if codigo == 'P':
@@ -247,7 +306,7 @@ def build_asistencia_registro(
                 elif codigo == 'A':
                     ausentes += 1
 
-            porcentaje = round((presentes / len(dias_unicos)) * 100, 1) if dias_unicos else 0.0
+            porcentaje = round((presentes / dias_computables) * 100, 1) if dias_computables > 0 else 0.0
             filas.append({
                 'no': est_index[est.id],
                 'estudiante_id': est.id,
@@ -264,6 +323,20 @@ def build_asistencia_registro(
             'mes_num': mes_num,
             'dias': dias_unicos,
             'total_dias': len(dias_unicos),
+            # S1: `total_dias` sigue siendo el numero de COLUMNAS —la geometria
+            # del PDF depende de el— y `dias_computables` es el denominador del
+            # porcentaje. Antes de S1 eran el mismo numero y lo siguen siendo en
+            # cuanto no hay ninguna sesion declarada.
+            'dias_computables': dias_computables,
+            'dias_no_impartidos': dias_no_impartidos,
+            'no_impartidas': {
+                dia: {
+                    'motivo_codigo': ses.motivo_codigo,
+                    'motivo': ses.motivo_nombre,
+                    'motivo_detalle': ses.motivo_detalle,
+                    'etiqueta': ses.etiqueta,
+                } for dia, ses in sorted(sesiones_mes.items())
+            },
             'filas': filas,
             'fuente_dias': fuente,
             'dias_horario': sorted(dias_horario),

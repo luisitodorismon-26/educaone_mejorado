@@ -874,6 +874,41 @@ def _draw_text(c: canvas.Canvas, x: float, y: float, text: str,
     c.drawString(x, y, text)
 
 
+def _draw_sesion_no_impartida(c: canvas.Canvas, x_centro: float,
+                              y_centro: float, alto: float, etiqueta: str,
+                              size: float = 7):
+    """
+    S1 — escribe el motivo GIRADO dentro de la columna de su fecha.
+
+    La columna de un dia mide ~11 pt de ancho y ~567 pt de alto. Horizontal no
+    cabe ni "REUNION"; girada 90 grados sobra sitio: la etiqueta mas larga del
+    catalogo ocupa menos del 10% del alto disponible. Es ademas como se escribe
+    en el Registro en papel.
+
+    La fecha NO pierde su columna ni se corre ninguna otra: se escribe DENTRO de
+    la que ya tenia. Si la etiqueta fuera mas larga que la columna se recorta,
+    nunca se invade la celda vecina.
+    """
+    if not etiqueta:
+        return
+    etiqueta = str(etiqueta)
+    c.saveState()
+    try:
+        c.setFont(FONT_NORMAL, size)
+        c.setFillColorRGB(*AZUL)
+        margen = 8
+        disponible = max(alto - margen * 2, 0)
+        while (c.stringWidth(etiqueta, FONT_NORMAL, size) > disponible
+               and len(etiqueta) > 1):
+            etiqueta = etiqueta[:-1]
+        ancho = c.stringWidth(etiqueta, FONT_NORMAL, size)
+        c.translate(x_centro, y_centro)
+        c.rotate(90)                      # se lee de abajo hacia arriba
+        c.drawString(-ancho / 2.0, -size / 3.0, etiqueta)
+    finally:
+        c.restoreState()
+
+
 def _draw_x_mark(c: canvas.Canvas, x: float, y: float, size: float = 8):
     """Dibuja una X como marca de checkbox."""
     c.setFont(FONT_BOLD, size)
@@ -1215,6 +1250,20 @@ def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = Fa
             _draw_text(c, table[f"{prefix}_porcentaje_x"], y,
                        f"{est['porcentaje']:.0f}", size=FONT_SIZE_ASISTENCIA, center=True)
 
+    # S1 — el motivo de las sesiones no impartidas, girado en su propia columna.
+    # Va DESPUES de las filas para que quede por encima; con la escritura de
+    # asistencia cerrada sobre esas fechas, esas celdas estan vacias de todos
+    # modos. El alto es el del cuerpo de la tabla: 40 filas de `row_height`.
+    etiquetas = datos_mes.get("etiquetas_no_impartidas") or {}
+    if etiquetas:
+        alto = table["row_height"] * table["total_filas"]
+        centro_y = _y(table["primera_fila_y_plumber"] + alto / 2.0)
+        for d, etiqueta in etiquetas.items():
+            d = int(d)
+            if d >= len(dia_centers) or d >= 21:
+                continue
+            _draw_sesion_no_impartida(c, dia_centers[d], centro_y, alto, etiqueta)
+
 
 def draw_asistencia_4meses(c: canvas.Canvas, meses_pagina: List[Optional[Dict]],
                            pagina: int, docente: str = "", asignatura: str = ""):
@@ -1291,6 +1340,19 @@ def draw_asistencia_4meses(c: canvas.Canvas, meses_pagina: List[Optional[Dict]],
             if est.get("porcentaje") is not None:
                 _draw_text(c, blk["porcentaje_x"], y, f"{est['porcentaje']:.0f}",
                            size=FONT_SIZE_ASISTENCIA, center=True)
+
+        # S1 — mismo criterio que en la rejilla de 2 meses, con la geometria de
+        # esta: 10 columnas por bloque en vez de 21, y columnas algo mas
+        # estrechas (11.04 pt). El texto girado no depende del ancho.
+        etiquetas = datos_mes.get("etiquetas_no_impartidas") or {}
+        if etiquetas:
+            alto = t["row_height"] * t["total_filas"]
+            centro_y = _y(t["primera_fila_y_plumber"] + alto / 2.0)
+            for d, etiqueta in etiquetas.items():
+                d = int(d)
+                if d >= max_dias or d >= len(blk["dias"]):
+                    continue
+                _draw_sesion_no_impartida(c, blk["dias"][d], centro_y, alto, etiqueta)
 
 
 def _fila_completiva(cd: Optional[Dict]) -> Optional[Dict]:
@@ -2732,14 +2794,30 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
                         "porcentaje": fila.get("porcentaje", 0),
                     })
 
+                # S1 — las columnas se dibujan por INDICE, y `no_impartidas`
+                # viene indexado por numero de dia. Aqui se traduce una cosa en
+                # la otra usando las mismas columnas que ya se van a imprimir,
+                # asi que una etiqueta no puede acabar sobre la fecha vecina.
+                _no_imp = mes_data.get("no_impartidas") or {}
+                etiquetas_ni = {}
+                for _idx, _dia in enumerate(dias_mes):
+                    _info = _no_imp.get(_dia) or _no_imp.get(str(_dia))
+                    if _info:
+                        etiquetas_ni[_idx] = _info.get("etiqueta") or "NO IMPARTIDA"
+
                 if est_list:
                     meses_list.append({
                         "nombre_mes": mes_data.get("mes", ""),
                         "docente": "",
                         "asistencias": est_list,
                         "dias_labels": dias_mes,
-                        # marca interna para priorizar los meses con captura real
-                        "_tiene_marcas": any(v for f in est_list for v in f["dias"]),
+                        "etiquetas_no_impartidas": etiquetas_ni,
+                        # marca interna para priorizar los meses con captura real.
+                        # Un mes cuyo unico contenido es una justificacion TAMBIEN
+                        # necesita su hueco: si no, la unica pagina que explica por
+                        # que no hubo clase seria la que se cae de la hoja.
+                        "_tiene_marcas": (any(v for f in est_list for v in f["dias"])
+                                          or bool(etiquetas_ni)),
                     })
             # v2.19.7: la hoja MINERD tiene 10 huecos de mes por asignatura
             # (5 páginas x 2). Cuando el año escolar y las fechas realmente
