@@ -93,10 +93,13 @@ const iguales = (a, b, msg) => {
   if (A !== B) throw new Error(`${msg}\n        esperado ${B}\n        obtenido ${A}`);
 };
 
+// Misma forma que devuelve `Horario.to_dict()` en el backend: trae `profesor_id`
+// y NO trae el nombre del profesor. Fabricar un `profesor` que el API nunca
+// envía era lo que ocultaba el fallo de la vista Por Curso.
 const h = (id, dia, ini, fin, extra = {}) => ({
   id, dia, hora_inicio: ini, hora_fin: fin, tipo_bloque: 'clase',
-  curso_id: 1, asignatura_id: 1, profesor: 'Prof', asignatura: 'Mat',
-  curso: '1ro A', ...extra,
+  profesor_id: 4, curso_id: 1, asignatura_id: 1,
+  asignatura: 'Mat', curso: '1ro A', tanda: 'Matutina', aula: null, ...extra,
 });
 // Se usa la MISMA getHorariosEnCelda del componente, no una reimplementación.
 const enCelda = (hs, dia, inicio) => mod.celdaDe(hs)(dia, { inicio, fin: '' });
@@ -190,13 +193,13 @@ prueba('I  Libre y Recreo no cuentan como choque académico', () => {
 prueba('J/K  el cálculo es el mismo en Por Profesor y en Por Curso', () => {
   // El array llega acotado a un profesor (todas sus clases, cursos distintos)
   const porProfesor = [
-    h(19, 'Lunes', '11:15', '12:00', { curso_id: 2, profesor: 'Luis' }),
-    h(37, 'Lunes', '11:15', '12:00', { curso_id: 1, asignatura_id: 17, profesor: 'Luis' }),
+    h(19, 'Lunes', '11:15', '12:00', { profesor_id: 4, curso_id: 2 }),
+    h(37, 'Lunes', '11:15', '12:00', { profesor_id: 4, curso_id: 1, asignatura_id: 17 }),
   ];
   // o a un curso (todos sus profesores/materias)
   const porCurso = [
-    h(80, 'Lunes', '11:15', '12:00', { curso_id: 1, profesor: 'Luis', asignatura_id: 5 }),
-    h(81, 'Lunes', '11:15', '12:00', { curso_id: 1, profesor: 'Julio', asignatura_id: 1 }),
+    h(80, 'Lunes', '11:15', '12:00', { profesor_id: 4, curso_id: 1, asignatura_id: 5 }),
+    h(81, 'Lunes', '11:15', '12:00', { profesor_id: 5, curso_id: 1, asignatura_id: 1 }),
   ];
   iguales([...mod.conflictos(porProfesor)].sort((a, b) => a - b), [19, 37], 'por profesor');
   iguales([...mod.conflictos(porCurso)].sort((a, b) => a - b), [80, 81], 'por curso');
@@ -227,6 +230,48 @@ prueba('M  la celda anómala se distingue de la normal (protege Eliminar)', () =
   iguales(anomala(normal, 'Lunes', '08:00'), false, 'normal: Eliminar sigue activo');
   iguales(anomala(conflicto, 'Lunes', '11:15'), true, 'conflicto: Eliminar protegido');
   iguales(anomala(repetido, 'Viernes', '09:00'), true, 'repetido: Eliminar protegido');
+});
+
+// El bloqueador que encontró la revisión: en Por Curso, dos profesores distintos
+// dando lo mismo a la misma hora. Con la identidad basada en el NOMBRE —un campo
+// que el API no envía— ambos valían `undefined`, se agrupaban como "2 registros
+// idénticos" y su conflicto entre sí desaparecía. La identidad va por id.
+prueba('N  POR CURSO: dos profesores distintos NO son el mismo registro', () => {
+  const hs = [
+    h(80, 'Lunes', '11:15', '12:00', { profesor_id: 10, curso_id: 1, asignatura_id: 1 }),
+    h(81, 'Lunes', '11:15', '12:00', { profesor_id: 11, curso_id: 1, asignatura_id: 1 }),
+  ];
+  const celda = enCelda(hs, 'Lunes', '11:15');
+  iguales(celda.length, 2, 'la celda trae los dos');
+  iguales(mod.agrupar(celda).length, 2, 'DOS grupos: no son duplicados');
+  iguales(mod.agrupar(celda).map(g => g.length), [1, 1], 'ninguno dice "2 idénticos"');
+  iguales([...mod.conflictos(hs)].sort((a, b) => a - b), [80, 81],
+          'y su choque entre sí SÍ se detecta');
+});
+
+prueba('N2 mismo profesor_id y todo lo demás igual: eso SÍ es repetido', () => {
+  const hs = [
+    h(34, 'Viernes', '09:00', '09:45', { profesor_id: 4 }),
+    h(35, 'Viernes', '09:00', '09:45', { profesor_id: 4 }),
+  ];
+  const g = mod.agrupar(enCelda(hs, 'Viernes', '09:00'));
+  iguales(g.length, 1, 'un solo grupo');
+  iguales(g[0].length, 2, 'que declara 2 registros');
+  iguales([...mod.conflictos(hs)], [], 'repetido no es choque de agenda');
+});
+
+prueba('N3 el nombre del profesor no participa en la identidad', () => {
+  // Aunque el API llegara a enviar nombres distintos, o ninguno, la agrupación
+  // depende solo de los ids: no se puede confundir por como se escriba un nombre.
+  const a = h(1, 'Lunes', '08:00', '08:45', { profesor_id: 7 });
+  const b = h(2, 'Lunes', '08:00', '08:45', { profesor_id: 7 });
+  iguales(mod.identidadBloque(a), mod.identidadBloque(b), 'mismos ids, misma identidad');
+  const c = h(3, 'Lunes', '08:00', '08:45', { profesor_id: 8 });
+  if (mod.identidadBloque(a) === mod.identidadBloque(c))
+    throw new Error('profesores distintos comparten identidad');
+  // y la identidad NO menciona ningún nombre
+  if (/Prof|Luis|Julio/.test(mod.identidadBloque(a)))
+    throw new Error('la identidad incluye un nombre: ' + mod.identidadBloque(a));
 });
 
 console.log('='.repeat(74));

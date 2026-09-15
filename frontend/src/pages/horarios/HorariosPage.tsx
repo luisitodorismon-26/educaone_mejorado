@@ -14,7 +14,12 @@ interface Horario {
   asignatura_id: number | null;
   curso: string | null;
   curso_id: number | null;
-  profesor: string;
+  // `Horario.to_dict()` entrega `profesor_id`, NO el nombre. La interface
+  // declaraba `profesor: string`, un campo que nunca llega: en la vista Por
+  // Curso la tarjeta quedaba vacía, y peor, dos filas de profesores distintos
+  // tenían ambas `profesor === undefined` y se confundían entre sí. El docente
+  // se resuelve contra el array `profesores`, que la página ya carga.
+  profesor_id: number;
   aula?: string;
   tipo_bloque: 'clase' | 'libre' | 'recreo';
   tanda?: string;
@@ -83,7 +88,7 @@ const seSolapan = (a: Horario, b: Horario): boolean =>
  *  coinciden en todo esto, son la misma clase escrita dos veces. */
 const identidadBloque = (h: Horario): string =>
   [h.dia, h.hora_inicio, h.hora_fin, h.tipo_bloque || 'clase',
-   h.curso_id ?? '-', h.asignatura_id ?? '-', h.profesor || '-'].join('|');
+   h.profesor_id ?? '-', h.curso_id ?? '-', h.asignatura_id ?? '-'].join('|');
 
 // Generar bloques de horario para una tanda
 const generarBloquesHorario = (tandaInicio: string, tandaFin: string, recreos: Recreo[], duracionBloque: number = 50) => {
@@ -419,6 +424,14 @@ export const HorariosPage = () => {
     return Array.from(grupos.values());
   };
 
+  // El nombre del docente no viene en el horario: se resuelve por id contra los
+  // profesores que la página ya carga. El fallback deja rastro del id en vez de
+  // dejar la tarjeta muda si el profesor no está en la lista (por ejemplo, si
+  // el filtro de nivel lo recortó).
+  const nombreProfesor = (profesorIdBloque: number) =>
+    profesores.find(p => p.id === profesorIdBloque)?.nombre_completo
+    || `Profesor #${profesorIdBloque}`;
+
   const getColorAsignatura = (asignatura: string) => {
     const colores: Record<string, string> = {
       'Matemática': 'bg-blue-50 border-blue-200 text-blue-700',
@@ -735,7 +748,9 @@ export const HorariosPage = () => {
                                         {formatHora(horario.hora_inicio)} – {formatHora(horario.hora_fin)}
                                       </p>
                                       <p className="text-[9px] uppercase opacity-75">
-                                        {vistaActual === 'profesor' ? horario.curso : horario.profesor}
+                                        {vistaActual === 'profesor'
+                                          ? horario.curso
+                                          : nombreProfesor(horario.profesor_id)}
                                       </p>
                                       {horario.aula && (
                                         <p className="text-[8px] opacity-60">Aula: {horario.aula}</p>
