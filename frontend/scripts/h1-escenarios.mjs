@@ -77,6 +77,7 @@ ${cuerpoFines}
 ${retornoFines}
 }
 export { seSolapan, identidadBloque, aMinutos, profesorIdParaGuardar, recargarSegunVista };
+export { idsDelGrupo, accionesRetiroDeGrupo, mensajeRetiro };
 `;
 
 const js = transformSync(modulo, { loader: 'ts', format: 'esm' }).code;
@@ -313,6 +314,101 @@ prueba('P  tras guardar se refresca la vista que se esta mirando', () => {
   llamadas.length = 0;
   mod.recargarSegunVista('curso', porProf, porCurso);
   iguales(llamadas, ['curso'], 'Por Curso refresca el CURSO, no el profesor');
+});
+
+// ==========================================================================
+// H2-B2 — RETIRAR UN DUPLICADO EXACTO: EL ID LO ELIGE DIRECCIÓN
+//   Un solo botón sobre `grupo[0]` hacía que la interfaz decidiera cuál de
+//   34/35 desaparece. Estos casos fijan que ya no decide nadie más.
+// ==========================================================================
+console.log('\nH2-B2 — SELECCIÓN DE ID EN DUPLICADOS\n' + '='.repeat(74));
+
+// Los legacy reales de producción: 34/35 son el grupo de dos, 62–69 el de ocho.
+const dup = (ids) => ids.map(id => h(id, 'Lunes', '08:00', '08:45'));
+
+prueba('Q  dos duplicados exactos forman un grupo con los dos ids visibles', () => {
+  const grupos = mod.agrupar(dup([35, 34]));
+  iguales(grupos.length, 1, 'tienen que ser UNA tarjeta, no dos');
+  iguales(mod.idsDelGrupo(grupos[0]), [34, 35], 'ids ordenados, sin perder ninguno');
+});
+
+prueba('R  hay una acción independiente por registro, no una sola', () => {
+  const [grupo] = mod.agrupar(dup([35, 34]));
+  const acciones = mod.accionesRetiroDeGrupo(grupo);
+  iguales(acciones.length, 2, 'una acción por id');
+  iguales(acciones.map(a => a.etiqueta), ['Retirar ID 34', 'Retirar ID 35'], 'etiquetas');
+});
+
+prueba('S  pulsar "Retirar ID 35" llama a /35/retirar y NO a /34/retirar', () => {
+  const [grupo] = mod.agrupar(dup([35, 34]));
+  const llamadas = [];
+  const handleRetirar = (id) => llamadas.push(`POST /api/horarios/${id}/retirar`);
+
+  const elegida = mod.accionesRetiroDeGrupo(grupo).find(a => a.etiqueta === 'Retirar ID 35');
+  handleRetirar(elegida.id);   // es lo que hace el onClick de ese botón
+  iguales(llamadas, ['POST /api/horarios/35/retirar'], 'solo el 35');
+});
+
+prueba('T  pulsar "Retirar ID 34" llama a /34/retirar, y solo a una fila', () => {
+  const [grupo] = mod.agrupar(dup([35, 34]));
+  const llamadas = [];
+  const handleRetirar = (id) => llamadas.push(`POST /api/horarios/${id}/retirar`);
+
+  const elegida = mod.accionesRetiroDeGrupo(grupo).find(a => a.etiqueta === 'Retirar ID 34');
+  handleRetirar(elegida.id);
+  iguales(llamadas, ['POST /api/horarios/34/retirar'], 'solo el 34, nunca los dos');
+});
+
+prueba('T2 el grupo de ocho (62–69) ofrece ocho acciones, una por id', () => {
+  const ids = [66, 62, 69, 64, 63, 68, 65, 67];
+  const [grupo] = mod.agrupar(dup(ids));
+  const acciones = mod.accionesRetiroDeGrupo(grupo);
+  iguales(acciones.map(a => a.id), [62, 63, 64, 65, 66, 67, 68, 69], 'orden numérico');
+  iguales(acciones.length, 8, 'ninguno se pierde ni se agrupa en un botón');
+  // y ninguna acción arrastra a otra
+  const llamadas = [];
+  acciones.filter(a => a.id === 65).forEach(a => llamadas.push(a.id));
+  iguales(llamadas, [65], 'la acción del 65 retira el 65');
+});
+
+prueba('U  un bloque normal sigue teniendo una sola acción Retirar', () => {
+  const [grupo] = mod.agrupar([h(7, 'Lunes', '08:00', '08:45')]);
+  iguales(grupo.length, 1, 'un solo registro');
+  iguales(mod.idsDelGrupo(grupo), [7], 'su propio id');
+  // `repetido` es false, así que la tarjeta usa el botón único de siempre
+  // sobre ese mismo id: no hay ambigüedad que resolver.
+  iguales(mod.accionesRetiroDeGrupo(grupo).map(a => a.id), [7], 'y apunta a él');
+});
+
+prueba('V  los conflictos NO idénticos siguen siendo tarjetas separadas', () => {
+  // 19 Francés y 37 Inglés: mismo hueco, distinta asignatura. H1 los deja
+  // aparte para que Dirección vea que son dos clases distintas.
+  const hs = [
+    h(19, 'Lunes', '08:00', '08:45', { asignatura_id: 5, asignatura: 'Francés' }),
+    h(37, 'Lunes', '08:00', '08:45', { asignatura_id: 6, asignatura: 'Inglés' }),
+  ];
+  const grupos = mod.agrupar(hs);
+  iguales(grupos.length, 2, 'dos tarjetas, no un grupo de duplicados');
+  iguales(grupos.map(g => mod.idsDelGrupo(g)), [[19], [37]], 'cada una con su id');
+  iguales(Array.from(mod.conflictos(hs)).sort((a, b) => a - b), [19, 37], 'siguen en conflicto');
+});
+
+prueba('W  la confirmación nombra el registro que se va a retirar', () => {
+  const msg = mod.mensajeRetiro(35);
+  if (!msg.includes('ID 35')) throw new Error('no dice qué registro: ' + msg);
+  if (msg.includes('ID 34')) throw new Error('nombra el registro equivocado');
+  if (!msg.includes('podrá reactivarse')) throw new Error('no dice que es reversible');
+});
+
+// El único trozo que no es función pura es el `onClick` del botón. Se comprueba
+// contra el fuente para que no pueda volver a apuntar a `horario.id`.
+prueba('W2 el onClick del botón por id usa el id de la acción, no grupo[0]', () => {
+  const src = readFileSync(FUENTE, 'utf8');
+  if (!src.includes('onClick={() => handleRetirar(accion.id)}'))
+    throw new Error('el botón por registro no llama a handleRetirar(accion.id)');
+  const bloque = src.slice(src.indexOf('accionesRetiroDeGrupo(grupo).map'));
+  if (bloque.slice(0, 400).includes('handleRetirar(horario.id)'))
+    throw new Error('el botón por registro sigue retirando grupo[0]');
 });
 
 console.log('='.repeat(74));

@@ -6079,6 +6079,18 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
             db.rollback()  # descartar los cambios pendientes: nada existente se toca
             return _sin_asig
 
+    # H2-B2: un bloque RETIRADO no se edita por la via normal. Las cuatro
+    # lecturas ya no lo devuelven, asi que la pantalla no puede llegar a el; esto
+    # cierra la puerta por API. El orden correcto es Reactivar y luego Editar, de
+    # modo que la vuelta al horario pase por las validaciones de reactivar en vez
+    # de colarse por un PUT.
+    if not horario.activo:
+        db.rollback()
+        return JSONResponse({
+            'error': ('Este bloque está retirado. Reactívelo antes de editarlo.'),
+            'horario_id': horario.id,
+        }, status_code=409)
+
     # v2.19.8.1 — mismas validaciones de solapamiento que al crear, excluyendo
     # el propio horario (editar sin cambiar la hora NO choca consigo mismo).
     if horario.tipo_bloque == 'clase':
@@ -6126,14 +6138,154 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
     return {'message': 'Horario actualizado', 'horario': horario.to_dict()}
 
 
+_BORRADO_HORARIO_DESHABILITADO = {
+    'error': ('El borrado permanente de horarios está deshabilitado. Un bloque '
+              'que deja de impartirse se RETIRA: desaparece del horario actual '
+              'y deja de bloquear conflictos, pero se conserva y puede '
+              'reactivarse. Use Retirar.')
+}
+
+
+def _foto_horario(h: Horario) -> dict:
+    """Los campos del bloque, para que la auditoría diga QUÉ clase era.
+
+    El borrado físico dejaba en el log solo «DELETE /api/horarios/19»: ni el
+    profesor, ni el curso, ni el día. Retirar guarda la ficha entera, que es
+    justo lo que hacía falta para reconstruir la historia en la auditoría H2-A.
+    """
+    return {
+        'id': h.id, 'colegio_id': h.colegio_id, 'profesor_id': h.profesor_id,
+        'curso_id': h.curso_id, 'asignatura_id': h.asignatura_id,
+        'dia': h.dia, 'hora_inicio': h.hora_inicio, 'hora_fin': h.hora_fin,
+        'aula': h.aula, 'tipo_bloque': h.tipo_bloque or 'clase',
+        'activo': bool(h.activo),
+    }
+
+
 @app.delete("/api/horarios/{id}")
 async def delete_horario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Eliminar un horario. Valida tenant antes de borrar."""
+    """
+    DESHABILITADO — el borrado de horarios pasó a ser RETIRO reversible.
+
+    Antes hacía `db.delete(horario)`. La fila desaparecía y con ella el día, la
+    hora, el profesor, el curso y la asignatura: la auditoría solo conservaba
+    «DELETE /api/horarios/19», así que era imposible saber después qué clase se
+    había borrado — la reconstrucción forense de H2-A se topó con eso.
+
+    La ruta se conserva en vez de eliminarse para que un cliente antiguo reciba
+    una explicación en lugar de un 404 que parezca un fallo de red.
+
+    El `get_tenant_or_404` se mantiene **antes** de la respuesta aunque la ruta
+    ya no escriba nada. EducaOne contesta 404, nunca 403, a un recurso de otro
+    colegio: un 403 admitiría que la fila existe. Deshabilitar el borrado no es
+    motivo para aflojar esa regla, así que quien no puede ver el horario sigue
+    recibiendo el mismo 404 de siempre, y solo quien sí puede verlo recibe la
+    explicación. Se consulta la fila; no se modifica.
+    """
+    get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    return JSONResponse(_BORRADO_HORARIO_DESHABILITADO, status_code=403)
+
+
+@app.get("/api/horarios/retirados")
+async def get_horarios_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Los bloques retirados del colegio. Lo que las cuatro lecturas ya no muestran.
+
+    Aplica el mismo lente de nivel que `GET /api/horarios`: bajo «Horarios —
+    Secundaria» no tienen por qué asomar los retirados de Primaria. Los bloques
+    sin curso (libre/recreo) se conservan siempre, porque pertenecen al
+    profesor y no a un nivel — igual que en el listado activo.
+    """
+    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.activo.is_(False)
+    ).order_by(Horario.dia, Horario.hora_inicio, Horario.id).all()
+    _niv = nivel_efectivo(current_user, request)
+    if _niv is not None:
+        _cids = cursos_ids_de_nivel(db, current_user, _niv) or set()
+        horarios = [h for h in horarios if h.curso_id is None or h.curso_id in _cids]
+    return [h.to_dict() for h in horarios]
+
+
+@app.post("/api/horarios/{id}/retirar")
+async def retirar_horario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Retira un bloque: deja el horario actual, pero NO se borra.
+
+    Solo cambia `activo`. No toca la `AsignacionProfesor` del docente, ni la
+    titularidad, ni ninguna asistencia, nota o sesión ya registrada: retirar un
+    bloque de la agenda de hoy no puede reescribir lo que pasó ayer.
+    """
     horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
-    db.delete(horario)
+
+    if not horario.activo:
+        # Idempotente: pedir dos veces lo mismo no es un error, y no se vuelve a
+        # auditar un cambio que no ocurrió.
+        return {'message': 'El horario ya estaba retirado', 'horario': horario.to_dict()}
+
+    antes = _foto_horario(horario)
+    horario.activo = False
+    log_auditoria(db, 'RETIRAR_HORARIO', 'horarios', horario.id,
+                  antes, _foto_horario(horario), user=current_user, request=request)
     db.commit()
-    cache_clear_tenant(current_user.colegio_id)
-    return {'message': 'Horario eliminado'}
+    cache_clear_tenant(horario.colegio_id)
+    return {'message': 'Horario retirado', 'horario': horario.to_dict()}
+
+
+@app.post("/api/horarios/{id}/reactivar")
+async def reactivar_horario(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Devuelve un bloque retirado al horario actual.
+
+    Reactivar es un alta a efectos prácticos, así que pasa por las MISMAS
+    validaciones que crear: la asignación del docente tiene que seguir vigente y
+    la franja tiene que estar libre. El horario pudo retirarse hace meses y el
+    mundo haber cambiado: el profesor ya no da esa materia, o alguien ocupó esa
+    hora. Si no cabe, se queda retirado y se explica por qué.
+    """
+    horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+
+    if horario.activo:
+        return {'message': 'El horario ya estaba activo', 'horario': horario.to_dict()}
+
+    if (horario.tipo_bloque or 'clase') == 'clase':
+        if horario.curso_id is None or horario.asignatura_id is None:
+            return JSONResponse({
+                'error': ('Este bloque de clase no tiene curso o asignatura, así que '
+                          'no puede volver al horario. Créelo de nuevo.'),
+            }, status_code=409)
+
+        # El nivel del curso tiene que seguir contratado. Va primero, igual que
+        # en `crear_horario`: si Crear rechazaría hoy este curso porque su
+        # módulo Primaria/Secundaria está deshabilitado, Reactivar tiene que
+        # rechazarlo por lo mismo. Una clase retirada hace meses no vuelve a un
+        # nivel que ya no está activo. Levanta 403 antes de tocar nada.
+        assert_nivel_curso_activo(db, current_user, horario.curso_id)
+
+        # La asignación tiene que seguir viva: mismo criterio que al crear.
+        _sin_asig = _exige_asignacion_activa(
+            db, colegio_id=horario.colegio_id, profesor_id=horario.profesor_id,
+            curso_id=horario.curso_id, asignatura_id=horario.asignatura_id,
+        )
+        if _sin_asig is not None:
+            return _sin_asig
+
+        # Y la franja tiene que estar libre AHORA. Se excluye el propio bloque
+        # porque un retirado no se cuenta a sí mismo como obstáculo.
+        _conf = _conflicto_clase(
+            db, colegio_id=horario.colegio_id, dia=horario.dia,
+            hora_inicio=horario.hora_inicio, hora_fin=horario.hora_fin,
+            profesor_id=horario.profesor_id, curso_id=horario.curso_id,
+            excluir_id=horario.id,
+        )
+        if _conf is not None:
+            return _conf
+
+    antes = _foto_horario(horario)
+    horario.activo = True
+    log_auditoria(db, 'REACTIVAR_HORARIO', 'horarios', horario.id,
+                  antes, _foto_horario(horario), user=current_user, request=request)
+    db.commit()
+    cache_clear_tenant(horario.colegio_id)
+    return {'message': 'Horario reactivado', 'horario': horario.to_dict()}
 
 # ============== CALIFICACIONES ==============
 
