@@ -115,6 +115,13 @@ const mensajeRetiro = (id: number): string =>
   `Vas a retirar el registro de horario ID ${id}.\n` +
   'Dejará de aparecer en el horario actual, pero se conservará y podrá reactivarse.';
 
+/** Retirar es reversible y la confirmación lo dice; esta no puede decir lo
+ *  mismo, porque aquí no hay vuelta atrás. */
+const mensajeEliminacionDefinitiva = (id: number): string =>
+  `Vas a eliminar definitivamente el horario ID ${id}.\n` +
+  'Esta acción no se puede deshacer.\n' +
+  'Si se necesita nuevamente deberá crearse un horario nuevo.';
+
 /**
  * De quien es el bloque que se esta guardando.
  *
@@ -404,6 +411,22 @@ export const HorariosPage = () => {
     } catch (e: any) {
       // El backend explica el caso: la asignacion ya no existe, o la franja se ocupo.
       setMessage({ type: 'error', text: e.response?.data?.error || 'No se pudo reactivar' });
+    }
+  };
+
+  // H2-B3: borrado permanente, solo desde el panel de retirados y solo fila a
+  // fila. Una fila, una decisión: no hay «eliminar todos» ni limpieza por
+  // antigüedad. El id viaja en el cuerpo porque es lo que separa «eliminar el
+  // 64» de «eliminar el que estaba mirando».
+  const handleEliminarDefinitivo = async (id: number) => {
+    if (!confirm(mensajeEliminacionDefinitiva(id))) return;
+    try {
+      await api.post(`/horarios/${id}/eliminar-definitivo`, { confirmar_id: id });
+      setMessage({ type: 'success', text: `Horario ID ${id} eliminado definitivamente` });
+      cargarRetirados();
+    } catch (e: any) {
+      // El backend explica el caso: sigue activo, o hay historia que lo ata.
+      setMessage({ type: 'error', text: e.response?.data?.error || 'No se pudo eliminar' });
     }
   };
 
@@ -970,12 +993,21 @@ export const HorariosPage = () => {
                           </td>
                           <td className="py-2 pr-3">{h.tipo_bloque}</td>
                           <td className="py-2">
-                            <button
-                              onClick={() => handleReactivar(h.id)}
-                              className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded hover:bg-emerald-100 text-xs"
-                            >
-                              Reactivar
-                            </button>
+                            <div className="flex gap-1">
+                              <button
+                                onClick={() => handleReactivar(h.id)}
+                                className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded hover:bg-emerald-100 text-xs whitespace-nowrap"
+                              >
+                                Reactivar
+                              </button>
+                              <button
+                                onClick={() => handleEliminarDefinitivo(h.id)}
+                                className="px-3 py-1 bg-red-50 text-red-700 border border-red-200 rounded hover:bg-red-100 text-xs whitespace-nowrap"
+                                title={`Eliminar para siempre el horario ${h.id}. No se puede deshacer.`}
+                              >
+                                Eliminar definitivamente
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}

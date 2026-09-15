@@ -6287,6 +6287,104 @@ async def reactivar_horario(id, request: Request, db: Session = Depends(get_db),
     cache_clear_tenant(horario.colegio_id)
     return {'message': 'Horario reactivado', 'horario': horario.to_dict()}
 
+
+def _referencias_historicas_horario(db: Session, horario: Horario) -> list:
+    """Qué información ya registrada apunta a este bloque.
+
+    La auditoría de H2-B3 midió el esquema entero: NO hay ninguna foreign key
+    hacia `horarios`, y en toda la base existe una sola columna que guarda un id
+    de horario — `sesiones_no_impartidas.horario_id`, nullable y sin FK, donde S1
+    anota la PROCEDENCIA de la sesión.
+
+    Todo lo demás —el Registro, la Asistencia, los Reportes, el dashboard del
+    profesor, Reemplazar Profesor— lee los horarios vivos por profesor, curso,
+    día y hora; no guarda ningún id, así que borrar la fila no deja un puntero
+    roto en ninguno.
+
+    El log de auditoría queda deliberadamente fuera: `registro_id` es un entero
+    sin FK, y un log que dejara de poder referirse a lo que ya no existe no
+    serviría de nada. La historia sobrevive al borrado; ese es su trabajo.
+    """
+    referencias = []
+    n_sesiones = db.query(SesionNoImpartida).filter(
+        SesionNoImpartida.horario_id == horario.id
+    ).count()
+    if n_sesiones:
+        referencias.append(
+            '%d sesión(es) no impartida(s) registradas con este bloque' % n_sesiones)
+    return referencias
+
+
+@app.post("/api/horarios/{id}/eliminar-definitivo")
+async def eliminar_horario_definitivo(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Borra para siempre un bloque YA RETIRADO. No hay vuelta atrás.
+
+    Retirar dejó de ser destructivo justamente para no repetir lo de H2-A, donde
+    cuatro horarios desaparecieron sin que quedara rastro de qué clase eran. Pero
+    un bloque que Dirección sabe que no volverá no tiene por qué quedarse para
+    siempre en la lista de retirados. Esta ruta existe para eso, y solo para eso.
+
+    `DELETE /api/horarios/{id}` sigue deshabilitado: el borrado permanente tiene
+    que pedirse a propósito, nombrando el id, no caer por accidente desde un
+    cliente viejo que creía estar quitando un bloque cualquiera.
+
+    Exige, en orden: mismo colegio, que exista, que esté retirado, que quien
+    llama confirme el id exacto, y que nada ya registrado apunte al bloque.
+    """
+    horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+
+    if horario.activo:
+        return JSONResponse({
+            'error': 'Retire primero el horario.',
+        }, status_code=409)
+
+    # El id va también en el cuerpo. Es lo único que separa «eliminar el 64» de
+    # «eliminar el que estaba mirando»: en un grupo de duplicados esa diferencia
+    # es toda la decisión.
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    # Se acepta 64 y "64" —un formulario manda cadenas— pero nada más: ni un
+    # booleano (que en Python valdría 1), ni un decimal que al truncarse
+    # acertaría por casualidad. La confirmación tiene que ser un entero dicho a
+    # propósito.
+    crudo = (data or {}).get('confirmar_id')
+    confirmado = None
+    if isinstance(crudo, int) and not isinstance(crudo, bool):
+        confirmado = crudo
+    elif isinstance(crudo, str) and crudo.strip().lstrip('-').isdigit():
+        confirmado = int(crudo.strip())
+    if confirmado != horario.id:
+        return JSONResponse({
+            'error': ('Confirme el ID del horario que va a eliminar. Se esperaba '
+                      '%d.' % horario.id),
+        }, status_code=400)
+
+    referencias = _referencias_historicas_horario(db, horario)
+    if referencias:
+        return JSONResponse({
+            'error': ('Este horario está vinculado a información histórica y debe '
+                      'permanecer retirado.'),
+            'referencias': referencias,
+        }, status_code=409)
+
+    # La ficha entera, ANTES de borrar: es lo último que quedará del bloque.
+    foto = _foto_horario(horario)
+    log_auditoria(db, 'ELIMINAR_HORARIO_DEFINITIVO', 'horarios', horario.id,
+                  foto, None, user=current_user, request=request)
+    # Un solo commit para el log y el borrado. Si el delete falla, el rollback se
+    # lleva también la auditoría: no puede quedar constancia de algo que no pasó.
+    try:
+        db.delete(horario)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    cache_clear_tenant(current_user.colegio_id)
+    return {'message': 'Horario eliminado definitivamente', 'horario': foto}
+
 # ============== CALIFICACIONES ==============
 
 @app.get("/api/calificaciones/curso/{curso_id}/asignatura/{asignatura_id}")
