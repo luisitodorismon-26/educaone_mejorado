@@ -172,6 +172,10 @@ export const HorariosPage = () => {
   const [cursoId, setCursoId] = useState(0);
   const [tandaId, setTandaId] = useState(0);
   const [vistaActual, setVistaActual] = useState<'profesor' | 'curso'>('profesor');
+  // H2-B2: los retirados viven en su propio panel, nunca mezclados con la
+  // cuadricula activa: son historia, no horario vigente.
+  const [retirados, setRetirados] = useState<Horario[]>([]);
+  const [mostrarRetirados, setMostrarRetirados] = useState(false);
   const [horarios, setHorarios] = useState<Horario[]>([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
@@ -344,14 +348,40 @@ export const HorariosPage = () => {
     setShowModal(true);
   };
 
-  const handleDelete = async (id: number) => {
-    if (!confirm('¿Eliminar este bloque de horario?')) return;
+  // H2-B2: retirar, no borrar. El bloque sale del horario actual pero la fila se
+  // conserva entera, asi que se puede reactivar y la historia no se pierde.
+  const handleRetirar = async (id: number) => {
+    if (!confirm(
+      'Este horario dejará de aparecer en el horario actual, ' +
+      'pero se conservará y podrá reactivarse.'
+    )) return;
     try {
-      await api.delete(`/horarios/${id}`);
-      if (vistaActual === 'profesor') loadHorariosProfesor();
-      else loadHorariosCurso();
-    } catch (e) {
-      console.error('Error eliminando:', e);
+      await api.post(`/horarios/${id}/retirar`);
+      recargarSegunVista(vistaActual, loadHorariosProfesor, loadHorariosCurso);
+      if (mostrarRetirados) cargarRetirados();
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.response?.data?.error || 'No se pudo retirar' });
+    }
+  };
+
+  const cargarRetirados = async () => {
+    try {
+      const r = await api.get('/horarios/retirados');
+      setRetirados(r.data || []);
+    } catch {
+      setRetirados([]);
+    }
+  };
+
+  const handleReactivar = async (id: number) => {
+    try {
+      await api.post(`/horarios/${id}/reactivar`);
+      setMessage({ type: 'success', text: 'Horario reactivado' });
+      cargarRetirados();
+      recargarSegunVista(vistaActual, loadHorariosProfesor, loadHorariosCurso);
+    } catch (e: any) {
+      // El backend explica el caso: la asignacion ya no existe, o la franja se ocupo.
+      setMessage({ type: 'error', text: e.response?.data?.error || 'No se pudo reactivar' });
     }
   };
 
@@ -804,29 +834,23 @@ export const HorariosPage = () => {
                                       >
                                         <Settings size={12} />
                                       </button>
-                                      {/* El borrado es FÍSICO. Mientras el bloque esté en
-                                          conflicto o repetido, eliminar "el que sobra" es
-                                          justo la decisión que nadie ha tomado todavía, y
-                                          no habría vuelta atrás. Se deshabilita aquí; el
-                                          resto de celdas conserva el comportamiento de
-                                          siempre. Sustituir el borrado físico por algo
-                                          reversible es una fase aparte. */}
-                                      {anomala ? (
-                                        <span
-                                          className="p-1 bg-slate-100 text-slate-400 rounded cursor-not-allowed"
-                                          title="Resolución pendiente: no elimine este bloque hasta confirmar el horario institucional."
-                                        >
-                                          <Trash2 size={12} />
-                                        </span>
-                                      ) : (
-                                        <button
-                                          onClick={() => handleDelete(horario.id)}
-                                          className="p-1 bg-red-100 text-red-600 rounded hover:bg-red-200"
-                                          title="Eliminar"
-                                        >
-                                          <Trash2 size={12} />
-                                        </button>
-                                      )}
+                                      {/* H2-B2: el borrado permanente desaparecio.
+                                          Retirar es reversible, asi que ya no hace
+                                          falta bloquearlo en las celdas con anomalia
+                                          —H1 lo deshabilitaba porque no habia vuelta
+                                          atras—. El aviso de conflicto se conserva:
+                                          sigue habiendo algo que Direccion decide. */}
+                                      <button
+                                        onClick={() => handleRetirar(horario.id)}
+                                        className={`p-1 rounded ${anomala
+                                          ? 'bg-amber-100 text-amber-700 hover:bg-amber-200'
+                                          : 'bg-red-100 text-red-600 hover:bg-red-200'}`}
+                                        title={anomala
+                                          ? 'Retirar este bloque. Se conserva y puede reactivarse; confirme antes cuál es el horario institucional.'
+                                          : 'Retirar del horario actual'}
+                                      >
+                                        <Trash2 size={12} />
+                                      </button>
                                     </div>
                                   )}
                                 </div>
@@ -844,6 +868,75 @@ export const HorariosPage = () => {
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {/* H2-B2 — LOS RETIRADOS, EN SU PROPIO PANEL.
+          Nunca dentro de la cuadricula: alli solo va el horario vigente. Este
+          acceso es de Direccion, que es quien puede devolverlos. */}
+      {canEdit && (
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
+          <button
+            onClick={() => {
+              const abrir = !mostrarRetirados;
+              setMostrarRetirados(abrir);
+              if (abrir) cargarRetirados();
+            }}
+            className="w-full px-4 py-3 text-left text-sm text-slate-600 hover:bg-slate-50 flex items-center justify-between"
+          >
+            <span>🗂️ Ver horarios retirados</span>
+            <span className="text-slate-400">{mostrarRetirados ? '▲' : '▼'}</span>
+          </button>
+
+          {mostrarRetirados && (
+            <div className="border-t border-slate-100 p-4">
+              {retirados.length === 0 ? (
+                <p className="text-sm text-slate-400">
+                  No hay horarios retirados en este colegio.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm">
+                    <thead>
+                      <tr className="text-[11px] uppercase text-slate-400">
+                        <th className="py-2 pr-3 font-medium">ID</th>
+                        <th className="py-2 pr-3 font-medium">Profesor</th>
+                        <th className="py-2 pr-3 font-medium">Curso</th>
+                        <th className="py-2 pr-3 font-medium">Asignatura</th>
+                        <th className="py-2 pr-3 font-medium">Día</th>
+                        <th className="py-2 pr-3 font-medium">Hora</th>
+                        <th className="py-2 pr-3 font-medium">Tipo</th>
+                        <th className="py-2 font-medium"></th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {retirados.map(h => (
+                        <tr key={h.id} className="text-slate-600">
+                          <td className="py-2 pr-3 font-mono text-xs text-slate-400">{h.id}</td>
+                          <td className="py-2 pr-3">{nombreProfesor(h.profesor_id)}</td>
+                          <td className="py-2 pr-3">{h.curso || '—'}</td>
+                          <td className="py-2 pr-3">{h.asignatura || '—'}</td>
+                          <td className="py-2 pr-3">{h.dia}</td>
+                          <td className="py-2 pr-3 whitespace-nowrap">
+                            {formatHora(h.hora_inicio)} – {formatHora(h.hora_fin)}
+                          </td>
+                          <td className="py-2 pr-3">{h.tipo_bloque}</td>
+                          <td className="py-2">
+                            <button
+                              onClick={() => handleReactivar(h.id)}
+                              className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded hover:bg-emerald-100 text-xs"
+                            >
+                              Reactivar
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
