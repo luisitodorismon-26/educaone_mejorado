@@ -76,7 +76,7 @@ export function rotuloFila(horarios: Horario[], inicio: string) {
 ${cuerpoFines}
 ${retornoFines}
 }
-export { seSolapan, identidadBloque, aMinutos };
+export { seSolapan, identidadBloque, aMinutos, profesorIdParaGuardar, recargarSegunVista };
 `;
 
 const js = transformSync(modulo, { loader: 'ts', format: 'esm' }).code;
@@ -272,6 +272,47 @@ prueba('N3 el nombre del profesor no participa en la identidad', () => {
   // y la identidad NO menciona ningún nombre
   if (/Prof|Luis|Julio/.test(mod.identidadBloque(a)))
     throw new Error('la identidad incluye un nombre: ' + mod.identidadBloque(a));
+});
+
+// ==========================================================================
+// O — GUARDAR DESDE POR CURSO CON EL SELECTOR DE POR PROFESOR "SUCIO"
+//
+// H1 deja Editar disponible en los bloques conflictivos, asi que este camino
+// —que ya existia— pasa a usarse justo donde mas dano haria: reasignar la clase
+// a otro docente mientras Direccion intenta resolver un conflicto.
+// ==========================================================================
+prueba('O  editar Por Curso NO usa el profesor que quedo en el selector', () => {
+  // Direccion miro Por Profesor (id 4), luego paso a Por Curso y edita un
+  // bloque cuyo profesor real es el 11.
+  const editando = h(200, 'Lunes', '11:15', '12:00', { profesor_id: 11, curso_id: 3 });
+  const profesorIdSelector = 4;
+  const efectivo = mod.profesorIdParaGuardar(editando, profesorIdSelector);
+  iguales(efectivo, 11, 'manda el profesor del BLOQUE, no el del selector');
+  if (efectivo === profesorIdSelector)
+    throw new Error('el PUT reasignaria la clase al profesor equivocado');
+});
+
+prueba('O2 crear un bloque nuevo sigue usando el profesor del selector', () => {
+  iguales(mod.profesorIdParaGuardar(null, 4), 4, 'alta desde Por Profesor');
+  iguales(mod.profesorIdParaGuardar(undefined, 7), 7, 'sin bloque en edicion');
+});
+
+prueba('O3 un profesor_id 0 del bloque no se confunde con "no hay bloque"', () => {
+  // ?? solo cae al selector con null/undefined: un 0 legitimo se respeta.
+  iguales(mod.profesorIdParaGuardar({ profesor_id: 0 }, 4), 0, 'respeta el 0');
+});
+
+prueba('P  tras guardar se refresca la vista que se esta mirando', () => {
+  const llamadas = [];
+  const porProf = () => llamadas.push('profesor');
+  const porCurso = () => llamadas.push('curso');
+
+  mod.recargarSegunVista('profesor', porProf, porCurso);
+  iguales(llamadas, ['profesor'], 'Por Profesor refresca el profesor');
+
+  llamadas.length = 0;
+  mod.recargarSegunVista('curso', porProf, porCurso);
+  iguales(llamadas, ['curso'], 'Por Curso refresca el CURSO, no el profesor');
 });
 
 console.log('='.repeat(74));

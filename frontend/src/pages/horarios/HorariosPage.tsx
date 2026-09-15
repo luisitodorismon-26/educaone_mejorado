@@ -90,6 +90,29 @@ const identidadBloque = (h: Horario): string =>
   [h.dia, h.hora_inicio, h.hora_fin, h.tipo_bloque || 'clase',
    h.profesor_id ?? '-', h.curso_id ?? '-', h.asignatura_id ?? '-'].join('|');
 
+/**
+ * De quien es el bloque que se esta guardando.
+ *
+ * Al CREAR se usa el profesor del selector, porque el alta se hace desde la
+ * vista Por Profesor y ese selector ES la eleccion. Al EDITAR manda siempre el
+ * profesor del bloque: Direccion puede haber mirado Por Profesor antes de pasar
+ * a Por Curso, y entonces el selector conserva a un docente que no tiene nada
+ * que ver con la fila que esta tocando. Enviar ese id reasignaria la clase a
+ * otro profesor sin que nadie lo pidiera.
+ */
+const profesorIdParaGuardar = (
+  editando: { profesor_id: number } | null,
+  profesorIdSeleccionado: number,
+): number => editando?.profesor_id ?? profesorIdSeleccionado;
+
+/** Tras guardar se refresca el listado que el usuario esta viendo, no siempre el
+ *  de profesor: una edicion hecha Por Curso dejaba la pantalla con otros datos. */
+const recargarSegunVista = (
+  vista: 'profesor' | 'curso',
+  cargarProfesor: () => void,
+  cargarCurso: () => void,
+): void => { vista === 'curso' ? cargarCurso() : cargarProfesor(); };
+
 // Generar bloques de horario para una tanda
 const generarBloquesHorario = (tandaInicio: string, tandaFin: string, recreos: Recreo[], duracionBloque: number = 50) => {
   const bloques: { inicio: string; fin: string; recreo?: boolean; nombreRecreo?: string }[] = [];
@@ -278,7 +301,7 @@ export const HorariosPage = () => {
     
     try {
       const dataToSend = {
-        profesor_id: profesorId,
+        profesor_id: profesorIdParaGuardar(editingHorario, profesorId),
         dia: form.dia,
         hora_inicio: form.hora_inicio,
         hora_fin: form.hora_fin,
@@ -298,7 +321,7 @@ export const HorariosPage = () => {
         await api.post('/horarios', dataToSend);
         setMessage({ type: 'success', text: 'Horario creado' });
       }
-      loadHorariosProfesor();
+      recargarSegunVista(vistaActual, loadHorariosProfesor, loadHorariosCurso);
       setShowModal(false);
       setEditingHorario(null);
       setForm({ dia: 'Lunes', hora_inicio: '07:30', hora_fin: '08:20', curso_id: 0, asignatura_id: 0, aula: '', tipo_bloque: 'clase' });
