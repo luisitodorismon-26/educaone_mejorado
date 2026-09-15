@@ -5604,7 +5604,19 @@ async def get_horarios(request: Request, db: Session = Depends(get_db), current_
     # 'Horarios — Primaria' solo salen los bloques de clase de cursos de
     # primaria; los bloques sin curso (libre/recreo del profesor) se conservan
     # siempre porque pertenecen al profesor, no a un nivel.
-    horarios = tenant_filter(db.query(Horario), Horario, current_user).all()
+    # H2-B1 — un horario RETIRADO no se muestra.
+    #
+    # `Horario.activo` existe en el modelo desde siempre y ya lo respetan el guard
+    # de conflictos, S1, el dashboard del profesor, Reemplazar Profesor y el
+    # Registro. Estas cuatro lecturas —las principales— no lo miraban, asi que
+    # poner una fila en activo=False no la habria quitado de la cuadricula: el
+    # retiro logico no significaba nada. El filtro va en el SQL, no despues de
+    # cargar, para no traer filas que luego se descartan.
+    #
+    # Hoy es un no-op medido: las 95 filas de produccion estan activas y ninguna
+    # tiene activo NULL. Lo que habilita es que retirar pase a tener efecto.
+    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.activo.is_(True)).all()
     _niv = nivel_efectivo(current_user, request)
     if _niv is not None:
         _cids = cursos_ids_de_nivel(db, current_user, _niv) or set()
@@ -5616,8 +5628,21 @@ async def get_horarios_profesor(id, request: Request, db: Session = Depends(get_
     # Validar que el profesor pertenezca al mismo colegio (404 si no)
     get_tenant_or_404(db, Usuario, id, current_user, name='profesor')
 
-    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(
-        profesor_id=id).order_by(Horario.dia, Horario.hora_inicio).all()
+    # H2-B1 — un horario RETIRADO no se muestra.
+    #
+    # `Horario.activo` existe en el modelo desde siempre y ya lo respetan el guard
+    # de conflictos, S1, el dashboard del profesor, Reemplazar Profesor y el
+    # Registro. Estas cuatro lecturas —las principales— no lo miraban, asi que
+    # poner una fila en activo=False no la habria quitado de la cuadricula: el
+    # retiro logico no significaba nada. El filtro va en el SQL, no despues de
+    # cargar, para no traer filas que luego se descartan.
+    #
+    # Hoy es un no-op medido: las 95 filas de produccion estan activas y ninguna
+    # tiene activo NULL. Lo que habilita es que retirar pase a tener efecto.
+    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.profesor_id == id,
+        Horario.activo.is_(True),
+    ).order_by(Horario.dia, Horario.hora_inicio).all()
 
     # v2.19.8 (ajuste de auditoría): este endpoint tiene DOS consumidores.
     #
@@ -5649,7 +5674,21 @@ async def get_horarios_curso(id, request: Request, db: Session = Depends(get_db)
     _g = _guardia_nivel_lectura_curso(db, current_user, id)
     if _g is not None:
         return _g
-    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(curso_id=id).order_by(Horario.dia, Horario.hora_inicio).all()
+    # H2-B1 — un horario RETIRADO no se muestra.
+    #
+    # `Horario.activo` existe en el modelo desde siempre y ya lo respetan el guard
+    # de conflictos, S1, el dashboard del profesor, Reemplazar Profesor y el
+    # Registro. Estas cuatro lecturas —las principales— no lo miraban, asi que
+    # poner una fila en activo=False no la habria quitado de la cuadricula: el
+    # retiro logico no significaba nada. El filtro va en el SQL, no despues de
+    # cargar, para no traer filas que luego se descartan.
+    #
+    # Hoy es un no-op medido: las 95 filas de produccion estan activas y ninguna
+    # tiene activo NULL. Lo que habilita es que retirar pase a tener efecto.
+    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.curso_id == id,
+        Horario.activo.is_(True),
+    ).order_by(Horario.dia, Horario.hora_inicio).all()
     return [h.to_dict() for h in horarios]
 
 @app.get("/api/horarios/mi-horario-hoy")
@@ -5657,9 +5696,21 @@ async def get_mi_horario_hoy(request: Request, db: Session = Depends(get_db), cu
     dias = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
     dia_hoy = dias[today_rd().weekday()]
     
-    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter_by(
-        profesor_id=current_user.id,
-        dia=dia_hoy
+    # H2-B1 — un horario RETIRADO no se muestra.
+    #
+    # `Horario.activo` existe en el modelo desde siempre y ya lo respetan el guard
+    # de conflictos, S1, el dashboard del profesor, Reemplazar Profesor y el
+    # Registro. Estas cuatro lecturas —las principales— no lo miraban, asi que
+    # poner una fila en activo=False no la habria quitado de la cuadricula: el
+    # retiro logico no significaba nada. El filtro va en el SQL, no despues de
+    # cargar, para no traer filas que luego se descartan.
+    #
+    # Hoy es un no-op medido: las 95 filas de produccion estan activas y ninguna
+    # tiene activo NULL. Lo que habilita es que retirar pase a tener efecto.
+    horarios = tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.profesor_id == current_user.id,
+        Horario.dia == dia_hoy,
+        Horario.activo.is_(True),
     ).order_by(Horario.hora_inicio).all()
     
     return [h.to_dict() for h in horarios]
