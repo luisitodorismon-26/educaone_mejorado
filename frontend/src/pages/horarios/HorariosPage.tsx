@@ -90,6 +90,31 @@ const identidadBloque = (h: Horario): string =>
   [h.dia, h.hora_inicio, h.hora_fin, h.tipo_bloque || 'clase',
    h.profesor_id ?? '-', h.curso_id ?? '-', h.asignatura_id ?? '-'].join('|');
 
+/** Los ids de un grupo de filas idénticas, en orden numérico. Es solo
+ *  presentación: que 34 salga antes que 35 evita que la lista parezca
+ *  arbitraria, pero el orden no elige nada. */
+const idsDelGrupo = (grupo: Horario[]): number[] =>
+  grupo.map(h => h.id).sort((a, b) => a - b);
+
+/**
+ * Las acciones de Retirar que ofrece una tarjeta agrupada: una por registro.
+ *
+ * Un grupo de filas idénticas —34/35, o 62 a 69— se dibuja como una sola
+ * tarjeta, y hasta ahora tenía un solo botón que retiraba `grupo[0]`. Eso hacía
+ * que la interfaz eligiera por Dirección cuál de los registros desaparece. Que
+ * el retiro sea reversible reduce el daño, pero no autoriza al sistema a tomar
+ * la decisión: es exactamente la que nadie ha tomado todavía. Así que cada id
+ * tiene su propio botón, y ninguno retira más de una fila.
+ */
+const accionesRetiroDeGrupo = (grupo: Horario[]): { id: number; etiqueta: string }[] =>
+  idsDelGrupo(grupo).map(id => ({ id, etiqueta: `Retirar ID ${id}` }));
+
+/** El texto de confirmación nombra el registro: en un grupo de duplicados,
+ *  «este horario» no dice cuál. */
+const mensajeRetiro = (id: number): string =>
+  `Vas a retirar el registro de horario ID ${id}.\n` +
+  'Dejará de aparecer en el horario actual, pero se conservará y podrá reactivarse.';
+
 /**
  * De quien es el bloque que se esta guardando.
  *
@@ -351,10 +376,7 @@ export const HorariosPage = () => {
   // H2-B2: retirar, no borrar. El bloque sale del horario actual pero la fila se
   // conserva entera, asi que se puede reactivar y la historia no se pierde.
   const handleRetirar = async (id: number) => {
-    if (!confirm(
-      'Este horario dejará de aparecer en el horario actual, ' +
-      'pero se conservará y podrá reactivarse.'
-    )) return;
+    if (!confirm(mensajeRetiro(id))) return;
     try {
       await api.post(`/horarios/${id}/retirar`);
       recargarSegunVista(vistaActual, loadHorariosProfesor, loadHorariosCurso);
@@ -821,8 +843,29 @@ export const HorariosPage = () => {
                                   )}
                                   {anomala && (
                                     <p className="mt-0.5 text-[8px] font-mono opacity-60 leading-tight">
-                                      {grupo.length > 1 ? 'IDs' : 'ID'} {grupo.map(g => g.id).join(', ')}
+                                      {repetido ? 'IDs' : 'ID'} {idsDelGrupo(grupo).join(', ')}
                                     </p>
+                                  )}
+
+                                  {/* H2-B2 — en un grupo de filas idénticas, una acción
+                                      por registro. Un botón único retiraría `grupo[0]`,
+                                      y con eso la interfaz estaría eligiendo cuál de los
+                                      duplicados desaparece: justo la decisión que le
+                                      toca a Dirección. Van siempre visibles, no al pasar
+                                      el ratón, porque son una elección y no un atajo. */}
+                                  {canEdit && repetido && (
+                                    <div className="mt-1 flex flex-wrap gap-1">
+                                      {accionesRetiroDeGrupo(grupo).map(accion => (
+                                        <button
+                                          key={accion.id}
+                                          onClick={() => handleRetirar(accion.id)}
+                                          className="px-1.5 py-0.5 text-[9px] font-medium bg-amber-100 text-amber-800 border border-amber-300 rounded hover:bg-amber-200"
+                                          title={`Retirar solo el registro ${accion.id}. Se conserva y puede reactivarse.`}
+                                        >
+                                          {accion.etiqueta}
+                                        </button>
+                                      ))}
+                                    </div>
                                   )}
 
                                   {canEdit && (
@@ -840,17 +883,22 @@ export const HorariosPage = () => {
                                           —H1 lo deshabilitaba porque no habia vuelta
                                           atras—. El aviso de conflicto se conserva:
                                           sigue habiendo algo que Direccion decide. */}
-                                      <button
-                                        onClick={() => handleRetirar(horario.id)}
-                                        className={`p-1 rounded ${anomala
-                                          ? 'bg-amber-100 text-amber-700 hover:bg-amber-200'
-                                          : 'bg-red-100 text-red-600 hover:bg-red-200'}`}
-                                        title={anomala
-                                          ? 'Retirar este bloque. Se conserva y puede reactivarse; confirme antes cuál es el horario institucional.'
-                                          : 'Retirar del horario actual'}
-                                      >
-                                        <Trash2 size={12} />
-                                      </button>
+                                      {/* Con filas idénticas este botón no existe: no
+                                          hay «el bloque», hay 34 y 35. Las acciones
+                                          por id están dentro de la tarjeta. */}
+                                      {!repetido && (
+                                        <button
+                                          onClick={() => handleRetirar(horario.id)}
+                                          className={`p-1 rounded ${anomala
+                                            ? 'bg-amber-100 text-amber-700 hover:bg-amber-200'
+                                            : 'bg-red-100 text-red-600 hover:bg-red-200'}`}
+                                          title={anomala
+                                            ? 'Retirar este bloque. Se conserva y puede reactivarse; confirme antes cuál es el horario institucional.'
+                                            : 'Retirar del horario actual'}
+                                        >
+                                          <Trash2 size={12} />
+                                        </button>
+                                      )}
                                     </div>
                                   )}
                                 </div>
