@@ -626,6 +626,102 @@ def _():
     assert _fila(H_SEC)["dia"] == "Martes", "la edicion normal dejo de funcionar"
 
 
+# ==========================================================================
+# V–W — EL NIVEL MANDA TAMBIEN EN LO RETIRADO
+#   Retirar no puede convertirse en una puerta lateral por la que un nivel vea
+#   o recupere lo del otro.
+# ==========================================================================
+@test("V  los retirados respetan el lente de nivel, igual que el listado activo")
+def _():
+    _seed()
+    for hid in (H_SEC, H_PRI, H_LIBRE):
+        assert retirar(hid).status_code == 200, hid
+
+    sec = _ids(client.get("/api/horarios/retirados",
+                          headers={**H_DIR, "X-Nivel": "secundaria"}))
+    assert H_SEC in sec, "falta el retirado de Secundaria bajo su propio lente"
+    assert H_PRI not in sec, "el lente Secundaria muestra un retirado de Primaria"
+    assert H_LIBRE in sec, "se perdio el bloque sin curso: pertenece al profesor"
+
+    pri = _ids(client.get("/api/horarios/retirados",
+                          headers={**H_DIR, "X-Nivel": "primaria"}))
+    assert H_PRI in pri, "falta el retirado de Primaria bajo su propio lente"
+    assert H_SEC not in pri, "el lente Primaria muestra un retirado de Secundaria"
+    assert H_LIBRE in pri, "se perdio el bloque sin curso"
+
+    # Sin lente, Direccion los ve todos: el comportamiento institucional.
+    assert _ids(client.get("/api/horarios/retirados", headers=H_DIR)) == {
+        H_SEC, H_PRI, H_LIBRE}
+
+    # Y el coordinador de Primaria tiene lente fijo: el header no se lo quita.
+    # (no puede leer este endpoint, asi que se comprueba que sigue siendo 403)
+    assert client.get("/api/horarios/retirados",
+                      headers={**H_COORD, "X-Nivel": "secundaria"}).status_code == 403
+
+
+@test("W  reactivar exige el nivel activo, igual que crear")
+def _():
+    _seed()
+    assert retirar(H_SEC).status_code == 200
+
+    # El colegio deja de tener Secundaria contratada. Es la misma configuracion
+    # real de modulos que mira `assert_modulo_activo`.
+    d = SessionLocal()
+    try:
+        d.query(M.Colegio).filter_by(id=COL_A).update({"plan_secundaria": False})
+        d.commit()
+    finally:
+        d.close()
+
+    n_aud = _n_auditoria('REACTIVAR_HORARIO')
+    asig_antes = _foto_academica()
+
+    # Crear rechazaria hoy este curso; reactivar tiene que rechazarlo igual.
+    r_crear = client.post("/api/horarios", headers=H_DIR, json={
+        "profesor_id": PROF, "curso_id": CUR_SEC, "asignatura_id": LEN,
+        "dia": "Martes", "hora_inicio": "07:00", "hora_fin": "07:45",
+        "tipo_bloque": "clase"})
+    r_react = reactivar(H_SEC)
+    assert r_crear.status_code == 403, (r_crear.status_code, r_crear.text[:200])
+    assert r_react.status_code == r_crear.status_code, (
+        "crear da %s y reactivar %s" % (r_crear.status_code, r_react.status_code))
+
+    assert _fila(H_SEC)["activo"] is False, "volvio a un nivel que ya no esta activo"
+    assert _n_auditoria('REACTIVAR_HORARIO') == n_aud, "audito una reactivacion que no ocurrio"
+    assert _foto_academica() == asig_antes, "algo academico se movio"
+
+    # Primaria sigue contratada: su retirado SI puede volver.
+    assert retirar(H_PRI).status_code == 200
+    assert reactivar(H_PRI).status_code == 200
+    assert _fila(H_PRI)["activo"] is True
+
+    # Y al recontratar Secundaria, el bloque vuelve sin haber perdido nada.
+    d = SessionLocal()
+    try:
+        d.query(M.Colegio).filter_by(id=COL_A).update({"plan_secundaria": True})
+        d.commit()
+    finally:
+        d.close()
+    assert reactivar(H_SEC).status_code == 200
+    f = _fila(H_SEC)
+    assert f["activo"] is True and f["dia"] == DIA and f["hora_inicio"] == "08:00"
+
+
+@test("W2 retirar NO exige el nivel activo: un nivel caido no atrapa bloques")
+def _():
+    _seed()
+    d = SessionLocal()
+    try:
+        d.query(M.Colegio).filter_by(id=COL_A).update({"plan_secundaria": False})
+        d.commit()
+    finally:
+        d.close()
+    # Retirar solo saca del horario vigente; bloquearlo dejaria filas
+    # imposibles de retirar mientras el modulo esté dado de baja.
+    assert retirar(H_SEC).status_code == 200
+    assert _fila(H_SEC)["activo"] is False
+
+
 @test("U3 el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

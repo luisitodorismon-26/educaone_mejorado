@@ -6188,10 +6188,20 @@ async def delete_horario(id, request: Request, db: Session = Depends(get_db), cu
 
 @app.get("/api/horarios/retirados")
 async def get_horarios_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Los bloques retirados del colegio. Lo que las cuatro lecturas ya no muestran."""
+    """Los bloques retirados del colegio. Lo que las cuatro lecturas ya no muestran.
+
+    Aplica el mismo lente de nivel que `GET /api/horarios`: bajo «Horarios —
+    Secundaria» no tienen por qué asomar los retirados de Primaria. Los bloques
+    sin curso (libre/recreo) se conservan siempre, porque pertenecen al
+    profesor y no a un nivel — igual que en el listado activo.
+    """
     horarios = tenant_filter(db.query(Horario), Horario, current_user).filter(
         Horario.activo.is_(False)
     ).order_by(Horario.dia, Horario.hora_inicio, Horario.id).all()
+    _niv = nivel_efectivo(current_user, request)
+    if _niv is not None:
+        _cids = cursos_ids_de_nivel(db, current_user, _niv) or set()
+        horarios = [h for h in horarios if h.curso_id is None or h.curso_id in _cids]
     return [h.to_dict() for h in horarios]
 
 
@@ -6242,6 +6252,13 @@ async def reactivar_horario(id, request: Request, db: Session = Depends(get_db),
                 'error': ('Este bloque de clase no tiene curso o asignatura, así que '
                           'no puede volver al horario. Créelo de nuevo.'),
             }, status_code=409)
+
+        # El nivel del curso tiene que seguir contratado. Va primero, igual que
+        # en `crear_horario`: si Crear rechazaría hoy este curso porque su
+        # módulo Primaria/Secundaria está deshabilitado, Reactivar tiene que
+        # rechazarlo por lo mismo. Una clase retirada hace meses no vuelve a un
+        # nivel que ya no está activo. Levanta 403 antes de tocar nada.
+        assert_nivel_curso_activo(db, current_user, horario.curso_id)
 
         # La asignación tiene que seguir viva: mismo criterio que al crear.
         _sin_asig = _exige_asignacion_activa(
