@@ -14,7 +14,12 @@ interface Horario {
   asignatura_id: number | null;
   curso: string | null;
   curso_id: number | null;
-  profesor: string;
+  // `Horario.to_dict()` entrega `profesor_id`, NO el nombre. La interface
+  // declaraba `profesor: string`, un campo que nunca llega: en la vista Por
+  // Curso la tarjeta quedaba vacía, y peor, dos filas de profesores distintos
+  // tenían ambas `profesor === undefined` y se confundían entre sí. El docente
+  // se resuelve contra el array `profesores`, que la página ya carga.
+  profesor_id: number;
   aula?: string;
   tipo_bloque: 'clase' | 'libre' | 'recreo';
   tanda?: string;
@@ -53,6 +58,60 @@ const formatHora = (hora: string): string => {
   const hora12 = h % 12 || 12;
   return `${hora12}:${m.toString().padStart(2, '0')} ${ampm}`;
 };
+
+// ---------------------------------------------------------------------------
+// H1 — LA CUADRÍCULA MUESTRA TODO LO QUE HAY EN LA BASE
+//
+// Antes, una celda se resolvía con `horarios.find(dia + hora_inicio)`: si dos
+// filas coincidían en día y hora de inicio, la segunda no se dibujaba, no se
+// contaba y no se avisaba. En producción eso ocultaba nueve grupos de bloques
+// —seis duplicados exactos y tres conflictos reales—, y cuál de los dos se veía
+// lo decidía el orden con que la base devolvía las filas, no una regla nuestra.
+//
+// Estas funciones no borran, no deduplican y no eligen cuál bloque sobra: eso
+// es una decisión institucional de Dirección. Solo hacen visible lo que existe.
+// ---------------------------------------------------------------------------
+
+const aMinutos = (hora: string): number => {
+  const [h, m] = (hora || '0:0').split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+};
+
+/** Dos bloques se pisan si comparten aunque sea un minuto. Mismo criterio que
+ *  `_conflicto_clase` en el backend: A.inicio < B.fin && B.inicio < A.fin.
+ *  Dos bloques consecutivos —11:15–12:00 y 12:00–12:45— NO se pisan. */
+const seSolapan = (a: Horario, b: Horario): boolean =>
+  aMinutos(a.hora_inicio) < aMinutos(b.hora_fin) &&
+  aMinutos(b.hora_inicio) < aMinutos(a.hora_fin);
+
+/** Identidad de un bloque a efectos de "registro repetido": si dos filas
+ *  coinciden en todo esto, son la misma clase escrita dos veces. */
+const identidadBloque = (h: Horario): string =>
+  [h.dia, h.hora_inicio, h.hora_fin, h.tipo_bloque || 'clase',
+   h.profesor_id ?? '-', h.curso_id ?? '-', h.asignatura_id ?? '-'].join('|');
+
+/**
+ * De quien es el bloque que se esta guardando.
+ *
+ * Al CREAR se usa el profesor del selector, porque el alta se hace desde la
+ * vista Por Profesor y ese selector ES la eleccion. Al EDITAR manda siempre el
+ * profesor del bloque: Direccion puede haber mirado Por Profesor antes de pasar
+ * a Por Curso, y entonces el selector conserva a un docente que no tiene nada
+ * que ver con la fila que esta tocando. Enviar ese id reasignaria la clase a
+ * otro profesor sin que nadie lo pidiera.
+ */
+const profesorIdParaGuardar = (
+  editando: { profesor_id: number } | null,
+  profesorIdSeleccionado: number,
+): number => editando?.profesor_id ?? profesorIdSeleccionado;
+
+/** Tras guardar se refresca el listado que el usuario esta viendo, no siempre el
+ *  de profesor: una edicion hecha Por Curso dejaba la pantalla con otros datos. */
+const recargarSegunVista = (
+  vista: 'profesor' | 'curso',
+  cargarProfesor: () => void,
+  cargarCurso: () => void,
+): void => { vista === 'curso' ? cargarCurso() : cargarProfesor(); };
 
 // Generar bloques de horario para una tanda
 const generarBloquesHorario = (tandaInicio: string, tandaFin: string, recreos: Recreo[], duracionBloque: number = 50) => {
@@ -242,7 +301,7 @@ export const HorariosPage = () => {
     
     try {
       const dataToSend = {
-        profesor_id: profesorId,
+        profesor_id: profesorIdParaGuardar(editingHorario, profesorId),
         dia: form.dia,
         hora_inicio: form.hora_inicio,
         hora_fin: form.hora_fin,
@@ -262,7 +321,7 @@ export const HorariosPage = () => {
         await api.post('/horarios', dataToSend);
         setMessage({ type: 'success', text: 'Horario creado' });
       }
-      loadHorariosProfesor();
+      recargarSegunVista(vistaActual, loadHorariosProfesor, loadHorariosCurso);
       setShowModal(false);
       setEditingHorario(null);
       setForm({ dia: 'Lunes', hora_inicio: '07:30', hora_fin: '08:20', curso_id: 0, asignatura_id: 0, aula: '', tipo_bloque: 'clase' });
@@ -350,12 +409,51 @@ export const HorariosPage = () => {
     setShowRecreoModal(true);
   };
 
-  const getHorarioEnCelda = (dia: string, hora: { inicio: string; fin: string }) => {
-    return horarios.find(h => 
-      h.dia === dia && 
-      h.hora_inicio === hora.inicio
-    );
+  // TODOS los bloques que empiezan en esa celda, no solo el primero.
+  const getHorariosEnCelda = (dia: string, hora: { inicio: string; fin: string }) =>
+    horarios.filter(h => h.dia === dia && h.hora_inicio === hora.inicio);
+
+  // Ids de bloques de CLASE que se pisan con algún otro del mismo día. El array
+  // `horarios` ya viene acotado a un solo profesor (vista Por Profesor) o a un
+  // solo curso (vista Por Curso), así que el mismo cálculo sirve para las dos:
+  // en una detecta al docente en dos aulas a la vez, en la otra al grupo con dos
+  // clases simultáneas. Libre y Recreo no cuentan como choque académico.
+  const idsEnConflicto = (() => {
+    const clases = horarios.filter(h => (h.tipo_bloque || 'clase') === 'clase');
+    const ids = new Set<number>();
+    for (let i = 0; i < clases.length; i++) {
+      for (let j = i + 1; j < clases.length; j++) {
+        const a = clases[i], b = clases[j];
+        if (a.dia === b.dia && seSolapan(a, b)) {
+          // Dos filas idénticas son un registro repetido, no un choque de
+          // agenda: se señalan aparte para no mezclar los dos problemas.
+          if (identidadBloque(a) === identidadBloque(b)) continue;
+          ids.add(a.id);
+          ids.add(b.id);
+        }
+      }
+    }
+    return ids;
+  })();
+
+  // Agrupa los bloques de una celda por identidad: las filas idénticas forman un
+  // solo grupo con su cuenta, en vez de dibujar ocho tarjetas iguales.
+  const agruparPorIdentidad = (bloques: Horario[]) => {
+    const grupos = new Map<string, Horario[]>();
+    bloques.forEach(h => {
+      const k = identidadBloque(h);
+      grupos.set(k, [...(grupos.get(k) || []), h]);
+    });
+    return Array.from(grupos.values());
   };
+
+  // El nombre del docente no viene en el horario: se resuelve por id contra los
+  // profesores que la página ya carga. El fallback deja rastro del id en vez de
+  // dejar la tarjeta muda si el profesor no está en la lista (por ejemplo, si
+  // el filtro de nivel lo recortó).
+  const nombreProfesor = (profesorIdBloque: number) =>
+    profesores.find(p => p.id === profesorIdBloque)?.nombre_completo
+    || `Profesor #${profesorIdBloque}`;
 
   const getColorAsignatura = (asignatura: string) => {
     const colores: Record<string, string> = {
@@ -401,16 +499,26 @@ export const HorariosPage = () => {
     
     // Crear bloques con las horas de los horarios
     return horasOrdenadas.map(inicio => {
-      const horarioEjemplo = horarios.find(h => h.hora_inicio === inicio);
       const recreo = recreosTanda.find(r => r.hora_inicio === inicio);
       
       if (recreo) {
         return { inicio: recreo.hora_inicio, fin: recreo.hora_fin, recreo: true, nombreRecreo: recreo.nombre };
       }
+
+      // La fila solo puede rotular un final si TODOS los bloques que empiezan a
+      // esa hora terminan a la misma. Antes se tomaba el de un `find` cualquiera
+      // y se presentaba como si fuera el de la fila entera: con 11:15-11:45 y
+      // 11:15-12:00 conviviendo, la columna afirmaba una hora que no era la de
+      // la mitad de las tarjetas. Cuando hay varios finales no se elige ninguno;
+      // cada tarjeta lleva el suyo.
+      const finesDistintos = Array.from(new Set(
+        horarios.filter(h => h.hora_inicio === inicio).map(h => h.hora_fin)
+      ));
       
       return { 
         inicio, 
-        fin: horarioEjemplo?.hora_fin || inicio 
+        fin: finesDistintos.length === 1 ? finesDistintos[0] : inicio,
+        variosFines: finesDistintos.length > 1,
       };
     });
   };
@@ -586,7 +694,11 @@ export const HorariosPage = () => {
                   <tr key={idx} className={hora.recreo ? 'bg-amber-50' : 'hover:bg-slate-50/50'}>
                     <td className="p-3 text-xs text-slate-500 border-r border-slate-100">
                       <div className="font-medium">{formatHora(hora.inicio)}</div>
-                      <div className="text-slate-400">{formatHora(hora.fin)}</div>
+                      {(hora as any).variosFines ? (
+                        <div className="text-amber-600 text-[10px] leading-tight">varios finales</div>
+                      ) : (
+                        <div className="text-slate-400">{formatHora(hora.fin)}</div>
+                      )}
                     </td>
                     {DIAS.map(dia => {
                       if (hora.recreo) {
@@ -600,57 +712,126 @@ export const HorariosPage = () => {
                         );
                       }
                       
-                      const horario = getHorarioEnCelda(dia, hora);
-                      
+                      const bloquesCelda = getHorariosEnCelda(dia, hora);
+                      const grupos = agruparPorIdentidad(bloquesCelda);
+                      const hayConflicto = bloquesCelda.some(h => idsEnConflicto.has(h.id));
+                      const hayRepetidos = grupos.some(g => g.length > 1);
+                      const anomala = hayConflicto || hayRepetidos;
+
                       return (
-                        <td key={`${dia}-${idx}`} className="p-2">
-                          {horario ? (
-                            <div className={`p-2 rounded border relative group ${
-                              horario.tipo_bloque === 'libre' 
-                                ? 'bg-gray-100 border-gray-300 text-gray-600' 
-                                : horario.tipo_bloque === 'recreo'
-                                  ? 'bg-green-50 border-green-300 text-green-700'
-                                  : getColorAsignatura(horario.asignatura || '')
-                            }`}>
-                              {horario.tipo_bloque === 'libre' ? (
-                                <>
-                                  <p className="text-[11px] font-bold">🕐 Libre</p>
-                                  <p className="text-[9px] opacity-75">Hora libre</p>
-                                </>
-                              ) : horario.tipo_bloque === 'recreo' ? (
-                                <>
-                                  <p className="text-[11px] font-bold">☕ Recreo</p>
-                                  <p className="text-[9px] opacity-75">Descanso</p>
-                                </>
-                              ) : (
-                                <>
-                                  <p className="text-[11px] font-bold">{horario.asignatura}</p>
-                                  <p className="text-[9px] uppercase opacity-75">
-                                    {vistaActual === 'profesor' ? horario.curso : horario.profesor}
+                        <td key={`${dia}-${idx}`} className="p-2 align-top">
+                          {bloquesCelda.length > 0 ? (
+                            <div className="space-y-1">
+                              {/* H1: el aviso va una sola vez por celda, arriba, para que
+                                  Dirección lo vea antes que las tarjetas. No dice cuál
+                                  bloque quitar: esa decisión no es del sistema. */}
+                              {hayConflicto && (
+                                <div className="rounded border border-amber-400 bg-amber-50 px-2 py-1">
+                                  <p className="text-[10px] font-bold text-amber-800 leading-tight">
+                                    ⚠ Conflicto de horario
                                   </p>
-                                  {horario.aula && (
-                                    <p className="text-[8px] opacity-60">Aula: {horario.aula}</p>
-                                  )}
-                                </>
-                              )}
-                              {canEdit && (
-                                <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                  <button
-                                    onClick={() => handleEditHorario(horario)}
-                                    className="p-1 bg-blue-100 text-blue-600 rounded hover:bg-blue-200"
-                                    title="Editar"
-                                  >
-                                    <Settings size={12} />
-                                  </button>
-                                  <button
-                                    onClick={() => handleDelete(horario.id)}
-                                    className="p-1 bg-red-100 text-red-600 rounded hover:bg-red-200"
-                                    title="Eliminar"
-                                  >
-                                    <Trash2 size={12} />
-                                  </button>
+                                  <p className="text-[9px] text-amber-700 leading-tight">
+                                    Hay varios bloques que se superponen. Dirección debe
+                                    revisar cuál corresponde.
+                                  </p>
                                 </div>
                               )}
+                              {grupos.map((grupo) => {
+                                const horario = grupo[0];
+                                const enConflicto = idsEnConflicto.has(horario.id);
+                                const repetido = grupo.length > 1;
+                                return (
+                                <div
+                                  key={horario.id}
+                                  className={`p-2 rounded border relative group ${
+                                    horario.tipo_bloque === 'libre'
+                                      ? 'bg-gray-100 border-gray-300 text-gray-600'
+                                      : horario.tipo_bloque === 'recreo'
+                                        ? 'bg-green-50 border-green-300 text-green-700'
+                                        : getColorAsignatura(horario.asignatura || '')
+                                  } ${enConflicto ? 'ring-2 ring-amber-400' : ''}`}
+                                >
+                                  {horario.tipo_bloque === 'libre' ? (
+                                    <>
+                                      <p className="text-[11px] font-bold">🕐 Libre</p>
+                                      <p className="text-[9px] opacity-75">Hora libre</p>
+                                    </>
+                                  ) : horario.tipo_bloque === 'recreo' ? (
+                                    <>
+                                      <p className="text-[11px] font-bold">☕ Recreo</p>
+                                      <p className="text-[9px] opacity-75">Descanso</p>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <p className="text-[11px] font-bold">{horario.asignatura}</p>
+                                      {/* La hora propia de ESTA tarjeta. La columna
+                                          izquierda no puede rotularla cuando conviven
+                                          varios finales en la misma fila. */}
+                                      <p className="text-[9px] font-medium opacity-80">
+                                        {formatHora(horario.hora_inicio)} – {formatHora(horario.hora_fin)}
+                                      </p>
+                                      <p className="text-[9px] uppercase opacity-75">
+                                        {vistaActual === 'profesor'
+                                          ? horario.curso
+                                          : nombreProfesor(horario.profesor_id)}
+                                      </p>
+                                      {horario.aula && (
+                                        <p className="text-[8px] opacity-60">Aula: {horario.aula}</p>
+                                      )}
+                                    </>
+                                  )}
+
+                                  {/* Filas idénticas: se dice cuántas son y con qué ids,
+                                      en vez de dibujar ocho tarjetas iguales o —peor—
+                                      deduplicarlas y aparentar que solo hay una. */}
+                                  {repetido && (
+                                    <p className="mt-1 text-[9px] font-bold text-amber-800 bg-amber-100 rounded px-1 py-0.5 leading-tight">
+                                      ⚠ {grupo.length} registros idénticos
+                                    </p>
+                                  )}
+                                  {anomala && (
+                                    <p className="mt-0.5 text-[8px] font-mono opacity-60 leading-tight">
+                                      {grupo.length > 1 ? 'IDs' : 'ID'} {grupo.map(g => g.id).join(', ')}
+                                    </p>
+                                  )}
+
+                                  {canEdit && (
+                                    <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                      <button
+                                        onClick={() => handleEditHorario(horario)}
+                                        className="p-1 bg-blue-100 text-blue-600 rounded hover:bg-blue-200"
+                                        title="Editar"
+                                      >
+                                        <Settings size={12} />
+                                      </button>
+                                      {/* El borrado es FÍSICO. Mientras el bloque esté en
+                                          conflicto o repetido, eliminar "el que sobra" es
+                                          justo la decisión que nadie ha tomado todavía, y
+                                          no habría vuelta atrás. Se deshabilita aquí; el
+                                          resto de celdas conserva el comportamiento de
+                                          siempre. Sustituir el borrado físico por algo
+                                          reversible es una fase aparte. */}
+                                      {anomala ? (
+                                        <span
+                                          className="p-1 bg-slate-100 text-slate-400 rounded cursor-not-allowed"
+                                          title="Resolución pendiente: no elimine este bloque hasta confirmar el horario institucional."
+                                        >
+                                          <Trash2 size={12} />
+                                        </span>
+                                      ) : (
+                                        <button
+                                          onClick={() => handleDelete(horario.id)}
+                                          className="p-1 bg-red-100 text-red-600 rounded hover:bg-red-200"
+                                          title="Eliminar"
+                                        >
+                                          <Trash2 size={12} />
+                                        </button>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                                );
+                              })}
                             </div>
                           ) : (
                             <div className="h-12"></div>
