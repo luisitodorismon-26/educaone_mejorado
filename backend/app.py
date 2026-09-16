@@ -6722,7 +6722,34 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
         asignatura = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(id=asignatura_id).first()
         if not asignatura:
             return JSONResponse({'error': 'Asignatura no encontrada'}, status_code=404)
-        
+
+        # Un profesor solo lee la combinación curso+asignatura que tenga
+        # ASIGNADA. El aislamiento entre colegios ya lo daba `tenant_filter`;
+        # lo que faltaba era el alcance DENTRO del colegio: cualquier profesor
+        # podía leer las notas de cualquier curso de Primaria. Con dos alumnos
+        # es poco; con el colegio lleno son datos de menores.
+        #
+        # Es la misma política del GET de Secundaria, sin ampliarla ni
+        # recortarla: solo se restringe al rol 'profesor'. Dirección,
+        # coordinación, secretaría y psicología conservan la supervisión que ya
+        # tenían, porque en Secundaria también la tienen.
+        #
+        # El alcance se mide por la ASIGNACIÓN exacta, no por una propiedad
+        # global del docente: un profesor con clases en los dos niveles entra
+        # aquí por sus cursos de Primaria y por ninguno más.
+        if current_user.role == 'profesor':
+            asignacion = tenant_filter(
+                db.query(AsignacionProfesor), AsignacionProfesor, current_user
+            ).filter_by(
+                profesor_id=current_user.id,
+                curso_id=curso.id,
+                asignatura_id=asignatura.id,
+                activo=True,
+            ).first()
+            if not asignacion:
+                return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'},
+                                    status_code=403)
+
         # Determinar número de competencias (default 3)
         num_competencias = 3
         if grado.ciclo:
@@ -6793,6 +6820,32 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
         logger.error(f"Error en calificaciones-primaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({'error': f'Error del servidor: {str(e)}'}, status_code=500)
 
+def _es_curso_primaria(db, curso_id: int) -> bool:
+    """True solo si el curso pertenece REALMENTE al nivel primaria.
+
+    Es una comprobación POSITIVA, no el negativo de `_es_curso_secundaria`:
+    EducaOne contempla también nivel inicial, así que «no es secundaria» no
+    significa «es primaria». Aquí solo pasa 'primaria'; inicial, secundaria y
+    un nivel que no se puede determinar —curso inexistente, sin grado, o con el
+    grado sin nivel— se rechazan por igual.
+    """
+    curso = db.get(Curso, curso_id)
+    if not curso or not curso.grado_id:
+        return False
+    grado = db.get(Grado, curso.grado_id)
+    return bool(grado) and (grado.nivel or '').strip().lower() == 'primaria'
+
+
+def _rechazo_nota(db: Session, campo: str, motivo: str):
+    """400 por un valor de nota inválido, descartando lo pendiente.
+
+    El `rollback` es lo que garantiza que un payload con una nota buena y otra
+    mala no deje la buena a medio escribir: o entran todas o no entra ninguna.
+    """
+    db.rollback()
+    return JSONResponse({'error': f'{campo}: {motivo}', 'campo': campo}, status_code=400)
+
+
 @app.post("/api/calificaciones-primaria")
 async def save_calificacion_primaria(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Guardar/actualizar calificación primaria por competencia (estructura MINERD).
@@ -6841,7 +6894,21 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             'error': 'Estudiante retirado: no se pueden modificar sus calificaciones',
             'fecha_retiro': estudiante_obj.fecha_retiro.isoformat() if estudiante_obj.fecha_retiro else None,
         }, status_code=403)
-    
+
+    # El curso tiene que ser de PRIMARIA de verdad. El docstring decía «siempre
+    # primaria acá», pero nada lo comprobaba: se podía crear una
+    # CalificacionPrimaria para un alumno de Secundaria y dejarle el expediente
+    # con dos estructuras académicas incompatibles.
+    #
+    # Un profesor puede tener asignaciones en los dos niveles a la vez; lo que
+    # decide aquí NO es el profesor sino el CURSO: curso → grado → nivel.
+    if not _es_curso_primaria(db, estudiante_obj.curso_id):
+        return JSONResponse({
+            'error': ('Este estudiante no pertenece a Primaria. Use el flujo del '
+                      'nivel que le corresponde.'),
+            'curso_id': estudiante_obj.curso_id,
+        }, status_code=400)
+
     if estudiante_obj.curso_id:
         assert_nivel_curso_activo(db, current_user, estudiante_obj.curso_id)
     
@@ -6861,7 +6928,12 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
         competencia_numero=competencia_numero, ano_escolar_id=ano.id
     ).first()
     
-    if not calif:
+    # Si no existe se construye, pero NO se añade a la sesión todavía: hasta
+    # después de mirar los períodos no se sabe si hay algo que guardar. Con el
+    # `db.add()` aquí, un intento sobre un período cerrado creaba igualmente la
+    # fila y la commiteaba vacía — una calificación sin ninguna nota.
+    es_nueva = calif is None
+    if es_nueva:
         calif = CalificacionPrimaria(
             estudiante_id=estudiante_id,
             asignatura_id=asignatura_id,
@@ -6870,14 +6942,95 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             ano_escolar_id=ano.id,
             colegio_id=current_user.colegio_id
         )
-        db.add(calif)
-    
+
+    # Un período CERRADO no se toca. Misma política que ya aplica Secundaria, y
+    # no es una regla suya: sale de `ano.pN_cerrado` y de PermisoTemporalCalificacion,
+    # que son comunes a todo el colegio. Primaria no la miraba, así que una nota
+    # de un período ya cerrado por Dirección podía reescribirse sin dejar rastro.
+    #
+    # El campo del período cerrado se SALTA, no se rechaza la petición entera:
+    # si el docente envía P1 (cerrado) y P2 (abierto), P2 se guarda. Cambiar eso
+    # sería inventar una política distinta a la del resto del sistema.
+    periodos_cerrados_ignorados = []
+
+    def _periodo_esta_cerrado(num_periodo):
+        """True si el período está cerrado Y el profesor no tiene permiso temporal."""
+        if not getattr(ano, f'p{num_periodo}_cerrado', False):
+            return False  # abierto → se puede editar
+        permiso = tenant_filter(
+            db.query(PermisoTemporalCalificacion), PermisoTemporalCalificacion, current_user
+        ).filter(
+            PermisoTemporalCalificacion.profesor_id == current_user.id,
+            PermisoTemporalCalificacion.activo == True,  # noqa: E712
+            PermisoTemporalCalificacion.fecha_fin > now_rd(),
+            (PermisoTemporalCalificacion.periodo == num_periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
+            (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+        ).first()
+        return permiso is None  # cerrado y sin permiso → bloqueado
+
     # Campos aceptados: 4 períodos + 4 recuperaciones + nombre competencia
-    campos_validos = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4', 'competencia_nombre']
-    for campo in campos_validos:
-        if campo in data:
-            setattr(calif, campo, data[campo])
-    
+    #
+    # Antes se hacía `setattr(calif, campo, data[campo])` con lo que llegara: se
+    # podía guardar 500, -1 o "abc", y eso corrompe la CF, el literal y el
+    # boletín sin avisar. Misma semántica que Secundaria: None o cadena vacía
+    # LIMPIAN la nota; cualquier otra cosa tiene que ser un número de 0 a 100.
+    campos_notas = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4']
+    _pendientes = {}
+    for campo in campos_notas:
+        if campo not in data:
+            continue
+        num_periodo = int(campo[-1])   # p1/rp1 → 1, p2/rp2 → 2, ...
+        if _periodo_esta_cerrado(num_periodo):
+            if num_periodo not in periodos_cerrados_ignorados:
+                periodos_cerrados_ignorados.append(num_periodo)
+            continue  # no modificar un período cerrado
+        valor = data[campo]
+        if valor is None or valor == '':
+            _pendientes[campo] = None
+            continue
+        # Un booleano NO es una nota. En Python `float(True)` vale 1.0, así que
+        # sin esto un `true` entraría como un 1 y nadie lo notaría.
+        if isinstance(valor, bool):
+            return _rechazo_nota(db, campo, 'debe ser número')
+        try:
+            nota = float(valor)
+        except (ValueError, TypeError):
+            return _rechazo_nota(db, campo, 'debe ser número')
+        # NaN se escapa de cualquier comparación —`nan < 0` y `nan > 100` son
+        # las dos falsas—, así que pasaría el rango sin ser un número usable.
+        if nota != nota or nota in (float('inf'), float('-inf')):
+            return _rechazo_nota(db, campo, 'debe ser número')
+        if nota < 0 or nota > 100:
+            return _rechazo_nota(db, campo, 'debe estar entre 0 y 100')
+        _pendientes[campo] = nota
+
+    # Una calificación NUEVA cuyo único contenido caía en un período cerrado no
+    # llega a existir: crearla dejaría una fila académica sin ninguna nota, que
+    # es peor que no tener nada. La fila EXISTENTE, en cambio, se conserva
+    # intacta — aquí no se borra ni se modifica nada.
+    if es_nueva and not _pendientes and 'competencia_nombre' not in data \
+            and periodos_cerrados_ignorados:
+        return {
+            'message': 'No se guardó ninguna calificación: el período está cerrado',
+            'id': None,
+            'calificacion': None,
+            'periodos_cerrados_ignorados': periodos_cerrados_ignorados,
+            'aviso': (
+                'No se guardaron los períodos %s porque están cerrados. Solicite una '
+                'corrección a Dirección si necesita editarlos.'
+                % ', '.join('P%d' % p for p in periodos_cerrados_ignorados)
+            ),
+        }
+
+    # Se aplican solo cuando TODOS los campos pasaron: si uno falla, no puede
+    # quedar la mitad escrita.
+    for campo, valor in _pendientes.items():
+        setattr(calif, campo, valor)
+    if 'competencia_nombre' in data:
+        calif.competencia_nombre = data['competencia_nombre']
+    if es_nueva:
+        db.add(calif)
+
     # Calcular final de la competencia (C1/C2/C3) automáticamente
     final = calif.calcular_final()
     if final is not None:
@@ -6886,7 +7039,18 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     
     db.commit()
     cache_clear(f'stats:{current_user.colegio_id}')
-    return {'message': 'Calificación primaria guardada', 'id': calif.id, 'calificacion': calif.to_dict()}
+    respuesta = {'message': 'Calificación primaria guardada', 'id': calif.id,
+                 'calificacion': calif.to_dict()}
+    if periodos_cerrados_ignorados:
+        # Se dice cuáles no se guardaron: callarlo haría creer al docente que su
+        # corrección entró.
+        respuesta['periodos_cerrados_ignorados'] = periodos_cerrados_ignorados
+        respuesta['aviso'] = (
+            'No se guardaron los períodos %s porque están cerrados. Solicite una '
+            'corrección a Dirección si necesita editarlos.'
+            % ', '.join('P%d' % p for p in periodos_cerrados_ignorados)
+        )
+    return respuesta
 
 
 # ============== CALIFICACIONES SECUNDARIA v2.12 (estructura MINERD por competencia) ==============

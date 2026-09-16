@@ -7,6 +7,7 @@ import {
   NOMBRES_COMPETENCIAS_PRIM, MINIMO_APROBATORIO_PRIMARIA,
   UMBRAL_RP_PRIMARIA, rpHabilitado, finalCompetencia,
 } from './tipos';
+import { avisoPeriodoCerrado, mensajeAvisos } from './periodoCerrado';
 
 // ════════════════════════════════════════════════════════════════════
 // TAB NOTAS POR COMPETENCIA — PRIMARIA (v2.13.45)
@@ -29,7 +30,7 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
   const [compSel, setCompSel] = useState(1);
   const [drafts, setDrafts] = useState<Draft>({});
   const [guardando, setGuardando] = useState(false);
-  const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error'; texto: string } | null>(null);
+  const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error' | 'warning'; texto: string } | null>(null);
 
   const key = (estId: number, comp: number) => `${estId}-${comp}`;
 
@@ -73,20 +74,29 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
     setMensaje(null);
     try {
       const aGuardar = Object.keys(drafts).filter(k => k.endsWith(`-${compSel}`) && Object.keys(drafts[k]).length > 0);
+      // El backend responde 200 aunque haya saltado un período cerrado: guarda
+      // lo que puede y avisa de lo que no. Si no se mira esa respuesta, el
+      // profesor ve "Guardado" y cree que su corrección entró cuando no entró.
+      const avisos: string[] = [];
       for (const k of aGuardar) {
         const estId = Number(k.split('-')[0]);
         const payload: any = { estudiante_id: estId, asignatura_id: asignaturaId, competencia_numero: compSel };
         for (const [campo, val] of Object.entries(drafts[k])) {
           payload[campo] = val === '' ? null : Number(val);
         }
-        await api.post('/calificaciones-primaria', payload);
+        const response = await api.post('/calificaciones-primaria', payload);
+        const aviso = avisoPeriodoCerrado(response?.data);
+        if (aviso) avisos.push(aviso);
       }
       setDrafts(prev => {
         const n = { ...prev };
         aGuardar.forEach(k => delete n[k]);
         return n;
       });
-      setMensaje({ tipo: 'success', texto: `Guardado (${aGuardar.length} estudiante${aGuardar.length !== 1 ? 's' : ''})` });
+      setMensaje(avisos.length > 0
+        ? { tipo: 'warning', texto: mensajeAvisos(avisos) }
+        : { tipo: 'success', texto: `Guardado (${aGuardar.length} estudiante${aGuardar.length !== 1 ? 's' : ''})` });
+      // Recargar en ambos casos: lo que quedó en el servidor es la verdad.
       await onReload();
     } catch (e: any) {
       setMensaje({ tipo: 'error', texto: e.response?.data?.error || 'Error al guardar' });

@@ -6,6 +6,7 @@ import {
   EstudiantePrimData, CampoEditable,
   NOMBRES_COMPETENCIAS_PRIM, UMBRAL_RP_PRIMARIA, rpHabilitado,
 } from './tipos';
+import { avisoPeriodoCerrado, mensajeAvisos } from './periodoCerrado';
 
 // ════════════════════════════════════════════════════════════════════
 // TAB NOTAS POR PERÍODO — PRIMARIA (v2.13.45)
@@ -28,7 +29,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
   const [periodo, setPeriodo] = useState(1);
   const [drafts, setDrafts] = useState<Draft>({});
   const [guardando, setGuardando] = useState(false);
-  const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error'; texto: string } | null>(null);
+  const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error' | 'warning'; texto: string } | null>(null);
 
   const campoP = `p${periodo}` as CampoEditable;
   const campoRP = `rp${periodo}` as CampoEditable;
@@ -57,16 +58,25 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
     setMensaje(null);
     try {
       const aGuardar = Object.keys(drafts).filter(k => Object.keys(drafts[k]).length > 0);
+      // El backend responde 200 aunque haya saltado un período cerrado: guarda
+      // lo que puede y avisa de lo que no. Si no se mira esa respuesta, el
+      // profesor ve "Guardado" y cree que su corrección entró cuando no entró.
+      const avisos: string[] = [];
       for (const k of aGuardar) {
         const [estId, compNum] = k.split('-').map(Number);
         const payload: any = { estudiante_id: estId, asignatura_id: asignaturaId, competencia_numero: compNum };
         for (const [campo, val] of Object.entries(drafts[k])) {
           payload[campo] = val === '' ? null : Number(val);
         }
-        await api.post('/calificaciones-primaria', payload);
+        const response = await api.post('/calificaciones-primaria', payload);
+        const aviso = avisoPeriodoCerrado(response?.data);
+        if (aviso) avisos.push(aviso);
       }
       setDrafts({});
-      setMensaje({ tipo: 'success', texto: `Guardado (${aGuardar.length} celda${aGuardar.length !== 1 ? 's' : ''})` });
+      setMensaje(avisos.length > 0
+        ? { tipo: 'warning', texto: mensajeAvisos(avisos) }
+        : { tipo: 'success', texto: `Guardado (${aGuardar.length} celda${aGuardar.length !== 1 ? 's' : ''})` });
+      // Recargar en ambos casos: lo que quedó en el servidor es la verdad.
       await onReload();
     } catch (e: any) {
       setMensaje({ tipo: 'error', texto: e.response?.data?.error || 'Error al guardar' });
