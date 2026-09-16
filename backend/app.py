@@ -6793,6 +6793,16 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
         logger.error(f"Error en calificaciones-primaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({'error': f'Error del servidor: {str(e)}'}, status_code=500)
 
+def _rechazo_nota(db: Session, campo: str, motivo: str):
+    """400 por un valor de nota inválido, descartando lo pendiente.
+
+    El `rollback` es lo que garantiza que un payload con una nota buena y otra
+    mala no deje la buena a medio escribir: o entran todas o no entra ninguna.
+    """
+    db.rollback()
+    return JSONResponse({'error': f'{campo}: {motivo}', 'campo': campo}, status_code=400)
+
+
 @app.post("/api/calificaciones-primaria")
 async def save_calificacion_primaria(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Guardar/actualizar calificación primaria por competencia (estructura MINERD).
@@ -6898,15 +6908,45 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
         return permiso is None  # cerrado y sin permiso → bloqueado
 
     # Campos aceptados: 4 períodos + 4 recuperaciones + nombre competencia
+    #
+    # Antes se hacía `setattr(calif, campo, data[campo])` con lo que llegara: se
+    # podía guardar 500, -1 o "abc", y eso corrompe la CF, el literal y el
+    # boletín sin avisar. Misma semántica que Secundaria: None o cadena vacía
+    # LIMPIAN la nota; cualquier otra cosa tiene que ser un número de 0 a 100.
     campos_notas = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4']
+    _pendientes = {}
     for campo in campos_notas:
-        if campo in data:
-            num_periodo = int(campo[-1])   # p1/rp1 → 1, p2/rp2 → 2, ...
-            if _periodo_esta_cerrado(num_periodo):
-                if num_periodo not in periodos_cerrados_ignorados:
-                    periodos_cerrados_ignorados.append(num_periodo)
-                continue  # no modificar un período cerrado
-            setattr(calif, campo, data[campo])
+        if campo not in data:
+            continue
+        num_periodo = int(campo[-1])   # p1/rp1 → 1, p2/rp2 → 2, ...
+        if _periodo_esta_cerrado(num_periodo):
+            if num_periodo not in periodos_cerrados_ignorados:
+                periodos_cerrados_ignorados.append(num_periodo)
+            continue  # no modificar un período cerrado
+        valor = data[campo]
+        if valor is None or valor == '':
+            _pendientes[campo] = None
+            continue
+        # Un booleano NO es una nota. En Python `float(True)` vale 1.0, así que
+        # sin esto un `true` entraría como un 1 y nadie lo notaría.
+        if isinstance(valor, bool):
+            return _rechazo_nota(db, campo, 'debe ser número')
+        try:
+            nota = float(valor)
+        except (ValueError, TypeError):
+            return _rechazo_nota(db, campo, 'debe ser número')
+        # NaN se escapa de cualquier comparación —`nan < 0` y `nan > 100` son
+        # las dos falsas—, así que pasaría el rango sin ser un número usable.
+        if nota != nota or nota in (float('inf'), float('-inf')):
+            return _rechazo_nota(db, campo, 'debe ser número')
+        if nota < 0 or nota > 100:
+            return _rechazo_nota(db, campo, 'debe estar entre 0 y 100')
+        _pendientes[campo] = nota
+
+    # Se aplican solo cuando TODOS los campos pasaron: si uno falla, no puede
+    # quedar la mitad escrita.
+    for campo, valor in _pendientes.items():
+        setattr(calif, campo, valor)
     if 'competencia_nombre' in data:
         calif.competencia_nombre = data['competencia_nombre']
 

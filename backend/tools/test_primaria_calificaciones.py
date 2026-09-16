@@ -346,6 +346,93 @@ def _():
     assert _calif(E_PRIM, INGLES)["p1"] is None
 
 
+# ==========================================================================
+# B — VALOR DE LA NOTA
+# ==========================================================================
+@test("B1 los límites del rango son válidos: 0 y 100")
+def _():
+    _seed()
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=0).status_code == 200
+    assert _calif(E_PRIM, INGLES)["p1"] == 0
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=100).status_code == 200
+    assert _calif(E_PRIM, INGLES)["p1"] == 100
+
+
+@test("B2 un decimal se conserva tal cual (comportamiento actual del sistema)")
+def _():
+    _seed()
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=78.5).status_code == 200
+    assert _calif(E_PRIM, INGLES)["p1"] == 78.5
+    # y una cadena numérica se acepta como número, igual que en Secundaria
+    assert guardar(H_MIX, E_PRIM, INGLES, p2="81.25").status_code == 200
+    assert _calif(E_PRIM, INGLES)["p2"] == 81.25
+
+
+@test("B3 fuera de rango -> 400 y la nota previa no cambia")
+def _():
+    _seed()
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=80).status_code == 200
+    for malo in (-1, 101, -0.5, 100.01, 1000):
+        r = guardar(H_MIX, E_PRIM, INGLES, p1=malo)
+        assert r.status_code == 400, (malo, r.status_code, r.text[:200])
+        assert "entre 0 y 100" in r.json()["error"], malo
+        assert _calif(E_PRIM, INGLES)["p1"] == 80, ("piso la nota previa", malo)
+
+
+@test("B4 no numérico -> 400")
+def _():
+    _seed()
+    for malo in ("abc", "", " ", [], {}, "80abc"):
+        r = guardar(H_MIX, E_PRIM, INGLES, p1=malo)
+        if malo == "":
+            # cadena vacía = limpiar, misma semántica que Secundaria
+            assert r.status_code == 200, (malo, r.text[:200])
+            continue
+        assert r.status_code == 400, (malo, r.status_code, r.text[:200])
+    assert _calif(E_PRIM, INGLES) is None or _calif(E_PRIM, INGLES)["p1"] is None
+
+
+@test("B5 un booleano NO se acepta como 0/1")
+def _():
+    _seed()
+    for malo in (True, False):
+        r = guardar(H_MIX, E_PRIM, INGLES, p1=malo)
+        assert r.status_code == 400, (malo, r.status_code, r.text[:200])
+        assert "número" in r.json()["error"], malo
+    assert _calif(E_PRIM, INGLES) is None or _calif(E_PRIM, INGLES)["p1"] is None
+
+
+@test("B6 NaN e infinito -> 400")
+def _():
+    _seed()
+    for malo in ("NaN", "nan", "inf", "-inf", "Infinity"):
+        r = guardar(H_MIX, E_PRIM, INGLES, p1=malo)
+        assert r.status_code == 400, (malo, r.status_code, r.text[:200])
+    assert _calif(E_PRIM, INGLES) is None or _calif(E_PRIM, INGLES)["p1"] is None
+
+
+@test("B7 None y cadena vacía LIMPIAN la nota, como en Secundaria")
+def _():
+    _seed()
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=80, p2=90).status_code == 200
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=None).status_code == 200
+    assert _calif(E_PRIM, INGLES)["p1"] is None, "None no limpio la nota"
+    assert _calif(E_PRIM, INGLES)["p2"] == 90, "limpio de mas"
+    assert guardar(H_MIX, E_PRIM, INGLES, p2="").status_code == 200
+    assert _calif(E_PRIM, INGLES)["p2"] is None
+
+
+@test("B8 si un campo del payload es inválido, NINGUNO se guarda")
+def _():
+    _seed()
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=80, p2=500)
+    assert r.status_code == 400, (r.status_code, r.text[:200])
+    c = _calif(E_PRIM, INGLES)
+    assert c is None or (c["p1"] is None and c["p2"] is None), (
+        "escritura parcial: se guardo p1 pese al fallo de p2")
+    assert _n_calif_primaria() == 0, "creo la fila igualmente"
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
