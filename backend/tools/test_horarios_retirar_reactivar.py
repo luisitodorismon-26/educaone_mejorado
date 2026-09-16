@@ -722,6 +722,131 @@ def _():
     assert _fila(H_SEC)["activo"] is False
 
 
+# ==========================================================================
+# X — SERIALIZACION
+#   Desde que existe el borrado definitivo, los tres cambios de estado de un
+#   horario compiten por la misma fila. Los tres tienen que pasar por el mismo
+#   candado y decidir con el valor actual, no con el que leyeron al entrar.
+# ==========================================================================
+def _interferir(accion):
+    """Ejecuta `accion(sesion)` justo despues del chequeo de tenant."""
+    real = APP.get_tenant_or_404
+
+    def envuelto(*a, **k):
+        r = real(*a, **k)
+        otra = SessionLocal()
+        try:
+            accion(otra)
+            otra.commit()
+        finally:
+            otra.close()
+        return r
+    return real, envuelto
+
+
+@test("X1 retirar y reactivar usan el mismo bloqueo que eliminar")
+def _():
+    import inspect
+    for fn in (APP.retirar_horario, APP.reactivar_horario, APP.eliminar_horario_definitivo):
+        fuente = inspect.getsource(fn)
+        assert "_horario_bloqueado(db, id, current_user).first()" in fuente, fn.__name__
+        assert "get_tenant_or_404" in fuente, ("perdio el contrato 404", fn.__name__)
+        assert "raise HTTPException(status_code=404" in fuente, (
+            "no contempla que la fila desaparezca", fn.__name__)
+
+
+@test("X2 retirar decide con la fila actual, no con la que leyó al entrar")
+def _():
+    _seed()
+    n = _n_auditoria('RETIRAR_HORARIO')
+
+    def ya_retirado(s):     # alguien se le adelanta
+        s.query(M.Horario).filter_by(id=H_SEC).update({"activo": False})
+
+    real, envuelto = _interferir(ya_retirado)
+    APP.get_tenant_or_404 = envuelto
+    try:
+        r = retirar(H_SEC)
+    finally:
+        APP.get_tenant_or_404 = real
+
+    assert r.status_code == 200, (r.status_code, r.text[:200])
+    assert "ya estaba retirado" in r.json()["message"], (
+        "no vio el retiro que acababa de ocurrir")
+    assert _n_auditoria('RETIRAR_HORARIO') == n, "audito un cambio que no hizo"
+
+
+@test("X3 reactivar decide con la fila actual")
+def _():
+    _seed()
+    assert retirar(H_SEC).status_code == 200
+    n = _n_auditoria('REACTIVAR_HORARIO')
+
+    def ya_activo(s):
+        s.query(M.Horario).filter_by(id=H_SEC).update({"activo": True})
+
+    real, envuelto = _interferir(ya_activo)
+    APP.get_tenant_or_404 = envuelto
+    try:
+        r = reactivar(H_SEC)
+    finally:
+        APP.get_tenant_or_404 = real
+
+    assert r.status_code == 200, (r.status_code, r.text[:200])
+    assert "ya estaba activo" in r.json()["message"]
+    assert _n_auditoria('REACTIVAR_HORARIO') == n
+
+
+@test("X4 si eliminar gana la carrera, reactivar da 404 controlado, no 500")
+def _():
+    _seed()
+    assert retirar(H_SEC).status_code == 200
+
+    def lo_elimina(s):
+        s.query(M.Horario).filter_by(id=H_SEC).delete()
+
+    real, envuelto = _interferir(lo_elimina)
+    APP.get_tenant_or_404 = envuelto
+    try:
+        r = reactivar(H_SEC)
+    finally:
+        APP.get_tenant_or_404 = real
+
+    assert r.status_code == 404, (r.status_code, r.text[:250])
+    assert _fila(H_SEC) is None, "resucito una fila eliminada"
+    assert _n_auditoria('REACTIVAR_HORARIO') == 0
+
+
+@test("X5 lo mismo al retirar: la fila eliminada no vuelve por la puerta de atrás")
+def _():
+    _seed()
+
+    def lo_elimina(s):
+        s.query(M.Horario).filter_by(id=H_SEC).delete()
+
+    real, envuelto = _interferir(lo_elimina)
+    APP.get_tenant_or_404 = envuelto
+    try:
+        r = retirar(H_SEC)
+    finally:
+        APP.get_tenant_or_404 = real
+
+    assert r.status_code == 404, (r.status_code, r.text[:250])
+    assert _fila(H_SEC) is None
+    assert _n_auditoria('RETIRAR_HORARIO') == 0
+
+
+@test("X6 el camino normal de retirar y reactivar no cambió")
+def _():
+    _seed()
+    assert retirar(H_SEC).status_code == 200
+    assert _fila(H_SEC)["activo"] is False
+    assert reactivar(H_SEC).status_code == 200
+    assert _fila(H_SEC)["activo"] is True
+    assert _n_auditoria('RETIRAR_HORARIO') == 1
+    assert _n_auditoria('REACTIVAR_HORARIO') == 1
+
+
 @test("U3 el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

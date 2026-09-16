@@ -60,6 +60,32 @@ interface MainLayoutProps {
 // reportes), así que esas dos arrancan abiertas.
 const SECCIONES_DEFAULT_ABIERTAS = ['Académico', 'Personas'];
 
+/**
+ * Lo que un profesor imparte de verdad, para la cabecera.
+ *
+ * La cabecera leía `nivel_asignado`, que para un profesor es a lo sumo su
+ * división principal. Un profesor con `nivel_asignado = 'secundaria'` que
+ * además da clases en Primaria veía «Viendo: División Secundaria» mientras el
+ * menú —que sí mira las asignaciones activas— le ofrecía las dos. Dos fuentes
+ * contradiciéndose sobre la misma persona.
+ *
+ * `nivelesProfesor` lo calcula el backend desde las asignaciones activas: es la
+ * única fuente que corresponde. Esto es INFORMATIVO y no recorta nada: un
+ * profesor mixto sigue viendo sus clases de los dos niveles.
+ *
+ * Con `null` —todavía cargando, o la llamada falló— y con los dos en false no
+ * se dice nada. Inventarle un nivel a alguien es peor que no decir ninguno.
+ */
+export const etiquetaNivelesProfesor = (
+  niveles: { primaria: boolean; secundaria: boolean } | null | undefined
+): string | null => {
+  if (!niveles) return null;
+  if (niveles.primaria && niveles.secundaria) return 'Imparte: Primaria y Secundaria';
+  if (niveles.primaria) return 'Imparte: Primaria';
+  if (niveles.secundaria) return 'Imparte: Secundaria';
+  return null;
+};
+
 export const MainLayout = ({ children }: MainLayoutProps) => {
   const { user, logout } = useAuth();
   const location = useLocation();
@@ -651,7 +677,19 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
                 {/* v2.19.2: con nivel FIJO el badge muestra su división asignada
                     (antes leía nivelVista, que para ellos siempre era "todos" y
                     dejaba el badge en blanco o con la división equivocada). */}
-                {(nivelFijo || (puedeCambiarDivision && nivelVista !== 'todos')) && (
+                {/* H2-B3 — al profesor se le dice lo que IMPARTE, no una
+                    división que quizá no refleja sus clases. Antes este badge
+                    leía `nivel_asignado` para todo el mundo, así que un
+                    profesor mixto veía «Viendo: División Secundaria» mientras
+                    el menú le ofrecía Primaria. Es informativo: no recorta
+                    nada, y el switch de división sigue siendo administrativo. */}
+                {user?.role === 'profesor' ? (
+                  etiquetaNivelesProfesor(nivelesProfesor) && (
+                    <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold border bg-slate-50 text-slate-600 border-slate-200">
+                      {etiquetaNivelesProfesor(nivelesProfesor)}
+                    </span>
+                  )
+                ) : (nivelFijo || (puedeCambiarDivision && nivelVista !== 'todos')) && (
                   <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${(nivelFijo || nivelVista) === 'primaria' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-purple-50 text-purple-700 border-purple-200'}`}>
                     Viendo: {(nivelFijo || nivelVista) === 'primaria' ? '🎒 División Primaria' : '🏫 División Secundaria'}
                   </span>

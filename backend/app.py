@@ -6213,8 +6213,16 @@ async def retirar_horario(id, request: Request, db: Session = Depends(get_db), c
     Solo cambia `activo`. No toca la `AsignacionProfesor` del docente, ni la
     titularidad, ni ninguna asistencia, nota o sesión ya registrada: retirar un
     bloque de la agenda de hoy no puede reescribir lo que pasó ayer.
+
+    Va sobre la fila bloqueada. Desde que existe el borrado definitivo, los tres
+    cambios de estado de un horario —retirar, reactivar y eliminar— compiten por
+    la misma fila, así que se serializan con el mismo candado.
     """
-    horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    horario = _horario_bloqueado(db, id, current_user).first()
+    if horario is None:
+        # Lo eliminaron entremedias: no hay nada que retirar.
+        raise HTTPException(status_code=404, detail='horario no encontrado')
 
     if not horario.activo:
         # Idempotente: pedir dos veces lo mismo no es un error, y no se vuelve a
@@ -6240,8 +6248,16 @@ async def reactivar_horario(id, request: Request, db: Session = Depends(get_db),
     la franja tiene que estar libre. El horario pudo retirarse hace meses y el
     mundo haber cambiado: el profesor ya no da esa materia, o alguien ocupó esa
     hora. Si no cabe, se queda retirado y se explica por qué.
+
+    Va sobre la fila bloqueada, igual que retirar y eliminar. Sin eso, reactivar
+    podía leer `activo=False`, perder la carrera contra una eliminación y acabar
+    lanzando un UPDATE sobre una fila que ya no existe.
     """
-    horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    horario = _horario_bloqueado(db, id, current_user).first()
+    if horario is None:
+        # Lo eliminaron entremedias: no se resucita nada, se dice que no está.
+        raise HTTPException(status_code=404, detail='horario no encontrado')
 
     if horario.activo:
         return {'message': 'El horario ya estaba activo', 'horario': horario.to_dict()}
@@ -6286,6 +6302,148 @@ async def reactivar_horario(id, request: Request, db: Session = Depends(get_db),
     db.commit()
     cache_clear_tenant(horario.colegio_id)
     return {'message': 'Horario reactivado', 'horario': horario.to_dict()}
+
+
+def _referencias_historicas_horario(db: Session, horario: Horario) -> list:
+    """Qué información ya registrada apunta a este bloque.
+
+    La auditoría de H2-B3 midió el esquema entero: NO hay ninguna foreign key
+    hacia `horarios`, y en toda la base existe una sola columna que guarda un id
+    de horario — `sesiones_no_impartidas.horario_id`, nullable y sin FK, donde S1
+    anota la PROCEDENCIA de la sesión.
+
+    Todo lo demás —el Registro, la Asistencia, los Reportes, el dashboard del
+    profesor, Reemplazar Profesor— lee los horarios vivos por profesor, curso,
+    día y hora; no guarda ningún id, así que borrar la fila no deja un puntero
+    roto en ninguno.
+
+    El log de auditoría queda deliberadamente fuera: `registro_id` es un entero
+    sin FK, y un log que dejara de poder referirse a lo que ya no existe no
+    serviría de nada. La historia sobrevive al borrado; ese es su trabajo.
+    """
+    referencias = []
+    n_sesiones = db.query(SesionNoImpartida).filter(
+        SesionNoImpartida.horario_id == horario.id
+    ).count()
+    if n_sesiones:
+        referencias.append(
+            '%d sesión(es) no impartida(s) registradas con este bloque' % n_sesiones)
+    return referencias
+
+
+def _horario_bloqueado(db: Session, horario_id: int, current_user: Usuario):
+    """La consulta que toma el bloqueo de fila del horario, dentro del tenant.
+
+    Devuelve la Query sin ejecutar para que se pueda inspeccionar el SQL que
+    genera; quien la usa hace `.first()`.
+
+    Dos piezas, y las dos hacen falta:
+
+    `with_for_update()` pone un `SELECT ... FOR UPDATE` en PostgreSQL, así que
+    mientras dure la transacción nadie más puede modificar ni borrar esa fila:
+    una segunda petición sobre el mismo horario espera su turno en vez de correr
+    en paralelo. En SQLite no se emite nada —no lo soporta— y la suite sigue
+    funcionando, aunque ahí lo que se prueba es la revalidación, no el candado.
+
+    `populate_existing()` es la mitad que se olvida. Sin ella SQLAlchemy ve que
+    el objeto ya está en el mapa de identidad y devuelve el que tenía en memoria
+    SIN releer los valores: se tomaría el bloqueo y luego se decidiría con el
+    estado viejo, que es exactamente lo que se quería evitar. Con ella, los
+    atributos se sobrescriben con lo que hay en la fila ahora.
+
+    Va con el `tenant_filter` puesto, para que el bloqueo no pueda alcanzar la
+    fila de otro colegio.
+    """
+    return tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.id == horario_id
+    ).populate_existing().with_for_update()
+
+
+@app.post("/api/horarios/{id}/eliminar-definitivo")
+async def eliminar_horario_definitivo(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """
+    Borra para siempre un bloque YA RETIRADO. No hay vuelta atrás.
+
+    Retirar dejó de ser destructivo justamente para no repetir lo de H2-A, donde
+    cuatro horarios desaparecieron sin que quedara rastro de qué clase eran. Pero
+    un bloque que Dirección sabe que no volverá no tiene por qué quedarse para
+    siempre en la lista de retirados. Esta ruta existe para eso, y solo para eso.
+
+    `DELETE /api/horarios/{id}` sigue deshabilitado: el borrado permanente tiene
+    que pedirse a propósito, nombrando el id, no caer por accidente desde un
+    cliente viejo que creía estar quitando un bloque cualquiera.
+
+    Exige, en orden: mismo colegio, que exista, que esté retirado, que quien
+    llama confirme el id exacto, y que nada ya registrado apunte al bloque.
+
+    Todo eso se comprueba sobre una fila BLOQUEADA. Un borrado no tiene vuelta
+    atrás, así que no puede decidirse con un estado leído hace un instante: si
+    otra persona de Dirección reactiva el bloque entremedias, quien borra tiene
+    que enterarse antes de borrar, no después.
+    """
+    # Primero el tenant, con el 404 de siempre y sin tocar `get_tenant_or_404`.
+    get_tenant_or_404(db, Horario, id, current_user, name='horario')
+
+    # Y ahora la MISMA fila, bloqueada y releída. A partir de aquí no se usa
+    # nada de lo que se leyó antes: si entre las dos consultas alguien reactivó
+    # el bloque, se ve reactivado; si alguien lo borró, no se encuentra.
+    horario = _horario_bloqueado(db, id, current_user).first()
+    if horario is None:
+        # Otra petición gana la carrera y lo elimina: esta no borra dos veces ni
+        # revienta con un estado inconsistente, contesta el 404 de un horario
+        # que ya no existe.
+        raise HTTPException(status_code=404, detail='horario no encontrado')
+
+    if horario.activo:
+        return JSONResponse({
+            'error': 'Retire primero el horario.',
+        }, status_code=409)
+
+    # El id va también en el cuerpo. Es lo único que separa «eliminar el 64» de
+    # «eliminar el que estaba mirando»: en un grupo de duplicados esa diferencia
+    # es toda la decisión.
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    # Se acepta 64 y "64" —un formulario manda cadenas— pero nada más: ni un
+    # booleano (que en Python valdría 1), ni un decimal que al truncarse
+    # acertaría por casualidad. La confirmación tiene que ser un entero dicho a
+    # propósito.
+    crudo = (data or {}).get('confirmar_id')
+    confirmado = None
+    if isinstance(crudo, int) and not isinstance(crudo, bool):
+        confirmado = crudo
+    elif isinstance(crudo, str) and crudo.strip().lstrip('-').isdigit():
+        confirmado = int(crudo.strip())
+    if confirmado != horario.id:
+        return JSONResponse({
+            'error': ('Confirme el ID del horario que va a eliminar. Se esperaba '
+                      '%d.' % horario.id),
+        }, status_code=400)
+
+    referencias = _referencias_historicas_horario(db, horario)
+    if referencias:
+        return JSONResponse({
+            'error': ('Este horario está vinculado a información histórica y debe '
+                      'permanecer retirado.'),
+            'referencias': referencias,
+        }, status_code=409)
+
+    # La ficha entera, ANTES de borrar: es lo último que quedará del bloque.
+    foto = _foto_horario(horario)
+    log_auditoria(db, 'ELIMINAR_HORARIO_DEFINITIVO', 'horarios', horario.id,
+                  foto, None, user=current_user, request=request)
+    # Un solo commit para el log y el borrado. Si el delete falla, el rollback se
+    # lleva también la auditoría: no puede quedar constancia de algo que no pasó.
+    try:
+        db.delete(horario)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    cache_clear_tenant(current_user.colegio_id)
+    return {'message': 'Horario eliminado definitivamente', 'horario': foto}
 
 # ============== CALIFICACIONES ==============
 
@@ -11371,6 +11529,20 @@ async def crear_sesion_no_impartida(
         return _guard_div
 
     # --- el bloque programado -------------------------------------------------
+    #
+    # `with_for_update(read=True)` emite FOR SHARE en PostgreSQL: mientras esta
+    # transacción decide y anota la procedencia, nadie puede retirar ni borrar
+    # esos bloques. Sin eso quedaba una ventana estrecha pero real: S1 lee el
+    # horario activo, otra petición lo retira, el borrado definitivo toma su
+    # lock, no ve todavía la sesión que aún no se ha guardado y borra la fila, y
+    # S1 termina guardando un `horario_id` que ya no apunta a nada. Como
+    # `sesiones_no_impartidas` no tiene FK hacia `horarios`, nada lo impediría.
+    #
+    # FOR SHARE y no FOR UPDATE porque aquí solo se lee: varias sesiones S1
+    # pueden mirar el mismo bloque a la vez, lo que no pueden es hacerlo
+    # mientras alguien lo modifica. El lock se suelta con el commit o el
+    # rollback de esta misma petición. SQLite no lo emite y las suites siguen
+    # corriendo igual.
     dia_nombre = _DIAS_SEMANA_S1[fecha.weekday()]
     bloques = tenant_filter(db.query(Horario), Horario, current_user).filter(
         Horario.profesor_id == current_user.id,
@@ -11379,7 +11551,7 @@ async def crear_sesion_no_impartida(
         Horario.dia == dia_nombre,
         Horario.activo == True,  # noqa: E712
         or_(Horario.tipo_bloque == 'clase', Horario.tipo_bloque.is_(None)),
-    ).order_by(Horario.hora_inicio).all()
+    ).order_by(Horario.hora_inicio).with_for_update(read=True).all()
 
     if not bloques:
         return JSONResponse({

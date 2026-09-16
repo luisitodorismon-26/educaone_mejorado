@@ -90,6 +90,30 @@ const identidadBloque = (h: Horario): string =>
   [h.dia, h.hora_inicio, h.hora_fin, h.tipo_bloque || 'clase',
    h.profesor_id ?? '-', h.curso_id ?? '-', h.asignatura_id ?? '-'].join('|');
 
+/**
+ * El sufijo de nivel del título: «Horarios — Primaria».
+ *
+ * Es un rótulo ADMINISTRATIVO: dice bajo qué lente está mirando Dirección o
+ * coordinación. Al profesor no le corresponde. Esta página es su horario
+ * personal y se le muestra entero aunque cruce niveles, pero el título salía de
+ * `nivel_asignado`, que para un profesor es a lo sumo su división principal: uno
+ * que solo imparte Secundaria podía leer «Horarios — Primaria» encima de sus
+ * propias clases de Secundaria.
+ *
+ * Para el profesor, entonces, el título es «Horarios» a secas. Qué imparte de
+ * verdad ya lo dice la cabecera de MainLayout, calculado desde sus asignaciones
+ * activas; aquí no se repite esa consulta ni se filtra nada.
+ */
+const sufijoNivelTitulo = (
+  rol: string | undefined,
+  nivelActivo: 'primaria' | 'secundaria' | null
+): string | null => {
+  if (rol === 'profesor') return null;
+  if (nivelActivo === 'primaria') return 'Primaria';
+  if (nivelActivo === 'secundaria') return 'Secundaria';
+  return null;
+};
+
 /** Los ids de un grupo de filas idénticas, en orden numérico. Es solo
  *  presentación: que 34 salga antes que 35 evita que la lista parezca
  *  arbitraria, pero el orden no elige nada. */
@@ -114,6 +138,13 @@ const accionesRetiroDeGrupo = (grupo: Horario[]): { id: number; etiqueta: string
 const mensajeRetiro = (id: number): string =>
   `Vas a retirar el registro de horario ID ${id}.\n` +
   'Dejará de aparecer en el horario actual, pero se conservará y podrá reactivarse.';
+
+/** Retirar es reversible y la confirmación lo dice; esta no puede decir lo
+ *  mismo, porque aquí no hay vuelta atrás. */
+const mensajeEliminacionDefinitiva = (id: number): string =>
+  `Vas a eliminar definitivamente el horario ID ${id}.\n` +
+  'Esta acción no se puede deshacer.\n' +
+  'Si se necesita nuevamente deberá crearse un horario nuevo.';
 
 /**
  * De quien es el bloque que se esta guardando.
@@ -244,7 +275,7 @@ export const HorariosPage = () => {
     nivelFijo
       ? nivelFijo
       : (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null);
-  const nivelLabel = nivelActivo ? (nivelActivo === 'primaria' ? 'Primaria' : 'Secundaria') : null;
+  const nivelLabel = sufijoNivelTitulo(user?.role, nivelActivo);
 
   // v2.19.8: administrar horarios por CURSO y RECREOS exige un contexto de nivel
   // concreto. Dirección en "Todos" (sin lente) NO puede: no elegimos un recreo
@@ -404,6 +435,22 @@ export const HorariosPage = () => {
     } catch (e: any) {
       // El backend explica el caso: la asignacion ya no existe, o la franja se ocupo.
       setMessage({ type: 'error', text: e.response?.data?.error || 'No se pudo reactivar' });
+    }
+  };
+
+  // H2-B3: borrado permanente, solo desde el panel de retirados y solo fila a
+  // fila. Una fila, una decisión: no hay «eliminar todos» ni limpieza por
+  // antigüedad. El id viaja en el cuerpo porque es lo que separa «eliminar el
+  // 64» de «eliminar el que estaba mirando».
+  const handleEliminarDefinitivo = async (id: number) => {
+    if (!confirm(mensajeEliminacionDefinitiva(id))) return;
+    try {
+      await api.post(`/horarios/${id}/eliminar-definitivo`, { confirmar_id: id });
+      setMessage({ type: 'success', text: `Horario ID ${id} eliminado definitivamente` });
+      cargarRetirados();
+    } catch (e: any) {
+      // El backend explica el caso: sigue activo, o hay historia que lo ata.
+      setMessage({ type: 'error', text: e.response?.data?.error || 'No se pudo eliminar' });
     }
   };
 
@@ -970,12 +1017,21 @@ export const HorariosPage = () => {
                           </td>
                           <td className="py-2 pr-3">{h.tipo_bloque}</td>
                           <td className="py-2">
-                            <button
-                              onClick={() => handleReactivar(h.id)}
-                              className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded hover:bg-emerald-100 text-xs"
-                            >
-                              Reactivar
-                            </button>
+                            <div className="flex gap-1">
+                              <button
+                                onClick={() => handleReactivar(h.id)}
+                                className="px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded hover:bg-emerald-100 text-xs whitespace-nowrap"
+                              >
+                                Reactivar
+                              </button>
+                              <button
+                                onClick={() => handleEliminarDefinitivo(h.id)}
+                                className="px-3 py-1 bg-red-50 text-red-700 border border-red-200 rounded hover:bg-red-100 text-xs whitespace-nowrap"
+                                title={`Eliminar para siempre el horario ${h.id}. No se puede deshacer.`}
+                              >
+                                Eliminar definitivamente
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
