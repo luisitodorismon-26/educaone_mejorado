@@ -163,15 +163,17 @@ def _seed(cerrar_periodos=()):
             d.add(u)
 
         n = 200
-        def AP(prof, cur, asig, col=COL_A, ano=ANO_A, activo=True):
+        def AP(prof, cur, asig, col=COL_A, ano=ANO_A, activo=True, titular=False):
             nonlocal n
             n += 1
             d.add(M.AsignacionProfesor(id=n, colegio_id=col, profesor_id=prof,
                                        curso_id=cur, asignatura_id=asig,
-                                       ano_escolar_id=ano, activo=activo))
+                                       ano_escolar_id=ano, activo=activo,
+                                       es_titular=titular))
 
-        # EL PROFESOR MIXTO: Inglés en Primaria y en Secundaria
-        AP(PROF_MIXTO, CUR_PRIM, INGLES)
+        # EL PROFESOR MIXTO: Inglés en Primaria y en Secundaria, y titular del
+        # curso de primaria (el validador del Registro lo exige).
+        AP(PROF_MIXTO, CUR_PRIM, INGLES, titular=True)
         AP(PROF_MIXTO, CUR_SEC, INGLES)
         # solo primaria
         AP(PROF_PRIM, CUR_PRIM, CNAT)
@@ -179,6 +181,19 @@ def _seed(cerrar_periodos=()):
         # otro profesor, otro curso de primaria
         AP(PROF_OTRO, CUR_PRIM2, INGLES)
         AP(DIR_B, CUR_B, MAT_B, col=COL_B, ano=ANO_B)
+
+        # El Registro exige la ficha del centro: sin ella su validador responde
+        # 400 antes de mirar nada, y el smoke no probaria nada.
+        d.add(M.ConfiguracionColegio(
+            colegio_id=COL_A, nombre="Colegio A", rnc="130000000",
+            codigo_centro="05123", distrito="05", regional="10",
+            director="Directora", direccion="Calle 1", telefono="8090000000"))
+        # En primaria un solo docente dicta todas las áreas del grado: el
+        # validador exige ese titular y un horario para el curso.
+        d.add(M.Horario(id=900, colegio_id=COL_A, profesor_id=PROF_MIXTO,
+                        curso_id=CUR_PRIM, asignatura_id=INGLES, dia="Lunes",
+                        hora_inicio="08:00", hora_fin="08:45",
+                        tipo_bloque="clase", activo=True))
 
         for eid, cur, col, nom in ((E_PRIM, CUR_PRIM, COL_A, "Juan"),
                                    (E_PRIM2, CUR_PRIM2, COL_A, "Ana"),
@@ -614,6 +629,208 @@ def _():
     r = leer(H_MIX, CUR_SEC, INGLES)
     assert r.status_code == 400, (r.status_code, r.text[:250])
     assert "primaria" in r.text.lower()
+
+
+# ==========================================================================
+# F — CF, LITERAL Y max(P, RP)
+#   Estas reglas NO se cambian: se fijan tal como estan hoy, para que
+#   endurecer el endpoint no las mueva.
+# ==========================================================================
+def _modelo(**campos):
+    c = M.CalificacionPrimaria(estudiante_id=E_PRIM, asignatura_id=INGLES,
+                               competencia_numero=1, colegio_id=COL_A)
+    for k, v in campos.items():
+        setattr(c, k, v)
+    return c
+
+
+@test("F1 valor_periodo = max(P, RP), y RP sola vale si no hay P")
+def _():
+    assert _modelo(p1=60, rp1=75).valor_periodo(1) == 75, "la recuperacion no subio"
+    assert _modelo(p1=60).valor_periodo(1) == 60
+    assert _modelo(rp1=75).valor_periodo(1) == 75, "RP sin P deberia valer"
+    assert _modelo().valor_periodo(1) is None
+
+
+@test("F2 una recuperación MENOR que la nota original no baja el período")
+def _():
+    # Es la consecuencia de max(): recuperar peor no puede perjudicar.
+    assert _modelo(p1=80, rp1=50).valor_periodo(1) == 80
+    assert _modelo(p1=80, rp1=80).valor_periodo(1) == 80
+
+
+@test("F3 CF con los 4 períodos = promedio, redondeado a 2 decimales")
+def _():
+    c = _modelo(p1=80, p2=78, p3=79, p4=78)
+    assert c.calcular_final() == 78.75
+    c = _modelo(p1=71, p2=74, p3=88, p4=82)
+    assert c.calcular_final() == 78.75
+    # el redondeo es a 2 decimales
+    c = _modelo(p1=80, p2=80, p3=80, p4=81)
+    assert c.calcular_final() == 80.25
+
+
+@test("F4 CF con períodos NE: promedia SOLO los evaluados (regla MINERD)")
+def _():
+    assert _modelo(p1=80, p2=90).calcular_final() == 85.0, "no promedio solo los evaluados"
+    assert _modelo(p1=90).calcular_final() == 90.0
+    assert _modelo().calcular_final() is None, "sin ningun periodo no hay CF"
+
+
+@test("F5 la CF usa el valor recuperado del período, no la nota original")
+def _():
+    c = _modelo(p1=60, rp1=80, p2=80, p3=80, p4=80)
+    assert c.calcular_final() == 80.0, "la CF ignoro la recuperacion"
+
+
+@test("F6 literal: A>=90, B>=80, C>=70, F por debajo")
+def _():
+    c = _modelo()
+    for nota, esperado in ((100, 'A'), (90, 'A'), (89.99, 'B'), (80, 'B'),
+                           (79.99, 'C'), (70, 'C'), (69.99, 'F'), (0, 'F')):
+        assert c.get_literal(nota) == esperado, (nota, c.get_literal(nota))
+    assert c.get_literal(None) is None
+
+
+@test("F7 el endpoint calcula CF y literal al guardar, de punta a punta")
+def _():
+    _seed()
+    for p, v in (('p1', 80), ('p2', 78), ('p3', 79), ('p4', 78)):
+        assert guardar(H_MIX, E_PRIM, INGLES, **{p: v}).status_code == 200
+    c = _calif(E_PRIM, INGLES)
+    assert c["final"] == 78.75, c
+    assert c["literal"] == 'C', c
+
+
+# ==========================================================================
+# G — RECUPERACIÓN DE ÁREA (reglas EXISTENTES, no se rediseñan)
+# ==========================================================================
+def _rec(**campos):
+    r = M.RecuperacionPrimaria(estudiante_id=E_PRIM, asignatura_id=INGLES,
+                               colegio_id=COL_A)
+    for k, v in campos.items():
+        setattr(r, k, v)
+    return r
+
+
+@test("G1 es COMPLEMENTARIA: los puntos se suman a la CF")
+def _():
+    r = _rec(cf_area=60, puntos_final=10)
+    r.recalcular()
+    assert r.recuperacion_final == 70, r.recuperacion_final
+
+
+@test("G2 el máximo de puntos es 100 - CF: nunca se pasa de 100")
+def _():
+    assert _rec(cf_area=60).maximo_puntos() == 40
+    assert _rec(cf_area=95).maximo_puntos() == 5
+    assert _rec(cf_area=100).maximo_puntos() == 0
+
+
+@test("G3 el corte de aprobación es 65")
+def _():
+    assert M.RecuperacionPrimaria.MINIMO == 65
+    r = _rec(cf_area=60, puntos_final=5); r.recalcular()
+    assert r.condicion_final == 'aprobado_recuperacion', r.condicion_final
+    r = _rec(cf_area=60, puntos_final=4); r.recalcular()
+    assert r.condicion_final != 'aprobado_recuperacion', r.condicion_final
+
+
+@test("G4 con la CF ya aprobada no hace falta recuperación")
+def _():
+    r = _rec(cf_area=70); r.recalcular()
+    assert r.condicion_final == 'aprobado', r.condicion_final
+    assert r.fase_pendiente() is None, r.fase_pendiente()
+
+
+@test("G5 si tras la recuperación final sigue por debajo, queda la especial")
+def _():
+    r = _rec(cf_area=50, puntos_final=5); r.recalcular()
+    assert r.recuperacion_final == 55
+    assert r.condicion_final != 'aprobado_recuperacion'
+    assert r.fase_pendiente() == 'especial', r.fase_pendiente()
+    r.puntos_especial = 10; r.recalcular()
+    assert r.recuperacion_especial == 60
+
+
+# ==========================================================================
+# H — BOLETÍN Y REGISTRO (smoke: que lo endurecido no los rompa)
+# ==========================================================================
+@test("H1 el boletín de primaria lee las notas guardadas")
+def _():
+    _seed()
+    for p, v in (('p1', 90), ('p2', 90), ('p3', 90), ('p4', 90)):
+        assert guardar(H_MIX, E_PRIM, INGLES, **{p: v}).status_code == 200
+    r = client.get(f"/api/boletines-primaria/estudiante/{E_PRIM}", headers=H_DIR)
+    assert r.status_code == 200, (r.status_code, r.text[:300])
+    assert "90" in r.text or "A" in r.text
+
+
+@test("H2 el boletín de primaria RECHAZA un estudiante de secundaria")
+def _():
+    _seed()
+    r = client.get(f"/api/boletines-primaria/estudiante/{E_SEC}", headers=H_DIR)
+    assert r.status_code in (400, 404), (r.status_code, r.text[:250])
+
+
+@test("H3 el boletín respeta el alcance del profesor y el colegio")
+def _():
+    _seed()
+    assert client.get(f"/api/boletines-primaria/estudiante/{E_PRIM}",
+                      headers=H_MIX).status_code == 200
+    # PROF_OTRO no da clase en CUR_PRIM
+    assert client.get(f"/api/boletines-primaria/estudiante/{E_PRIM}",
+                      headers=H_OTRO).status_code == 403
+    # y otro colegio no llega
+    assert client.get(f"/api/boletines-primaria/estudiante/{E_PRIM}",
+                      headers=H_DIRB).status_code == 404
+
+
+@test("H4 el Registro de primaria se genera con las notas que guarda el endpoint")
+def _():
+    _seed()
+    # Las tres competencias completas de CADA área del curso, por la vía normal
+    # y con el docente que tiene cada una asignada.
+    for hdr, asig in ((H_MIX, INGLES), (H_PRIM, CNAT)):
+        for comp in (1, 2, 3):
+            assert guardar(hdr, E_PRIM, asig, comp=comp,
+                           p1=80, p2=85, p3=90, p4=95).status_code == 200, (asig, comp)
+    # El Registro exige asistencia; en primaria es del CURSO, sin asignatura.
+    d = SessionLocal()
+    try:
+        d.add(M.Asistencia(colegio_id=COL_A, estudiante_id=E_PRIM, curso_id=CUR_PRIM,
+                           asignatura_id=None, fecha=date(2026, 9, 7),
+                           estado="presente", registrado_por=PROF_MIXTO))
+        d.commit()
+    finally:
+        d.close()
+    r = client.get(f"/api/registros/primaria/{CUR_PRIM}", headers=H_DIR)
+    assert r.status_code == 200, (r.status_code, r.text[:400])
+    # y el alcance del profesor se mantiene
+    assert client.get(f"/api/registros/primaria/{CUR_PRIM}",
+                      headers=H_OTRO).status_code == 403
+
+
+@test("H5 el validador del Registro sigue exigiendo lo suyo: sin notas, 400")
+def _():
+    _seed()
+    r = client.get(f"/api/registros/primaria/{CUR_PRIM}", headers=H_DIR)
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "alificaciones" in r.text, r.text[:250]
+
+
+@test("B9 con una fila YA existente, un payload mixto no pisa la nota buena previa")
+def _():
+    _seed()
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=80, p2=70).status_code == 200
+    # p1 válido + p2 inválido: ni el cambio de p1 puede quedar
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=90, p2=500)
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    c = _calif(E_PRIM, INGLES)
+    assert c["p1"] == 80, ("se aplico p1 pese al fallo de p2", c)
+    assert c["p2"] == 70, ("se toco p2", c)
+    # y la CF no se movio
+    assert c["final"] == 75.0, c
 
 
 @test("R  el repo no fue tocado: sge.db intacto")
