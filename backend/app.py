@@ -6793,6 +6793,22 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
         logger.error(f"Error en calificaciones-primaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({'error': f'Error del servidor: {str(e)}'}, status_code=500)
 
+def _es_curso_primaria(db, curso_id: int) -> bool:
+    """True solo si el curso pertenece REALMENTE al nivel primaria.
+
+    Es una comprobación POSITIVA, no el negativo de `_es_curso_secundaria`:
+    EducaOne contempla también nivel inicial, así que «no es secundaria» no
+    significa «es primaria». Aquí solo pasa 'primaria'; inicial, secundaria y
+    un nivel que no se puede determinar —curso inexistente, sin grado, o con el
+    grado sin nivel— se rechazan por igual.
+    """
+    curso = db.get(Curso, curso_id)
+    if not curso or not curso.grado_id:
+        return False
+    grado = db.get(Grado, curso.grado_id)
+    return bool(grado) and (grado.nivel or '').strip().lower() == 'primaria'
+
+
 def _rechazo_nota(db: Session, campo: str, motivo: str):
     """400 por un valor de nota inválido, descartando lo pendiente.
 
@@ -6851,7 +6867,21 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             'error': 'Estudiante retirado: no se pueden modificar sus calificaciones',
             'fecha_retiro': estudiante_obj.fecha_retiro.isoformat() if estudiante_obj.fecha_retiro else None,
         }, status_code=403)
-    
+
+    # El curso tiene que ser de PRIMARIA de verdad. El docstring decía «siempre
+    # primaria acá», pero nada lo comprobaba: se podía crear una
+    # CalificacionPrimaria para un alumno de Secundaria y dejarle el expediente
+    # con dos estructuras académicas incompatibles.
+    #
+    # Un profesor puede tener asignaciones en los dos niveles a la vez; lo que
+    # decide aquí NO es el profesor sino el CURSO: curso → grado → nivel.
+    if not _es_curso_primaria(db, estudiante_obj.curso_id):
+        return JSONResponse({
+            'error': ('Este estudiante no pertenece a Primaria. Use el flujo del '
+                      'nivel que le corresponde.'),
+            'curso_id': estudiante_obj.curso_id,
+        }, status_code=400)
+
     if estudiante_obj.curso_id:
         assert_nivel_curso_activo(db, current_user, estudiante_obj.curso_id)
     

@@ -433,6 +433,126 @@ def _():
     assert _n_calif_primaria() == 0, "creo la fila igualmente"
 
 
+# ==========================================================================
+# C — EL NIVEL LO DECIDE EL CURSO
+# ==========================================================================
+@test("C1 un alumno de PRIMARIA se califica con normalidad")
+def _():
+    _seed()
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+
+
+@test("C2 un alumno de SECUNDARIA -> 400, y no se crea nada")
+def _():
+    _seed()
+    # PROF_MIXTO tiene asignación REAL de Inglés en el curso de Secundaria:
+    # el rechazo tiene que venir del nivel del curso, no de la asignación.
+    r = guardar(H_MIX, E_SEC, INGLES, p1=80)
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "Primaria" in r.json()["error"]
+    assert _n_calif_primaria() == 0, "creo una CalificacionPrimaria para Secundaria"
+
+
+@test("C3 un alumno de INICIAL -> 400: 'no es secundaria' no significa 'es primaria'")
+def _():
+    _seed()
+    r = guardar(H_PRIM, E_INI, INGLES, p1=80)
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "Primaria" in r.json()["error"]
+    assert _n_calif_primaria() == 0
+
+
+@test("C4 nivel indeterminable (grado sin nivel, o con un nivel inválido) -> 400")
+def _():
+    # `cursos.grado_id` es NOT NULL, así que lo indeterminable en la práctica es
+    # un grado cuyo `nivel` esté vacío o traiga un valor que no reconocemos.
+    for valor in (None, '', '   ', 'xyz', 'Primario'):
+        _seed()
+        d = SessionLocal()
+        try:
+            d.query(M.Grado).filter_by(id=G_PRIM).update({"nivel": valor})
+            d.commit()
+        finally:
+            d.close()
+        r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
+        assert r.status_code == 400, (valor, r.status_code, r.text[:250])
+        assert _n_calif_primaria() == 0, valor
+
+
+@test("C4b 'Primaria' con mayúscula o espacios SÍ se reconoce")
+def _():
+    for valor in ('Primaria', 'PRIMARIA', ' primaria '):
+        _seed()
+        d = SessionLocal()
+        try:
+            d.query(M.Grado).filter_by(id=G_PRIM).update({"nivel": valor})
+            d.commit()
+        finally:
+            d.close()
+        r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
+        assert r.status_code == 200, (valor, r.status_code, r.text[:250])
+
+
+@test("C5 el aislamiento entre colegios sigue igual")
+def _():
+    _seed()
+    # Dirección de B no puede ni llegar: no es profesor
+    r = guardar(H_DIRB, E_PRIM, INGLES, p1=80)
+    assert r.status_code == 403, (r.status_code, r.text[:200])
+    # y un profesor de A no alcanza a un alumno de B
+    r = guardar(H_MIX, E_B, MAT_B, p1=80)
+    assert r.status_code == 404, (r.status_code, r.text[:200])
+    assert _n_calif_primaria() == 0
+
+
+# ==========================================================================
+# D — PROFESOR MULTINIVEL: UN NIVEL NO CONTAMINA AL OTRO
+# ==========================================================================
+@test("D1 el profesor mixto califica su materia de PRIMARIA")
+def _():
+    _seed()
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=85).status_code == 200
+    assert _calif(E_PRIM, INGLES)["p1"] == 85
+
+
+@test("D2 el mismo profesor califica su materia de SECUNDARIA por SU flujo")
+def _():
+    _seed()
+    r = client.post("/api/calificaciones-secundaria", headers=H_MIX, json={
+        "estudiante_id": E_SEC, "asignatura_id": INGLES,
+        "competencia_numero": 1, "p1": 85})
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        assert d.query(M.CalificacionSecundaria).filter_by(
+            estudiante_id=E_SEC, asignatura_id=INGLES).first() is not None
+        # y NO se creó nada en el carril de primaria
+        assert d.query(M.CalificacionPrimaria).count() == 0, (
+            "Secundaria escribio en CalificacionPrimaria")
+    finally:
+        d.close()
+
+
+@test("D3 tener asignación en Primaria no da acceso a otro curso de Primaria")
+def _():
+    _seed()
+    # PROF_MIXTO da Inglés en CUR_PRIM, no en CUR_PRIM2
+    r = guardar(H_MIX, E_PRIM2, INGLES, p1=80)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert "asignada" in r.json()["error"].lower()
+    assert _n_calif_primaria() == 0
+
+
+@test("D4 tener asignación en Secundaria no da acceso a la materia de Primaria")
+def _():
+    _seed()
+    # PROF_OTRO da Inglés en CUR_PRIM2; no da Ciencias Naturales en ningún lado
+    r = guardar(H_OTRO, E_PRIM, CNAT, p1=80)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert _n_calif_primaria() == 0
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
