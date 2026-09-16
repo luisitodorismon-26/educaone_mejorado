@@ -6928,7 +6928,12 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
         competencia_numero=competencia_numero, ano_escolar_id=ano.id
     ).first()
     
-    if not calif:
+    # Si no existe se construye, pero NO se añade a la sesión todavía: hasta
+    # después de mirar los períodos no se sabe si hay algo que guardar. Con el
+    # `db.add()` aquí, un intento sobre un período cerrado creaba igualmente la
+    # fila y la commiteaba vacía — una calificación sin ninguna nota.
+    es_nueva = calif is None
+    if es_nueva:
         calif = CalificacionPrimaria(
             estudiante_id=estudiante_id,
             asignatura_id=asignatura_id,
@@ -6937,8 +6942,7 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             ano_escolar_id=ano.id,
             colegio_id=current_user.colegio_id
         )
-        db.add(calif)
-    
+
     # Un período CERRADO no se toca. Misma política que ya aplica Secundaria, y
     # no es una regla suya: sale de `ano.pN_cerrado` y de PermisoTemporalCalificacion,
     # que son comunes a todo el colegio. Primaria no la miraba, así que una nota
@@ -7000,12 +7004,32 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             return _rechazo_nota(db, campo, 'debe estar entre 0 y 100')
         _pendientes[campo] = nota
 
+    # Una calificación NUEVA cuyo único contenido caía en un período cerrado no
+    # llega a existir: crearla dejaría una fila académica sin ninguna nota, que
+    # es peor que no tener nada. La fila EXISTENTE, en cambio, se conserva
+    # intacta — aquí no se borra ni se modifica nada.
+    if es_nueva and not _pendientes and 'competencia_nombre' not in data \
+            and periodos_cerrados_ignorados:
+        return {
+            'message': 'No se guardó ninguna calificación: el período está cerrado',
+            'id': None,
+            'calificacion': None,
+            'periodos_cerrados_ignorados': periodos_cerrados_ignorados,
+            'aviso': (
+                'No se guardaron los períodos %s porque están cerrados. Solicite una '
+                'corrección a Dirección si necesita editarlos.'
+                % ', '.join('P%d' % p for p in periodos_cerrados_ignorados)
+            ),
+        }
+
     # Se aplican solo cuando TODOS los campos pasaron: si uno falla, no puede
     # quedar la mitad escrita.
     for campo, valor in _pendientes.items():
         setattr(calif, campo, valor)
     if 'competencia_nombre' in data:
         calif.competencia_nombre = data['competencia_nombre']
+    if es_nueva:
+        db.add(calif)
 
     # Calcular final de la competencia (C1/C2/C3) automáticamente
     final = calif.calcular_final()

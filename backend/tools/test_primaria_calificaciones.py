@@ -237,6 +237,12 @@ def _calif(est, asig, comp=1):
         d.close()
 
 
+def _nota(est, asig, campo, comp=1):
+    """El valor guardado del campo, o None si no se guardo (con o sin fila)."""
+    c = _calif(est, asig, comp)
+    return None if c is None else c[campo]
+
+
 def _n_calif_primaria():
     d = SessionLocal()
     try:
@@ -266,7 +272,7 @@ def _():
     _seed(cerrar_periodos=(1,))
     r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
     assert r.status_code == 200, (r.status_code, r.text[:250])
-    assert _calif(E_PRIM, INGLES)["p1"] is None, "escribio en un periodo cerrado"
+    assert _nota(E_PRIM, INGLES, "p1") is None, "escribio en un periodo cerrado"
     assert r.json().get("periodos_cerrados_ignorados") == [1], r.json()
     assert "cerrado" in r.json().get("aviso", "").lower()
 
@@ -276,7 +282,7 @@ def _():
     _seed(cerrar_periodos=(1,))
     r = guardar(H_MIX, E_PRIM, INGLES, rp1=90)
     assert r.status_code == 200, (r.status_code, r.text[:250])
-    assert _calif(E_PRIM, INGLES)["rp1"] is None
+    assert _nota(E_PRIM, INGLES, "rp1") is None
 
 
 @test("A4 P1 cerrado pero P2 abierto: p2 SÍ se guarda")
@@ -340,7 +346,7 @@ def _():
         d.close()
     r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
     assert r.status_code == 200
-    assert _calif(E_PRIM, INGLES)["p1"] is None, "un permiso vencido dejo escribir"
+    assert _nota(E_PRIM, INGLES, "p1") is None, "un permiso vencido dejo escribir"
 
 
 @test("A8 el permiso de OTRO profesor no me abre el período")
@@ -358,7 +364,7 @@ def _():
         d.close()
     r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
     assert r.status_code == 200
-    assert _calif(E_PRIM, INGLES)["p1"] is None
+    assert _nota(E_PRIM, INGLES, "p1") is None
 
 
 # ==========================================================================
@@ -831,6 +837,82 @@ def _():
     assert c["p2"] == 70, ("se toco p2", c)
     # y la CF no se movio
     assert c["final"] == 75.0, c
+
+
+# ==========================================================================
+# I — UN PERIODO CERRADO NO DEJA FILAS VACIAS
+#   El `db.add()` iba antes de mirar los periodos, asi que un intento sobre un
+#   periodo cerrado creaba igualmente la fila y la commiteaba SIN ninguna nota.
+# ==========================================================================
+@test("I1 calificación NUEVA + solo P1 cerrado: no se crea fila vacía")
+def _():
+    _seed(cerrar_periodos=(1,))
+    assert _n_calif_primaria() == 0
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _n_calif_primaria() == 0, "creo una CalificacionPrimaria sin ninguna nota"
+    cuerpo = r.json()
+    assert cuerpo["periodos_cerrados_ignorados"] == [1], cuerpo
+    assert "cerrado" in cuerpo.get("aviso", "").lower(), cuerpo
+    assert cuerpo["id"] is None and cuerpo["calificacion"] is None, cuerpo
+
+
+@test("I2 fila EXISTENTE + P1 cerrado: la nota previa queda intacta, sin fila extra")
+def _():
+    _seed()
+    assert guardar(H_MIX, E_PRIM, INGLES, p1=80).status_code == 200
+    assert _n_calif_primaria() == 1
+    d = SessionLocal()
+    try:
+        d.query(M.AnoEscolar).filter_by(id=ANO_A).update({"p1_cerrado": True})
+        d.commit()
+    finally:
+        d.close()
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=10)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _n_calif_primaria() == 1, "creo una fila adicional"
+    assert _calif(E_PRIM, INGLES)["p1"] == 80, "piso la nota previa"
+    assert r.json()["periodos_cerrados_ignorados"] == [1]
+
+
+@test("I3 NUEVA + P1 cerrado y P2 abierto: se crea UNA fila, solo con P2")
+def _():
+    _seed(cerrar_periodos=(1,))
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=80, p2=75)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _n_calif_primaria() == 1, "no creo la fila que si tocaba crear"
+    c = _calif(E_PRIM, INGLES)
+    assert c["p1"] is None and c["p2"] == 75, c
+    assert r.json()["periodos_cerrados_ignorados"] == [1]
+    assert r.json()["id"] is not None
+
+
+@test("I4 NUEVA + P1 cerrado CON permiso temporal: sí se crea y se guarda")
+def _():
+    _seed(cerrar_periodos=(1,))
+    d = SessionLocal()
+    try:
+        d.add(M.PermisoTemporalCalificacion(
+            colegio_id=COL_A, profesor_id=PROF_MIXTO, periodo=1,
+            asignatura_id=INGLES, activo=True,
+            fecha_fin=APP.now_rd() + timedelta(days=1), otorgado_por=DIR))
+        d.commit()
+    finally:
+        d.close()
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=80)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _n_calif_primaria() == 1
+    assert _calif(E_PRIM, INGLES)["p1"] == 80
+    assert "periodos_cerrados_ignorados" not in r.json()
+
+
+@test("I5 los cuatro períodos cerrados: ni fila ni notas, y se avisa de todos")
+def _():
+    _seed(cerrar_periodos=(1, 2, 3, 4))
+    r = guardar(H_MIX, E_PRIM, INGLES, p1=80, p2=81, rp3=90, p4=70)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _n_calif_primaria() == 0
+    assert sorted(r.json()["periodos_cerrados_ignorados"]) == [1, 2, 3, 4], r.json()
 
 
 @test("R  el repo no fue tocado: sge.db intacto")
