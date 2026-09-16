@@ -90,6 +90,30 @@ const identidadBloque = (h: Horario): string =>
   [h.dia, h.hora_inicio, h.hora_fin, h.tipo_bloque || 'clase',
    h.profesor_id ?? '-', h.curso_id ?? '-', h.asignatura_id ?? '-'].join('|');
 
+/**
+ * El sufijo de nivel del título: «Horarios — Primaria».
+ *
+ * Es un rótulo ADMINISTRATIVO: dice bajo qué lente está mirando Dirección o
+ * coordinación. Al profesor no le corresponde. Esta página es su horario
+ * personal y se le muestra entero aunque cruce niveles, pero el título salía de
+ * `nivel_asignado`, que para un profesor es a lo sumo su división principal: uno
+ * que solo imparte Secundaria podía leer «Horarios — Primaria» encima de sus
+ * propias clases de Secundaria.
+ *
+ * Para el profesor, entonces, el título es «Horarios» a secas. Qué imparte de
+ * verdad ya lo dice la cabecera de MainLayout, calculado desde sus asignaciones
+ * activas; aquí no se repite esa consulta ni se filtra nada.
+ */
+const sufijoNivelTitulo = (
+  rol: string | undefined,
+  nivelActivo: 'primaria' | 'secundaria' | null
+): string | null => {
+  if (rol === 'profesor') return null;
+  if (nivelActivo === 'primaria') return 'Primaria';
+  if (nivelActivo === 'secundaria') return 'Secundaria';
+  return null;
+};
+
 /** Los ids de un grupo de filas idénticas, en orden numérico. Es solo
  *  presentación: que 34 salga antes que 35 evita que la lista parezca
  *  arbitraria, pero el orden no elige nada. */
@@ -251,7 +275,7 @@ export const HorariosPage = () => {
     nivelFijo
       ? nivelFijo
       : (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null);
-  const nivelLabel = nivelActivo ? (nivelActivo === 'primaria' ? 'Primaria' : 'Secundaria') : null;
+  const nivelLabel = sufijoNivelTitulo(user?.role, nivelActivo);
 
   // v2.19.8: administrar horarios por CURSO y RECREOS exige un contexto de nivel
   // concreto. Dirección en "Todos" (sin lente) NO puede: no elegimos un recreo

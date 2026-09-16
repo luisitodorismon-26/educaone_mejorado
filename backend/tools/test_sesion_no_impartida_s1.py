@@ -899,6 +899,67 @@ def _():
     assert a == _sge_mtime, "sge.db fue modificado"
 
 
+# ==========================================================================
+# CONCURRENCIA — S1 vs RETIRAR / ELIMINAR
+#   `sesiones_no_impartidas` no tiene FK hacia `horarios`, asi que nada impide
+#   por si mismo guardar un horario_id que ya no exista. La ventana: S1 lee el
+#   bloque activo, otra peticion lo retira, el borrado definitivo toma su lock,
+#   no ve todavia la sesion que aun no se ha guardado, y borra la fila.
+# ==========================================================================
+@test("CC1 la consulta de bloques de S1 pide FOR SHARE en PostgreSQL")
+def _():
+    import inspect
+    import app as APP
+    from sqlalchemy.dialects import postgresql, sqlite as _sqlite
+    import sqlalchemy as sa
+    import models as _M
+
+    fuente = inspect.getsource(APP.crear_sesion_no_impartida)
+    assert "with_for_update(read=True)" in fuente, (
+        "la lectura de bloques de S1 no toma bloqueo compartido")
+
+    # Y que eso, efectivamente, se traduce en FOR SHARE (y no en FOR UPDATE:
+    # varias sesiones S1 pueden mirar el mismo bloque a la vez).
+    q = sa.select(_M.Horario).where(_M.Horario.id == 1).with_for_update(read=True)
+    sql_pg = str(q.compile(dialect=postgresql.dialect())).upper()
+    assert "FOR SHARE" in sql_pg, sql_pg[-120:]
+    assert "FOR UPDATE" not in sql_pg, sql_pg[-120:]
+    # SQLite no lo emite: por eso estas suites corren igual
+    assert "FOR SHARE" not in str(q.compile(dialect=_sqlite.dialect())).upper()
+
+
+@test("CC2 el bloqueo de S1 va en la consulta de bloques, no en otra")
+def _():
+    import inspect
+    import app as APP
+    fuente = inspect.getsource(APP.crear_sesion_no_impartida)
+    i = fuente.index("Horario.dia == dia_nombre")
+    # el bloqueo tiene que estar en ESA consulta, no suelto por ahi
+    assert ".with_for_update(read=True).all()" in fuente[i:i + 400], fuente[i:i + 400]
+    # una sola LLAMADA (las menciones del comentario no cuentan)
+    assert fuente.count(".with_for_update(") == 1, "hay mas de un bloqueo en S1"
+    # y de solo lectura: S1 no escribe sobre el horario
+    assert ".with_for_update()" not in fuente, "S1 esta tomando FOR UPDATE, no FOR SHARE"
+
+
+@test("CC3 S1 sigue guardando horario_id y el bloque sigue existiendo")
+def _():
+    # El camino feliz despues de meter el bloqueo: la sesion se crea, apunta al
+    # bloque, y el bloque esta ahi. Sin puntero colgado.
+    import models as _M
+    d = SessionLocal()
+    try:
+        antes = d.query(_M.SesionNoImpartida).count()
+        colgados = d.query(_M.SesionNoImpartida).filter(
+            _M.SesionNoImpartida.horario_id.isnot(None)).all()
+        for s in colgados:
+            assert d.get(_M.Horario, s.horario_id) is not None, (
+                "sesion S1 con horario_id colgado: %s" % s.horario_id)
+        assert antes >= 0
+    finally:
+        d.close()
+
+
 print("\n" + "=" * 70)
 print(f"{B}S1 SESION NO IMPARTIDA (backend): {_ok}/{_total} pruebas{X}")
 if _fail:

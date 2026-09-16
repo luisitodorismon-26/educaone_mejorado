@@ -78,6 +78,7 @@ ${retornoFines}
 }
 export { seSolapan, identidadBloque, aMinutos, profesorIdParaGuardar, recargarSegunVista };
 export { idsDelGrupo, accionesRetiroDeGrupo, mensajeRetiro };
+export { sufijoNivelTitulo };
 `;
 
 const js = transformSync(modulo, { loader: 'ts', format: 'esm' }).code;
@@ -409,6 +410,44 @@ prueba('W2 el onClick del botón por id usa el id de la acción, no grupo[0]', (
   const bloque = src.slice(src.indexOf('accionesRetiroDeGrupo(grupo).map'));
   if (bloque.slice(0, 400).includes('handleRetirar(horario.id)'))
     throw new Error('el botón por registro sigue retirando grupo[0]');
+});
+
+// ==========================================================================
+// H2-B3 — EL TÍTULO DE LA PÁGINA
+//   «Horarios — Primaria» es un rótulo administrativo: dice bajo qué lente
+//   mira Dirección. Al profesor no le corresponde, y encima salía de
+//   `nivel_asignado`, que puede no ser lo que imparte.
+// ==========================================================================
+console.log('\nH2-B3 — TÍTULO DE HORARIOS\n' + '='.repeat(74));
+
+prueba('X  el profesor no ve sufijo de nivel, imparta lo que imparta', () => {
+  // Con nivel_asignado='primaria', nivelActivo llega como 'primaria'.
+  iguales(mod.sufijoNivelTitulo('profesor', 'primaria'), null, 'no «Horarios — Primaria»');
+  iguales(mod.sufijoNivelTitulo('profesor', 'secundaria'), null, 'no «Horarios — Secundaria»');
+  iguales(mod.sufijoNivelTitulo('profesor', null), null, 'sin lente tampoco');
+});
+
+prueba('X2 Dirección conserva el sufijo exactamente como estaba', () => {
+  iguales(mod.sufijoNivelTitulo('direccion', 'primaria'), 'Primaria', 'Horarios — Primaria');
+  iguales(mod.sufijoNivelTitulo('direccion', 'secundaria'), 'Secundaria', 'Horarios — Secundaria');
+  iguales(mod.sufijoNivelTitulo('direccion', null), null, 'en Todos, sin sufijo');
+});
+
+prueba('X3 coordinación con nivel fijo también lo conserva', () => {
+  iguales(mod.sufijoNivelTitulo('coordinador', 'primaria'), 'Primaria', 'lente fijo');
+  iguales(mod.sufijoNivelTitulo('psicologia', 'secundaria'), 'Secundaria', 'lente fijo');
+  iguales(mod.sufijoNivelTitulo('secretaria', 'primaria'), 'Primaria', 'lente fijo');
+});
+
+prueba('X4 el título del .tsx usa esa función, y el horario NO se filtra', () => {
+  if (!tsx.includes('const nivelLabel = sufijoNivelTitulo(user?.role, nivelActivo);'))
+    throw new Error('el título ya no sale de sufijoNivelTitulo');
+  // el profesor sigue exento de exigir nivel: su horario se muestra entero
+  if (!tsx.includes("const requiereNivel = user?.role !== 'profesor' && !nivelActivo;"))
+    throw new Error('se tocó la exención del profesor');
+  // y no se añadió ninguna llamada nueva para saber sus niveles
+  if (tsx.includes('nivelesProfesor') || tsx.includes('/dashboard/profesor'))
+    throw new Error('HorariosPage duplicó la consulta de niveles del profesor');
 });
 
 console.log('='.repeat(74));
