@@ -6722,7 +6722,34 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
         asignatura = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter_by(id=asignatura_id).first()
         if not asignatura:
             return JSONResponse({'error': 'Asignatura no encontrada'}, status_code=404)
-        
+
+        # Un profesor solo lee la combinación curso+asignatura que tenga
+        # ASIGNADA. El aislamiento entre colegios ya lo daba `tenant_filter`;
+        # lo que faltaba era el alcance DENTRO del colegio: cualquier profesor
+        # podía leer las notas de cualquier curso de Primaria. Con dos alumnos
+        # es poco; con el colegio lleno son datos de menores.
+        #
+        # Es la misma política del GET de Secundaria, sin ampliarla ni
+        # recortarla: solo se restringe al rol 'profesor'. Dirección,
+        # coordinación, secretaría y psicología conservan la supervisión que ya
+        # tenían, porque en Secundaria también la tienen.
+        #
+        # El alcance se mide por la ASIGNACIÓN exacta, no por una propiedad
+        # global del docente: un profesor con clases en los dos niveles entra
+        # aquí por sus cursos de Primaria y por ninguno más.
+        if current_user.role == 'profesor':
+            asignacion = tenant_filter(
+                db.query(AsignacionProfesor), AsignacionProfesor, current_user
+            ).filter_by(
+                profesor_id=current_user.id,
+                curso_id=curso.id,
+                asignatura_id=asignatura.id,
+                activo=True,
+            ).first()
+            if not asignacion:
+                return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'},
+                                    status_code=403)
+
         # Determinar número de competencias (default 3)
         num_competencias = 3
         if grado.ciclo:

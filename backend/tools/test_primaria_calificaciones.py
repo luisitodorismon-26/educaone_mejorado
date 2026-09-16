@@ -553,6 +553,69 @@ def _():
     assert _n_calif_primaria() == 0
 
 
+# ==========================================================================
+# E — ALCANCE DE LECTURA
+#   Misma matriz que el GET de Secundaria: solo se restringe al profesor.
+# ==========================================================================
+@test("E1 profesor con la asignación exacta -> 200")
+def _():
+    _seed()
+    r = leer(H_MIX, CUR_PRIM, INGLES)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+
+
+@test("E2 profesor del mismo curso pero OTRA materia -> 403")
+def _():
+    _seed()
+    # PROF_MIXTO da Inglés en CUR_PRIM; Ciencias Naturales la da PROF_PRIM
+    r = leer(H_MIX, CUR_PRIM, CNAT)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert "asignación" in r.json()["error"].lower()
+
+
+@test("E3 profesor de OTRO curso -> 403")
+def _():
+    _seed()
+    # PROF_OTRO da Inglés en CUR_PRIM2, no en CUR_PRIM
+    r = leer(H_OTRO, CUR_PRIM, INGLES)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    # y en el suyo sí entra
+    assert leer(H_OTRO, CUR_PRIM2, INGLES).status_code == 200
+
+
+@test("E4 profesor de OTRO colegio -> bloqueado, sin filtrar existencia")
+def _():
+    _seed()
+    r = leer(H_DIRB, CUR_PRIM, INGLES)
+    assert r.status_code == 404, (r.status_code, r.text[:250])
+
+
+@test("E5 Dirección y coordinación conservan la supervisión, igual que en Secundaria")
+def _():
+    _seed()
+    for hdr, quien in ((H_DIR, "direccion"), (H_COORD, "coordinador"),
+                       (H_SECRE, "secretaria")):
+        rp = leer(hdr, CUR_PRIM, INGLES)
+        rs = client.get(f"/api/calificaciones/curso/{CUR_SEC}/asignatura/{INGLES}",
+                        headers=hdr)
+        assert rp.status_code == rs.status_code, (
+            quien, "Primaria y Secundaria difieren", rp.status_code, rs.status_code)
+        assert rp.status_code == 200, (quien, rp.status_code, rp.text[:200])
+
+
+@test("E6 profesor multinivel: lee su Primaria, y su Secundaria por el otro flujo")
+def _():
+    _seed()
+    assert leer(H_MIX, CUR_PRIM, INGLES).status_code == 200
+    r = client.get(f"/api/calificaciones/curso/{CUR_SEC}/asignatura/{INGLES}",
+                   headers=H_MIX)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    # pero el endpoint de Primaria NO le devuelve su curso de Secundaria
+    r = leer(H_MIX, CUR_SEC, INGLES)
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "primaria" in r.text.lower()
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
