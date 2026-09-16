@@ -6315,6 +6315,34 @@ def _referencias_historicas_horario(db: Session, horario: Horario) -> list:
     return referencias
 
 
+def _horario_bloqueado(db: Session, horario_id: int, current_user: Usuario):
+    """La consulta que toma el bloqueo de fila del horario, dentro del tenant.
+
+    Devuelve la Query sin ejecutar para que se pueda inspeccionar el SQL que
+    genera; quien la usa hace `.first()`.
+
+    Dos piezas, y las dos hacen falta:
+
+    `with_for_update()` pone un `SELECT ... FOR UPDATE` en PostgreSQL, así que
+    mientras dure la transacción nadie más puede modificar ni borrar esa fila:
+    una segunda petición sobre el mismo horario espera su turno en vez de correr
+    en paralelo. En SQLite no se emite nada —no lo soporta— y la suite sigue
+    funcionando, aunque ahí lo que se prueba es la revalidación, no el candado.
+
+    `populate_existing()` es la mitad que se olvida. Sin ella SQLAlchemy ve que
+    el objeto ya está en el mapa de identidad y devuelve el que tenía en memoria
+    SIN releer los valores: se tomaría el bloqueo y luego se decidiría con el
+    estado viejo, que es exactamente lo que se quería evitar. Con ella, los
+    atributos se sobrescriben con lo que hay en la fila ahora.
+
+    Va con el `tenant_filter` puesto, para que el bloqueo no pueda alcanzar la
+    fila de otro colegio.
+    """
+    return tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.id == horario_id
+    ).populate_existing().with_for_update()
+
+
 @app.post("/api/horarios/{id}/eliminar-definitivo")
 async def eliminar_horario_definitivo(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """
@@ -6331,8 +6359,24 @@ async def eliminar_horario_definitivo(id, request: Request, db: Session = Depend
 
     Exige, en orden: mismo colegio, que exista, que esté retirado, que quien
     llama confirme el id exacto, y que nada ya registrado apunte al bloque.
+
+    Todo eso se comprueba sobre una fila BLOQUEADA. Un borrado no tiene vuelta
+    atrás, así que no puede decidirse con un estado leído hace un instante: si
+    otra persona de Dirección reactiva el bloque entremedias, quien borra tiene
+    que enterarse antes de borrar, no después.
     """
-    horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    # Primero el tenant, con el 404 de siempre y sin tocar `get_tenant_or_404`.
+    get_tenant_or_404(db, Horario, id, current_user, name='horario')
+
+    # Y ahora la MISMA fila, bloqueada y releída. A partir de aquí no se usa
+    # nada de lo que se leyó antes: si entre las dos consultas alguien reactivó
+    # el bloque, se ve reactivado; si alguien lo borró, no se encuentra.
+    horario = _horario_bloqueado(db, id, current_user).first()
+    if horario is None:
+        # Otra petición gana la carrera y lo elimina: esta no borra dos veces ni
+        # revienta con un estado inconsistente, contesta el 404 de un horario
+        # que ya no existe.
+        raise HTTPException(status_code=404, detail='horario no encontrado')
 
     if horario.activo:
         return JSONResponse({

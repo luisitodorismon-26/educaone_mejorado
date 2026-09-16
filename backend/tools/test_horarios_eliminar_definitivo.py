@@ -562,6 +562,197 @@ def _():
         assert H_64 not in {h["id"] for h in r.json()}, url
 
 
+# ==========================================================================
+# Q–S — CONCURRENCIA
+#   Un borrado no tiene vuelta atras, asi que no puede decidirse con un estado
+#   leido hace un instante. Estas pruebas meten un cambio JUSTO entre la
+#   comprobacion de tenant y la decision, que es la ventana que preocupa.
+#
+#   SQLite no implementa FOR UPDATE, asi que aqui no se prueba el candado: se
+#   prueba que la decision se toma sobre la fila releida. El candado en si se
+#   comprueba en Q compilando el SQL real contra el dialecto de PostgreSQL.
+# ==========================================================================
+def _interferir(accion):
+    """Ejecuta `accion(sesion)` justo despues del chequeo de tenant."""
+    real = APP.get_tenant_or_404
+
+    def envuelto(*a, **k):
+        r = real(*a, **k)
+        otra = SessionLocal()
+        try:
+            accion(otra)
+            otra.commit()
+        finally:
+            otra.close()
+        return r
+    return real, envuelto
+
+
+@test("Q  la consulta destructiva pide bloqueo de fila y respeta el tenant")
+def _():
+    _seed()
+    from sqlalchemy.dialects import postgresql, sqlite as _sqlite
+    d = SessionLocal()
+    try:
+        director = d.get(M.Usuario, DIR_A)
+        q = APP._horario_bloqueado(d, H_64, director)
+        sql_pg = str(q.statement.compile(dialect=postgresql.dialect()))
+        assert "FOR UPDATE" in sql_pg.upper(), sql_pg[-200:]
+        # el bloqueo no puede alcanzar la fila de otro colegio
+        assert "colegio_id" in sql_pg, sql_pg
+        # y en SQLite simplemente no se emite: por eso la suite corre igual
+        sql_lite = str(q.statement.compile(dialect=_sqlite.dialect()))
+        assert "FOR UPDATE" not in sql_lite.upper()
+    finally:
+        d.close()
+    # y el endpoint usa esa consulta, no una suya
+    import inspect
+    fuente = inspect.getsource(APP.eliminar_horario_definitivo)
+    assert "_horario_bloqueado(db, id, current_user).first()" in fuente, fuente[:400]
+
+
+@test("Q2 el estado se revalida DESPUÉS del bloqueo, no antes")
+def _():
+    _seed()
+    # populate_existing() es lo que obliga a releer: sin ella SQLAlchemy
+    # devolveria el objeto que ya tenia en memoria y se decidiria con el
+    # estado viejo. Se comprueba sobre la funcion real.
+    import inspect
+    fuente = inspect.getsource(APP._horario_bloqueado)
+    assert "populate_existing()" in fuente, "se tomaria el lock y se leeria en frio"
+    assert "with_for_update()" in fuente
+    assert "tenant_filter" in fuente
+
+
+@test("Q3 el bloqueo RELEE la fila: no devuelve el estado que tenía en memoria")
+def _():
+    _seed()
+    # Esta es la prueba que decide si `populate_existing()` sirve de algo. Con
+    # dos sesiones de verdad: una lee, la otra reactiva y commitea, y la
+    # primera vuelve a pedir la fila bloqueada. Sin populate_existing()
+    # SQLAlchemy devolveria el objeto que ya tenia en el mapa de identidad, con
+    # el activo viejo, y se borraria un bloque que acaban de reactivar.
+    s1 = SessionLocal()
+    try:
+        director = s1.get(M.Usuario, DIR_A)
+        h = s1.query(M.Horario).filter(M.Horario.id == H_64).first()
+        assert h.activo is False, "punto de partida"
+
+        s2 = SessionLocal()
+        try:
+            s2.query(M.Horario).filter_by(id=H_64).update({"activo": True})
+            s2.commit()
+        finally:
+            s2.close()
+
+        vuelto = APP._horario_bloqueado(s1, H_64, director).first()
+        assert vuelto is not None
+        assert vuelto.activo is True, (
+            "el bloqueo devolvio el estado viejo que ya tenia en memoria")
+    finally:
+        s1.close()
+
+
+@test("Q4 el bloqueo no alcanza la fila de otro colegio")
+def _():
+    _seed()
+    s = SessionLocal()
+    try:
+        dir_a = s.get(M.Usuario, DIR_A)
+        dir_b = s.get(M.Usuario, DIR_B)
+        assert APP._horario_bloqueado(s, H_B, dir_a).first() is None, (
+            "A puede bloquear una fila de B")
+        assert APP._horario_bloqueado(s, H_64, dir_b).first() is None, (
+            "B puede bloquear una fila de A")
+        assert APP._horario_bloqueado(s, H_64, dir_a).first() is not None, (
+            "A no puede bloquear su propia fila")
+    finally:
+        s.close()
+
+
+@test("R  si Reactivar gana la carrera, Eliminar ve activo=True y da 409")
+def _():
+    _seed()
+    n = _n_aud(ACC)
+
+    def reactiva(s):
+        s.query(M.Horario).filter_by(id=H_64).update({"activo": True})
+
+    real, envuelto = _interferir(reactiva)
+    APP.get_tenant_or_404 = envuelto
+    try:
+        r = borrar(H_64)
+    finally:
+        APP.get_tenant_or_404 = real
+
+    assert r.status_code == 409, (r.status_code, r.text[:250])
+    assert r.json()["error"] == "Retire primero el horario."
+    f = _fila(H_64)
+    assert f is not None, "borro una fila que acababan de reactivar"
+    assert f["activo"] is True, "ademas la dejo en un estado raro"
+    assert _n_aud(ACC) == n, "audito un borrado que no ocurrio"
+
+
+@test("S  dos eliminaciones del mismo id: una gana, la otra 404 sin auditar")
+def _():
+    _seed()
+    n = _n_aud(ACC)
+
+    def borra_antes(s):
+        s.query(M.Horario).filter_by(id=H_64).delete()
+
+    real, envuelto = _interferir(borra_antes)
+    APP.get_tenant_or_404 = envuelto
+    try:
+        r = borrar(H_64)     # la segunda peticion, que llega tarde
+    finally:
+        APP.get_tenant_or_404 = real
+
+    assert r.status_code == 404, (r.status_code, r.text[:250])
+    assert _fila(H_64) is None
+    assert _n_aud(ACC) == n, "la segunda dejo una auditoria de mas"
+    # y no se llevo por delante a los vecinos
+    assert _ids_horarios() == sorted([H_ACTIVO, H_CON_S1, H_62, H_63, H_65,
+                                      H_LIBRE, H_B])
+
+
+@test("S2 si aparece historia entre la lectura y el bloqueo, tampoco borra")
+def _():
+    _seed()
+    n = _n_aud(ACC)
+
+    def anota_sesion(s):
+        s.add(M.SesionNoImpartida(
+            id=99, colegio_id=COL_A, fecha=date(2026, 9, 8), curso_id=CUR_SEC,
+            asignatura_id=MAT, profesor_id=PROF, horario_id=H_64,
+            dia_semana_snapshot=DIA, hora_inicio_snapshot="10:00",
+            hora_fin_snapshot="10:45", motivo_codigo="REUNION",
+            registrado_por=PROF, activo=True))
+
+    real, envuelto = _interferir(anota_sesion)
+    APP.get_tenant_or_404 = envuelto
+    try:
+        r = borrar(H_64)
+    finally:
+        APP.get_tenant_or_404 = real
+
+    assert r.status_code == 409, (r.status_code, r.text[:250])
+    assert _fila(H_64) is not None, "borro un bloque que acababa de recibir historia"
+    assert _n_aud(ACC) == n
+
+
+@test("S3 el camino feliz sigue igual tras meter el bloqueo")
+def _():
+    _seed()
+    r = borrar(H_64)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _fila(H_64) is None
+    assert _n_aud(ACC) == 1
+    # y la sesion no queda con la transaccion abierta: otra escritura pasa
+    assert borrar(H_65).status_code == 200
+    assert _fila(H_65) is None
+
+
 @test("P3 el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
