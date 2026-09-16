@@ -6872,12 +6872,44 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
         )
         db.add(calif)
     
+    # Un período CERRADO no se toca. Misma política que ya aplica Secundaria, y
+    # no es una regla suya: sale de `ano.pN_cerrado` y de PermisoTemporalCalificacion,
+    # que son comunes a todo el colegio. Primaria no la miraba, así que una nota
+    # de un período ya cerrado por Dirección podía reescribirse sin dejar rastro.
+    #
+    # El campo del período cerrado se SALTA, no se rechaza la petición entera:
+    # si el docente envía P1 (cerrado) y P2 (abierto), P2 se guarda. Cambiar eso
+    # sería inventar una política distinta a la del resto del sistema.
+    periodos_cerrados_ignorados = []
+
+    def _periodo_esta_cerrado(num_periodo):
+        """True si el período está cerrado Y el profesor no tiene permiso temporal."""
+        if not getattr(ano, f'p{num_periodo}_cerrado', False):
+            return False  # abierto → se puede editar
+        permiso = tenant_filter(
+            db.query(PermisoTemporalCalificacion), PermisoTemporalCalificacion, current_user
+        ).filter(
+            PermisoTemporalCalificacion.profesor_id == current_user.id,
+            PermisoTemporalCalificacion.activo == True,  # noqa: E712
+            PermisoTemporalCalificacion.fecha_fin > now_rd(),
+            (PermisoTemporalCalificacion.periodo == num_periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
+            (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+        ).first()
+        return permiso is None  # cerrado y sin permiso → bloqueado
+
     # Campos aceptados: 4 períodos + 4 recuperaciones + nombre competencia
-    campos_validos = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4', 'competencia_nombre']
-    for campo in campos_validos:
+    campos_notas = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4']
+    for campo in campos_notas:
         if campo in data:
+            num_periodo = int(campo[-1])   # p1/rp1 → 1, p2/rp2 → 2, ...
+            if _periodo_esta_cerrado(num_periodo):
+                if num_periodo not in periodos_cerrados_ignorados:
+                    periodos_cerrados_ignorados.append(num_periodo)
+                continue  # no modificar un período cerrado
             setattr(calif, campo, data[campo])
-    
+    if 'competencia_nombre' in data:
+        calif.competencia_nombre = data['competencia_nombre']
+
     # Calcular final de la competencia (C1/C2/C3) automáticamente
     final = calif.calcular_final()
     if final is not None:
@@ -6886,7 +6918,18 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     
     db.commit()
     cache_clear(f'stats:{current_user.colegio_id}')
-    return {'message': 'Calificación primaria guardada', 'id': calif.id, 'calificacion': calif.to_dict()}
+    respuesta = {'message': 'Calificación primaria guardada', 'id': calif.id,
+                 'calificacion': calif.to_dict()}
+    if periodos_cerrados_ignorados:
+        # Se dice cuáles no se guardaron: callarlo haría creer al docente que su
+        # corrección entró.
+        respuesta['periodos_cerrados_ignorados'] = periodos_cerrados_ignorados
+        respuesta['aviso'] = (
+            'No se guardaron los períodos %s porque están cerrados. Solicite una '
+            'corrección a Dirección si necesita editarlos.'
+            % ', '.join('P%d' % p for p in periodos_cerrados_ignorados)
+        )
+    return respuesta
 
 
 # ============== CALIFICACIONES SECUNDARIA v2.12 (estructura MINERD por competencia) ==============
