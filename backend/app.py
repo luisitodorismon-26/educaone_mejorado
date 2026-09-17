@@ -11353,7 +11353,27 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     """Asistencia de un curso para una fecha y asignatura (sin N+1, validado por tenant)."""
     # Validar tenant del curso
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    
+
+    # P3.1 — restringir la ESCRITURA al titular no significa esconderle la
+    # información al resto. El profesor de Inglés o de Educación Física necesita
+    # saber quién está presente, ausente, tarde o excusado para dar su clase.
+    #
+    # Lee cualquier profesor con al menos UNA asignación activa en el curso, sea
+    # cual sea su materia. No se exige ser titular: eso solo aplica a escribir.
+    # Lo que sí se cierra es que un profesor del colegio SIN nada en ese curso
+    # pueda leerlo; el aislamiento entre colegios ya lo daba get_tenant_or_404.
+    #
+    # Solo se acota al rol 'profesor': Dirección, coordinación y el resto
+    # conservan exactamente la visibilidad que tenían.
+    if current_user.role == 'profesor':
+        _tiene = tenant_filter(
+            db.query(AsignacionProfesor), AsignacionProfesor, current_user
+        ).filter_by(profesor_id=current_user.id, curso_id=curso.id, activo=True).first()
+        if not _tiene:
+            return JSONResponse({
+                'error': 'No tiene asignación activa en este curso.',
+            }, status_code=403)
+
     fecha_str = request.query_params.get('fecha', today_rd().isoformat())
     try:
         fecha = datetime.strptime(fecha_str, '%Y-%m-%d').date()

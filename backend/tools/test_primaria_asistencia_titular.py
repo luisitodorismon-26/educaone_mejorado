@@ -397,6 +397,61 @@ def _():
     assert len(_filas(fecha=FECHA)) == 2
 
 
+# ==========================================================================
+# B — LECTURA: TODO PROFESOR DEL CURSO, SEA CUAL SEA SU MATERIA
+# ==========================================================================
+@test("B1 los cuatro profesores del curso VEN la asistencia")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "ausente").status_code == 200
+    for hdr, quien in ((H_ROSA, "titular"), (H_LUIS, "ingles"),
+                       (H_PEDRO, "ed. fisica"), (H_CARLA, "artistica")):
+        r = leer_curso(hdr, CUR_5A)
+        assert r.status_code == 200, (quien, r.status_code, r.text[:200])
+        filas = r.json().get("asistencias", [])
+        fila = [x for x in filas if x["estudiante"]["id"] == E_5A]
+        assert fila, (quien, "no devolvio al estudiante", r.text[:250])
+        assert fila[0]["asistencia"]["estado"] == "ausente", (quien, fila)
+
+
+@test("B2 un profesor SIN asignación en el curso no lo ve")
+def _():
+    _seed()
+    r = leer_curso(H_AJENO, CUR_5A)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert "asignación" in r.json()["error"].lower()
+    # y el suyo sí lo ve
+    assert leer_curso(H_AJENO, CUR_1A).status_code == 200
+
+
+@test("B3 leer NO da permiso para escribir")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    assert leer_curso(H_LUIS, CUR_5A).status_code == 200
+    assert marcar(H_LUIS, E_5A, CUR_5A, "ausente").status_code == 403
+    assert _filas(E_5A, FECHA)[0]["estado"] == "presente"
+
+
+@test("B4 Dirección y coordinación conservan la visibilidad que ya tenían")
+def _():
+    _seed()
+    for hdr, quien in ((H_DIR, "direccion"), (H_COORD, "coordinador")):
+        assert leer_curso(hdr, CUR_5A).status_code == 200, quien
+    # y siguen SIN poder escribir, como antes de esta fase
+    for hdr, quien in ((H_DIR, "direccion"), (H_COORD, "coordinador")):
+        r = marcar(hdr, E_5A, CUR_5A, "presente")
+        assert r.status_code == 403, (quien, r.status_code, r.text[:200])
+        assert "profesores" in r.json()["error"], quien
+
+
+@test("B5 el aislamiento entre colegios no se toca")
+def _():
+    _seed()
+    assert leer_curso(H_DIRB, CUR_5A).status_code == 404
+    assert marcar(H_DIRB, E_5A, CUR_5A).status_code in (403, 404)
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
