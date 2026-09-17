@@ -545,6 +545,67 @@ def _():
     assert len(f) == 1 and f[0]["registrado_por"] == LUIS, f
 
 
+# ==========================================================================
+# E — UNICIDAD DE LA ASISTENCIA GENERAL
+# ==========================================================================
+@test("E1 el índice parcial existe en una base creada con create_all()")
+def _():
+    # Esta DB temporal se creo con Base.metadata.create_all(). Antes el indice
+    # solo lo creaba app.py al arrancar, asi que una base nueva se quedaba sin
+    # la garantia que si tiene produccion.
+    from sqlalchemy import inspect as _inspect
+    idx = _inspect(engine).get_indexes('asistencias')
+    nombres = {i['name'] for i in idx}
+    assert 'uq_asistencia_general_est_fecha' in nombres, sorted(nombres)
+    el = [i for i in idx if i['name'] == 'uq_asistencia_general_est_fecha'][0]
+    assert el.get('unique'), el
+    assert list(el['column_names']) == ['estudiante_id', 'fecha'], el
+
+
+@test("E2 un segundo POST legítimo ACTUALIZA, no inserta otra fila")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    assert marcar(H_ROSA, E_5A, CUR_5A, "ausente").status_code == 200
+    assert marcar(H_ROSA, E_5A, CUR_5A, "tardanza").status_code == 200
+    f = _filas(E_5A, FECHA)
+    assert len(f) == 1, ("se insertaron filas de mas", f)
+    assert f[0]["estado"] == "tardanza" and f[0]["asignatura_id"] is None
+
+
+@test("E3 la base RECHAZA a nivel de índice una segunda asistencia general")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    d = SessionLocal()
+    try:   # salteandose el endpoint, directo contra la tabla
+        d.add(M.Asistencia(colegio_id=COL_A, estudiante_id=E_5A, curso_id=CUR_5A,
+                           asignatura_id=None, fecha=date.fromisoformat(FECHA),
+                           estado="ausente", registrado_por=LUIS))
+        try:
+            d.commit()
+            raise AssertionError("la base acepto una segunda asistencia general")
+        except AssertionError:
+            raise
+        except Exception:
+            d.rollback()   # lo esperado: el indice lo impide
+    finally:
+        d.close()
+    assert len(_filas(E_5A, FECHA)) == 1
+
+
+@test("E4 en SECUNDARIA el mismo día con materias distintas SÍ convive")
+def _():
+    _seed()
+    r1 = marcar(H_LUIS, E_SEC, CUR_SEC1, "presente", asignatura_id=INGLES)
+    assert r1.status_code == 200, (r1.status_code, r1.text[:250])
+    r2 = marcar(H_ROSA, E_SEC, CUR_SEC1, "ausente", asignatura_id=LENGUA)
+    assert r2.status_code == 200, (r2.status_code, r2.text[:250])
+    f = _filas(E_SEC, FECHA)
+    assert len(f) == 2, ("secundaria perdio una de sus dos marcas", f)
+    assert {x["asignatura_id"] for x in f} == {INGLES, LENGUA}, f
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
