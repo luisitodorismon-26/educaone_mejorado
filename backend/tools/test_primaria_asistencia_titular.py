@@ -669,6 +669,163 @@ def _():
             "la pantalla anuncia %s pero la escritura da %s" % (anuncia, escribe))
 
 
+# ==========================================================================
+# G — LAS TRES RESPONSABILIDADES NO SE MEZCLAN
+#   asistencia -> curso/dia -> titular
+#   calificaciones -> asignatura -> quien la tiene asignada
+#   recuperacion -> asignatura -> igual, sin cambios
+# ==========================================================================
+def calificar(hdr, est, asig, comp=1, **campos):
+    cuerpo = {"estudiante_id": est, "asignatura_id": asig, "competencia_numero": comp}
+    cuerpo.update(campos)
+    return client.post("/api/calificaciones-primaria", headers=hdr, json=cuerpo)
+
+
+def recuperar(hdr, est, asig, **campos):
+    cuerpo = {"estudiante_id": est, "asignatura_id": asig}
+    cuerpo.update(campos)
+    return client.post("/api/recuperaciones-primaria", headers=hdr, json=cuerpo)
+
+
+@test("G1 Rosa, titular, califica SUS materias")
+def _():
+    _seed()
+    for asig in (LENGUA, MATE, NAT):
+        r = calificar(H_ROSA, E_5A, asig, p1=80)
+        assert r.status_code == 200, (asig, r.status_code, r.text[:200])
+
+
+@test("G2 ser titular NO da derecho a calificar Inglés")
+def _():
+    _seed()
+    r = calificar(H_ROSA, E_5A, INGLES, p1=80)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert "asignada" in r.json()["error"].lower()
+
+
+@test("G3 Luis califica Inglés, pero no Matemática")
+def _():
+    _seed()
+    assert calificar(H_LUIS, E_5A, INGLES, p1=90).status_code == 200
+    r = calificar(H_LUIS, E_5A, MATE, p1=90)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+
+
+@test("G4 ver la asistencia no altera NINGÚN permiso de calificaciones")
+def _():
+    _seed()
+    assert leer_curso(H_PEDRO, CUR_5A).status_code == 200      # Pedro ve
+    r = calificar(H_PEDRO, E_5A, LENGUA, p1=80)                # pero no califica
+    assert r.status_code == 403, (r.status_code, r.text[:200])
+    r = calificar(H_PEDRO, E_5A, EF, p1=80)                    # lo suyo sí
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+
+
+@test("G5 la recuperación sigue atada a la asignatura, no a la titularidad")
+def _():
+    _seed()
+    # Rosa NO tiene Inglés: no puede tocar su recuperación aunque sea titular
+    r = recuperar(H_ROSA, E_5A, INGLES, tipo='final', puntos=5)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert "asignada" in r.json()["error"].lower()
+    # Luis, que sí la tiene, entra por su vía (el 400/409 posterior es de la
+    # regla academica, no del permiso)
+    r = recuperar(H_LUIS, E_5A, INGLES, tipo='final', puntos=5)
+    assert r.status_code != 403, (r.status_code, r.text[:250])
+
+
+@test("G6 ver la asistencia tampoco concede recuperación")
+def _():
+    _seed()
+    assert leer_curso(H_LUIS, CUR_5A).status_code == 200
+    r = recuperar(H_LUIS, E_5A, MATE, tipo='final', puntos=5)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+
+
+# ==========================================================================
+# H — PROFESOR MULTINIVEL
+# ==========================================================================
+@test("H1 Luis: ve la asistencia de 5to Primaria, NO la modifica, y califica Inglés")
+def _():
+    _seed()
+    assert leer_curso(H_LUIS, CUR_5A).status_code == 200
+    assert marcar(H_LUIS, E_5A, CUR_5A, "ausente").status_code == 403
+    assert calificar(H_LUIS, E_5A, INGLES, p1=88).status_code == 200
+
+
+@test("H2 el mismo Luis pasa asistencia en SUS cursos de Secundaria, sin titularidad")
+def _():
+    _seed()
+    for cur in (CUR_SEC1, CUR_SEC2):
+        d = SessionLocal()
+        try:
+            n = d.query(M.AsignacionProfesor).filter_by(
+                curso_id=cur, es_titular=True, activo=True).count()
+            assert n == 0, ("el fixture de secundaria no debe tener titulares", cur)
+        finally:
+            d.close()
+    r = marcar(H_LUIS, E_SEC, CUR_SEC1, "presente", asignatura_id=INGLES)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+
+
+@test("H3 la titularidad NO interviene en Secundaria")
+def _():
+    _seed()
+    # Rosa da Lengua en 1ro Secundaria y no es titular de nada allí: escribe igual
+    r = marcar(H_ROSA, E_SEC, CUR_SEC1, "ausente", asignatura_id=LENGUA)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+
+
+@test("H4 el Inglés interno de 1ro–3ro: Luis lo da, lo ve, y no pasa lista")
+def _():
+    _seed()
+    # 1ro A es primer ciclo; Luis tiene el Inglés interno, AJENO es el titular
+    assert leer_curso(H_LUIS, CUR_1A).status_code == 200
+    r = marcar(H_LUIS, E_1A, CUR_1A, "presente")
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert marcar(H_AJENO, E_1A, CUR_1A, "presente").status_code == 200
+    # y sus notas internas de Inglés se guardan con normalidad
+    assert calificar(H_LUIS, E_1A, INGLES, p1=85).status_code == 200
+
+
+# ==========================================================================
+# I — ESTUDIANTE RETIRADO Y MULTI-TENANT
+# ==========================================================================
+@test("I1 un estudiante retirado sigue protegido")
+def _():
+    _seed()
+    d = SessionLocal()
+    try:
+        d.query(M.Estudiante).filter_by(id=E_5A).update(
+            {"activo": False, "fecha_retiro": date(2026, 9, 1)})
+        d.commit()
+    finally:
+        d.close()
+    r = marcar(H_ROSA, E_5A, CUR_5A, "presente")
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert calificar(H_ROSA, E_5A, LENGUA, p1=80).status_code == 403
+    assert _filas(E_5A, FECHA) == []
+
+
+@test("I2 ninguna autorización cruza de colegio")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_B, CUR_B, "presente").status_code == 404
+    assert leer_curso(H_ROSA, CUR_B).status_code == 404
+    assert calificar(H_ROSA, E_B, MAT_B, p1=80).status_code == 404
+    assert marcar(H_DIRB, E_5A, CUR_5A).status_code in (403, 404)
+
+
+@test("I3 el guard de asistencia NO consulta Horario ni una vez")
+def _():
+    import inspect
+    for fn in (APP._guard_asistencia, APP._guard_titular_primaria,
+               APP._titulares_del_curso, APP._respuesta_asistencia_curso):
+        fuente = inspect.getsource(fn)
+        assert "Horario" not in fuente, (fn.__name__, "consulta el horario")
+        assert "nivel_asignado" not in fuente, (fn.__name__, "usa nivel_asignado")
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
