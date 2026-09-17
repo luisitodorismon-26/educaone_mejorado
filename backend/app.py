@@ -10986,6 +10986,20 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
             {'error': 'En Secundaria debe seleccionar una asignatura.'},
             status_code=400)
 
+    # P3.1 — el reverso: en PRIMARIA la asistencia es del curso, así que la
+    # materia sobra. Se rechaza en vez de ignorarla en silencio, porque
+    # aceptarla abría la puerta a una segunda asistencia oficial el mismo día:
+    # la general del titular con `asignatura_id` NULL, y otra por Inglés o
+    # Educación Física. Con dos filas contradictorias el Registro y el boletín
+    # llegan a conclusiones opuestas —el Registro se queda con la peor marca y
+    # el boletín con la mejor—, así que el mismo día saldría "ausente" en un
+    # documento y "presente" en el otro.
+    if nivel == 'primaria' and asignatura is not None:
+        return None, JSONResponse({
+            'error': ('En Primaria la asistencia es del curso, no de una materia: '
+                      'no lleva asignatura.'),
+        }, status_code=400)
+
     # El rol ya esta acotado a profesor arriba; aqui se exige ademas la
     # asignacion ACTIVA sobre (curso, asignatura): no basta con el rol.
     if curso is not None:
