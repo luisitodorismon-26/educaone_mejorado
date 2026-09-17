@@ -10847,6 +10847,62 @@ async def marcar_comunicado_leido(id, request: Request, db: Session = Depends(ge
 # ============== ASISTENCIA ==============
 
 
+def _titulares_del_curso(db, curso, current_user):
+    """Los `profesor_id` DISTINTOS marcados como titular activo del curso.
+
+    `es_titular` vive en `AsignacionProfesor`, o sea POR ASIGNATURA. Una maestra
+    de 2do que imparte las ocho áreas tiene ocho filas con `es_titular=True`, y
+    eso es UN titular, no ocho. Por eso se cuentan profesores distintos y no
+    filas: contar filas convertiría a la titular de un grado completo en una
+    "titularidad inconsistente".
+    """
+    filas = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, activo=True, es_titular=True).all()
+    return {f.profesor_id for f in filas}
+
+
+def _guard_titular_primaria(db, curso, current_user):
+    """Solo el titular del curso registra la asistencia diaria de Primaria.
+
+    La asistencia de Primaria es del CURSO y del día, no de una materia: hay una
+    sola por estudiante y fecha. Hasta ahora la escribía cualquier profesor con
+    asignación activa en el curso, y en producción eso ya ocurrió — tres
+    docentes distintos pasaron lista del mismo curso, uno de ellos el
+    especialista de Inglés. No se duplicó nada, porque el índice parcial lo
+    impide; lo que pasó es que cada uno SOBRESCRIBIÓ al anterior.
+
+    Sin titular NO hay respaldo a "el primer profesor activo": ese fallback es
+    justamente lo que ponía al de Inglés a decidir la asistencia del grado. Se
+    responde 409 y Dirección asigna el titular desde Asignaciones, que ya existe
+    y ya valida que sea uno solo.
+    """
+    titulares = _titulares_del_curso(db, curso, current_user)
+
+    if not titulares:
+        return JSONResponse({
+            'error': ('Este curso no tiene un profesor titular asignado. Dirección '
+                      'debe asignar un titular antes de registrar asistencia.'),
+            'curso_id': curso.id,
+        }, status_code=409)
+
+    if len(titulares) > 1:
+        return JSONResponse({
+            'error': ('El curso tiene una titularidad inconsistente. Dirección debe '
+                      'corregirla.'),
+            'curso_id': curso.id,
+        }, status_code=409)
+
+    if current_user.id not in titulares:
+        return JSONResponse({
+            'error': ('La asistencia diaria de Primaria la registra el profesor '
+                      'titular del curso. Puedes consultarla, pero no modificarla.'),
+            'curso_id': curso.id,
+        }, status_code=403)
+
+    return None
+
+
 def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
                       asignatura_id=None):
     """
@@ -10943,6 +10999,14 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
                 'error': ('Solo puedes registrar asistencia en los cursos y '
                           'asignaturas que tienes asignados')
             }, status_code=403)
+
+        # P3.1 — en PRIMARIA, además, hay que ser el titular. Secundaria no pasa
+        # por aquí: su asistencia es por materia y la escribe quien imparte esa
+        # materia, exactamente como hasta ahora.
+        if nivel == 'primaria':
+            _err_titular = _guard_titular_primaria(db, curso, current_user)
+            if _err_titular is not None:
+                return None, _err_titular
 
     return {'curso': curso, 'nivel': nivel, 'asignatura': asignatura}, None
 
