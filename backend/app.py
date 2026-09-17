@@ -10862,6 +10862,42 @@ def _titulares_del_curso(db, curso, current_user):
     return {f.profesor_id for f in filas}
 
 
+def _respuesta_asistencia_curso(db, curso, asistencias, current_user):
+    """El cuerpo de `GET /api/asistencia/curso/{id}`, con el permiso resuelto.
+
+    La pantalla necesita saber si puede editar, y la autoridad es el servidor:
+    el frontend NO debe deducir la titularidad por su cuenta, y menos aún
+    mirando el horario.
+
+    `puede_editar` solo tiene sentido en Primaria. En Secundaria se responde
+    None para no insinuar una regla que allí no existe: su asistencia es por
+    materia y la escribe quien la imparte, exactamente como siempre.
+    """
+    try:
+        nivel = (getattr(curso.grado, 'nivel', '') or '').strip().lower()
+    except Exception:
+        nivel = ''
+
+    puede, motivo = None, None
+    if nivel == 'primaria':
+        titulares = _titulares_del_curso(db, curso, current_user)
+        if current_user.role != 'profesor':
+            puede, motivo = False, 'solo_profesor'
+        elif not titulares:
+            puede, motivo = False, 'sin_titular'
+        elif len(titulares) > 1:
+            puede, motivo = False, 'titularidad_inconsistente'
+        else:
+            puede = current_user.id in titulares
+            motivo = None if puede else 'no_titular'
+
+    return {
+        'asistencias': asistencias,
+        'puede_editar': puede,
+        'motivo_solo_lectura': motivo,
+    }
+
+
 def _guard_titular_primaria(db, curso, current_user):
     """Solo el titular del curso registra la asistencia diaria de Primaria.
 
@@ -11411,8 +11447,13 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
         curso_id=curso.id
     ).order_by(Estudiante.no_lista).all()
+    # Sin estudiantes se devolvía una lista pelada, mientras el caso normal
+    # devuelve un objeto. Esa incoherencia ya existía; ahora importa más, porque
+    # es por aquí por donde la pantalla se entera de si puede editar. Se unifica
+    # la forma: el cuerpo siempre es un objeto con las mismas claves. El
+    # frontend ya leía `res.data.asistencias || []`, así que no cambia para él.
     if not estudiantes:
-        return []
+        return _respuesta_asistencia_curso(db, curso, [], current_user)
     est_ids = [e.id for e in estudiantes]
     
     # Una sola query para todas las asistencias (sin N+1)
@@ -11445,8 +11486,8 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
                 'registrado_por': asistencia.registrado_por if asistencia else None
             } if asistencia else None
         })
-    
-    return {'asistencias': resultado}
+
+    return _respuesta_asistencia_curso(db, curso, resultado, current_user)
 
 @app.post("/api/asistencia/masivo")
 async def registrar_asistencia_masivo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):

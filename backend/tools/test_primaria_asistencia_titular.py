@@ -606,6 +606,69 @@ def _():
     assert {x["asignatura_id"] for x in f} == {INGLES, LENGUA}, f
 
 
+# ==========================================================================
+# F — EL SERVIDOR DICE SI SE PUEDE EDITAR
+#   La pantalla no deduce la titularidad: la lee de aqui.
+# ==========================================================================
+@test("F1 al titular se le responde puede_editar = true")
+def _():
+    _seed()
+    r = leer_curso(H_ROSA, CUR_5A)
+    assert r.status_code == 200
+    assert r.json()["puede_editar"] is True, r.json()
+    assert r.json()["motivo_solo_lectura"] is None
+
+
+@test("F2 al profesor del curso que no es titular, false y el motivo")
+def _():
+    _seed()
+    for hdr, quien in ((H_LUIS, "ingles"), (H_PEDRO, "ef"), (H_CARLA, "arte")):
+        c = leer_curso(hdr, CUR_5A).json()
+        assert c["puede_editar"] is False, (quien, c)
+        assert c["motivo_solo_lectura"] == "no_titular", (quien, c)
+
+
+@test("F3 curso sin titular y con dos titulares: motivos distintos")
+def _():
+    _seed()
+    c = leer_curso(H_PEDRO, CUR_SIN_TIT).json()
+    assert c["puede_editar"] is False and c["motivo_solo_lectura"] == "sin_titular", c
+    c = leer_curso(H_ROSA, CUR_DOS_TIT).json()
+    assert c["puede_editar"] is False, c
+    assert c["motivo_solo_lectura"] == "titularidad_inconsistente", c
+
+
+@test("F4 Dirección y coordinación: false con motivo 'solo_profesor'")
+def _():
+    _seed()
+    for hdr, quien in ((H_DIR, "direccion"), (H_COORD, "coordinador")):
+        c = leer_curso(hdr, CUR_5A).json()
+        assert c["puede_editar"] is False, (quien, c)
+        assert c["motivo_solo_lectura"] == "solo_profesor", (quien, c)
+
+
+@test("F5 en SECUNDARIA no se insinúa una regla que allí no existe")
+def _():
+    _seed()
+    c = leer_curso(H_LUIS, CUR_SEC1, asignatura_id=INGLES).json()
+    assert c["puede_editar"] is None, c
+    assert c["motivo_solo_lectura"] is None, c
+    # y sigue pudiendo escribir por su via
+    assert marcar(H_LUIS, E_SEC, CUR_SEC1, "presente",
+                  asignatura_id=INGLES).status_code == 200
+
+
+@test("F6 el servidor y el endpoint de escritura dicen lo mismo")
+def _():
+    _seed()
+    for hdr, est, curso in ((H_ROSA, E_5A, CUR_5A), (H_LUIS, E_5A, CUR_5A),
+                            (H_PEDRO, E_5A, CUR_5A), (H_CARLA, E_5A, CUR_5A)):
+        anuncia = leer_curso(hdr, curso).json()["puede_editar"]
+        escribe = marcar(hdr, est, curso, "presente").status_code == 200
+        assert anuncia == escribe, (
+            "la pantalla anuncia %s pero la escritura da %s" % (anuncia, escribe))
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None
