@@ -452,6 +452,99 @@ def _():
     assert marcar(H_DIRB, E_5A, CUR_5A).status_code in (403, 404)
 
 
+# ==========================================================================
+# C — PRIMARIA NO LLEVA ASIGNATURA · SECUNDARIA SÍ
+# ==========================================================================
+@test("C1 en Primaria se RECHAZA asignatura_id, no se ignora")
+def _():
+    _seed()
+    r = marcar(H_ROSA, E_5A, CUR_5A, "presente", asignatura_id=LENGUA)
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "no lleva asignatura" in r.json()["error"]
+    assert _filas(E_5A, FECHA) == [], "creo la fila igualmente"
+
+
+@test("C2 sin asignatura, la asistencia de Primaria entra con normalidad")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    assert _filas(E_5A, FECHA)[0]["asignatura_id"] is None
+
+
+@test("C3 así no puede existir una SEGUNDA asistencia oficial el mismo día")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    # el de Inglés intenta la suya "por su materia": rechazada dos veces, por
+    # no ser titular y por llevar asignatura
+    r = marcar(H_LUIS, E_5A, CUR_5A, "ausente", asignatura_id=INGLES)
+    assert r.status_code in (400, 403), (r.status_code, r.text[:250])
+    f = _filas(E_5A, FECHA)
+    assert len(f) == 1 and f[0]["estado"] == "presente", f
+
+
+@test("C4 en SECUNDARIA la asignatura sigue siendo obligatoria")
+def _():
+    _seed()
+    r = marcar(H_LUIS, E_SEC, CUR_SEC1, "presente")
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "Secundaria" in r.json()["error"]
+
+
+# ==========================================================================
+# D — EL AUTOR ES QUIEN DEJÓ EL ESTADO ACTUAL
+# ==========================================================================
+@test("D1 al corregirse a sí mismo, el titular sigue siendo el autor")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    assert _filas(E_5A, FECHA)[0]["registrado_por"] == ROSA
+    assert marcar(H_ROSA, E_5A, CUR_5A, "ausente").status_code == 200
+    f = _filas(E_5A, FECHA)
+    assert len(f) == 1 and f[0]["estado"] == "ausente"
+    assert f[0]["registrado_por"] == ROSA
+
+
+@test("D2 tras un cambio de titular, el autor pasa a ser el nuevo")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    d = SessionLocal()
+    try:
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=ROSA)\
+            .update({"es_titular": False}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=LUIS)\
+            .update({"es_titular": True}, synchronize_session=False)
+        d.commit()
+    finally:
+        d.close()
+    assert marcar(H_LUIS, E_5A, CUR_5A, "excusa").status_code == 200
+    f = _filas(E_5A, FECHA)
+    assert len(f) == 1, ("se creo una fila nueva en vez de actualizar", f)
+    assert f[0]["estado"] == "excusa" and f[0]["registrado_por"] == LUIS, f
+
+
+@test("D3 el masivo también actualiza el autor")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    d = SessionLocal()
+    try:
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=ROSA)\
+            .update({"es_titular": False}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=LUIS)\
+            .update({"es_titular": True}, synchronize_session=False)
+        d.commit()
+    finally:
+        d.close()
+    r = client.post("/api/asistencia/masivo", headers=H_LUIS, json={
+        "fecha": FECHA, "curso_id": CUR_5A,
+        "asistencias": [{"estudiante_id": E_5A, "estado": "ausente"}]})
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    f = _filas(E_5A, FECHA)
+    assert len(f) == 1 and f[0]["registrado_por"] == LUIS, f
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

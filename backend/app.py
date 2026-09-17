@@ -11233,6 +11233,10 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     if asistencia:
         asistencia.estado = estado
         asistencia.observacion = data.get('observacion', '')
+        # `registrado_por` dice quién dejó el estado ACTUAL de la fila. Al
+        # actualizar no se tocaba, así que la marca cambiaba de mano pero seguía
+        # firmada por quien la creó: el estado decía una cosa y el autor otra.
+        asistencia.registrado_por = current_user.id
     else:
         asistencia = Asistencia(
             estudiante_id=data['estudiante_id'],
@@ -11568,6 +11572,9 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         asistencia = query.first()
         if asistencia:
             asistencia.estado = estado_item
+            # Igual que en el alta individual: el autor es quien deja el estado
+            # actual, no quien creó la fila.
+            asistencia.registrado_por = current_user.id
         else:
             db.add(Asistencia(
                 colegio_id=current_user.colegio_id,
