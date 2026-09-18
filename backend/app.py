@@ -11588,6 +11588,26 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     if _err_lote:
         return _err_lote
 
+    # P3.1 — el lote de PRIMARIA queda cerrado al curso que autorizó el guard.
+    #
+    # El guard resuelve el curso a partir del PRIMER estudiante y, en Primaria,
+    # comprueba que quien llama sea su titular. Pero si el cliente no mandaba
+    # `curso_id` en el nivel superior del payload —y el frontend no lo mandaba:
+    # lo ponía dentro de cada item—, la variable `curso` se quedaba en None y la
+    # comprobación cruzada de más abajo, `if curso is not None and ...`, no
+    # llegaba a ejecutarse. Cada fila se guardaba luego con el curso del propio
+    # estudiante.
+    #
+    # Es decir: un lote cuyo primer estudiante fuera del curso de la titular y
+    # el resto de otros cursos pasaba entero, reutilizando la autorización que
+    # dio el primero. Se toma el curso del contexto como ÚNICO permitido, y así
+    # la validación que ya existe empieza a morder.
+    #
+    # Solo Primaria: en Secundaria el lote es por materia y su semántica no se
+    # toca en esta fase.
+    if curso is None and (_ctx_lote or {}).get('nivel') == 'primaria':
+        curso = _ctx_lote.get('curso')
+
     # v2.13.1: Validar día de la semana según configuración del colegio
     dia_semana = fecha.weekday()
     if dia_semana >= 5:

@@ -108,6 +108,7 @@ ANO_A, ANO_B = 1, 2
 G_PRIM5, G_PRIM1, G_SEC = 30, 31, 32
 CUR_5A, CUR_1A, CUR_SEC1, CUR_SEC2 = 40, 41, 42, 43
 CUR_SIN_TIT, CUR_DOS_TIT = 44, 45
+CUR_4B = 46          # otro curso de Primaria, titular OTRA_TIT
 CUR_B = 90
 
 LENGUA, MATE, NAT, INGLES, EF, ART = 1, 2, 3, 4, 5, 6
@@ -117,6 +118,7 @@ ROSA, LUIS, PEDRO, CARLA, AJENO, OTRA_TIT = 51, 52, 53, 54, 55, 56
 DIR, COORD, DIR_B = 60, 61, 81
 
 E_5A, E_5A_2, E_1A, E_SEC = 70, 71, 72, 73
+E_4B = 74            # estudiante de 4to B
 E_B = 95
 
 FECHA = "2026-09-14"
@@ -149,6 +151,7 @@ def _seed():
                 (CUR_SEC2, G_SEC, COL_A, ANO_A, "B"),
                 (CUR_SIN_TIT, G_PRIM5, COL_A, ANO_A, "C"),
                 (CUR_DOS_TIT, G_PRIM5, COL_A, ANO_A, "D"),
+                (CUR_4B, G_PRIM5, COL_A, ANO_A, "4B"),
                 (CUR_B, 99, COL_B, ANO_B, "A")):
             d.add(M.Curso(id=cid, colegio_id=col, nombre=nom, grado_id=gid,
                           ano_escolar_id=ano, activo=True))
@@ -195,6 +198,9 @@ def _seed():
         AP(AJENO, CUR_1A, LENGUA, titular=True)
         # 1ro A: Rosa NO está; Luis da el Inglés interno de primer ciclo
         AP(LUIS, CUR_1A, INGLES)
+        # 4to B: otro titular. Rosa da clase pero NO es titular alli.
+        AP(OTRA_TIT, CUR_4B, LENGUA, titular=True)
+        AP(ROSA, CUR_4B, MATE)
         # cursos límite
         AP(PEDRO, CUR_SIN_TIT, EF)                      # sin ningún titular
         AP(ROSA, CUR_DOS_TIT, LENGUA, titular=True)     # dos titulares distintos
@@ -209,6 +215,7 @@ def _seed():
                                    (E_5A_2, CUR_5A, COL_A, "Beto"),
                                    (E_1A, CUR_1A, COL_A, "Cora"),
                                    (E_SEC, CUR_SEC1, COL_A, "Dani"),
+                                   (E_4B, CUR_4B, COL_A, "Eva"),
                                    (E_B, CUR_B, COL_B, "Otro")):
             d.add(M.Estudiante(id=eid, colegio_id=col, nombre=nom, apellido="T",
                                curso_id=cur, activo=True, no_lista=1))
@@ -1089,6 +1096,193 @@ def _():
     r = desmarcar(H_LUIS, E_SEC, asignatura_id=INGLES)
     assert r.status_code == 200, (r.status_code, r.text[:250])
     assert _filas(E_SEC, FECHA) == []
+
+
+# ==========================================================================
+# M — EL LOTE MASIVO, CERRADO AL CURSO AUTORIZADO
+#   El guard resuelve el curso por el PRIMER estudiante. Si el payload no traia
+#   `curso_id` arriba —y el frontend no lo traia—, la comprobacion cruzada no
+#   corria y el resto del lote podia ser de OTROS cursos, reutilizando la
+#   autorizacion del primero.
+# ==========================================================================
+def lote(hdr, items, fecha=FECHA, **extra):
+    cuerpo = {"fecha": fecha, "asistencias": items}
+    cuerpo.update(extra)
+    return client.post("/api/asistencia/masivo", headers=hdr, json=cuerpo)
+
+
+def it(est, estado="presente", curso=None):
+    """Un item del lote. `curso` imita al frontend, que lo pone DENTRO."""
+    d = {"estudiante_id": est, "estado": estado}
+    if curso is not None:
+        d["curso_id"] = curso
+    return d
+
+
+@test("M1 lote mezclado (5to A + 4to B): rechazado entero, cero escrituras")
+def _():
+    _seed()
+    r = lote(H_ROSA, [it(E_5A, curso=CUR_5A), it(E_4B, "ausente", curso=CUR_5A)])
+    assert r.status_code in (400, 403), (r.status_code, r.text[:250])
+    assert _filas(E_5A, FECHA) == [], "escribio el primero"
+    assert _filas(E_4B, FECHA) == [], "escribio el ajeno"
+
+
+@test("M2 el mismo lote en ORDEN INVERSO: bloqueado por el primer curso")
+def _():
+    _seed()
+    # Ahora el primero es de 4to B, donde Rosa NO es titular: el guard corta ahi.
+    r = lote(H_ROSA, [it(E_4B, curso=CUR_5A), it(E_5A, "ausente", curso=CUR_5A)])
+    assert r.status_code in (400, 403), (r.status_code, r.text[:250])
+    assert _filas(E_4B, FECHA) == [] and _filas(E_5A, FECHA) == []
+
+
+@test("M3 lote homogéneo de 5to A: se registra completo")
+def _():
+    _seed()
+    d = SessionLocal()
+    try:
+        for i in range(3, 21):      # hasta 20 estudiantes en 5to A
+            d.add(M.Estudiante(id=500 + i, colegio_id=COL_A, nombre="Est%d" % i,
+                               apellido="T", curso_id=CUR_5A, activo=True, no_lista=i))
+        d.commit()
+    finally:
+        d.close()
+    ids = [E_5A, E_5A_2] + [500 + i for i in range(3, 21)]
+    assert len(ids) == 20
+    r = lote(H_ROSA, [it(e, "presente", curso=CUR_5A) for e in ids])
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    d = SessionLocal()
+    try:
+        n = d.query(M.Asistencia).filter(
+            M.Asistencia.fecha == date.fromisoformat(FECHA),
+            M.Asistencia.estudiante_id.in_(ids)).count()
+    finally:
+        d.close()
+    assert n == 20, ("faltan filas", n)
+
+
+@test("M4 el profesor NO titular no pasa el lote de su propio curso")
+def _():
+    _seed()
+    r = lote(H_LUIS, [it(E_5A, curso=CUR_5A), it(E_5A_2, curso=CUR_5A)])
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert _filas(E_5A, FECHA) == [] and _filas(E_5A_2, FECHA) == []
+
+
+@test("M5 titular de DOS cursos: tampoco puede mezclarlos en un solo lote")
+def _():
+    _seed()
+    d = SessionLocal()
+    try:   # Rosa pasa a ser tambien titular de 4to B, legitimamente
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_4B, profesor_id=OTRA_TIT)\
+            .update({"es_titular": False}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_4B, profesor_id=ROSA)\
+            .update({"es_titular": True}, synchronize_session=False)
+        d.commit()
+    finally:
+        d.close()
+    # cada curso por separado: bien
+    assert lote(H_ROSA, [it(E_5A, curso=CUR_5A)]).status_code == 200
+    assert lote(H_ROSA, [it(E_4B, curso=CUR_4B)]).status_code == 200
+    # mezclados en UN lote: no. Un lote es la asistencia diaria de UN curso.
+    _seed()
+    d = SessionLocal()
+    try:
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_4B, profesor_id=OTRA_TIT)\
+            .update({"es_titular": False}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_4B, profesor_id=ROSA)\
+            .update({"es_titular": True}, synchronize_session=False)
+        d.commit()
+    finally:
+        d.close()
+    r = lote(H_ROSA, [it(E_5A, curso=CUR_5A), it(E_4B, curso=CUR_5A)])
+    assert r.status_code in (400, 403), (r.status_code, r.text[:250])
+    assert _filas(E_5A, FECHA) == [] and _filas(E_4B, FECHA) == []
+
+
+@test("M6 un estudiante de OTRO COLEGIO en el lote: bloqueado, cero escrituras")
+def _():
+    _seed()
+    r = lote(H_ROSA, [it(E_5A, curso=CUR_5A), it(E_B, curso=CUR_5A)])
+    assert r.status_code in (400, 403, 404), (r.status_code, r.text[:250])
+    assert _filas(E_5A, FECHA) == [] and _filas(E_B, FECHA) == []
+
+
+@test("M7 un estudiante RETIRADO en el lote: rechazo completo")
+def _():
+    _seed()
+    d = SessionLocal()
+    try:
+        d.query(M.Estudiante).filter_by(id=E_5A_2).update(
+            {"activo": False, "fecha_retiro": date(2026, 9, 1)})
+        d.commit()
+    finally:
+        d.close()
+    r = lote(H_ROSA, [it(E_5A, curso=CUR_5A), it(E_5A_2, curso=CUR_5A)])
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert _filas(E_5A, FECHA) == [], "escribio pese al retirado del lote"
+
+
+@test("M8 el lote NO se fía del curso_id que manda el cliente")
+def _():
+    _seed()
+    # Item con un curso_id mentido: el de 4to B disfrazado de 5to A. La autoridad
+    # es el curso REAL del estudiante, no lo que diga el payload.
+    r = lote(H_ROSA, [it(E_5A, curso=CUR_5A), it(E_4B, curso=CUR_5A)])
+    assert r.status_code in (400, 403), (r.status_code, r.text[:250])
+    # y al reves: con curso_id superior mentido tampoco
+    r = lote(H_ROSA, [it(E_4B)], curso_id=CUR_5A)
+    assert r.status_code in (400, 403), (r.status_code, r.text[:250])
+    assert _filas(E_4B, FECHA) == []
+
+
+@test("M9 SECUNDARIA: el lote por materia sigue funcionando igual")
+def _():
+    _seed()
+    r = lote(H_LUIS, [it(E_SEC, "presente")], asignatura_id=INGLES)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    f = _filas(E_SEC, FECHA)
+    assert len(f) == 1 and f[0]["asignatura_id"] == INGLES, f
+    # la asignatura sigue siendo obligatoria
+    r = lote(H_LUIS, [it(E_SEC, "ausente")])
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    # y la titularidad no interviene: Luis no es titular de nada en Secundaria
+    d = SessionLocal()
+    try:
+        n = d.query(M.AsignacionProfesor).filter_by(
+            curso_id=CUR_SEC1, es_titular=True, activo=True).count()
+        assert n == 0, n
+    finally:
+        d.close()
+
+
+@test("M10 SECUNDARIA: el lote cruzado sigue comportandose como en la base")
+def _():
+    _seed()
+    d = SessionLocal()
+    try:
+        d.add(M.Estudiante(id=600, colegio_id=COL_A, nombre="Sec2", apellido="T",
+                           curso_id=CUR_SEC2, activo=True, no_lista=1))
+        d.commit()
+    finally:
+        d.close()
+    # Medido contra fc44ada: sin `curso_id` arriba, un lote de Secundaria con
+    # estudiantes de DOS cursos se aceptaba y escribia las dos filas. El cierre
+    # de P3.1 es de Primaria, asi que esto no debe cambiar.
+    #
+    # Y que quede dicho: el mismo agujero existe en Secundaria. No se toca aqui
+    # a proposito — cerrarlo es una fase suya, con su propia revision.
+    BASE_STATUS, BASE_FILAS = 200, 2
+    r = lote(H_LUIS, [it(E_SEC, "presente"), it(600, "ausente")],
+             asignatura_id=INGLES)
+    escritas = len(_filas(E_SEC, FECHA)) + len(_filas(600, FECHA))
+    assert r.status_code == BASE_STATUS, (
+        "P3.1 cambio el lote de Secundaria: base %s, ahora %s"
+        % (BASE_STATUS, r.status_code))
+    assert escritas == BASE_FILAS, (
+        "P3.1 cambio cuantas filas escribe el lote de Secundaria: base %d, ahora %d"
+        % (BASE_FILAS, escritas))
 
 
 @test("R  el repo no fue tocado: sge.db intacto")
