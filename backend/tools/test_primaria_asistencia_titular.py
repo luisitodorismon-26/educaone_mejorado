@@ -826,6 +826,86 @@ def _():
         assert "nivel_asignado" not in fuente, (fn.__name__, "usa nivel_asignado")
 
 
+# ==========================================================================
+# J — EL ALCANCE DE LECTURA ES SOLO DE PRIMARIA
+#   La primera version del guard corria para TODOS los cursos y con eso
+#   cambiaba la politica de lectura de Secundaria, que en esta fase tiene que
+#   quedar intacta. Estos casos lo fijan.
+# ==========================================================================
+@test("J1 SECUNDARIA: un profesor SIN asignación en el curso lee igual que en la base")
+def _():
+    _seed()
+    # En fc44ada el endpoint no tenia NINGUN control de alcance: cualquier
+    # usuario autenticado del colegio recibia 200. Ese es el comportamiento que
+    # P3.1 debe conservar, guste o no — cambiarlo es otra fase.
+    BASE_SECUNDARIA = 200
+    r = leer_curso(H_PEDRO, CUR_SEC1, asignatura_id=INGLES)
+    assert r.status_code == BASE_SECUNDARIA, (
+        "P3.1 cambio la politica de LECTURA de Secundaria: la base daba %s y ahora da %s"
+        % (BASE_SECUNDARIA, r.status_code))
+    # y Carla, que tampoco tiene nada en Secundaria
+    assert leer_curso(H_CARLA, CUR_SEC2, asignatura_id=INGLES).status_code == BASE_SECUNDARIA
+
+
+@test("J2 SECUNDARIA: el profesor asignado sigue igual, y su flujo completo también")
+def _():
+    _seed()
+    assert leer_curso(H_LUIS, CUR_SEC1, asignatura_id=INGLES).status_code == 200
+    # asistencia por materia
+    assert marcar(H_LUIS, E_SEC, CUR_SEC1, "presente",
+                  asignatura_id=INGLES).status_code == 200
+    # varias materias el mismo dia
+    assert marcar(H_ROSA, E_SEC, CUR_SEC1, "ausente",
+                  asignatura_id=LENGUA).status_code == 200
+    f = _filas(E_SEC, FECHA)
+    assert len(f) == 2 and {x["asignatura_id"] for x in f} == {INGLES, LENGUA}, f
+    # y la asignatura sigue siendo obligatoria
+    assert marcar(H_LUIS, E_SEC, CUR_SEC1, "presente").status_code == 400
+
+
+@test("J3 PRIMARIA: el profesor del curso lee, el ajeno no")
+def _():
+    _seed()
+    for hdr, quien in ((H_ROSA, "titular"), (H_LUIS, "ingles"),
+                       (H_PEDRO, "ed. fisica"), (H_CARLA, "artistica")):
+        assert leer_curso(hdr, CUR_5A).status_code == 200, quien
+    r = leer_curso(H_AJENO, CUR_5A)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+
+
+@test("J4 el MISMO profesor: 403 en el curso de Primaria ajeno, 200 en el de Secundaria")
+def _():
+    _seed()
+    # Pedro no tiene nada ni en 1ro Primaria ni en 1ro Secundaria. La diferencia
+    # de respuesta prueba que el guard depende del NIVEL DEL CURSO y no del
+    # profesor: si corriera para todo, las dos darian 403.
+    assert leer_curso(H_PEDRO, CUR_1A).status_code == 403, "primaria ajena deberia cerrarse"
+    assert leer_curso(H_PEDRO, CUR_SEC1, asignatura_id=INGLES).status_code == 200, \
+        "secundaria no debe verse afectada"
+
+
+@test("J5 el nivel se resuelve por Curso -> Grado -> nivel, no por el usuario")
+def _():
+    import inspect
+
+    def solo_codigo(fn):
+        """El fuente sin comentarios: buscar en la prosa da falsos positivos."""
+        lineas = []
+        for l in inspect.getsource(fn).split("\n"):
+            sin = l.split("#", 1)[0]
+            if sin.strip():
+                lineas.append(sin)
+        return "\n".join(lineas)
+
+    codigo = solo_codigo(APP.get_asistencia_curso)
+    assert "_es_curso_primaria(db, curso.id)" in codigo, (
+        "el guard no acota por nivel del curso")
+    assert "nivel_asignado" not in codigo, "usa nivel_asignado como autoridad"
+    assert "Horario" not in codigo, "consulta el horario"
+    # y _es_curso_primaria va por el grado, no por otra cosa
+    assert "grado.nivel" in solo_codigo(APP._es_curso_primaria)
+
+
 @test("R  el repo no fue tocado: sge.db intacto")
 def _():
     a = os.path.getmtime(_REPO_SGE) if os.path.exists(_REPO_SGE) else None

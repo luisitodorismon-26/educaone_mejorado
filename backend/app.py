@@ -11412,14 +11412,25 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     # información al resto. El profesor de Inglés o de Educación Física necesita
     # saber quién está presente, ausente, tarde o excusado para dar su clase.
     #
-    # Lee cualquier profesor con al menos UNA asignación activa en el curso, sea
-    # cual sea su materia. No se exige ser titular: eso solo aplica a escribir.
-    # Lo que sí se cierra es que un profesor del colegio SIN nada en ese curso
-    # pueda leerlo; el aislamiento entre colegios ya lo daba get_tenant_or_404.
+    # En PRIMARIA lee cualquier profesor con al menos UNA asignación activa en
+    # el curso, sea cual sea su materia. No se exige ser titular: eso solo aplica
+    # a escribir. Lo que sí se cierra es que un profesor del colegio SIN nada en
+    # ese curso pueda leerlo; el aislamiento entre colegios ya lo daba
+    # get_tenant_or_404.
     #
-    # Solo se acota al rol 'profesor': Dirección, coordinación y el resto
-    # conservan exactamente la visibilidad que tenían.
-    if current_user.role == 'profesor':
+    # SOLO PRIMARIA. La primera versión de este guard corría para todos los
+    # cursos y con eso cambiaba también la política de lectura de Secundaria,
+    # que en esta fase tiene que quedar funcionalmente intacta. Que la
+    # restricción pueda parecer una mejora de seguridad no la hace parte de
+    # P3.1: revisar el alcance de lectura de Secundaria es una fase propia, con
+    # sus propias pruebas.
+    #
+    # El nivel se resuelve en el servidor por Curso -> Grado -> nivel; nunca por
+    # `nivel_asignado`, ni por el horario, ni por lo que mande el cliente.
+    #
+    # Dentro de Primaria solo se acota el rol 'profesor': Dirección, coordinación
+    # y el resto conservan exactamente la visibilidad que tenían.
+    if current_user.role == 'profesor' and _es_curso_primaria(db, curso.id):
         _tiene = tenant_filter(
             db.query(AsignacionProfesor), AsignacionProfesor, current_user
         ).filter_by(profesor_id=current_user.id, curso_id=curso.id, activo=True).first()
