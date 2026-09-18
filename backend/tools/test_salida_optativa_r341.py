@@ -785,9 +785,14 @@ def _seed_primaria():
         d.add(u)
         d.add(M.Estudiante(id=EST_PRIM, colegio_id=COL_A, nombre="EstPrim",
                            apellido="T", curso_id=CPRIM_R341, activo=True, no_lista=1))
+        # P3.1: en Primaria la asistencia diaria la registra el TITULAR del
+        # curso. Este profesor es el unico del curso y es quien pasa lista en
+        # los casos §F3 y §F7, asi que se le marca como tal — antes el fixture
+        # no lo decia y el curso quedaba sin titular.
         d.add(M.AsignacionProfesor(id=850, colegio_id=COL_A, profesor_id=U_PROF_PRIM,
                                    curso_id=CPRIM_R341, asignatura_id=A_PRIM,
-                                   ano_escolar_id=ANO_A, activo=True))
+                                   ano_escolar_id=ANO_A, activo=True,
+                                   es_titular=True))
         d.commit()
     finally:
         d.close()

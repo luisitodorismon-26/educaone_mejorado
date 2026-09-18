@@ -5,6 +5,7 @@ import { NivelTabs } from '../../components/NivelTabs';
 import { useNivelesActivos, Nivel } from '../../hooks/useNivelesActivos';
 import { labelCurso } from '../../utils/labelCurso';
 import { SesionNoImpartidaPanel, SesionNI } from './SesionNoImpartida';
+import { textoSoloLectura } from './permisoAsistencia';
 
 interface Estudiante {
   id: number;
@@ -48,11 +49,19 @@ export const AsistenciaPage = () => {
   const [sesionNI, setSesionNI] = useState<SesionNI | null>(null);
   const niveles = useNivelesActivos();
   const [nivelFiltro, setNivelFiltro] = useState<Nivel | 'todos'>('todos');
+  // Lo que el servidor responde sobre si este usuario puede editar ESTE curso.
+  const [permisoAsistencia, setPermisoAsistencia] =
+    useState<{ puedeEditar: boolean | null; motivo: string | null }>(
+      { puedeEditar: null, motivo: null });
   // Mantener siempre 'todos' por defecto al cargar — solo cambia si el usuario elige tab
 
   // Solo profesores pueden marcar asistencia
   const esProfesor = user?.role === 'profesor';
-  const puedeEditar = esProfesor;
+  // P3.1 — en Primaria la asistencia diaria la registra el TITULAR del curso.
+  // Quién lo es lo decide el servidor y llega en la respuesta: el frontend no
+  // lo deduce, y menos aún mirando el horario. `null` = Secundaria, donde esta
+  // regla no aplica y el permiso de siempre no cambia.
+  const puedeEditar = esProfesor && permisoAsistencia.puedeEditar !== false;
   // S1: mientras la clase este declarada NO impartida, no se pasa lista. El
   // backend ya lo rechaza; esto evita que el profesor lo descubra a base de
   // errores. `puedeEditar` NO se toca: el panel de S1 sigue siendo suyo.
@@ -132,6 +141,10 @@ export const AsistenciaPage = () => {
         : `/asistencia/curso/${cursoId}?fecha=${fecha}&asignatura_id=${asignaturaId}`;
       const res = await api.get(url);
       setAsistencias(res.data.asistencias || []);
+      setPermisoAsistencia({
+        puedeEditar: res.data.puede_editar ?? null,
+        motivo: res.data.motivo_solo_lectura ?? null,
+      });
 
       // S1: solo Secundaria. Se consulta la misma clase y fecha que se acaba de
       // cargar; si esta declarada no impartida, los botones de la tabla se
@@ -286,10 +299,13 @@ export const AsistenciaPage = () => {
         )}
       </div>
       
+      {/* P3.1 — el profesor que no es titular SÍ ve la lista: necesita saber
+          quién está presente para dar su clase. Solo se le apagan los
+          controles, y se le dice por qué en una línea. */}
       {!puedeEditar && (
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
           <p className="text-blue-800">
-            <strong>ℹ️</strong> Solo los profesores pueden registrar asistencia.
+            <strong>ℹ️</strong> {textoSoloLectura(esProfesor, permisoAsistencia.motivo)}
           </p>
         </div>
       )}

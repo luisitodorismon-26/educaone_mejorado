@@ -5,7 +5,7 @@ Modelos de Base de Datos (SQLAlchemy puro para FastAPI)
 import os as _os
 from sqlalchemy import (
     Column, Integer, String, Text, Float, Boolean, Date, DateTime,
-    ForeignKey, Table, UniqueConstraint, Index
+    ForeignKey, Table, UniqueConstraint, Index, text
 )
 from sqlalchemy.orm import relationship, backref
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -1385,6 +1385,22 @@ class Asistencia(Base):
     
     __table_args__ = (
         UniqueConstraint('estudiante_id', 'fecha', 'asignatura_id', name='unique_asistencia_por_dia_materia'),
+        # La UniqueConstraint de arriba NO protege la asistencia de Primaria:
+        # ahí `asignatura_id` es NULL, y en PostgreSQL cada NULL cuenta como
+        # distinto, así que (estudiante, fecha, NULL) puede repetirse.
+        #
+        # Este índice parcial es el que garantiza UNA asistencia general por
+        # estudiante y día. Ya existe en producción —app.py lo crea al arrancar
+        # con CREATE UNIQUE INDEX IF NOT EXISTS— pero no estaba declarado aquí,
+        # así que una base levantada solo con `Base.metadata.create_all()` se
+        # quedaba sin él. Declararlo no cambia producción: el índice es el
+        # mismo, con el mismo nombre y la misma definición.
+        #
+        # No toca la unicidad de Secundaria: allí `asignatura_id` nunca es NULL
+        # y el mismo estudiante puede tener varias materias el mismo día.
+        Index('uq_asistencia_general_est_fecha', 'estudiante_id', 'fecha',
+              unique=True, postgresql_where=text('asignatura_id IS NULL'),
+              sqlite_where=text('asignatura_id IS NULL')),
         # Índices compuestos para queries frecuentes:
         # - Resumen mensual de asistencia por estudiante (filtra por estudiante + rango de fecha)
         # - Listado por curso + fecha (Index sobre curso_id + fecha)

@@ -10847,6 +10847,136 @@ async def marcar_comunicado_leido(id, request: Request, db: Session = Depends(ge
 # ============== ASISTENCIA ==============
 
 
+def _titulares_del_curso(db, curso, current_user):
+    """Los `profesor_id` DISTINTOS marcados como titular activo del curso.
+
+    `es_titular` vive en `AsignacionProfesor`, o sea POR ASIGNATURA. Una maestra
+    de 2do que imparte las ocho áreas tiene ocho filas con `es_titular=True`, y
+    eso es UN titular, no ocho. Por eso se cuentan profesores distintos y no
+    filas: contar filas convertiría a la titular de un grado completo en una
+    "titularidad inconsistente".
+    """
+    filas = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, activo=True, es_titular=True).all()
+    return {f.profesor_id for f in filas}
+
+
+def _guard_lectura_asistencia_primaria(db, curso, current_user):
+    """Alcance de LECTURA de la asistencia de Primaria. None si puede leer.
+
+    En Primaria lee cualquier profesor con al menos UNA asignación activa en el
+    curso, sea cual sea su materia: el de Inglés o el de Educación Física
+    necesita saber quién está presente para dar su clase. NO se exige ser
+    titular —eso solo aplica a escribir— ni una asignatura concreta, porque la
+    asistencia general del curso no tiene materia.
+
+    Lo que sí se cierra es que un profesor del colegio SIN nada en ese curso
+    pueda leerlo. El aislamiento entre colegios ya lo da `get_tenant_or_404`.
+
+    SOLO PRIMARIA, y el nivel se resuelve por Curso -> Grado -> nivel: nunca por
+    `nivel_asignado`, ni por el horario, ni por lo que mande el cliente. En
+    Secundaria devuelve None sin mirar nada, para que su política de lectura
+    quede exactamente como estaba.
+
+    Vive en un solo sitio porque hay TRES rutas que devuelven asistencia
+    —`/api/asistencia`, `/api/asistencia/curso/{id}` y
+    `/api/asistencia/resumen/{id}`— y cerrar solo una deja puertas laterales:
+    `/api/asistencia` únicamente comprobaba la asignación cuando venía
+    `asignatura_id`, que en Primaria no viene nunca, y `resumen` no comprobaba
+    nada.
+    """
+    if current_user.role != 'profesor':
+        return None
+    if not _es_curso_primaria(db, curso.id):
+        return None
+    tiene = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(profesor_id=current_user.id, curso_id=curso.id, activo=True).first()
+    if tiene:
+        return None
+    return JSONResponse({
+        'error': 'No tiene asignación activa en este curso.',
+    }, status_code=403)
+
+
+def _respuesta_asistencia_curso(db, curso, asistencias, current_user):
+    """El cuerpo de `GET /api/asistencia/curso/{id}`, con el permiso resuelto.
+
+    La pantalla necesita saber si puede editar, y la autoridad es el servidor:
+    el frontend NO debe deducir la titularidad por su cuenta, y menos aún
+    mirando el horario.
+
+    `puede_editar` solo tiene sentido en Primaria. En Secundaria se responde
+    None para no insinuar una regla que allí no existe: su asistencia es por
+    materia y la escribe quien la imparte, exactamente como siempre.
+    """
+    try:
+        nivel = (getattr(curso.grado, 'nivel', '') or '').strip().lower()
+    except Exception:
+        nivel = ''
+
+    puede, motivo = None, None
+    if nivel == 'primaria':
+        titulares = _titulares_del_curso(db, curso, current_user)
+        if current_user.role != 'profesor':
+            puede, motivo = False, 'solo_profesor'
+        elif not titulares:
+            puede, motivo = False, 'sin_titular'
+        elif len(titulares) > 1:
+            puede, motivo = False, 'titularidad_inconsistente'
+        else:
+            puede = current_user.id in titulares
+            motivo = None if puede else 'no_titular'
+
+    return {
+        'asistencias': asistencias,
+        'puede_editar': puede,
+        'motivo_solo_lectura': motivo,
+    }
+
+
+def _guard_titular_primaria(db, curso, current_user):
+    """Solo el titular del curso registra la asistencia diaria de Primaria.
+
+    La asistencia de Primaria es del CURSO y del día, no de una materia: hay una
+    sola por estudiante y fecha. Hasta ahora la escribía cualquier profesor con
+    asignación activa en el curso, y en producción eso ya ocurrió — tres
+    docentes distintos pasaron lista del mismo curso, uno de ellos el
+    especialista de Inglés. No se duplicó nada, porque el índice parcial lo
+    impide; lo que pasó es que cada uno SOBRESCRIBIÓ al anterior.
+
+    Sin titular NO hay respaldo a "el primer profesor activo": ese fallback es
+    justamente lo que ponía al de Inglés a decidir la asistencia del grado. Se
+    responde 409 y Dirección asigna el titular desde Asignaciones, que ya existe
+    y ya valida que sea uno solo.
+    """
+    titulares = _titulares_del_curso(db, curso, current_user)
+
+    if not titulares:
+        return JSONResponse({
+            'error': ('Este curso no tiene un profesor titular asignado. Dirección '
+                      'debe asignar un titular antes de registrar asistencia.'),
+            'curso_id': curso.id,
+        }, status_code=409)
+
+    if len(titulares) > 1:
+        return JSONResponse({
+            'error': ('El curso tiene una titularidad inconsistente. Dirección debe '
+                      'corregirla.'),
+            'curso_id': curso.id,
+        }, status_code=409)
+
+    if current_user.id not in titulares:
+        return JSONResponse({
+            'error': ('La asistencia diaria de Primaria la registra el profesor '
+                      'titular del curso. Puedes consultarla, pero no modificarla.'),
+            'curso_id': curso.id,
+        }, status_code=403)
+
+    return None
+
+
 def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
                       asignatura_id=None):
     """
@@ -10930,6 +11060,20 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
             {'error': 'En Secundaria debe seleccionar una asignatura.'},
             status_code=400)
 
+    # P3.1 — el reverso: en PRIMARIA la asistencia es del curso, así que la
+    # materia sobra. Se rechaza en vez de ignorarla en silencio, porque
+    # aceptarla abría la puerta a una segunda asistencia oficial el mismo día:
+    # la general del titular con `asignatura_id` NULL, y otra por Inglés o
+    # Educación Física. Con dos filas contradictorias el Registro y el boletín
+    # llegan a conclusiones opuestas —el Registro se queda con la peor marca y
+    # el boletín con la mejor—, así que el mismo día saldría "ausente" en un
+    # documento y "presente" en el otro.
+    if nivel == 'primaria' and asignatura is not None:
+        return None, JSONResponse({
+            'error': ('En Primaria la asistencia es del curso, no de una materia: '
+                      'no lleva asignatura.'),
+        }, status_code=400)
+
     # El rol ya esta acotado a profesor arriba; aqui se exige ademas la
     # asignacion ACTIVA sobre (curso, asignatura): no basta con el rol.
     if curso is not None:
@@ -10943,6 +11087,14 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
                 'error': ('Solo puedes registrar asistencia en los cursos y '
                           'asignaturas que tienes asignados')
             }, status_code=403)
+
+        # P3.1 — en PRIMARIA, además, hay que ser el titular. Secundaria no pasa
+        # por aquí: su asistencia es por materia y la escribe quien imparte esa
+        # materia, exactamente como hasta ahora.
+        if nivel == 'primaria':
+            _err_titular = _guard_titular_primaria(db, curso, current_user)
+            if _err_titular is not None:
+                return None, _err_titular
 
     return {'curso': curso, 'nivel': nivel, 'asignatura': asignatura}, None
 
@@ -10977,7 +11129,15 @@ async def get_asistencia(request: Request, db: Session = Depends(get_db), curren
         ).first()
         if not asignacion:
             return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'}, status_code=403)
-    
+
+    # P3.1 — el chequeo de arriba solo corre cuando viene `asignatura_id`, y en
+    # Primaria no viene NUNCA: la asistencia es del curso. Esta ruta quedaba
+    # abierta a cualquier profesor del colegio. Se cierra con el mismo guard que
+    # las demás; en Secundaria no hace nada.
+    _err_lectura = _guard_lectura_asistencia_primaria(db, curso, current_user)
+    if _err_lectura is not None:
+        return _err_lectura
+
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
         curso_id=curso.id, activo=True
     ).order_by(Estudiante.no_lista).all()
@@ -11155,6 +11315,16 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     if asistencia:
         asistencia.estado = estado
         asistencia.observacion = data.get('observacion', '')
+        # `registrado_por` conserva a quien REGISTRÓ originalmente la fila.
+        # P3.1 lo puso a apuntar al último editor, y eso redefinía el campo sin
+        # tener dónde guardar al autor original: el modelo no tiene
+        # `actualizado_por` ni historial de edición, así que el cambio no añadía
+        # información, la sustituía. Y lo hacía en los DOS niveles, cuando esta
+        # fase debe dejar Secundaria intacta.
+        #
+        # Saber quién fue el último en tocar una asistencia es una necesidad
+        # legítima, pero pide su propia fase: `actualizado_por`,
+        # `fecha_actualizacion` y un historial de cambios, diseñados a propósito.
     else:
         asistencia = Asistencia(
             estudiante_id=data['estudiante_id'],
@@ -11220,7 +11390,14 @@ async def get_resumen_asistencia(curso_id, request: Request, db: Session = Depen
     """Resumen de asistencia de un curso por mes (sin N+1, validado por tenant)."""
     # Validar tenant del curso
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    
+
+    # P3.1 — esta ruta no tenía ningún alcance dentro del colegio: el resumen de
+    # asistencia de cualquier curso de Primaria era legible por cualquier
+    # profesor. Mismo guard que las otras dos; Secundaria sin cambios.
+    _err_lectura = _guard_lectura_asistencia_primaria(db, curso, current_user)
+    if _err_lectura is not None:
+        return _err_lectura
+
     try:
         mes = int(request.query_params.get('mes', today_rd().month))
         ano = int(request.query_params.get('ano', today_rd().year))
@@ -11289,7 +11466,14 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     """Asistencia de un curso para una fecha y asignatura (sin N+1, validado por tenant)."""
     # Validar tenant del curso
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    
+
+    # P3.1 — alcance de lectura de Primaria. Ver `_guard_lectura_asistencia_primaria`:
+    # lee todo profesor del curso, no hace falta ser titular, y Secundaria no
+    # cambia.
+    _err_lectura = _guard_lectura_asistencia_primaria(db, curso, current_user)
+    if _err_lectura is not None:
+        return _err_lectura
+
     fecha_str = request.query_params.get('fecha', today_rd().isoformat())
     try:
         fecha = datetime.strptime(fecha_str, '%Y-%m-%d').date()
@@ -11309,8 +11493,13 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
         curso_id=curso.id
     ).order_by(Estudiante.no_lista).all()
+    # Sin estudiantes se devolvía una lista pelada, mientras el caso normal
+    # devuelve un objeto. Esa incoherencia ya existía; ahora importa más, porque
+    # es por aquí por donde la pantalla se entera de si puede editar. Se unifica
+    # la forma: el cuerpo siempre es un objeto con las mismas claves. El
+    # frontend ya leía `res.data.asistencias || []`, así que no cambia para él.
     if not estudiantes:
-        return []
+        return _respuesta_asistencia_curso(db, curso, [], current_user)
     est_ids = [e.id for e in estudiantes]
     
     # Una sola query para todas las asistencias (sin N+1)
@@ -11343,8 +11532,8 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
                 'registrado_por': asistencia.registrado_por if asistencia else None
             } if asistencia else None
         })
-    
-    return {'asistencias': resultado}
+
+    return _respuesta_asistencia_curso(db, curso, resultado, current_user)
 
 @app.post("/api/asistencia/masivo")
 async def registrar_asistencia_masivo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
@@ -11398,6 +11587,26 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         asignatura_id=getattr(asignatura_id, 'id', asignatura_id))
     if _err_lote:
         return _err_lote
+
+    # P3.1 — el lote de PRIMARIA queda cerrado al curso que autorizó el guard.
+    #
+    # El guard resuelve el curso a partir del PRIMER estudiante y, en Primaria,
+    # comprueba que quien llama sea su titular. Pero si el cliente no mandaba
+    # `curso_id` en el nivel superior del payload —y el frontend no lo mandaba:
+    # lo ponía dentro de cada item—, la variable `curso` se quedaba en None y la
+    # comprobación cruzada de más abajo, `if curso is not None and ...`, no
+    # llegaba a ejecutarse. Cada fila se guardaba luego con el curso del propio
+    # estudiante.
+    #
+    # Es decir: un lote cuyo primer estudiante fuera del curso de la titular y
+    # el resto de otros cursos pasaba entero, reutilizando la autorización que
+    # dio el primero. Se toma el curso del contexto como ÚNICO permitido, y así
+    # la validación que ya existe empieza a morder.
+    #
+    # Solo Primaria: en Secundaria el lote es por materia y su semántica no se
+    # toca en esta fase.
+    if curso is None and (_ctx_lote or {}).get('nivel') == 'primaria':
+        curso = _ctx_lote.get('curso')
 
     # v2.13.1: Validar día de la semana según configuración del colegio
     dia_semana = fecha.weekday()
@@ -11470,6 +11679,7 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         asistencia = query.first()
         if asistencia:
             asistencia.estado = estado_item
+            # Igual que en el alta individual: no se redefine `registrado_por`.
         else:
             db.add(Asistencia(
                 colegio_id=current_user.colegio_id,
