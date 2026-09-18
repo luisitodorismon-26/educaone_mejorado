@@ -889,21 +889,170 @@ def _():
     import inspect
 
     def solo_codigo(fn):
-        """El fuente sin comentarios: buscar en la prosa da falsos positivos."""
-        lineas = []
-        for l in inspect.getsource(fn).split("\n"):
-            sin = l.split("#", 1)[0]
-            if sin.strip():
-                lineas.append(sin)
-        return "\n".join(lineas)
+        """Solo el CODIGO de la funcion: sin comentarios ni docstring.
 
+        Buscar en la prosa da falsos positivos — el propio comentario que
+        explica "nunca por nivel_asignado" contiene esa palabra.
+        """
+        import ast
+        import textwrap
+        arbol = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        cuerpo = arbol.body[0]
+        if (cuerpo.body and isinstance(cuerpo.body[0], ast.Expr)
+                and isinstance(cuerpo.body[0].value, ast.Constant)
+                and isinstance(cuerpo.body[0].value.value, str)):
+            cuerpo.body = cuerpo.body[1:]      # fuera el docstring
+        return ast.unparse(arbol)              # unparse ya descarta comentarios
+
+    # El endpoint delega en el guard...
     codigo = solo_codigo(APP.get_asistencia_curso)
-    assert "_es_curso_primaria(db, curso.id)" in codigo, (
-        "el guard no acota por nivel del curso")
+    assert "_guard_lectura_asistencia_primaria(db, curso, current_user)" in codigo, (
+        "el endpoint no delega en el guard de lectura")
     assert "nivel_asignado" not in codigo, "usa nivel_asignado como autoridad"
     assert "Horario" not in codigo, "consulta el horario"
-    # y _es_curso_primaria va por el grado, no por otra cosa
+
+    # ...y el guard acota por el NIVEL DEL CURSO, resuelto via grado.
+    guard = solo_codigo(APP._guard_lectura_asistencia_primaria)
+    assert "_es_curso_primaria(db, curso.id)" in guard, (
+        "el guard no acota por nivel del curso")
+    assert "nivel_asignado" not in guard, "el guard usa nivel_asignado"
+    assert "Horario" not in guard, "el guard consulta el horario"
     assert "grado.nivel" in solo_codigo(APP._es_curso_primaria)
+
+
+# ==========================================================================
+# K — LAS TRES RUTAS DE LECTURA, CON LA MISMA REGLA
+#   Cerrar solo una dejaba puertas laterales: `/api/asistencia` unicamente
+#   comprobaba la asignacion cuando venia `asignatura_id` —que en Primaria no
+#   viene nunca— y `resumen` no comprobaba nada.
+# ==========================================================================
+def _rutas_lectura(curso, fecha=FECHA):
+    return {
+        'GET /api/asistencia': f"/api/asistencia?curso_id={curso}&fecha={fecha}",
+        'GET /api/asistencia/curso/{id}': f"/api/asistencia/curso/{curso}?fecha={fecha}",
+        'GET /api/asistencia/resumen/{id}': f"/api/asistencia/resumen/{curso}?mes=9&ano=2026",
+    }
+
+
+def _status_rutas(hdr, curso):
+    return {n: client.get(u, headers=hdr).status_code
+            for n, u in _rutas_lectura(curso).items()}
+
+
+@test("K1 PRIMARIA: el titular lee por las TRES rutas")
+def _():
+    _seed()
+    st = _status_rutas(H_ROSA, CUR_5A)
+    assert set(st.values()) == {200}, st
+
+
+@test("K2 PRIMARIA: el profesor del curso NO titular lee por las tres")
+def _():
+    _seed()
+    for hdr, quien in ((H_LUIS, "ingles"), (H_PEDRO, "ed. fisica"), (H_CARLA, "arte")):
+        st = _status_rutas(hdr, CUR_5A)
+        assert set(st.values()) == {200}, (quien, st)
+
+
+@test("K3 PRIMARIA: el profesor AJENO recibe 403 en las tres")
+def _():
+    _seed()
+    st = _status_rutas(H_AJENO, CUR_5A)
+    assert set(st.values()) == {403}, ("queda una puerta lateral abierta", st)
+
+
+@test("K4 PRIMARIA: Dirección y coordinación leen por las tres, como antes")
+def _():
+    _seed()
+    for hdr, quien in ((H_DIR, "direccion"), (H_COORD, "coordinador")):
+        st = _status_rutas(hdr, CUR_5A)
+        assert set(st.values()) == {200}, (quien, st)
+
+
+@test("K5 otro colegio: bloqueado en las tres")
+def _():
+    _seed()
+    st = _status_rutas(H_DIRB, CUR_5A)
+    assert set(st.values()) == {404}, st
+
+
+@test("K6 SECUNDARIA: las tres rutas dan lo MISMO que en la base fc44ada")
+def _():
+    _seed()
+    # En la base ninguna de las tres tenia alcance por curso para Primaria, y en
+    # Secundaria `/api/asistencia` solo pedia asignacion cuando venia
+    # asignatura_id. Sin asignatura_id, un profesor ajeno leia: 200 en las tres.
+    BASE = {'GET /api/asistencia': 200,
+            'GET /api/asistencia/curso/{id}': 200,
+            'GET /api/asistencia/resumen/{id}': 200}
+    for hdr, quien in ((H_PEDRO, "sin nada en secundaria"),
+                       (H_CARLA, "tampoco")):
+        st = _status_rutas(hdr, CUR_SEC1)
+        assert st == BASE, (
+            "P3.1 cambio la lectura de Secundaria para %s: base %s, ahora %s"
+            % (quien, BASE, st))
+
+
+@test("K7 SECUNDARIA: con asignatura_id, el chequeo base sigue vivo")
+def _():
+    _seed()
+    # Esta es la unica proteccion que Secundaria ya tenia, y no se toca.
+    r = client.get(f"/api/asistencia?curso_id={CUR_SEC1}&fecha={FECHA}"
+                   f"&asignatura_id={INGLES}", headers=H_PEDRO)
+    assert r.status_code == 403, (r.status_code, r.text[:200])
+    r = client.get(f"/api/asistencia?curso_id={CUR_SEC1}&fecha={FECHA}"
+                   f"&asignatura_id={INGLES}", headers=H_LUIS)
+    assert r.status_code == 200, (r.status_code, r.text[:200])
+
+
+@test("K8 el guard de lectura vive en UN solo sitio y lo usan las tres rutas")
+def _():
+    import inspect
+    for fn in (APP.get_asistencia, APP.get_asistencia_curso, APP.get_resumen_asistencia):
+        fuente = inspect.getsource(fn)
+        assert "_guard_lectura_asistencia_primaria(db, curso, current_user)" in fuente, \
+            fn.__name__
+    g = inspect.getsource(APP._guard_lectura_asistencia_primaria)
+    assert "_es_curso_primaria" in g, "no acota por nivel del curso"
+    assert "es_titular" not in g, "exige titular para LEER"
+    assert "asignatura" not in g.split("\"\"\"")[-1], "exige una asignatura concreta"
+
+
+# ==========================================================================
+# L — DESMARCAR
+# ==========================================================================
+def desmarcar(hdr, est, fecha=FECHA, **params):
+    q = f"/api/asistencia/{est}?fecha={fecha}"
+    for k, v in params.items():
+        q += f"&{k}={v}"
+    return client.request("DELETE", q, headers=hdr)
+
+
+@test("L1 PRIMARIA: el titular desmarca; el profesor del curso y el ajeno, no")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
+    for hdr, quien in ((H_LUIS, "ingles"), (H_PEDRO, "ed. fisica"),
+                       (H_CARLA, "arte")):
+        r = desmarcar(hdr, E_5A)
+        assert r.status_code == 403, (quien, r.status_code, r.text[:200])
+        assert len(_filas(E_5A, FECHA)) == 1, (quien, "borro la marca")
+    r = desmarcar(H_AJENO, E_5A)
+    assert r.status_code == 403, (r.status_code, r.text[:200])
+    # el titular sí
+    r = desmarcar(H_ROSA, E_5A)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _filas(E_5A, FECHA) == []
+
+
+@test("L2 SECUNDARIA: desmarcar sigue igual, sin titularidad de por medio")
+def _():
+    _seed()
+    assert marcar(H_LUIS, E_SEC, CUR_SEC1, "presente",
+                  asignatura_id=INGLES).status_code == 200
+    r = desmarcar(H_LUIS, E_SEC, asignatura_id=INGLES)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert _filas(E_SEC, FECHA) == []
 
 
 @test("R  el repo no fue tocado: sge.db intacto")

@@ -10862,6 +10862,44 @@ def _titulares_del_curso(db, curso, current_user):
     return {f.profesor_id for f in filas}
 
 
+def _guard_lectura_asistencia_primaria(db, curso, current_user):
+    """Alcance de LECTURA de la asistencia de Primaria. None si puede leer.
+
+    En Primaria lee cualquier profesor con al menos UNA asignación activa en el
+    curso, sea cual sea su materia: el de Inglés o el de Educación Física
+    necesita saber quién está presente para dar su clase. NO se exige ser
+    titular —eso solo aplica a escribir— ni una asignatura concreta, porque la
+    asistencia general del curso no tiene materia.
+
+    Lo que sí se cierra es que un profesor del colegio SIN nada en ese curso
+    pueda leerlo. El aislamiento entre colegios ya lo da `get_tenant_or_404`.
+
+    SOLO PRIMARIA, y el nivel se resuelve por Curso -> Grado -> nivel: nunca por
+    `nivel_asignado`, ni por el horario, ni por lo que mande el cliente. En
+    Secundaria devuelve None sin mirar nada, para que su política de lectura
+    quede exactamente como estaba.
+
+    Vive en un solo sitio porque hay TRES rutas que devuelven asistencia
+    —`/api/asistencia`, `/api/asistencia/curso/{id}` y
+    `/api/asistencia/resumen/{id}`— y cerrar solo una deja puertas laterales:
+    `/api/asistencia` únicamente comprobaba la asignación cuando venía
+    `asignatura_id`, que en Primaria no viene nunca, y `resumen` no comprobaba
+    nada.
+    """
+    if current_user.role != 'profesor':
+        return None
+    if not _es_curso_primaria(db, curso.id):
+        return None
+    tiene = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(profesor_id=current_user.id, curso_id=curso.id, activo=True).first()
+    if tiene:
+        return None
+    return JSONResponse({
+        'error': 'No tiene asignación activa en este curso.',
+    }, status_code=403)
+
+
 def _respuesta_asistencia_curso(db, curso, asistencias, current_user):
     """El cuerpo de `GET /api/asistencia/curso/{id}`, con el permiso resuelto.
 
@@ -11091,7 +11129,15 @@ async def get_asistencia(request: Request, db: Session = Depends(get_db), curren
         ).first()
         if not asignacion:
             return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'}, status_code=403)
-    
+
+    # P3.1 — el chequeo de arriba solo corre cuando viene `asignatura_id`, y en
+    # Primaria no viene NUNCA: la asistencia es del curso. Esta ruta quedaba
+    # abierta a cualquier profesor del colegio. Se cierra con el mismo guard que
+    # las demás; en Secundaria no hace nada.
+    _err_lectura = _guard_lectura_asistencia_primaria(db, curso, current_user)
+    if _err_lectura is not None:
+        return _err_lectura
+
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
         curso_id=curso.id, activo=True
     ).order_by(Estudiante.no_lista).all()
@@ -11338,7 +11384,14 @@ async def get_resumen_asistencia(curso_id, request: Request, db: Session = Depen
     """Resumen de asistencia de un curso por mes (sin N+1, validado por tenant)."""
     # Validar tenant del curso
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    
+
+    # P3.1 — esta ruta no tenía ningún alcance dentro del colegio: el resumen de
+    # asistencia de cualquier curso de Primaria era legible por cualquier
+    # profesor. Mismo guard que las otras dos; Secundaria sin cambios.
+    _err_lectura = _guard_lectura_asistencia_primaria(db, curso, current_user)
+    if _err_lectura is not None:
+        return _err_lectura
+
     try:
         mes = int(request.query_params.get('mes', today_rd().month))
         ano = int(request.query_params.get('ano', today_rd().year))
@@ -11408,36 +11461,12 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     # Validar tenant del curso
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
 
-    # P3.1 — restringir la ESCRITURA al titular no significa esconderle la
-    # información al resto. El profesor de Inglés o de Educación Física necesita
-    # saber quién está presente, ausente, tarde o excusado para dar su clase.
-    #
-    # En PRIMARIA lee cualquier profesor con al menos UNA asignación activa en
-    # el curso, sea cual sea su materia. No se exige ser titular: eso solo aplica
-    # a escribir. Lo que sí se cierra es que un profesor del colegio SIN nada en
-    # ese curso pueda leerlo; el aislamiento entre colegios ya lo daba
-    # get_tenant_or_404.
-    #
-    # SOLO PRIMARIA. La primera versión de este guard corría para todos los
-    # cursos y con eso cambiaba también la política de lectura de Secundaria,
-    # que en esta fase tiene que quedar funcionalmente intacta. Que la
-    # restricción pueda parecer una mejora de seguridad no la hace parte de
-    # P3.1: revisar el alcance de lectura de Secundaria es una fase propia, con
-    # sus propias pruebas.
-    #
-    # El nivel se resuelve en el servidor por Curso -> Grado -> nivel; nunca por
-    # `nivel_asignado`, ni por el horario, ni por lo que mande el cliente.
-    #
-    # Dentro de Primaria solo se acota el rol 'profesor': Dirección, coordinación
-    # y el resto conservan exactamente la visibilidad que tenían.
-    if current_user.role == 'profesor' and _es_curso_primaria(db, curso.id):
-        _tiene = tenant_filter(
-            db.query(AsignacionProfesor), AsignacionProfesor, current_user
-        ).filter_by(profesor_id=current_user.id, curso_id=curso.id, activo=True).first()
-        if not _tiene:
-            return JSONResponse({
-                'error': 'No tiene asignación activa en este curso.',
-            }, status_code=403)
+    # P3.1 — alcance de lectura de Primaria. Ver `_guard_lectura_asistencia_primaria`:
+    # lee todo profesor del curso, no hace falta ser titular, y Secundaria no
+    # cambia.
+    _err_lectura = _guard_lectura_asistencia_primaria(db, curso, current_user)
+    if _err_lectura is not None:
+        return _err_lectura
 
     fecha_str = request.query_params.get('fecha', today_rd().isoformat())
     try:
