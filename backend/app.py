@@ -11315,10 +11315,16 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     if asistencia:
         asistencia.estado = estado
         asistencia.observacion = data.get('observacion', '')
-        # `registrado_por` dice quién dejó el estado ACTUAL de la fila. Al
-        # actualizar no se tocaba, así que la marca cambiaba de mano pero seguía
-        # firmada por quien la creó: el estado decía una cosa y el autor otra.
-        asistencia.registrado_por = current_user.id
+        # `registrado_por` conserva a quien REGISTRÓ originalmente la fila.
+        # P3.1 lo puso a apuntar al último editor, y eso redefinía el campo sin
+        # tener dónde guardar al autor original: el modelo no tiene
+        # `actualizado_por` ni historial de edición, así que el cambio no añadía
+        # información, la sustituía. Y lo hacía en los DOS niveles, cuando esta
+        # fase debe dejar Secundaria intacta.
+        #
+        # Saber quién fue el último en tocar una asistencia es una necesidad
+        # legítima, pero pide su propia fase: `actualizado_por`,
+        # `fecha_actualizacion` y un historial de cambios, diseñados a propósito.
     else:
         asistencia = Asistencia(
             estudiante_id=data['estudiante_id'],
@@ -11653,9 +11659,7 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         asistencia = query.first()
         if asistencia:
             asistencia.estado = estado_item
-            # Igual que en el alta individual: el autor es quien deja el estado
-            # actual, no quien creó la fila.
-            asistencia.registrado_por = current_user.id
+            # Igual que en el alta individual: no se redefine `registrado_por`.
         else:
             db.add(Asistencia(
                 colegio_id=current_user.colegio_id,

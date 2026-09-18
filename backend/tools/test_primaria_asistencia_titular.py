@@ -492,48 +492,56 @@ def _():
 
 
 # ==========================================================================
-# D — EL AUTOR ES QUIEN DEJÓ EL ESTADO ACTUAL
+# D — EL AUTOR ORIGINAL SE PRESERVA
+#   `registrado_por` dice quien REGISTRO la fila. No se redefine como "ultimo
+#   editor": el modelo no tiene `actualizado_por` ni historial, asi que ese
+#   cambio no anadiria informacion, la sustituiria — y ademas tocaria los dos
+#   niveles, cuando esta fase debe dejar Secundaria intacta.
 # ==========================================================================
-@test("D1 al corregirse a sí mismo, el titular sigue siendo el autor")
+@test("D1 al crear, el autor es quien registro la fila")
 def _():
     _seed()
     assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
     assert _filas(E_5A, FECHA)[0]["registrado_por"] == ROSA
+
+
+@test("D2 al editarse a si mismo, el autor no cambia")
+def _():
+    _seed()
+    assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
     assert marcar(H_ROSA, E_5A, CUR_5A, "ausente").status_code == 200
     f = _filas(E_5A, FECHA)
     assert len(f) == 1 and f[0]["estado"] == "ausente"
     assert f[0]["registrado_por"] == ROSA
 
 
-@test("D2 tras un cambio de titular, el autor pasa a ser el nuevo")
+@test("D3 tras un cambio de titular, el autor ORIGINAL se conserva")
 def _():
     _seed()
     assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
     d = SessionLocal()
     try:
-        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=ROSA)\
-            .update({"es_titular": False}, synchronize_session=False)
-        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=LUIS)\
-            .update({"es_titular": True}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=ROSA)            .update({"es_titular": False}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=LUIS)            .update({"es_titular": True}, synchronize_session=False)
         d.commit()
     finally:
         d.close()
     assert marcar(H_LUIS, E_5A, CUR_5A, "excusa").status_code == 200
     f = _filas(E_5A, FECHA)
     assert len(f) == 1, ("se creo una fila nueva en vez de actualizar", f)
-    assert f[0]["estado"] == "excusa" and f[0]["registrado_por"] == LUIS, f
+    assert f[0]["estado"] == "excusa", f
+    assert f[0]["registrado_por"] == ROSA, (
+        "se redefinio registrado_por como ultimo editor", f)
 
 
-@test("D3 el masivo también actualiza el autor")
+@test("D4 el masivo sobre una fila existente tambien conserva al creador")
 def _():
     _seed()
     assert marcar(H_ROSA, E_5A, CUR_5A, "presente").status_code == 200
     d = SessionLocal()
     try:
-        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=ROSA)\
-            .update({"es_titular": False}, synchronize_session=False)
-        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=LUIS)\
-            .update({"es_titular": True}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=ROSA)            .update({"es_titular": False}, synchronize_session=False)
+        d.query(M.AsignacionProfesor).filter_by(curso_id=CUR_5A, profesor_id=LUIS)            .update({"es_titular": True}, synchronize_session=False)
         d.commit()
     finally:
         d.close()
@@ -542,7 +550,35 @@ def _():
         "asistencias": [{"estudiante_id": E_5A, "estado": "ausente"}]})
     assert r.status_code == 200, (r.status_code, r.text[:250])
     f = _filas(E_5A, FECHA)
-    assert len(f) == 1 and f[0]["registrado_por"] == LUIS, f
+    assert len(f) == 1 and f[0]["estado"] == "ausente"
+    assert f[0]["registrado_por"] == ROSA, f
+
+
+@test("D5 SECUNDARIA conserva la semantica base de registrado_por")
+def _():
+    _seed()
+    assert marcar(H_LUIS, E_SEC, CUR_SEC1, "presente",
+                  asignatura_id=INGLES).status_code == 200
+    assert _filas(E_SEC, FECHA)[0]["registrado_por"] == LUIS
+    # Rosa tambien da clase en ese curso: edita la marca de Ingles? No — su
+    # asignacion es de Lengua, asi que su escritura va a OTRA fila. Lo que se
+    # comprueba aqui es que la fila de Luis conserva a Luis.
+    assert marcar(H_LUIS, E_SEC, CUR_SEC1, "ausente",
+                  asignatura_id=INGLES).status_code == 200
+    f = [x for x in _filas(E_SEC, FECHA) if x["asignatura_id"] == INGLES]
+    assert len(f) == 1 and f[0]["estado"] == "ausente"
+    assert f[0]["registrado_por"] == LUIS, f
+
+
+@test("D6 el codigo no reasigna registrado_por al actualizar")
+def _():
+    import inspect
+    for fn in (APP.registrar_asistencia, APP.registrar_asistencia_masivo):
+        fuente = inspect.getsource(fn)
+        assert "asistencia.registrado_por = current_user.id" not in fuente, (
+            fn.__name__, "redefine el autor al actualizar")
+        assert "registrado_por=current_user.id" in fuente, (
+            fn.__name__, "se perdio el autor en el alta")
 
 
 # ==========================================================================
