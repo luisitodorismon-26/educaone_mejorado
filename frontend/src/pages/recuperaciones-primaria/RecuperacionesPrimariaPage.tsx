@@ -3,6 +3,7 @@ import api from '../../services/api';
 import { AlertTriangle, Save, CheckCircle, RefreshCw, Backpack } from 'lucide-react';
 import { Button, Alert, Spinner } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
+import { TabRecuperacionCualitativa } from './TabRecuperacionCualitativa';
 
 // ═══════════════════════════════════════════════════════════════
 // RECUPERACIONES DE PRIMARIA — v2.13.50
@@ -217,6 +218,20 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
       </div>
 
       {mensaje && <Alert variant={mensaje.tipo} onClose={() => setMensaje(null)}>{mensaje.texto}</Alert>}
+
+      {/* Recuperación pedagógica DEL PERÍODO. Un solo módulo: la modalidad la
+          decide el servidor a partir del curso, no un selector del docente.
+          Lo de abajo sigue siendo la recuperación FINAL del área, que es
+          cuantitativa en los seis grados y no cambia. */}
+      <TabRecuperacionCualitativa />
+
+      <div className="pt-2">
+        <h2 className="text-lg font-bold text-gray-800">Recuperación final del área</h2>
+        <p className="text-xs text-gray-500">
+          Proceso distinto del anterior: ocurre al final del año, sobre la calificación
+          final del área, y es cuantitativa en todos los grados.
+        </p>
+      </div>
 
       {pendientes.length === 0 && resueltas.length === 0 && (
         <div className="bg-white rounded-xl shadow-sm border p-10 text-center">
