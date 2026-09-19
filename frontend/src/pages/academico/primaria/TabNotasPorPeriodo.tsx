@@ -5,6 +5,7 @@ import { Button, Alert } from '../../../components/ui';
 import {
   EstudiantePrimData, CampoEditable,
   NOMBRES_COMPETENCIAS_PRIM, UMBRAL_RP_PRIMARIA, rpHabilitado,
+  ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
 } from './tipos';
 import { avisoPeriodoCerrado, mensajeAvisos } from './periodoCerrado';
 
@@ -19,13 +20,16 @@ interface Props {
   asignaturaId: number;
   numCompetencias: number;
   puedeEditar: boolean;
+  modalidadRecuperacion?: ModalidadRecuperacion | null;
   onReload: () => Promise<void>;
 }
 
 // draft key: "estudianteId-competencia" -> { campo: valor }
 type Draft = Record<string, Partial<Record<CampoEditable, string>>>;
 
-export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, numCompetencias, puedeEditar, onReload }) => {
+export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, numCompetencias, puedeEditar, modalidadRecuperacion, onReload }) => {
+  // En 1ro y 2do no hay columna RP: la recuperacion del periodo es cualitativa.
+  const conRp = admiteRpNumerica(modalidadRecuperacion);
   const [periodo, setPeriodo] = useState(1);
   const [drafts, setDrafts] = useState<Draft>({});
   const [guardando, setGuardando] = useState(false);
@@ -120,7 +124,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
             <tr>
               <th rowSpan={2} className="px-3 py-2 text-left font-medium text-gray-600 sticky left-0 bg-gray-50 align-bottom">Estudiante</th>
               {comps.map(n => (
-                <th key={n} colSpan={2} className="px-2 py-1.5 text-center font-medium text-gray-600 border-l">
+                <th key={n} colSpan={conRp ? 2 : 1} className="px-2 py-1.5 text-center font-medium text-gray-600 border-l">
                   C{n} · {NOMBRES_COMPETENCIAS_PRIM[n]?.split(',')[0] || `Comp ${n}`}
                 </th>
               ))}
@@ -129,7 +133,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
               {comps.map(n => (
                 <Fragment key={n}>
                   <th className="px-1 py-1 text-center font-medium text-gray-500 border-l">P{periodo}</th>
-                  <th className="px-1 py-1 text-center font-normal text-gray-400">RP{periodo}</th>
+                  {conRp && <th className="px-1 py-1 text-center font-normal text-gray-400">RP{periodo}</th>}
                 </Fragment>
               ))}
             </tr>
@@ -152,17 +156,17 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                         className="w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50"
                       />
                     </td>
-                    <td className="px-1 py-1 text-center">
+                    {conRp && <td className="px-1 py-1 text-center">
                       <input
                         type="number" min={0} max={100}
                         value={rpOn ? getValor(est, n, campoRP) : ''}
                         onChange={e => handleChange(est.estudiante.id, n, campoRP, e.target.value)}
                         disabled={!puedeEditar || !rpOn}
                         placeholder={rpOn ? 'RP' : '—'}
-                        title={rpOn ? `Recuperación del P${periodo}` : `RP se habilita solo si P${periodo} < ${UMBRAL_RP_PRIMARIA}`}
+                        title={rpOn ? AYUDA_RP_PRIMARIA : `RP se habilita solo si P${periodo} < ${UMBRAL_RP_PRIMARIA}`}
                         className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                       />
-                    </td>
+                    </td>}
                   </Fragment>
                   );
                 })}
@@ -173,7 +177,9 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       </div>
 
       <p className="text-xs text-gray-500">
-        Cada celda: P{periodo} y su recuperación (RP{periodo}). Se toma el mayor de los dos como valor del período.
+        {conRp
+          ? `Cada celda: P${periodo} y su recuperación (RP${periodo}). ${AYUDA_RP_PRIMARIA}`
+          : AVISO_RP_CUALITATIVA}
       </p>
     </div>
   );

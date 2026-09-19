@@ -6,6 +6,7 @@ import {
   EstudiantePrimData, CampoEditable, CAMPOS_PERIODOS,
   NOMBRES_COMPETENCIAS_PRIM, MINIMO_APROBATORIO_PRIMARIA,
   UMBRAL_RP_PRIMARIA, rpHabilitado, finalCompetencia,
+  ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
 } from './tipos';
 import { avisoPeriodoCerrado, mensajeAvisos } from './periodoCerrado';
 
@@ -20,13 +21,16 @@ interface Props {
   asignaturaId: number;
   numCompetencias: number;
   puedeEditar: boolean;
+  modalidadRecuperacion?: ModalidadRecuperacion | null;
   onReload: () => Promise<void>;
 }
 
 // draft key: "estudianteId-competencia" -> { campo: valor }
 type Draft = Record<string, Partial<Record<CampoEditable, string>>>;
 
-export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignaturaId, numCompetencias, puedeEditar, onReload }) => {
+export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignaturaId, numCompetencias, puedeEditar, modalidadRecuperacion, onReload }) => {
+  // En 1ro y 2do no hay columna RP: la recuperacion del periodo es cualitativa.
+  const conRp = admiteRpNumerica(modalidadRecuperacion);
   const [compSel, setCompSel] = useState(1);
   const [drafts, setDrafts] = useState<Draft>({});
   const [guardando, setGuardando] = useState(false);
@@ -137,7 +141,7 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
               {CAMPOS_PERIODOS.map(cp => (
                 <Fragment key={cp.periodo}>
                   <th className="px-2 py-2 text-center font-medium text-gray-600">P{cp.periodo}</th>
-                  <th className="px-2 py-2 text-center font-normal text-gray-400 text-xs">RP{cp.periodo}</th>
+                  {conRp && <th className="px-2 py-2 text-center font-normal text-gray-400 text-xs">RP{cp.periodo}</th>}
                 </Fragment>
               ))}
               <th className="px-3 py-2 text-center font-medium text-blue-700">Final</th>
@@ -164,17 +168,17 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                           className="w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50"
                         />
                       </td>
-                      <td className="px-1 py-1 text-center">
+                      {conRp && <td className="px-1 py-1 text-center">
                         <input
                           type="number" min={0} max={100}
                           value={rpOn ? getValor(est, cp.rp) : ''}
                           onChange={e => handleChange(est.estudiante.id, cp.rp, e.target.value)}
                           disabled={!puedeEditar || !rpOn}
                           placeholder={rpOn ? 'RP' : '—'}
-                          title={rpOn ? `Recuperación del P${cp.periodo}` : `RP se habilita solo si P${cp.periodo} < ${UMBRAL_RP_PRIMARIA}`}
+                          title={rpOn ? AYUDA_RP_PRIMARIA : `RP se habilita solo si P${cp.periodo} < ${UMBRAL_RP_PRIMARIA}`}
                           className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                         />
-                      </td>
+                      </td>}
                     </Fragment>
                     );
                   })}

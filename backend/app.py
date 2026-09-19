@@ -6828,6 +6828,12 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
                 'competencias': competencias_data
             })
         
+        # P2A-R1: la pantalla necesita saber si este grado admite RP numérica.
+        # Se manda resuelto desde el servidor para que el frontend no lo deduzca
+        # del nombre del grado por su cuenta. Campo aditivo: quien no lo lea
+        # sigue viendo exactamente la misma respuesta de antes.
+        _modalidad_rec, _ = _modalidad_recuperacion_primaria(db, curso_id, current_user)
+
         return {
             'calificaciones': resultado,
             'num_competencias': num_competencias,
@@ -6836,6 +6842,7 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
             'ciclo': grado.ciclo,
             'ano_escolar': ano.nombre,
             'periodo_activo': ano.periodo_activo,
+            'modalidad_recuperacion': _modalidad_rec,
         }
     except Exception as e:
         import traceback
@@ -6933,7 +6940,31 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
 
     if estudiante_obj.curso_id:
         assert_nivel_curso_activo(db, current_user, estudiante_obj.curso_id)
-    
+
+    # P2A-R1: en 1ro y 2do la recuperación pedagógica del PERÍODO es cualitativa
+    # («lograda / no lograda»), así que una rpN numérica no tiene dónde
+    # imprimirse: ni el Informe de Aprendizaje ni el Registro de esos grados
+    # traen columnas RP. Aceptarla cambiaría la calificación del período sin
+    # aparecer en ningún documento oficial.
+    #
+    # Se RECHAZA en vez de ignorarse: callarlo haría creer al docente que su
+    # recuperación quedó registrada. Mandar null o cadena vacía sí se permite,
+    # porque eso LIMPIA, no escribe.
+    _modalidad_rp, _ctx_rp = _modalidad_recuperacion_primaria(
+        db, estudiante_obj.curso_id, current_user)
+    if _modalidad_rp == 'cualitativa':
+        _rps = [c for c in ('rp1', 'rp2', 'rp3', 'rp4')
+                if c in data and data[c] is not None and data[c] != '']
+        if _rps:
+            return JSONResponse({
+                'error': ('En %s la recuperación pedagógica del período es CUALITATIVA: '
+                          'se registra en Recuperación Primaria (aspectos no logrados, '
+                          'estrategias y evidencias, competencia lograda o no lograda), '
+                          'no como nota.' % (_ctx_rp.get('grado') or 'este grado')),
+                'campos_rechazados': _rps,
+                **_ctx_rp,
+            }, status_code=400)
+
     # Año escolar activo
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
