@@ -178,6 +178,72 @@ prueba('el rótulo ambiguo desapareció', () => {
          'la ayuda debe decir qué NO se escribe');
 });
 
+
+console.log('\n\x1b[1mPATCH PRE-MERGE\x1b[0m');
+
+const PAGINA = leer('recuperaciones-primaria', 'RecuperacionesPrimariaPage.tsx');
+
+// Sólo texto visible: los comentarios del código pueden seguir describiendo el
+// backend, que todavía usa max(P,RP) — eso se corrige en P2A-R2.
+const sinComentarios = (src) =>
+  src.split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+
+prueba('el rótulo «mayor entre P y RP» no vuelve por ninguna puerta', () => {
+  const prohibidos = [
+    'mayor entre P y RP', 'mayor entre p y rp',
+    'se toma el mayor', 'Se toma el mayor',
+    'mayor de los dos', 'max entre P y RP',
+  ];
+  for (const [nombre, src] of [
+    ['por período', POR_PERIODO], ['por competencia', POR_COMPETENCIA],
+    ['recuperación', TAB_CUAL], ['página', PAGINA],
+  ]) {
+    const visible = sinComentarios(src);
+    for (const t of prohibidos) {
+      cierto(!visible.includes(t), `${nombre}: reapareció «${t}»`);
+    }
+  }
+});
+
+prueba('la pestaña por competencia explica RP según la modalidad', () => {
+  cierto(POR_COMPETENCIA.includes('{conRp ? AYUDA_RP_PRIMARIA : AVISO_RP_CUALITATIVA}'),
+         'el pie debe alternar según la modalidad');
+});
+
+prueba('el aviso cualitativo remite a Recuperación Primaria', () => {
+  const aviso = mod2().AVISO_RP_CUALITATIVA;
+  cierto(aviso.includes('de forma cualitativa'), 'debe decir que es cualitativa');
+  cierto(aviso.includes('Recuperación Primaria'), 'debe decir dónde se registra');
+  cierto(aviso.includes('No lleva nota'), 'debe dejar claro que no hay nota');
+});
+
+prueba('sólo Dirección y Coordinación retiran administrativamente', () => {
+  igual(mod.puedeRetirarAdministrativamente('direccion'), true, 'dirección');
+  igual(mod.puedeRetirarAdministrativamente('coordinador'), true, 'coordinación');
+  igual(mod.puedeRetirarAdministrativamente('secretaria'), false, 'secretaría NO');
+  igual(mod.puedeRetirarAdministrativamente('psicologia'), false, 'psicología NO');
+  igual(mod.puedeRetirarAdministrativamente('profesor'), false, 'el profesor usa su propio helper');
+  igual(mod.puedeRetirarAdministrativamente(null), false, 'sin rol');
+  igual(mod.puedeRetirarAdministrativamente(undefined), false, 'indefinido');
+});
+
+prueba('la pestaña usa ese control y ya no «!esProfesor»', () => {
+  cierto(TAB_CUAL.includes('puedeRetirarAdministrativamente(user?.role)'),
+         'debe calcular el permiso con el helper');
+  cierto(TAB_CUAL.includes('{puedeRetiroAdmin && i.activo &&'),
+         'el botón debe colgar de puedeRetiroAdmin');
+  cierto(!TAB_CUAL.includes('{!esProfesor && i.activo &&'),
+         'no debe quedar el control viejo por negación');
+});
+
+prueba('el texto de la recuperación especial es condicional', () => {
+  const i = PAGINA.indexOf('pasa a recuperación especial');
+  cierto(i > -1, 'el texto debe seguir existiendo para 3ro-6to');
+  const antes = PAGINA.slice(Math.max(0, i - 220), i);
+  cierto(antes.includes('hayEspecial &&'),
+         'no puede mostrarse como regla general: es falso para 1ro y 2do');
+});
+
 console.log('');
 if (fallos.length) {
   console.log(`\x1b[91m\x1b[1m  ${fallos.length} fallo(s) de ${ok + fallos.length}\x1b[0m`);

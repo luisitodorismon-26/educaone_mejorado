@@ -281,6 +281,29 @@ def set_asignacion(prof, curso, asig, activo):
         d.close()
 
 
+def set_ano(**campos):
+    d = SessionLocal()
+    try:
+        a = d.get(M.AnoEscolar, ANO_A)
+        for k, v in campos.items():
+            setattr(a, k, v)
+        d.commit()
+    finally:
+        d.close()
+
+
+def n_fichas_final():
+    d = SessionLocal()
+    try:
+        return d.query(M.RecuperacionPrimaria).count()
+    finally:
+        d.close()
+
+
+def abrir_pendientes(hdr=None):
+    return client.get("/api/recuperaciones-primaria/pendientes", headers=hdr or H_DIR)
+
+
 def set_periodo_cerrado(n, cerrado):
     d = SessionLocal()
     try:
@@ -679,10 +702,15 @@ def _():
 # ═══════════════════ I · RECUPERACION FINAL Y ESPECIAL ═══════════════════
 
 def _sembrar_area_reprobada(est, asig):
-    """Deja las 3 competencias con CF < 65 para que nazca la ficha final."""
+    """Deja las 3 competencias con CF < 65 y cierra P4 para que nazca la ficha.
+
+    Desde el patch la sincronizacion no materializa nada con P4 abierto, asi
+    que cerrarlo es parte del escenario, no un atajo del test.
+    """
     for comp in (1, 2, 3):
         calificar(H_PROF, est, asig, comp=comp, p1=50, p2=50, p3=50, p4=50)
-    return client.get("/api/recuperaciones-primaria/pendientes", headers=H_DIR)
+    set_ano(p4_cerrado=True)
+    return abrir_pendientes()
 
 
 @test("I1 en 1ro la Recuperacion FINAL sigue existiendo")
@@ -871,6 +899,204 @@ def _():
     assert "recuperaciones_pedagogicas_primaria" in insp.get_table_names()
     idx = {i["name"] for i in insp.get_indexes("recuperaciones_pedagogicas_primaria")}
     assert "ix_recped_prim_curso" in idx and "ix_recped_prim_estudiante" in idx, idx
+
+
+
+# ═══════════════ M · PATCH PRE-MERGE (revision independiente) ═══════════════
+#
+# M1-M5  P0: abrir la pantalla NO puede materializar Recuperacion Final
+#            mientras P4 siga abierto.
+# M6-M8  P1: el retiro del profesor respeta periodo y anio cerrados.
+# M9-M10 P2: 1ro/2do nunca muestran "especial pendiente".
+
+@test("M1 P1 abierto + CF parcial <65: abrir /pendientes no crea fichas")
+def _():
+    set_ano(p1_cerrado=False, p2_cerrado=False, p3_cerrado=False,
+            p4_cerrado=False, cerrado=False, activo=True, periodo_activo=1)
+    d = SessionLocal()
+    try:
+        for f in d.query(M.RecuperacionPrimaria).all():
+            d.delete(f)
+        for c in d.query(M.CalificacionPrimaria).filter_by(estudiante_id=E_2A).all():
+            d.delete(c)
+        d.commit()
+    finally:
+        d.close()
+    antes = n_fichas_final()
+    for comp in (1, 2, 3):
+        assert calificar(H_PROF, E_2A, LENGUA, comp=comp, p1=40).status_code == 200
+    r = abrir_pendientes()
+    assert r.status_code == 200, r.text[:200]
+    assert n_fichas_final() == antes, "se materializo una ficha con P4 abierto"
+
+
+@test("M2 P2 abierto: sigue sin crear fichas")
+def _():
+    set_ano(periodo_activo=2)
+    antes = n_fichas_final()
+    for comp in (1, 2, 3):
+        calificar(H_PROF, E_2A, LENGUA, comp=comp, p2=42)
+    abrir_pendientes()
+    assert n_fichas_final() == antes, "P2 abierto no debe materializar"
+
+
+@test("M3 P3 abierto: sigue sin crear fichas")
+def _():
+    set_ano(periodo_activo=3)
+    antes = n_fichas_final()
+    for comp in (1, 2, 3):
+        calificar(H_PROF, E_2A, LENGUA, comp=comp, p3=44)
+    abrir_pendientes()
+    assert n_fichas_final() == antes, "P3 abierto no debe materializar"
+
+
+@test("M4 P4 cargado pero AUN ABIERTO: sigue sin crear fichas")
+def _():
+    set_ano(periodo_activo=4, p4_cerrado=False)
+    antes = n_fichas_final()
+    for comp in (1, 2, 3):
+        calificar(H_PROF, E_2A, LENGUA, comp=comp, p4=46)
+    abrir_pendientes()
+    assert n_fichas_final() == antes, "cargar P4 no basta: hay que CERRARLO"
+
+
+@test("M5 con p4_cerrado=True se conserva la sincronizacion de siempre")
+def _():
+    assert n_fichas_final() == 0, "M1 dejo la tabla vacia"
+    set_ano(p4_cerrado=True)
+    try:
+        r = abrir_pendientes()
+        assert r.status_code == 200
+        assert n_fichas_final() > 0, "al cerrar P4 las fichas deben nacer"
+        mias = [p for p in r.json()["pendientes"]
+                if p["estudiante_id"] == E_2A and p["asignatura_id"] == LENGUA]
+        assert len(mias) == 1 and mias[0]["fase_pendiente"] == "final", mias
+    finally:
+        set_ano(p4_cerrado=False)
+
+
+@test("M6 profesor autor + asignacion activa + periodo cerrado -> retirar 403")
+def _():
+    r = crear(H_PROF, E_1A, LENGUA, periodo=2, aspectos="Para P2 cerrado")
+    rid = r.json()["id"]
+    set_periodo_cerrado(2, True)
+    try:
+        q = retirar(H_PROF, rid)
+        assert q.status_code == 403, (q.status_code, q.text[:250])
+        assert fila(rid).activo is True, "se retiro con el periodo cerrado"
+        e = editar(H_PROF, rid, periodo=2)
+        assert e.status_code == 403, (e.status_code, e.text[:250])
+    finally:
+        set_periodo_cerrado(2, False)
+
+
+@test("M7 mismo caso + permiso temporal valido + anio activo -> retirar permitido")
+def _():
+    r = crear(H_PROF, E_1A, LENGUA, periodo=2, aspectos="Con permiso")
+    rid = r.json()["id"]
+    set_periodo_cerrado(2, True)
+    d = SessionLocal()
+    try:
+        d.add(M.PermisoTemporalCalificacion(
+            colegio_id=COL_A, profesor_id=PROF, periodo=2, asignatura_id=LENGUA,
+            activo=True, fecha_fin=APP.now_rd() + timedelta(days=1), otorgado_por=DIR))
+        d.commit()
+    finally:
+        d.close()
+    try:
+        q = retirar(H_PROF, rid)
+        assert q.status_code == 200, (q.status_code, q.text[:250])
+        assert fila(rid).activo is False
+    finally:
+        set_periodo_cerrado(2, False)
+        d = SessionLocal()
+        try:
+            for x in d.query(M.PermisoTemporalCalificacion).all():
+                d.delete(x)
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("M8 anio historico/cerrado: el profesor no edita ni retira, ni con permiso")
+def _():
+    r = crear(H_PROF, E_1A, LENGUA, periodo=1, aspectos="Del anio viejo")
+    rid = r.json()["id"]
+    d = SessionLocal()
+    try:
+        d.add(M.PermisoTemporalCalificacion(
+            colegio_id=COL_A, profesor_id=PROF, periodo=None, asignatura_id=None,
+            activo=True, fecha_fin=APP.now_rd() + timedelta(days=1), otorgado_por=DIR))
+        d.commit()
+    finally:
+        d.close()
+    set_ano(cerrado=True)
+    try:
+        e = editar(H_PROF, rid)
+        assert e.status_code == 403, (e.status_code, e.text[:250])
+        assert "cerrado" in e.json()["error"].lower()
+        q = retirar(H_PROF, rid)
+        assert q.status_code == 403, (q.status_code, q.text[:250])
+        assert fila(rid).activo is True
+        # Anio no vigente: tampoco, aunque no este marcado cerrado.
+        set_ano(cerrado=False, activo=False)
+        assert editar(H_PROF, rid).status_code == 403
+        assert retirar(H_PROF, rid).status_code == 403
+    finally:
+        set_ano(cerrado=False, activo=True)
+        d = SessionLocal()
+        try:
+            for x in d.query(M.PermisoTemporalCalificacion).all():
+                d.delete(x)
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("M9 1ro con recuperacion final <65 NO dice 'especial pendiente'")
+def _():
+    set_ano(p4_cerrado=True)
+    try:
+        # Escenario propio: ficha de MUSICA en 1ro con la final ya cargada y
+        # todavia por debajo de 65 — el punto exacto donde 3ro-6to abriria la
+        # recuperacion especial.
+        abrir_pendientes()
+        q = client.post("/api/recuperaciones-primaria", headers=H_PROF, json={
+            "estudiante_id": E_1A, "asignatura_id": MUSICA, "tipo": "final", "puntos": 5})
+        assert q.status_code == 200, (q.status_code, q.text[:250])
+        r = abrir_pendientes()
+        mias = [p for p in (r.json()["pendientes"] + r.json()["resueltas"])
+                if p["estudiante_id"] == E_1A and p["asignatura_id"] == MUSICA]
+        assert len(mias) == 1, mias
+        it = mias[0]
+        assert it["recuperacion_final"] is not None and it["recuperacion_final"] < 65, it
+        assert it["fase_pendiente"] is None, it
+        assert it["admite_especial"] is False, it
+        assert it["condicion_final"] == "recuperacion_final_registrada", it
+        assert "especial_pendiente" not in str(it), it
+        for palabra in ("repite", "aplazado", "promovido"):
+            assert palabra not in str(it["condicion_final"]).lower(), it
+        # Ninguna fila de 1ro/2do puede llevar la etiqueta de especial.
+        for p in (r.json()["pendientes"] + r.json()["resueltas"]):
+            if p.get("admite_especial") is False:
+                assert p.get("condicion_final") != "especial_pendiente", p
+                assert p.get("fase_pendiente") != "especial", p
+    finally:
+        set_ano(p4_cerrado=False)
+
+
+@test("M10 3ro-6to conservan intacto el circuito de especial")
+def _():
+    set_ano(p4_cerrado=True)
+    try:
+        r = abrir_pendientes()
+        mias = [p for p in (r.json()["pendientes"] + r.json()["resueltas"])
+                if p["estudiante_id"] == E_4A and p["asignatura_id"] == MATE]
+        assert len(mias) == 1, mias
+        assert mias[0]["admite_especial"] is True, mias[0]
+        assert mias[0]["condicion_final"] != "recuperacion_final_registrada", mias[0]
+    finally:
+        set_ano(p4_cerrado=False)
 
 
 print(f"\n{B}{'=' * 62}{X}")
