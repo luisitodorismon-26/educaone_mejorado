@@ -12917,11 +12917,32 @@ async def get_recuperaciones_primaria_pendientes(
         .filter(Asignatura.id.in_({f.asignatura_id for f in fichas})).all()
     }
 
+    # P2A-R1: `fase_pendiente()` vive en el modelo y no conoce el grado, así
+    # que puede decir 'especial' en 1ro y 2do, donde esa fase no existe —el
+    # acta oficial de esos grados solo tiene «final del área» y «recuperación
+    # final», sin columna de recuperación especial—. El grado se conoce aquí,
+    # que es donde hay estudiante y curso, así que el recorte se hace aquí y no
+    # se toca RecuperacionPrimaria.
+    _cache_modalidad = {}
+
+    def _admite_especial(curso_de_est):
+        if not curso_de_est:
+            return True
+        if curso_de_est not in _cache_modalidad:
+            _mod, _ = _modalidad_recuperacion_primaria(db, curso_de_est, current_user)
+            _cache_modalidad[curso_de_est] = (_mod != 'cualitativa')
+        return _cache_modalidad[curso_de_est]
+
     pendientes, resueltas = [], []
     for f in fichas:
         est = ests.get(f.estudiante_id)
         if not est or (curso_id and str(est.curso_id) != str(curso_id)):
             continue
+        _fase = f.fase_pendiente()
+        if _fase == 'especial' and not _admite_especial(est.curso_id):
+            # La final ya se cargó y no alcanzó: en 1ro/2do ahí termina el
+            # proceso. No se ofrece una fase que el documento no contempla.
+            _fase = None
         item = {
             'estudiante_id': f.estudiante_id,
             'estudiante_nombre': est.nombre_completo,
@@ -12936,9 +12957,10 @@ async def get_recuperaciones_primaria_pendientes(
             'recuperacion_especial': f.recuperacion_especial,
             'nota_final': f.nota_final,
             'condicion_final': f.condicion_final,
-            'fase_pendiente': f.fase_pendiente(),
+            'fase_pendiente': _fase,
+            'admite_especial': _admite_especial(est.curso_id),
         }
-        (pendientes if f.fase_pendiente() else resueltas).append(item)
+        (pendientes if _fase else resueltas).append(item)
 
     pendientes.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
     resueltas.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
@@ -12980,6 +13002,20 @@ async def guardar_recuperacion_primaria(
             status_code=403)
     if tipo not in ('final', 'especial'):
         return JSONResponse({'error': "El tipo debe ser 'final' o 'especial'"}, status_code=400)
+
+    # P2A-R1: 1ro y 2do no tienen recuperación ESPECIAL. Su acta oficial trae
+    # «calificación final del área» y «recuperación final», y nada más. La
+    # recuperación FINAL sí existe en esos grados y se sigue aceptando.
+    if tipo == 'especial':
+        _mod_esp, _ctx_esp = _modalidad_recuperacion_primaria(
+            db, _est_rec.curso_id, current_user)
+        if _mod_esp == 'cualitativa':
+            return JSONResponse({
+                'error': ('En %s no existe la recuperación especial: el acta oficial de '
+                          'este grado solo contempla la recuperación final del área.'
+                          % (_ctx_esp.get('grado') or 'este grado')),
+                **_ctx_esp,
+            }, status_code=400)
 
     try:
         puntos_f = float(puntos)
