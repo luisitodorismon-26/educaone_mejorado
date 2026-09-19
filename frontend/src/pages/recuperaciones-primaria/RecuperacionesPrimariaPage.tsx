@@ -257,7 +257,7 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
           </h3>
           <p className="text-xs text-gray-500 mb-3">
             Escriba los puntos en la casilla azul — el resultado se calcula en vivo (valor con *) antes de guardar.
-            Si tras la recuperación final el área sigue por debajo de {minimo}, pasa a recuperación especial.
+            {hayEspecial && ` Si tras la recuperación final el área sigue por debajo de ${minimo}, pasa a recuperación especial.`}
           </p>
           <div className="overflow-x-auto">
             <table className="min-w-full border-collapse">

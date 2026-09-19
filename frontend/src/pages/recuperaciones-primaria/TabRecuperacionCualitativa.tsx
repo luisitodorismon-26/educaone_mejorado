@@ -6,7 +6,8 @@ import { useAuth } from '../../context/AuthContext';
 import {
   Intervencion, BorradorIntervencion, Modalidad,
   validarIntervencion, etiquetaResultado, etiquetaCompetencia,
-  historialPorEstudiante, puedeModificar, borradorVacio, textoModalidad,
+  historialPorEstudiante, puedeModificar, puedeRetirarAdministrativamente,
+  borradorVacio, textoModalidad,
 } from './recuperacionCualitativa';
 
 // ═══════════════════════════════════════════════════════════════
@@ -23,6 +24,8 @@ interface Asignatura { id: number; nombre: string }
 export const TabRecuperacionCualitativa: React.FC = () => {
   const { user } = useAuth();
   const esProfesor = user?.role === 'profesor';
+  // Secretaria lee pero no retira; psicologia ni siquiera entra aqui.
+  const puedeRetiroAdmin = puedeRetirarAdministrativamente(user?.role);
 
   const [cursos, setCursos] = useState<Curso[]>([]);
   const [asignaturas, setAsignaturas] = useState<Asignatura[]>([]);
@@ -104,8 +107,8 @@ export const TabRecuperacionCualitativa: React.FC = () => {
   };
 
   const retirar = async (i: Intervencion) => {
-    const motivo = esProfesor ? '' : (window.prompt('Motivo del retiro administrativo:') || '');
-    if (!esProfesor && !motivo.trim()) return;
+    const motivo = puedeRetiroAdmin ? (window.prompt('Motivo del retiro administrativo:') || '') : '';
+    if (puedeRetiroAdmin && !motivo.trim()) return;
     try {
       await api.post(`/recuperacion-primaria/cualitativa/${i.id}/retirar`, { motivo_retiro: motivo });
       await cargar();
@@ -277,7 +280,7 @@ export const TabRecuperacionCualitativa: React.FC = () => {
                               </button>
                             </span>
                           )}
-                          {!esProfesor && i.activo && (
+                          {puedeRetiroAdmin && i.activo && (
                             <button className="ml-2 text-red-600 hover:underline"
                                     onClick={() => retirar(i)}>Retirar</button>
                           )}

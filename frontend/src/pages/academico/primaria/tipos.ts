@@ -84,9 +84,9 @@ export const AYUDA_RP_PRIMARIA =
   'No escriba los puntos ganados; escriba la nota final resultante del período.';
 
 export const AVISO_RP_CUALITATIVA =
-  'En 1ro y 2do la recuperación pedagógica del período es cualitativa: se registra ' +
-  'en Recuperación Primaria (aspectos no logrados, estrategias y evidencias, ' +
-  'competencia lograda o no lograda), no como nota.';
+  'La recuperación pedagógica del período se registra de forma cualitativa desde ' +
+  'Recuperación Primaria: aspectos no logrados, estrategias y evidencias, y si la ' +
+  'competencia quedó lograda o no lograda. No lleva nota.';
 
 // Nombres oficiales de las competencias fundamentales (primaria)
 export const NOMBRES_COMPETENCIAS_PRIM: Record<number, string> = {

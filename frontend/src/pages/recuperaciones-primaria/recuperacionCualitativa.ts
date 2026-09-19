@@ -112,6 +112,18 @@ export const historialPorEstudiante = (
   return mapa;
 };
 
+/**
+ * Quien puede retirar ADMINISTRATIVAMENTE una intervención ajena.
+ *
+ * Solo Dirección y Coordinación. Secretaría tiene lectura en este módulo
+ * desde antes y no gana escritura aquí; Psicología no tiene ni lo uno ni lo
+ * otro. El backend ya devuelve 403, pero la pantalla tampoco debe ofrecer un
+ * botón que no va a funcionar.
+ */
+export const puedeRetirarAdministrativamente = (
+  rol: string | null | undefined
+): boolean => rol === 'direccion' || rol === 'coordinador';
+
 /** Un docente solo edita/retira lo que él registró. El resto lo ve. */
 export const puedeModificar = (
   i: Intervencion,

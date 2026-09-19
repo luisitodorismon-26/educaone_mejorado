@@ -193,7 +193,8 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
       </div>
 
       <p className="text-xs text-gray-500">
-        Valor de cada período = mayor entre P y RP. Final de competencia = promedio de los períodos evaluados. Aprueba con {MINIMO_APROBATORIO_PRIMARIA}.
+        {conRp ? AYUDA_RP_PRIMARIA : AVISO_RP_CUALITATIVA}{' '}
+        Final de competencia = promedio de los períodos evaluados. Aprueba con {MINIMO_APROBATORIO_PRIMARIA}.
       </p>
     </div>
   );
