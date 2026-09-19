@@ -54,7 +54,8 @@ from models import (
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
     HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
     ItemCompletivo, Notificacion,
-    AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
+    AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria,
+    RecuperacionPedagogicaPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
     AlertaAtendida, PushSubscription, CursoComponenteOptativo,
     SesionNoImpartida, MOTIVOS_SESION_NO_IMPARTIDA, init_db
 )
@@ -879,6 +880,27 @@ async def lifespan(app):
                     # arranque. Si falla, las asignaturas siguen configurables
                     # a mano desde Configuración.
                     logger.warning(f"No se pudo ejecutar el autovínculo curricular: {e}")
+
+        # === 6i. Recuperación pedagógica cualitativa de 1ro/2do (P2A-R1) ===
+        # Tabla NUEVA y VACÍA. No altera ninguna tabla existente, no hace
+        # backfill y no inserta ni una fila: un colegio que no use 1ro/2do no
+        # nota la diferencia. `Base.metadata.create_all` ya la crearía en una
+        # base nueva, pero se hace explícito para que la migración quede a la
+        # vista junto a las demás.
+        #
+        # Rollback (Postgres):
+        #   DROP TABLE recuperaciones_pedagogicas_primaria;
+        if 'recuperaciones_pedagogicas_primaria' not in inspector.get_table_names():
+            try:
+                RecuperacionPedagogicaPrimaria.__table__.create(bind=engine)
+                logger.info(
+                    "✅ Migración P2A-R1: tabla recuperaciones_pedagogicas_primaria "
+                    "creada (vacía, sin backfill)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"No se pudo crear recuperaciones_pedagogicas_primaria: {e}")
+                raise
 
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
