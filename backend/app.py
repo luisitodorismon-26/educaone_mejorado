@@ -12840,8 +12840,31 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
 # ═════════════════════════════════════════════════════════════════
 
 def _sincronizar_recuperaciones_primaria(db, current_user, ano):
-    """Crea/actualiza las fichas de recuperación de las áreas con CF < 65."""
+    """Crea/actualiza las fichas de recuperación de las áreas con CF < 65.
+
+    P2A-R1: no materializa NADA mientras P4 siga abierto.
+
+    La recuperación FINAL es del área y ocurre, según la norma, «al final del
+    año». Pero esta sincronización se dispara con solo abrir la pantalla, y
+    calculaba la CF con los períodos que hubiera: con P1 cargado y P2-P4 sin
+    evaluar ya creaba una ficha —y nada la borra después, aunque el año
+    termine aprobado—.
+
+    Eso venía de antes, pero P2A-R1 lo vuelve alcanzable todos los días: el
+    profesor de 1ro/2do ahora tiene que entrar a esta misma pantalla durante
+    los períodos para registrar la recuperación cualitativa. Así que se pone
+    el candado mínimo correcto —la recuperación final no nace antes de cerrar
+    P4— sin deshacer nada de lo que ya funciona.
+
+    NO sustituye la corrección de calcular_final(), cf_area() y NE, que exigen
+    además las tres competencias completas. Eso es P2A-R2.
+    """
     from calculo_primaria import cf_area as calc_cf_area, MINIMO_APROBATORIO_PRIMARIA
+
+    if not getattr(ano, 'p4_cerrado', False):
+        # Las fichas que ya existan se siguen leyendo y editando: aquí solo se
+        # deja de CREARLAS y de recalcularlas antes de tiempo.
+        return
 
     califs = tenant_filter(
         db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
@@ -12939,10 +12962,20 @@ async def get_recuperaciones_primaria_pendientes(
         if not est or (curso_id and str(est.curso_id) != str(curso_id)):
             continue
         _fase = f.fase_pendiente()
-        if _fase == 'especial' and not _admite_especial(est.curso_id):
-            # La final ya se cargó y no alcanzó: en 1ro/2do ahí termina el
-            # proceso. No se ofrece una fase que el documento no contempla.
-            _fase = None
+        _con_especial = _admite_especial(est.curso_id)
+        _condicion = f.condicion_final
+        if not _con_especial:
+            if _fase == 'especial':
+                # La final ya se cargó y no alcanzó: en 1ro/2do ahí termina el
+                # proceso. No se ofrece una fase que el documento no contempla.
+                _fase = None
+            if _condicion == 'especial_pendiente':
+                # `recalcular()` no conoce el grado y deja esa etiqueta igual.
+                # No se reescribe el modelo: se presenta el HECHO —la
+                # recuperación final quedó registrada— sin prometer una fase
+                # que no existe ni adelantar promovido/aplazado/repite, que se
+                # decide en la fase de promoción.
+                _condicion = 'recuperacion_final_registrada'
         item = {
             'estudiante_id': f.estudiante_id,
             'estudiante_nombre': est.nombre_completo,
@@ -12956,9 +12989,9 @@ async def get_recuperaciones_primaria_pendientes(
             'puntos_especial': f.puntos_especial,
             'recuperacion_especial': f.recuperacion_especial,
             'nota_final': f.nota_final,
-            'condicion_final': f.condicion_final,
+            'condicion_final': _condicion,
             'fase_pendiente': _fase,
-            'admite_especial': _admite_especial(est.curso_id),
+            'admite_especial': _con_especial,
         }
         (pendientes if _fase else resueltas).append(item)
 
@@ -13394,8 +13427,23 @@ async def crear_recuperacion_cualitativa(
             'intervencion': fila.to_dict()}
 
 
-def _intervencion_editable(db, id, current_user):
-    """Devuelve (fila, error_response). Comprueba autoría Y asignación vigente."""
+def _intervencion_editable(db, id, current_user, periodos_extra=()):
+    """Devuelve (fila, error_response) para que un PROFESOR la toque.
+
+    Seis condiciones, y las seis valen igual para editar y para retirar —
+    retirar es tan definitivo como editar, así que no puede pedir menos—:
+
+      1. la fila es de su tenant;
+      2. es su autor;
+      3. conserva la asignación exacta activa;
+      4. el año escolar de la fila existe;
+      5. ese año es el ACTIVO y no está cerrado —un año histórico no se
+         reescribe, y el permiso temporal no sirve para eso—;
+      6. el período está abierto, salvo permiso temporal aplicable.
+
+    `periodos_extra` son los períodos adicionales a comprobar: al editar hay
+    que mirar también el período al que se quiere mover la intervención.
+    """
     fila = tenant_filter(
         db.query(RecuperacionPedagogicaPrimaria), RecuperacionPedagogicaPrimaria, current_user
     ).filter_by(id=id).first()
@@ -13410,6 +13458,25 @@ def _intervencion_editable(db, id, current_user):
             {'error': ('Ya no tiene asignación activa en este curso/asignatura, '
                        'así que no puede modificar esta intervención.')},
             status_code=403)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(
+        id=fila.ano_escolar_id).first()
+    if ano is None:
+        return None, JSONResponse(
+            {'error': 'El año escolar de esta intervención no existe.'}, status_code=404)
+    if not ano.activo or ano.cerrado:
+        # Historia: se consulta, no se reescribe. Ni con permiso temporal.
+        return None, JSONResponse({
+            'error': ('Esta intervención pertenece a un año escolar cerrado o no vigente '
+                      '(%s). Se puede consultar, pero no modificar.' % ano.nombre),
+        }, status_code=403)
+
+    for p in sorted({fila.periodo} | {x for x in periodos_extra if x}):
+        if _periodo_cerrado_para_docente(db, current_user, ano, p, fila.asignatura_id):
+            return None, JSONResponse({
+                'error': (f'El período P{p} está cerrado. Solicite una corrección a '
+                          f'Dirección si necesita modificarlo.')}, status_code=403)
+
     return fila, None
 
 
@@ -13420,22 +13487,19 @@ async def editar_recuperacion_cualitativa(
     current_user: Usuario = Depends(RolesRequired('profesor'))
 ):
     """Corrige una intervención propia. No cambia su autor ni su fecha."""
-    fila, err = _intervencion_editable(db, id, current_user)
-    if err is not None:
-        return err
-    if not fila.activo:
-        return JSONResponse({'error': 'Esta intervención está retirada.'}, status_code=400)
-
     data = await request.json()
     limpio, err_val = _validar_cuerpo_cualitativa(data)
     if err_val:
         return JSONResponse({'error': err_val}, status_code=400)
 
-    ano = db.get(AnoEscolar, fila.ano_escolar_id)
-    for p in {fila.periodo, limpio['periodo']}:
-        if _periodo_cerrado_para_docente(db, current_user, ano, p, fila.asignatura_id):
-            return JSONResponse(
-                {'error': f'El período P{p} está cerrado.'}, status_code=403)
+    # El periodo DESTINO tambien tiene que estar abierto: mover una
+    # intervencion a un periodo cerrado seria escribir en el periodo cerrado.
+    fila, err = _intervencion_editable(db, id, current_user,
+                                       periodos_extra=(limpio['periodo'],))
+    if err is not None:
+        return err
+    if not fila.activo:
+        return JSONResponse({'error': 'Esta intervención está retirada.'}, status_code=400)
 
     antes = fila.to_dict()
     for campo, valor in limpio.items():
