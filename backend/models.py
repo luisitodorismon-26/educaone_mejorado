@@ -1059,6 +1059,103 @@ class RecuperacionPrimaria(Base):
             self.condicion_final = 'especial_pendiente'
 
 
+class RecuperacionPedagogicaPrimaria(Base):
+    """Recuperación pedagógica DEL PERÍODO, cualitativa — 1ro y 2do de Primaria.
+
+    POR QUÉ EXISTE
+        El Registro oficial del Nivel Primario trae, solo en 1ro y 2do, un
+        formulario de recuperación pedagógica con estas cuatro columnas:
+
+            Área: ____
+            | Nombre(s) y apellido(s)
+            | Aspecto(s) de la(s) competencia(s) no logrado y período en que
+              se trabajó
+            | Estrategias utilizadas y evidencias de aprendizaje
+            | Competencia: Lograda / No lograda
+
+        y la norma dice, para esos dos grados, que «la recuperación pedagógica
+        del período se registra de manera CUALITATIVA». En 3ro-6to se registra
+        de manera cuantitativa y para eso ya están las columnas rpN de
+        CalificacionPrimaria: ahí esta tabla no se usa.
+
+    LO QUE NO ES
+        - No es la Recuperación FINAL del área. Esa es `RecuperacionPrimaria`,
+          es cuantitativa y existe también en 1ro y 2do. Son dos procesos
+          distintos y viven en dos tablas distintas.
+        - No es NE. «no_lograda» significa evaluado y no alcanzado; NE
+          significa no evaluado por una causa justificada. Nada de aquí crea
+          ni implica un NE.
+        - No produce ninguna nota. Guardar «lograda» no toca pN, no toca
+          final_competencia y no toca la CF del área.
+
+    POR QUÉ NO HAY UNIQUE
+        El formulario ocupa trece hojas del registro, la norma describe la
+        recuperación como un proceso continuo «de tres formas», y la columna
+        habla de «competencia(s)» en plural. Una unicidad por
+        (estudiante, asignatura, competencia, período) contradiría el propio
+        documento: varias intervenciones sobre el mismo período son normales y
+        cada una es una fila. El historial es la secuencia, no la última.
+    """
+    __tablename__ = 'recuperaciones_pedagogicas_primaria'
+    __table_args__ = (
+        Index('ix_recped_prim_curso', 'colegio_id', 'ano_escolar_id',
+              'curso_id', 'asignatura_id', 'periodo'),
+        Index('ix_recped_prim_estudiante', 'estudiante_id', 'ano_escolar_id'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'), nullable=False, index=True)
+    # curso_id es un SNAPSHOT, no se deriva del estudiante al leer: si mañana
+    # cambia de curso, la intervención tiene que seguir contando dónde pasó.
+    curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False, index=True)
+    asignatura_id = Column(Integer, ForeignKey('asignaturas.id'), nullable=False, index=True)
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=False, index=True)
+
+    # NULL = la intervención cubre varias competencias o es del área entera,
+    # que es como está redactado el formulario oficial.
+    competencia_numero = Column(Integer, nullable=True)
+    periodo = Column(Integer, nullable=False)
+
+    aspectos_no_logrados = Column(Text, nullable=False)
+    estrategias_evidencias = Column(Text)
+    resultado = Column(String(12), nullable=False)      # 'lograda' | 'no_lograda'
+    observacion = Column(Text)
+
+    registrado_por = Column(Integer, ForeignKey('usuarios.id'), nullable=False)
+    fecha_registro = Column(DateTime, default=_now_dr, nullable=False)
+
+    # Retiro lógico. Una intervención pedagógica registrada no se borra: se
+    # retira, y queda quién la escribió, quién la retiró y por qué.
+    activo = Column(Boolean, default=True, nullable=False, index=True)
+    retirado_por = Column(Integer, ForeignKey('usuarios.id'))
+    fecha_retiro = Column(DateTime)
+    motivo_retiro = Column(String(255))
+
+    RESULTADOS = ('lograda', 'no_lograda')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'estudiante_id': self.estudiante_id,
+            'curso_id': self.curso_id,
+            'asignatura_id': self.asignatura_id,
+            'ano_escolar_id': self.ano_escolar_id,
+            'competencia_numero': self.competencia_numero,
+            'periodo': self.periodo,
+            'aspectos_no_logrados': self.aspectos_no_logrados,
+            'estrategias_evidencias': self.estrategias_evidencias,
+            'resultado': self.resultado,
+            'observacion': self.observacion,
+            'registrado_por': self.registrado_por,
+            'fecha_registro': self.fecha_registro.isoformat() if self.fecha_registro else None,
+            'activo': self.activo,
+            'retirado_por': self.retirado_por,
+            'fecha_retiro': self.fecha_retiro.isoformat() if self.fecha_retiro else None,
+            'motivo_retiro': self.motivo_retiro,
+        }
+
+
 class CalificacionSecundaria(Base):
     """Calificaciones secundaria v2.12 con estructura oficial MINERD por competencia."""
     __tablename__ = 'calificaciones_secundaria'

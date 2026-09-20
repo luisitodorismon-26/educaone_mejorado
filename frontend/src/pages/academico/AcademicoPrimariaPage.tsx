@@ -3,7 +3,7 @@ import api from '../../services/api';
 import { BookOpen, Backpack, Download } from 'lucide-react';
 import { Button, Spinner, Alert } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
-import { EstudiantePrimData, Curso, Asignatura } from './primaria/tipos';
+import { EstudiantePrimData, Curso, Asignatura, ModalidadRecuperacion } from './primaria/tipos';
 import { TabNotasPorCompetencia } from './primaria/TabNotasPorCompetencia';
 import { TabNotasPorPeriodo } from './primaria/TabNotasPorPeriodo';
 
@@ -26,6 +26,8 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
 
   const [estudiantes, setEstudiantes] = useState<EstudiantePrimData[]>([]);
   const [numCompetencias, setNumCompetencias] = useState(3);
+  // Modalidad de recuperacion del periodo: la resuelve el servidor por grado.
+  const [modalidadRecuperacion, setModalidadRecuperacion] = useState<ModalidadRecuperacion | null>(null);
   const [loading, setLoading] = useState(false);
   const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('competencia');
   const [descargando, setDescargando] = useState(false);
@@ -71,6 +73,7 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
       const res = await api.get(`/calificaciones-primaria/curso/${cursoId}/asignatura/${asignaturaId}`);
       setEstudiantes(res.data.calificaciones || []);
       setNumCompetencias(res.data.num_competencias || 3);
+      setModalidadRecuperacion(res.data.modalidad_recuperacion ?? null);
     } catch (err: any) {
       console.error('Error cargando calificaciones de primaria', err);
     } finally {
@@ -158,6 +161,7 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
           estudiantes={estudiantes}
           asignaturaId={asignaturaId}
           numCompetencias={numCompetencias}
+          modalidadRecuperacion={modalidadRecuperacion}
           puedeEditar={puedeEditar}
           onReload={cargar}
         />
@@ -166,6 +170,7 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
           estudiantes={estudiantes}
           asignaturaId={asignaturaId}
           numCompetencias={numCompetencias}
+          modalidadRecuperacion={modalidadRecuperacion}
           puedeEditar={puedeEditar}
           onReload={cargar}
         />

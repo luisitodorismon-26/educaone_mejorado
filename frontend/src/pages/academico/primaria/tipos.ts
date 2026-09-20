@@ -66,6 +66,28 @@ export function rpHabilitado(pValor: number | null): boolean {
   return pValor != null && pValor < UMBRAL_RP_PRIMARIA;
 }
 
+// P2A-R1: en 1ro y 2do la recuperación pedagógica del período es CUALITATIVA,
+// así que la columna RP no existe para esos grados — ni en la pantalla ni en
+// el Informe de Aprendizaje ni en el Registro. La modalidad llega resuelta
+// desde el servidor; aquí no se deduce del nombre del grado.
+export type ModalidadRecuperacion = 'cualitativa' | 'cuantitativa';
+
+export function admiteRpNumerica(modalidad: ModalidadRecuperacion | null | undefined): boolean {
+  return modalidad !== 'cualitativa';
+}
+
+// Qué se escribe en RP. El texto anterior —«se toma el mayor de los dos»—
+// invitaba a escribir los puntos ganados; la norma dice que la columna
+// guarda la calificación FINAL del período después de la recuperación.
+export const AYUDA_RP_PRIMARIA =
+  'RP = calificación final del período después de la recuperación pedagógica. ' +
+  'No escriba los puntos ganados; escriba la nota final resultante del período.';
+
+export const AVISO_RP_CUALITATIVA =
+  'La recuperación pedagógica del período se registra de forma cualitativa desde ' +
+  'Recuperación Primaria: aspectos no logrados, estrategias y evidencias, y si la ' +
+  'competencia quedó lograda o no lograda. No lleva nota.';
+
 // Nombres oficiales de las competencias fundamentales (primaria)
 export const NOMBRES_COMPETENCIAS_PRIM: Record<number, string> = {
   1: 'Comunicativa',

@@ -3,6 +3,7 @@ import api from '../../services/api';
 import { AlertTriangle, Save, CheckCircle, RefreshCw, Backpack } from 'lucide-react';
 import { Button, Alert, Spinner } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
+import { TabRecuperacionCualitativa } from './TabRecuperacionCualitativa';
 
 // ═══════════════════════════════════════════════════════════════
 // RECUPERACIONES DE PRIMARIA — v2.13.50
@@ -26,6 +27,8 @@ interface Recuperacion {
   nota_final: number | null;
   condicion_final: string | null;
   fase_pendiente: 'final' | 'especial' | null;
+  // 1ro y 2do no tienen recuperacion especial: su acta oficial no la trae.
+  admite_especial?: boolean;
 }
 
 export const RecuperacionesPrimariaPage: React.FC = () => {
@@ -89,6 +92,10 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
 
   const fmt = (v: number | null | undefined) => (v == null ? '—' : Math.round(v).toString());
 
+  // Si ningun area listada admite recuperacion especial (curso de 1ro/2do),
+  // las columnas no se dibujan: no existen en el documento de ese grado.
+  const hayEspecial = [...pendientes, ...resueltas].some(r => r.admite_especial !== false);
+
   const Encabezado = ({ conAccion }: { conAccion: boolean }) => (
     <thead>
       <tr className="text-xs">
@@ -97,15 +104,15 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
         <th rowSpan={2} className="px-2 py-1 text-left bg-gray-50 border">Área</th>
         <th rowSpan={2} className="px-2 py-1 text-center bg-gray-100 border font-bold">C.F.<br />del área</th>
         <th colSpan={2} className="px-2 py-1 text-center bg-amber-50 text-amber-800 border font-bold">RECUPERACIÓN FINAL</th>
-        <th colSpan={2} className="px-2 py-1 text-center bg-red-50 text-red-800 border font-bold">RECUPERACIÓN ESPECIAL</th>
+        {hayEspecial && <th colSpan={2} className="px-2 py-1 text-center bg-red-50 text-red-800 border font-bold">RECUPERACIÓN ESPECIAL</th>}
         <th rowSpan={2} className="px-2 py-1 text-center bg-gray-50 border">Situación</th>
         {conAccion && <th rowSpan={2} className="px-2 py-1 text-center bg-gray-50 border">Cargar</th>}
       </tr>
       <tr className="text-[11px] text-gray-600">
         <th className="px-1 py-1 text-center bg-amber-50 border">Puntos</th>
         <th className="px-1 py-1 text-center bg-amber-100 border font-bold">Resultado</th>
-        <th className="px-1 py-1 text-center bg-red-50 border">Puntos</th>
-        <th className="px-1 py-1 text-center bg-red-100 border font-bold">Resultado</th>
+        {hayEspecial && <th className="px-1 py-1 text-center bg-red-50 border">Puntos</th>}
+        {hayEspecial && <th className="px-1 py-1 text-center bg-red-100 border font-bold">Resultado</th>}
       </tr>
     </thead>
   );
@@ -162,7 +169,7 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
         </td>
         <td className="px-1 py-1 border text-center bg-amber-100/50">{celdaResultado('final', r.recuperacion_final)}</td>
         {/* Recuperación especial */}
-        <td className="px-1 py-1 border text-center bg-red-50/40">
+        {hayEspecial && <td className="px-1 py-1 border text-center bg-red-50/40">
           {editable && r.fase_pendiente === 'especial' ? (
             <input
               type="number" min={0} max={r.maximo_puntos ?? 100}
@@ -173,8 +180,8 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
               className="w-20 px-1 py-1 text-center border-2 border-blue-400 rounded text-sm bg-blue-50 font-bold"
             />
           ) : fmt(r.puntos_especial)}
-        </td>
-        <td className="px-1 py-1 border text-center bg-red-100/50">{celdaResultado('especial', r.recuperacion_especial)}</td>
+        </td>}
+        {hayEspecial && <td className="px-1 py-1 border text-center bg-red-100/50">{celdaResultado('especial', r.recuperacion_especial)}</td>}
         <td className="px-2 py-1 border text-center">{situacion()}</td>
         {editable && (
           <td className="px-2 py-1 border text-center">
@@ -218,6 +225,20 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
 
       {mensaje && <Alert variant={mensaje.tipo} onClose={() => setMensaje(null)}>{mensaje.texto}</Alert>}
 
+      {/* Recuperación pedagógica DEL PERÍODO. Un solo módulo: la modalidad la
+          decide el servidor a partir del curso, no un selector del docente.
+          Lo de abajo sigue siendo la recuperación FINAL del área, que es
+          cuantitativa en los seis grados y no cambia. */}
+      <TabRecuperacionCualitativa />
+
+      <div className="pt-2">
+        <h2 className="text-lg font-bold text-gray-800">Recuperación final del área</h2>
+        <p className="text-xs text-gray-500">
+          Proceso distinto del anterior: ocurre al final del año, sobre la calificación
+          final del área, y es cuantitativa en todos los grados.
+        </p>
+      </div>
+
       {pendientes.length === 0 && resueltas.length === 0 && (
         <div className="bg-white rounded-xl shadow-sm border p-10 text-center">
           <CheckCircle size={48} className="mx-auto text-green-300 mb-3" />
@@ -236,7 +257,7 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
           </h3>
           <p className="text-xs text-gray-500 mb-3">
             Escriba los puntos en la casilla azul — el resultado se calcula en vivo (valor con *) antes de guardar.
-            Si tras la recuperación final el área sigue por debajo de {minimo}, pasa a recuperación especial.
+            {hayEspecial && ` Si tras la recuperación final el área sigue por debajo de ${minimo}, pasa a recuperación especial.`}
           </p>
           <div className="overflow-x-auto">
             <table className="min-w-full border-collapse">

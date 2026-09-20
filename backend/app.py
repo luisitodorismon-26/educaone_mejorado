@@ -54,7 +54,8 @@ from models import (
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
     HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
     ItemCompletivo, Notificacion,
-    AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
+    AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria,
+    RecuperacionPedagogicaPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
     AlertaAtendida, PushSubscription, CursoComponenteOptativo,
     SesionNoImpartida, MOTIVOS_SESION_NO_IMPARTIDA, init_db
 )
@@ -879,6 +880,27 @@ async def lifespan(app):
                     # arranque. Si falla, las asignaturas siguen configurables
                     # a mano desde Configuración.
                     logger.warning(f"No se pudo ejecutar el autovínculo curricular: {e}")
+
+        # === 6i. Recuperación pedagógica cualitativa de 1ro/2do (P2A-R1) ===
+        # Tabla NUEVA y VACÍA. No altera ninguna tabla existente, no hace
+        # backfill y no inserta ni una fila: un colegio que no use 1ro/2do no
+        # nota la diferencia. `Base.metadata.create_all` ya la crearía en una
+        # base nueva, pero se hace explícito para que la migración quede a la
+        # vista junto a las demás.
+        #
+        # Rollback (Postgres):
+        #   DROP TABLE recuperaciones_pedagogicas_primaria;
+        if 'recuperaciones_pedagogicas_primaria' not in inspector.get_table_names():
+            try:
+                RecuperacionPedagogicaPrimaria.__table__.create(bind=engine)
+                logger.info(
+                    "✅ Migración P2A-R1: tabla recuperaciones_pedagogicas_primaria "
+                    "creada (vacía, sin backfill)"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"No se pudo crear recuperaciones_pedagogicas_primaria: {e}")
+                raise
 
         # === 7. Crear índices compuestos faltantes (idempotente, IF NOT EXISTS) ===
         # Compatible con SQLite (3.8.0+) y Postgres (9.5+).
@@ -6806,6 +6828,12 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
                 'competencias': competencias_data
             })
         
+        # P2A-R1: la pantalla necesita saber si este grado admite RP numérica.
+        # Se manda resuelto desde el servidor para que el frontend no lo deduzca
+        # del nombre del grado por su cuenta. Campo aditivo: quien no lo lea
+        # sigue viendo exactamente la misma respuesta de antes.
+        _modalidad_rec, _ = _modalidad_recuperacion_primaria(db, curso_id, current_user)
+
         return {
             'calificaciones': resultado,
             'num_competencias': num_competencias,
@@ -6814,6 +6842,7 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
             'ciclo': grado.ciclo,
             'ano_escolar': ano.nombre,
             'periodo_activo': ano.periodo_activo,
+            'modalidad_recuperacion': _modalidad_rec,
         }
     except Exception as e:
         import traceback
@@ -6911,7 +6940,31 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
 
     if estudiante_obj.curso_id:
         assert_nivel_curso_activo(db, current_user, estudiante_obj.curso_id)
-    
+
+    # P2A-R1: en 1ro y 2do la recuperación pedagógica del PERÍODO es cualitativa
+    # («lograda / no lograda»), así que una rpN numérica no tiene dónde
+    # imprimirse: ni el Informe de Aprendizaje ni el Registro de esos grados
+    # traen columnas RP. Aceptarla cambiaría la calificación del período sin
+    # aparecer en ningún documento oficial.
+    #
+    # Se RECHAZA en vez de ignorarse: callarlo haría creer al docente que su
+    # recuperación quedó registrada. Mandar null o cadena vacía sí se permite,
+    # porque eso LIMPIA, no escribe.
+    _modalidad_rp, _ctx_rp = _modalidad_recuperacion_primaria(
+        db, estudiante_obj.curso_id, current_user)
+    if _modalidad_rp == 'cualitativa':
+        _rps = [c for c in ('rp1', 'rp2', 'rp3', 'rp4')
+                if c in data and data[c] is not None and data[c] != '']
+        if _rps:
+            return JSONResponse({
+                'error': ('En %s la recuperación pedagógica del período es CUALITATIVA: '
+                          'se registra en Recuperación Primaria (aspectos no logrados, '
+                          'estrategias y evidencias, competencia lograda o no lograda), '
+                          'no como nota.' % (_ctx_rp.get('grado') or 'este grado')),
+                'campos_rechazados': _rps,
+                **_ctx_rp,
+            }, status_code=400)
+
     # Año escolar activo
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
@@ -12787,8 +12840,31 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
 # ═════════════════════════════════════════════════════════════════
 
 def _sincronizar_recuperaciones_primaria(db, current_user, ano):
-    """Crea/actualiza las fichas de recuperación de las áreas con CF < 65."""
+    """Crea/actualiza las fichas de recuperación de las áreas con CF < 65.
+
+    P2A-R1: no materializa NADA mientras P4 siga abierto.
+
+    La recuperación FINAL es del área y ocurre, según la norma, «al final del
+    año». Pero esta sincronización se dispara con solo abrir la pantalla, y
+    calculaba la CF con los períodos que hubiera: con P1 cargado y P2-P4 sin
+    evaluar ya creaba una ficha —y nada la borra después, aunque el año
+    termine aprobado—.
+
+    Eso venía de antes, pero P2A-R1 lo vuelve alcanzable todos los días: el
+    profesor de 1ro/2do ahora tiene que entrar a esta misma pantalla durante
+    los períodos para registrar la recuperación cualitativa. Así que se pone
+    el candado mínimo correcto —la recuperación final no nace antes de cerrar
+    P4— sin deshacer nada de lo que ya funciona.
+
+    NO sustituye la corrección de calcular_final(), cf_area() y NE, que exigen
+    además las tres competencias completas. Eso es P2A-R2.
+    """
     from calculo_primaria import cf_area as calc_cf_area, MINIMO_APROBATORIO_PRIMARIA
+
+    if not getattr(ano, 'p4_cerrado', False):
+        # Las fichas que ya existan se siguen leyendo y editando: aquí solo se
+        # deja de CREARLAS y de recalcularlas antes de tiempo.
+        return
 
     califs = tenant_filter(
         db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
@@ -12864,11 +12940,42 @@ async def get_recuperaciones_primaria_pendientes(
         .filter(Asignatura.id.in_({f.asignatura_id for f in fichas})).all()
     }
 
+    # P2A-R1: `fase_pendiente()` vive en el modelo y no conoce el grado, así
+    # que puede decir 'especial' en 1ro y 2do, donde esa fase no existe —el
+    # acta oficial de esos grados solo tiene «final del área» y «recuperación
+    # final», sin columna de recuperación especial—. El grado se conoce aquí,
+    # que es donde hay estudiante y curso, así que el recorte se hace aquí y no
+    # se toca RecuperacionPrimaria.
+    _cache_modalidad = {}
+
+    def _admite_especial(curso_de_est):
+        if not curso_de_est:
+            return True
+        if curso_de_est not in _cache_modalidad:
+            _mod, _ = _modalidad_recuperacion_primaria(db, curso_de_est, current_user)
+            _cache_modalidad[curso_de_est] = (_mod != 'cualitativa')
+        return _cache_modalidad[curso_de_est]
+
     pendientes, resueltas = [], []
     for f in fichas:
         est = ests.get(f.estudiante_id)
         if not est or (curso_id and str(est.curso_id) != str(curso_id)):
             continue
+        _fase = f.fase_pendiente()
+        _con_especial = _admite_especial(est.curso_id)
+        _condicion = f.condicion_final
+        if not _con_especial:
+            if _fase == 'especial':
+                # La final ya se cargó y no alcanzó: en 1ro/2do ahí termina el
+                # proceso. No se ofrece una fase que el documento no contempla.
+                _fase = None
+            if _condicion == 'especial_pendiente':
+                # `recalcular()` no conoce el grado y deja esa etiqueta igual.
+                # No se reescribe el modelo: se presenta el HECHO —la
+                # recuperación final quedó registrada— sin prometer una fase
+                # que no existe ni adelantar promovido/aplazado/repite, que se
+                # decide en la fase de promoción.
+                _condicion = 'recuperacion_final_registrada'
         item = {
             'estudiante_id': f.estudiante_id,
             'estudiante_nombre': est.nombre_completo,
@@ -12882,10 +12989,11 @@ async def get_recuperaciones_primaria_pendientes(
             'puntos_especial': f.puntos_especial,
             'recuperacion_especial': f.recuperacion_especial,
             'nota_final': f.nota_final,
-            'condicion_final': f.condicion_final,
-            'fase_pendiente': f.fase_pendiente(),
+            'condicion_final': _condicion,
+            'fase_pendiente': _fase,
+            'admite_especial': _con_especial,
         }
-        (pendientes if f.fase_pendiente() else resueltas).append(item)
+        (pendientes if _fase else resueltas).append(item)
 
     pendientes.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
     resueltas.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
@@ -12927,6 +13035,20 @@ async def guardar_recuperacion_primaria(
             status_code=403)
     if tipo not in ('final', 'especial'):
         return JSONResponse({'error': "El tipo debe ser 'final' o 'especial'"}, status_code=400)
+
+    # P2A-R1: 1ro y 2do no tienen recuperación ESPECIAL. Su acta oficial trae
+    # «calificación final del área» y «recuperación final», y nada más. La
+    # recuperación FINAL sí existe en esos grados y se sigue aceptando.
+    if tipo == 'especial':
+        _mod_esp, _ctx_esp = _modalidad_recuperacion_primaria(
+            db, _est_rec.curso_id, current_user)
+        if _mod_esp == 'cualitativa':
+            return JSONResponse({
+                'error': ('En %s no existe la recuperación especial: el acta oficial de '
+                          'este grado solo contempla la recuperación final del área.'
+                          % (_ctx_esp.get('grado') or 'este grado')),
+                **_ctx_esp,
+            }, status_code=400)
 
     try:
         puntos_f = float(puntos)
@@ -12979,6 +13101,527 @@ async def guardar_recuperacion_primaria(
         'condicion_final': ficha.condicion_final,
         'aprobado': (ficha.nota_final or 0) >= 65,
     }
+
+
+# ═════════════════════════════════════════════════════════════════
+# RECUPERACIÓN PEDAGÓGICA DEL PERÍODO — MODALIDAD SEGÚN EL GRADO (P2A-R1)
+#
+# La norma del Nivel Primario separa dos cosas que aquí estaban mezcladas:
+#   - 1ro y 2do: la recuperación pedagógica DEL PERÍODO es CUALITATIVA.
+#   - 3ro a 6to: es CUANTITATIVA, y se carga en las columnas rpN.
+# La recuperación FINAL del área es cuantitativa en los seis grados y no se
+# toca aquí: vive en RecuperacionPrimaria.
+# ═════════════════════════════════════════════════════════════════
+
+GRADOS_RECUPERACION_CUALITATIVA = (1, 2)
+RESULTADOS_RECUPERACION_CUALITATIVA = ('lograda', 'no_lograda')
+
+
+def _numero_grado_estricto(grado):
+    """Número del grado (1..6) leído de su nombre, o None si no se puede.
+
+    A propósito NO se usa `registro_validator._extraer_grado_numero`: aquella
+    devuelve 1 cuando no encuentra un número, y aquí ese default sería
+    peligroso —un grado con el nombre raro pasaría por 1ro y se le ofrecería
+    la recuperación cualitativa—. Si no se puede determinar, no se adivina.
+    """
+    import re as _re
+    if grado is None:
+        return None
+    m = _re.search(r'(\d+)', grado.nombre or '')
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= 6 else None
+
+
+def _modalidad_recuperacion_primaria(db, curso_id, current_user):
+    """('cualitativa'|'cuantitativa'|None, contexto).
+
+    La modalidad sale SIEMPRE de Curso → Grado. Nunca de lo que mande el
+    cliente y nunca de `nivel_asignado` del profesor: un docente puede dar
+    clases en 1ro y en 5to el mismo día, y la respuesta tiene que depender del
+    curso que está mirando, no de él.
+    """
+    curso = tenant_filter(db.query(Curso), Curso, current_user).filter_by(id=curso_id).first()
+    if curso is None:
+        return None, {'error': 'curso_no_encontrado'}
+    if not _es_curso_primaria(db, curso.id):
+        return None, {'error': 'no_es_primaria', 'curso_id': curso.id}
+    grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
+    numero = _numero_grado_estricto(grado)
+    if numero is None:
+        return None, {'error': 'grado_indeterminado', 'curso_id': curso.id,
+                      'grado': grado.nombre if grado else None}
+    modalidad = ('cualitativa' if numero in GRADOS_RECUPERACION_CUALITATIVA
+                 else 'cuantitativa')
+    return modalidad, {
+        'curso_id': curso.id,
+        'grado_id': grado.id,
+        'grado': grado.nombre,
+        'grado_numero': numero,
+        'ciclo': grado.ciclo,
+        'modalidad': modalidad,
+    }
+
+
+def _guard_division_recuperacion(db, current_user, curso_id):
+    """Lente de NIVEL para los endpoints nuevos de Recuperación Primaria.
+
+    No define una política nueva: delega en `validar_nivel_escritura`, que ya
+    es LA política de división del sistema. Solo cambia el texto, porque
+    aquella habla de modificar y estos endpoints son de consulta.
+
+    Lo que hereda de ese helper, y que es justo lo que hace falta aquí:
+
+      · Dirección queda exenta. Su switch X-Nivel es un lente de VISTA y no
+        puede convertirse en una prohibición permanente.
+      · El profesor queda exento: su candado son las asignaciones exactas, no
+        su `nivel_asignado` — un docente de Inglés puede dar clases en los dos
+        niveles el mismo día.
+      · Coordinación, secretaría y psicología con `nivel_asignado` fijo no
+        cruzan de división, ni llamando la API directo.
+      · `nivel_asignado` vacío o NULL significa AMBOS niveles. No se restringe.
+      · El nivel del curso se resuelve server-side (Curso → Grado → nivel),
+        nunca desde lo que mande el cliente, y dentro del tenant.
+
+    Sin ninguna condición de TANDA: un coordinador de Primaria trabaja la
+    matutina, la vespertina y cualquier otra tanda que exista. La división es
+    por nivel, no por horario.
+
+    ORDEN: primero TENANT, después NIVEL. `validar_nivel_escritura` busca los
+    cursos con `tenant_filter`, así que un curso de OTRO colegio tampoco
+    aparece entre los del nivel del usuario y saldría por el 403 de división.
+    Eso sería contar de más: un 403 «es del otro nivel» confirma que el curso
+    existe y en qué nivel está, de un colegio que no es el suyo. Frente a otro
+    tenant la respuesta es 404, como en el resto del sistema.
+    """
+    # Tenant primero. No se devuelve nada del curso: solo si existe aquí.
+    if curso_id is not None:
+        _existe = tenant_filter(db.query(Curso), Curso, current_user).filter_by(
+            id=curso_id).first()
+        if _existe is None:
+            return JSONResponse({'error': 'Curso no encontrado'}, status_code=404)
+
+    err = validar_nivel_escritura(db, current_user, curso_id=curso_id)
+    if err is None:
+        return None
+    nv = (getattr(current_user, 'nivel_asignado', None) or '').strip().lower()
+    return JSONResponse({
+        'error': (f'Tu división es {nv}: este curso pertenece al otro nivel y no '
+                  f'puedes consultarlo.'),
+    }, status_code=403)
+
+
+def _asignacion_exacta_activa(db, current_user, curso_id, asignatura_id):
+    """La asignación ACTIVA exacta del profesor sobre ese curso+asignatura.
+
+    Se vuelve a consultar en cada operación, también al editar y al retirar:
+    ser el autor de una intervención no basta si al docente ya le retiraron la
+    asignación —fue sustituido, cambió de curso— porque entonces ya no es quien
+    responde por ese grupo.
+    """
+    return tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(
+        profesor_id=current_user.id, curso_id=curso_id,
+        asignatura_id=asignatura_id, activo=True,
+    ).first()
+
+
+def _periodo_cerrado_para_docente(db, current_user, ano, periodo, asignatura_id):
+    """True si el período está cerrado y el profesor no tiene permiso temporal.
+
+    Misma política que ya aplica la escritura de calificaciones de Primaria.
+    Se reimplementa aquí en vez de extraer la de P1 porque P1 está congelada y
+    tocarla para refactorizar sería cambiar código que no pertenece a esta fase.
+    """
+    if not getattr(ano, f'p{periodo}_cerrado', False):
+        return False
+    permiso = tenant_filter(
+        db.query(PermisoTemporalCalificacion), PermisoTemporalCalificacion, current_user
+    ).filter(
+        PermisoTemporalCalificacion.profesor_id == current_user.id,
+        PermisoTemporalCalificacion.activo == True,  # noqa: E712
+        PermisoTemporalCalificacion.fecha_fin > now_rd(),
+        (PermisoTemporalCalificacion.periodo == periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
+        (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+    ).first()
+    return permiso is None
+
+
+@app.get("/api/recuperacion-primaria/contexto/{curso_id}")
+async def contexto_recuperacion_primaria(
+    curso_id: int, request: Request,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria', 'profesor'))
+):
+    """Qué modalidad de recuperación del período corresponde a este curso.
+
+    Existe para que el frontend NO tenga que decidirlo. El mismo módulo
+    «Recuperación Primaria» se dibuja de una forma o de otra según lo que
+    conteste este endpoint.
+    """
+    # El lente de division va PRIMERO: si el curso es del otro nivel, ni
+    # siquiera se confirma que exista ni de que grado es.
+    _err_div = _guard_division_recuperacion(db, current_user, curso_id)
+    if _err_div is not None:
+        return _err_div
+
+    modalidad, ctx = _modalidad_recuperacion_primaria(db, curso_id, current_user)
+    if modalidad is None:
+        if ctx.get('error') == 'curso_no_encontrado':
+            return JSONResponse({'error': 'Curso no encontrado'}, status_code=404)
+        if ctx.get('error') == 'no_es_primaria':
+            return JSONResponse({'error': 'Este curso no es de Primaria.'}, status_code=400)
+        return JSONResponse(
+            {'error': 'No se puede determinar el grado del curso. Dirección debe corregirlo.',
+             **ctx}, status_code=409)
+    return ctx
+
+
+def _serializar_intervencion(fila, nombres):
+    d = fila.to_dict()
+    d['estudiante_nombre'] = nombres.get(fila.estudiante_id)
+    return d
+
+
+@app.get("/api/recuperacion-primaria/cualitativa/{curso_id}/{asignatura_id}")
+async def listar_recuperacion_cualitativa(
+    curso_id: int, asignatura_id: int, request: Request,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria', 'profesor'))
+):
+    """Intervenciones cualitativas de un curso+asignatura (1ro/2do).
+
+    El alcance de lectura de los roles es EXACTAMENTE el que ya tenía el
+    módulo de Recuperación Primaria: dirección, coordinación, secretaría y
+    profesor. No se añade ningún rol nuevo.
+    """
+    _err_div = _guard_division_recuperacion(db, current_user, curso_id)
+    if _err_div is not None:
+        return _err_div
+
+    modalidad, ctx = _modalidad_recuperacion_primaria(db, curso_id, current_user)
+    if modalidad is None:
+        if ctx.get('error') == 'curso_no_encontrado':
+            return JSONResponse({'error': 'Curso no encontrado'}, status_code=404)
+        if ctx.get('error') == 'no_es_primaria':
+            return JSONResponse({'error': 'Este curso no es de Primaria.'}, status_code=400)
+        return JSONResponse({'error': 'No se puede determinar el grado del curso.', **ctx},
+                            status_code=409)
+    if modalidad != 'cualitativa':
+        return JSONResponse({
+            'error': ('En este grado la recuperación pedagógica del período es '
+                      'cuantitativa: se carga como RP en Calificaciones.'),
+            **ctx}, status_code=409)
+
+    get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+
+    # El profesor solo ve lo de SUS cursos+asignaturas. Dirección, coordinación
+    # y secretaría ven el curso completo, igual que en el resto del módulo.
+    if current_user.role == 'profesor' and not _asignacion_exacta_activa(
+            db, current_user, curso_id, asignatura_id):
+        return JSONResponse({'error': 'No tiene asignación activa en este curso/asignatura.'},
+                            status_code=403)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
+
+    q = tenant_filter(
+        db.query(RecuperacionPedagogicaPrimaria), RecuperacionPedagogicaPrimaria, current_user
+    ).filter_by(curso_id=curso_id, asignatura_id=asignatura_id, ano_escolar_id=ano.id)
+    periodo = request.query_params.get('periodo')
+    if periodo:
+        try:
+            q = q.filter_by(periodo=int(periodo))
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'periodo debe ser 1, 2, 3 o 4'}, status_code=400)
+    # Las retiradas también se devuelven: el historial de una intervención
+    # pedagógica no se oculta, se marca.
+    filas = q.order_by(RecuperacionPedagogicaPrimaria.fecha_registro.asc(),
+                       RecuperacionPedagogicaPrimaria.id.asc()).all()
+
+    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
+        curso_id=curso_id).all()
+    nombres = {e.id: e.nombre_completo for e in estudiantes}
+
+    return {
+        **ctx,
+        'ano_escolar': ano.nombre,
+        'periodo_activo': ano.periodo_activo,
+        'puede_editar': current_user.role == 'profesor',
+        'estudiantes': [
+            {'id': e.id, 'nombre_completo': e.nombre_completo, 'no_lista': e.no_lista,
+             'retirado': not e.activo}
+            for e in sorted(estudiantes,
+                            key=lambda e: (e.no_lista is None, e.no_lista or 0, e.apellido or ''))
+        ],
+        'intervenciones': [_serializar_intervencion(f, nombres) for f in filas],
+        'resultados_validos': list(RESULTADOS_RECUPERACION_CUALITATIVA),
+    }
+
+
+def _validar_cuerpo_cualitativa(data):
+    """Valida los campos comunes de crear/editar. Devuelve (limpio, error)."""
+    periodo = data.get('periodo')
+    try:
+        periodo = int(periodo)
+    except (TypeError, ValueError):
+        return None, 'El período debe ser 1, 2, 3 o 4.'
+    if periodo not in (1, 2, 3, 4):
+        return None, 'El período debe ser 1, 2, 3 o 4.'
+
+    resultado = data.get('resultado')
+    if resultado not in RESULTADOS_RECUPERACION_CUALITATIVA:
+        return None, "El resultado debe ser 'lograda' o 'no_lograda'."
+
+    aspectos = (data.get('aspectos_no_logrados') or '').strip()
+    if not aspectos:
+        return None, 'Indique el aspecto o los aspectos de la competencia no logrados.'
+
+    comp = data.get('competencia_numero')
+    # NULL es válido y significa «varias competencias / el área entera», que es
+    # como está redactado el formulario oficial.
+    if comp not in (None, '',):
+        try:
+            comp = int(comp)
+        except (TypeError, ValueError):
+            return None, 'La competencia debe ser 1, 2, 3 o vacío.'
+        if comp not in (1, 2, 3):
+            return None, 'La competencia debe ser 1, 2, 3 o vacío.'
+    else:
+        comp = None
+
+    return {
+        'periodo': periodo,
+        'resultado': resultado,
+        'aspectos_no_logrados': aspectos,
+        'estrategias_evidencias': (data.get('estrategias_evidencias') or '').strip() or None,
+        'observacion': (data.get('observacion') or '').strip() or None,
+        'competencia_numero': comp,
+    }, None
+
+
+@app.post("/api/recuperacion-primaria/cualitativa")
+async def crear_recuperacion_cualitativa(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('profesor'))
+):
+    """Registra UNA intervención de recuperación pedagógica cualitativa.
+
+    Cada llamada crea una fila nueva. No actualiza la anterior: que un
+    estudiante aparezca dos veces en el mismo período —«no lograda» en
+    noviembre, «lograda» en diciembre— es el caso normal, no un duplicado.
+    """
+    data = await request.json()
+
+    estudiante_id = data.get('estudiante_id')
+    asignatura_id = data.get('asignatura_id')
+    if not estudiante_id or not asignatura_id:
+        return JSONResponse({'error': 'Faltan datos (estudiante, asignatura)'}, status_code=400)
+
+    estudiante = get_tenant_or_404(db, Estudiante, estudiante_id, current_user, name='estudiante')
+    get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
+
+    if not estudiante.curso_id:
+        return JSONResponse({'error': 'El estudiante no tiene curso asignado.'}, status_code=400)
+
+    modalidad, ctx = _modalidad_recuperacion_primaria(db, estudiante.curso_id, current_user)
+    if modalidad is None:
+        if ctx.get('error') == 'no_es_primaria':
+            return JSONResponse(
+                {'error': 'Este estudiante no es de Primaria.'}, status_code=400)
+        return JSONResponse({'error': 'No se puede determinar el grado del curso.', **ctx},
+                            status_code=409)
+    if modalidad != 'cualitativa':
+        return JSONResponse({
+            'error': ('En este grado la recuperación pedagógica del período es cuantitativa: '
+                      'se carga como RP en Calificaciones, no aquí.'),
+            **ctx}, status_code=409)
+
+    if not _asignacion_exacta_activa(db, current_user, estudiante.curso_id, asignatura_id):
+        return JSONResponse({'error': 'No tiene asignación activa en este curso/asignatura.'},
+                            status_code=403)
+
+    if not estudiante.activo:
+        return JSONResponse(
+            {'error': 'Estudiante retirado: no se registran recuperaciones nuevas.'},
+            status_code=403)
+
+    assert_nivel_curso_activo(db, current_user, estudiante.curso_id)
+
+    limpio, err = _validar_cuerpo_cualitativa(data)
+    if err:
+        return JSONResponse({'error': err}, status_code=400)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
+
+    if _periodo_cerrado_para_docente(db, current_user, ano, limpio['periodo'], asignatura_id):
+        return JSONResponse({
+            'error': (f"El período P{limpio['periodo']} está cerrado. Solicite una corrección "
+                      f"a Dirección si necesita registrarlo.")}, status_code=403)
+
+    fila = RecuperacionPedagogicaPrimaria(
+        colegio_id=current_user.colegio_id,
+        estudiante_id=estudiante.id,
+        curso_id=estudiante.curso_id,
+        asignatura_id=asignatura_id,
+        ano_escolar_id=ano.id,
+        registrado_por=current_user.id,
+        **limpio,
+    )
+    db.add(fila)
+    db.flush()
+    log_auditoria(db, 'INSERT', 'recuperaciones_pedagogicas_primaria', fila.id,
+                  datos_nuevos=fila.to_dict(), user=current_user, request=request)
+    db.commit()
+
+    return {'message': 'Intervención registrada', 'id': fila.id,
+            'intervencion': fila.to_dict()}
+
+
+def _intervencion_editable(db, id, current_user, periodos_extra=()):
+    """Devuelve (fila, error_response) para que un PROFESOR la toque.
+
+    Seis condiciones, y las seis valen igual para editar y para retirar —
+    retirar es tan definitivo como editar, así que no puede pedir menos—:
+
+      1. la fila es de su tenant;
+      2. es su autor;
+      3. conserva la asignación exacta activa;
+      4. el año escolar de la fila existe;
+      5. ese año es el ACTIVO y no está cerrado —un año histórico no se
+         reescribe, y el permiso temporal no sirve para eso—;
+      6. el período está abierto, salvo permiso temporal aplicable.
+
+    `periodos_extra` son los períodos adicionales a comprobar: al editar hay
+    que mirar también el período al que se quiere mover la intervención.
+    """
+    fila = tenant_filter(
+        db.query(RecuperacionPedagogicaPrimaria), RecuperacionPedagogicaPrimaria, current_user
+    ).filter_by(id=id).first()
+    if fila is None:
+        return None, JSONResponse({'error': 'Intervención no encontrada'}, status_code=404)
+    if fila.registrado_por != current_user.id:
+        return None, JSONResponse(
+            {'error': 'Solo el docente que registró la intervención puede modificarla.'},
+            status_code=403)
+    if not _asignacion_exacta_activa(db, current_user, fila.curso_id, fila.asignatura_id):
+        return None, JSONResponse(
+            {'error': ('Ya no tiene asignación activa en este curso/asignatura, '
+                       'así que no puede modificar esta intervención.')},
+            status_code=403)
+
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(
+        id=fila.ano_escolar_id).first()
+    if ano is None:
+        return None, JSONResponse(
+            {'error': 'El año escolar de esta intervención no existe.'}, status_code=404)
+    if not ano.activo or ano.cerrado:
+        # Historia: se consulta, no se reescribe. Ni con permiso temporal.
+        return None, JSONResponse({
+            'error': ('Esta intervención pertenece a un año escolar cerrado o no vigente '
+                      '(%s). Se puede consultar, pero no modificar.' % ano.nombre),
+        }, status_code=403)
+
+    for p in sorted({fila.periodo} | {x for x in periodos_extra if x}):
+        if _periodo_cerrado_para_docente(db, current_user, ano, p, fila.asignatura_id):
+            return None, JSONResponse({
+                'error': (f'El período P{p} está cerrado. Solicite una corrección a '
+                          f'Dirección si necesita modificarlo.')}, status_code=403)
+
+    return fila, None
+
+
+@app.put("/api/recuperacion-primaria/cualitativa/{id}")
+async def editar_recuperacion_cualitativa(
+    id: int, request: Request,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('profesor'))
+):
+    """Corrige una intervención propia. No cambia su autor ni su fecha."""
+    data = await request.json()
+    limpio, err_val = _validar_cuerpo_cualitativa(data)
+    if err_val:
+        return JSONResponse({'error': err_val}, status_code=400)
+
+    # El periodo DESTINO tambien tiene que estar abierto: mover una
+    # intervencion a un periodo cerrado seria escribir en el periodo cerrado.
+    fila, err = _intervencion_editable(db, id, current_user,
+                                       periodos_extra=(limpio['periodo'],))
+    if err is not None:
+        return err
+    if not fila.activo:
+        return JSONResponse({'error': 'Esta intervención está retirada.'}, status_code=400)
+
+    antes = fila.to_dict()
+    for campo, valor in limpio.items():
+        setattr(fila, campo, valor)
+    # registrado_por y fecha_registro NO se tocan: la intervención sigue siendo
+    # de quien la escribió y del día en que la escribió.
+    log_auditoria(db, 'UPDATE', 'recuperaciones_pedagogicas_primaria', fila.id,
+                  datos_anteriores=antes, datos_nuevos=fila.to_dict(),
+                  user=current_user, request=request)
+    db.commit()
+    return {'message': 'Intervención actualizada', 'intervencion': fila.to_dict()}
+
+
+@app.post("/api/recuperacion-primaria/cualitativa/{id}/retirar")
+async def retirar_recuperacion_cualitativa(
+    id: int, request: Request,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(RolesRequired('profesor', 'direccion', 'coordinador'))
+):
+    """Retira una intervención. Nunca la borra.
+
+    El docente retira las suyas mientras siga a cargo del grupo. Dirección y
+    Coordinación retiran administrativamente cualquiera, con motivo obligatorio
+    — pero NO reescriben el texto pedagógico de otro docente: eso destruiría la
+    autoría de un documento oficial sin dejar rastro.
+    """
+    data = await request.json() if await request.body() else {}
+    motivo = (data.get('motivo_retiro') or '').strip()
+
+    if current_user.role == 'profesor':
+        fila, err = _intervencion_editable(db, id, current_user)
+        if err is not None:
+            return err
+    else:
+        fila = tenant_filter(
+            db.query(RecuperacionPedagogicaPrimaria), RecuperacionPedagogicaPrimaria, current_user
+        ).filter_by(id=id).first()
+        if fila is None:
+            return JSONResponse({'error': 'Intervención no encontrada'}, status_code=404)
+        if not motivo:
+            return JSONResponse(
+                {'error': 'Indique el motivo del retiro administrativo.'}, status_code=400)
+        # Mismo hueco y misma causa que en las dos lecturas: aquí se usaba
+        # nivel_efectivo(), que mira el header X-Nivel. Eso bloqueaba a una
+        # Dirección que tuviera el switch en Secundaria —su lente de vista
+        # convertido en prohibición— y se apoyaba en algo que manda el cliente.
+        # La división se decide con nivel_asignado y el nivel real del curso.
+        _err_div = _guard_division_recuperacion(db, current_user, fila.curso_id)
+        if _err_div is not None:
+            return _err_div
+
+    if not fila.activo:
+        return JSONResponse({'error': 'Esta intervención ya estaba retirada.'}, status_code=400)
+
+    antes = fila.to_dict()
+    fila.activo = False
+    fila.retirado_por = current_user.id
+    fila.fecha_retiro = now_rd()
+    fila.motivo_retiro = motivo or None
+    log_auditoria(db, 'UPDATE', 'recuperaciones_pedagogicas_primaria', fila.id,
+                  datos_anteriores=antes, datos_nuevos=fila.to_dict(),
+                  user=current_user, request=request)
+    db.commit()
+    return {'message': 'Intervención retirada', 'intervencion': fila.to_dict()}
 
 
 @app.get("/api/boletines-primaria/estudiante/{id}")
