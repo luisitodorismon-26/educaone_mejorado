@@ -1099,6 +1099,253 @@ def _():
         set_ano(p4_cerrado=False)
 
 
+
+# ═══════════════ N · LENTE DE NIVEL EN LOS ENDPOINTS NUEVOS ═══════════════
+#
+# La division del sistema es por NIVEL, nunca por TANDA. Un coordinador de
+# Primaria trabaja la matutina, la vespertina y cualquier otra tanda; lo que
+# no puede es cruzar a Secundaria. Y nivel_asignado vacio significa AMBOS.
+
+def _fixture_division():
+    """Usuarios con lente fijo, y un 1ro Primaria en tanda VESPERTINA."""
+    d = SessionLocal()
+    try:
+        d.add(M.Tanda(id=T_MAT, colegio_id=COL_A, nombre="Matutina",
+                      hora_inicio="07:30", hora_fin="12:30", activo=True))
+        d.add(M.Tanda(id=T_VES, colegio_id=COL_A, nombre="Vespertina",
+                      hora_inicio="14:00", hora_fin="18:00", activo=True))
+        # Los cursos que ya existian pasan a ser MATUTINOS.
+        for cid in (CUR_1A, CUR_2A, CUR_4A, CUR_SEC):
+            c = d.get(M.Curso, cid)
+            c.tanda_id = T_MAT
+        # Y se agrega un 1ro Primaria VESPERTINO: mismo nivel, otra tanda.
+        d.add(M.Curso(id=CUR_1A_VES, colegio_id=COL_A, nombre="B", grado_id=G_1RO,
+                      tanda_id=T_VES, ano_escolar_id=ANO_A, activo=True))
+        d.add(M.Estudiante(id=E_1A_VES, colegio_id=COL_A, nombre="EstVes", apellido="P",
+                           curso_id=CUR_1A_VES, activo=True, no_lista=1))
+        d.add(_asig(COL_A, PROF, CUR_1A_VES, LENGUA, ANO_A, titular=True))
+
+        for uid, user, rol, nivel in (
+            (CO_PRIM, "coprim", "coordinador", "primaria"),
+            (CO_SEC, "cosec", "coordinador", "secundaria"),
+            (CO_AMBOS, "coambos", "coordinador", None),
+            (SE_PRIM, "seprim", "secretaria", "primaria"),
+            (SE_SEC, "sesec", "secretaria", "secundaria"),
+            (SE_AMBOS, "seambos", "secretaria", None),
+        ):
+            u = _u(uid, COL_A, user, rol)
+            u.nivel_asignado = nivel
+            d.add(u)
+        d.commit()
+    finally:
+        d.close()
+
+
+T_MAT, T_VES = 501, 502
+CUR_1A_VES = 26
+E_1A_VES = 108
+CO_PRIM, CO_SEC, CO_AMBOS = 320, 321, 322
+SE_PRIM, SE_SEC, SE_AMBOS = 330, 331, 332
+
+_fixture_division()
+
+H_CO_PRIM = _tok("coprim")
+H_CO_SEC = _tok("cosec")
+H_CO_AMBOS = _tok("coambos")
+H_SE_PRIM = _tok("seprim")
+H_SE_SEC = _tok("sesec")
+H_SE_AMBOS = _tok("seambos")
+
+
+@test("N1 coordinador Primaria + curso Primaria MATUTINA -> permitido")
+def _():
+    r = contexto(H_CO_PRIM, CUR_1A)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert r.json()["modalidad"] == "cualitativa"
+
+
+@test("N2 coordinador Primaria + curso Primaria VESPERTINA -> permitido")
+def _():
+    r = contexto(H_CO_PRIM, CUR_1A_VES)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    assert r.json()["modalidad"] == "cualitativa"
+
+
+@test("N3 coordinador Primaria + curso de Secundaria -> bloqueado, sin fuga")
+def _():
+    r = contexto(H_CO_SEC, CUR_SEC)   # control: el de Secundaria si entra
+    assert r.status_code in (200, 400), (r.status_code, r.text[:200])
+    q = contexto(H_CO_PRIM, CUR_SEC)
+    assert q.status_code == 403, (q.status_code, q.text[:250])
+    # No se filtra nada del curso ajeno.
+    cuerpo = q.text.lower()
+    for fuga in ("grado_numero", "modalidad", "ciclo", "grado_id"):
+        assert fuga not in cuerpo, (fuga, q.text[:250])
+
+
+@test("N4 coordinador Secundaria + curso de Primaria -> bloqueado, sin fuga")
+def _():
+    q = contexto(H_CO_SEC, CUR_1A)
+    assert q.status_code == 403, (q.status_code, q.text[:250])
+    cuerpo = q.text.lower()
+    for fuga in ("grado_numero", "modalidad", "cualitativa"):
+        assert fuga not in cuerpo, (fuga, q.text[:250])
+
+
+@test("N5 coordinador Secundaria + curso de Secundaria -> no lo bloquea la division")
+def _():
+    r = contexto(H_CO_SEC, CUR_SEC)
+    # Pasa la division; lo rechaza el endpoint por no ser Primaria (400), que
+    # es otra cosa. Lo que importa es que NO sea el 403 de division.
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "no es de Primaria" in r.json()["error"], r.json()
+
+
+@test("N6 coordinador con nivel_asignado NULL + curso Primaria -> permitido")
+def _():
+    r = contexto(H_CO_AMBOS, CUR_1A)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+
+
+@test("N7 coordinador con nivel_asignado NULL + curso Secundaria -> no lo bloquea")
+def _():
+    r = contexto(H_CO_AMBOS, CUR_SEC)
+    assert r.status_code == 400, (r.status_code, r.text[:250])
+    assert "no es de Primaria" in r.json()["error"], r.json()
+
+
+@test("N8 el mismo lente protege /cualitativa/{curso}/{asignatura}")
+def _():
+    assert listar(H_CO_PRIM, CUR_1A, LENGUA).status_code == 200
+    assert listar(H_CO_PRIM, CUR_1A_VES, LENGUA).status_code == 200
+    q = listar(H_CO_SEC, CUR_1A, LENGUA)
+    assert q.status_code == 403, (q.status_code, q.text[:250])
+    assert "intervenciones" not in q.text, "fuga de datos del otro nivel"
+    assert listar(H_CO_AMBOS, CUR_1A, LENGUA).status_code == 200
+
+
+@test("N9 secretaria Primaria no cruza a Secundaria")
+def _():
+    assert contexto(H_SE_PRIM, CUR_1A).status_code == 200
+    q = contexto(H_SE_PRIM, CUR_SEC)
+    assert q.status_code == 403, (q.status_code, q.text[:250])
+
+
+@test("N10 secretaria Secundaria no cruza a Primaria")
+def _():
+    q = contexto(H_SE_SEC, CUR_1A)
+    assert q.status_code == 403, (q.status_code, q.text[:250])
+    assert listar(H_SE_SEC, CUR_1A, LENGUA).status_code == 403
+
+
+@test("N11 secretaria con nivel NULL conserva los dos niveles")
+def _():
+    assert contexto(H_SE_AMBOS, CUR_1A).status_code == 200
+    assert listar(H_SE_AMBOS, CUR_1A, LENGUA).status_code == 200
+    assert contexto(H_SE_AMBOS, CUR_SEC).status_code == 400  # division OK
+
+
+@test("N12 secretaria y psicologia no ganan ninguna escritura")
+def _():
+    for h in (H_SE_PRIM, H_SE_AMBOS, H_PSICO):
+        assert crear(h, E_1A, LENGUA).status_code == 403
+    rid = _ID_BASE["primera"]
+    for h in (H_SE_PRIM, H_SE_AMBOS, H_PSICO):
+        assert retirar(h, rid, "x").status_code == 403
+
+
+@test("N13 direccion no queda restringida, ni con el switch X-Nivel puesto")
+def _():
+    assert contexto(H_DIR, CUR_1A).status_code == 200
+    assert listar(H_DIR, CUR_1A, LENGUA).status_code == 200
+    # El switch visual de direccion NO puede volverse una prohibicion.
+    con_switch = dict(H_DIR)
+    con_switch["X-Nivel"] = "secundaria"
+    r = client.get(f"/api/recuperacion-primaria/contexto/{CUR_1A}", headers=con_switch)
+    assert r.status_code == 200, (r.status_code, r.text[:250])
+    r2 = client.get(f"/api/recuperacion-primaria/cualitativa/{CUR_1A}/{LENGUA}",
+                    headers=con_switch)
+    assert r2.status_code == 200, (r2.status_code, r2.text[:250])
+
+
+@test("N14 el profesor sigue rigiendose por sus asignaciones, no por nivel_asignado")
+def _():
+    # PROF_MULTI da clases en Primaria y en Secundaria: no se le aplica lente.
+    assert contexto(H_MULTI, CUR_1A).status_code == 200
+    assert listar(H_MULTI, CUR_1A, LENGUA).status_code == 200
+    # Y sin asignacion exacta sigue siendo 403, como antes del patch.
+    assert listar(H_SIN, CUR_1A, LENGUA).status_code == 403
+    assert listar(H_OTRA, CUR_1A, LENGUA).status_code == 403
+    # Un nivel_asignado puesto a un profesor NO lo autoriza ni lo bloquea.
+    d = SessionLocal()
+    try:
+        u = d.get(M.Usuario, PROF)
+        u.nivel_asignado = "secundaria"
+        d.commit()
+    finally:
+        d.close()
+    try:
+        assert contexto(H_PROF, CUR_1A).status_code == 200, \
+            "nivel_asignado no debe bloquear a un profesor con asignacion real"
+        assert listar(H_PROF, CUR_1A, LENGUA).status_code == 200
+    finally:
+        d = SessionLocal()
+        try:
+            u = d.get(M.Usuario, PROF)
+            u.nivel_asignado = None
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("N15 el tenant sigue cerrado por encima del lente")
+def _():
+    assert contexto(H_B, CUR_1A).status_code == 404
+    assert listar(H_B, CUR_1A, LENGUA).status_code == 404
+    # Y un coordinador de A tampoco alcanza el colegio B.
+    assert contexto(H_CO_AMBOS, CUR_B).status_code == 404
+
+
+@test("N16 la TANDA no autoriza ni bloquea: solo el nivel")
+def _():
+    # Mismo coordinador, mismo nivel, dos tandas distintas: las dos pasan.
+    for curso, tanda in ((CUR_1A, "matutina"), (CUR_1A_VES, "vespertina")):
+        for h, quien in ((H_CO_PRIM, "coordinador primaria"),
+                         (H_CO_AMBOS, "coordinador ambos"),
+                         (H_SE_PRIM, "secretaria primaria"),
+                         (H_DIR, "direccion")):
+            r = contexto(h, curso)
+            assert r.status_code == 200, (quien, tanda, r.status_code, r.text[:200])
+    # Y el guard no mira la tanda en ningun momento. Se compara el CODIGO,
+    # sin comentarios ni docstring: la propia docstring del guard explica
+    # que no hay condicion de tanda, y eso no puede hacer fallar la prueba.
+    import ast, inspect, textwrap
+
+    def solo_codigo(fn):
+        arbol = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        cuerpo = arbol.body[0]
+        if (cuerpo.body and isinstance(cuerpo.body[0], ast.Expr)
+                and isinstance(cuerpo.body[0].value, ast.Constant)
+                and isinstance(cuerpo.body[0].value.value, str)):
+            cuerpo.body = cuerpo.body[1:]      # fuera el docstring
+        return ast.unparse(arbol)
+
+    codigo = chr(10).join(solo_codigo(f) for f in (
+        APP._guard_division_recuperacion, APP.validar_nivel_escritura,
+        APP.cursos_ids_de_nivel))
+    assert "tanda" not in codigo.lower(), "el guard no puede mirar la tanda"
+
+
+@test("N17 el guard reutiliza la politica existente, no crea una paralela")
+def _():
+    import inspect
+    src = inspect.getsource(APP._guard_division_recuperacion)
+    assert "validar_nivel_escritura(" in src, \
+        "debe delegar en la politica de division que ya existe"
+    assert "nivel_efectivo(" not in src, \
+        "no debe decidir con el header X-Nivel"
+
+
 print(f"\n{B}{'=' * 62}{X}")
 if _fail:
     print(f"{R}{B}  {len(_fail)} FALLO(S) de {_total}{X}")

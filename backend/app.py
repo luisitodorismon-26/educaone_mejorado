@@ -13165,6 +13165,40 @@ def _modalidad_recuperacion_primaria(db, curso_id, current_user):
     }
 
 
+def _guard_division_recuperacion(db, current_user, curso_id):
+    """Lente de NIVEL para los endpoints nuevos de Recuperación Primaria.
+
+    No define una política nueva: delega en `validar_nivel_escritura`, que ya
+    es LA política de división del sistema. Solo cambia el texto, porque
+    aquella habla de modificar y estos endpoints son de consulta.
+
+    Lo que hereda de ese helper, y que es justo lo que hace falta aquí:
+
+      · Dirección queda exenta. Su switch X-Nivel es un lente de VISTA y no
+        puede convertirse en una prohibición permanente.
+      · El profesor queda exento: su candado son las asignaciones exactas, no
+        su `nivel_asignado` — un docente de Inglés puede dar clases en los dos
+        niveles el mismo día.
+      · Coordinación, secretaría y psicología con `nivel_asignado` fijo no
+        cruzan de división, ni llamando la API directo.
+      · `nivel_asignado` vacío o NULL significa AMBOS niveles. No se restringe.
+      · El nivel del curso se resuelve server-side (Curso → Grado → nivel),
+        nunca desde lo que mande el cliente, y dentro del tenant.
+
+    Sin ninguna condición de TANDA: un coordinador de Primaria trabaja la
+    matutina, la vespertina y cualquier otra tanda que exista. La división es
+    por nivel, no por horario.
+    """
+    err = validar_nivel_escritura(db, current_user, curso_id=curso_id)
+    if err is None:
+        return None
+    nv = (getattr(current_user, 'nivel_asignado', None) or '').strip().lower()
+    return JSONResponse({
+        'error': (f'Tu división es {nv}: este curso pertenece al otro nivel y no '
+                  f'puedes consultarlo.'),
+    }, status_code=403)
+
+
 def _asignacion_exacta_activa(db, current_user, curso_id, asignatura_id):
     """La asignación ACTIVA exacta del profesor sobre ese curso+asignatura.
 
@@ -13214,6 +13248,12 @@ async def contexto_recuperacion_primaria(
     «Recuperación Primaria» se dibuja de una forma o de otra según lo que
     conteste este endpoint.
     """
+    # El lente de division va PRIMERO: si el curso es del otro nivel, ni
+    # siquiera se confirma que exista ni de que grado es.
+    _err_div = _guard_division_recuperacion(db, current_user, curso_id)
+    if _err_div is not None:
+        return _err_div
+
     modalidad, ctx = _modalidad_recuperacion_primaria(db, curso_id, current_user)
     if modalidad is None:
         if ctx.get('error') == 'curso_no_encontrado':
@@ -13244,6 +13284,10 @@ async def listar_recuperacion_cualitativa(
     módulo de Recuperación Primaria: dirección, coordinación, secretaría y
     profesor. No se añade ningún rol nuevo.
     """
+    _err_div = _guard_division_recuperacion(db, current_user, curso_id)
+    if _err_div is not None:
+        return _err_div
+
     modalidad, ctx = _modalidad_recuperacion_primaria(db, curso_id, current_user)
     if modalidad is None:
         if ctx.get('error') == 'curso_no_encontrado':
@@ -13542,11 +13586,14 @@ async def retirar_recuperacion_cualitativa(
         if not motivo:
             return JSONResponse(
                 {'error': 'Indique el motivo del retiro administrativo.'}, status_code=400)
-        if current_user.role == 'coordinador':
-            # El coordinador solo actúa dentro de su lente de nivel.
-            if nivel_efectivo(current_user, request) == 'secundaria':
-                return JSONResponse(
-                    {'error': 'Esta intervención es de Primaria.'}, status_code=403)
+        # Mismo hueco y misma causa que en las dos lecturas: aquí se usaba
+        # nivel_efectivo(), que mira el header X-Nivel. Eso bloqueaba a una
+        # Dirección que tuviera el switch en Secundaria —su lente de vista
+        # convertido en prohibición— y se apoyaba en algo que manda el cliente.
+        # La división se decide con nivel_asignado y el nivel real del curso.
+        _err_div = _guard_division_recuperacion(db, current_user, fila.curso_id)
+        if _err_div is not None:
+            return _err_div
 
     if not fila.activo:
         return JSONResponse({'error': 'Esta intervención ya estaba retirada.'}, status_code=400)
