@@ -13188,7 +13188,21 @@ def _guard_division_recuperacion(db, current_user, curso_id):
     Sin ninguna condición de TANDA: un coordinador de Primaria trabaja la
     matutina, la vespertina y cualquier otra tanda que exista. La división es
     por nivel, no por horario.
+
+    ORDEN: primero TENANT, después NIVEL. `validar_nivel_escritura` busca los
+    cursos con `tenant_filter`, así que un curso de OTRO colegio tampoco
+    aparece entre los del nivel del usuario y saldría por el 403 de división.
+    Eso sería contar de más: un 403 «es del otro nivel» confirma que el curso
+    existe y en qué nivel está, de un colegio que no es el suyo. Frente a otro
+    tenant la respuesta es 404, como en el resto del sistema.
     """
+    # Tenant primero. No se devuelve nada del curso: solo si existe aquí.
+    if curso_id is not None:
+        _existe = tenant_filter(db.query(Curso), Curso, current_user).filter_by(
+            id=curso_id).first()
+        if _existe is None:
+            return JSONResponse({'error': 'Curso no encontrado'}, status_code=404)
+
     err = validar_nivel_escritura(db, current_user, curso_id=curso_id)
     if err is None:
         return None

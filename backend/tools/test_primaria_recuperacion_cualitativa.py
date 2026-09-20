@@ -1346,6 +1346,158 @@ def _():
         "no debe decidir con el header X-Nivel"
 
 
+
+# ═══════════════ O · ORDEN TENANT → NIVEL ═══════════════
+#
+# N15 comprobaba el tenant con H_CO_AMBOS, que tiene nivel_asignado NULL y
+# por tanto queda EXENTO del guard de division: nunca llegaba a ejercitar el
+# camino peligroso. Estos casos usan usuarios con lente FIJO, que son los
+# unicos que pueden confundir «otro tenant» con «otro nivel».
+#
+# Contrato: curso de otro colegio -> 404, nunca 403. Un 403 «es del otro
+# nivel» ya confirmaria que el curso existe y en que nivel esta, en un
+# colegio que no es el suyo.
+
+CURSO_INEXISTENTE = 99999
+
+
+def _sin_datos_ajenos(resp, etiqueta):
+    """Ni una pista del curso de otro tenant en el cuerpo."""
+    cuerpo = resp.text.lower()
+    for fuga in ("grado", "modalidad", "ciclo", "estudiantes",
+                 "intervenciones", "cualitativa", "cuantitativa",
+                 "primaria", "secundaria"):
+        assert fuga not in cuerpo, (etiqueta, fuga, resp.text[:250])
+
+
+@test("O1 coordinador Primaria de A + curso del colegio B -> 404 en contexto")
+def _():
+    r = contexto(H_CO_PRIM, CUR_B)
+    assert r.status_code == 404, (r.status_code, r.text[:250])
+    _sin_datos_ajenos(r, "contexto co_prim -> CUR_B")
+
+
+@test("O2 mismo caso en /cualitativa -> 404")
+def _():
+    r = listar(H_CO_PRIM, CUR_B, ASIG_B)
+    assert r.status_code == 404, (r.status_code, r.text[:250])
+    _sin_datos_ajenos(r, "cualitativa co_prim -> CUR_B")
+    # Y tampoco con una asignatura del propio colegio A.
+    r2 = listar(H_CO_PRIM, CUR_B, LENGUA)
+    assert r2.status_code == 404, (r2.status_code, r2.text[:250])
+
+
+@test("O3 coordinador Secundaria de A + curso del colegio B -> 404")
+def _():
+    # CUR_B es de PRIMARIA en el colegio B: el nivel contrario al suyo. Antes
+    # del patch, ese era justo el caso que salia por el 403 de division.
+    r = contexto(H_CO_SEC, CUR_B)
+    assert r.status_code == 404, (r.status_code, r.text[:250])
+    _sin_datos_ajenos(r, "contexto co_sec -> CUR_B")
+    assert listar(H_CO_SEC, CUR_B, ASIG_B).status_code == 404
+
+
+@test("O4 secretaria con nivel fijo + curso de otro tenant -> 404")
+def _():
+    for h, quien in ((H_SE_PRIM, "secretaria primaria"),
+                     (H_SE_SEC, "secretaria secundaria")):
+        r = contexto(h, CUR_B)
+        assert r.status_code == 404, (quien, r.status_code, r.text[:250])
+        _sin_datos_ajenos(r, quien)
+        assert listar(h, CUR_B, ASIG_B).status_code == 404, quien
+
+
+@test("O5 usuario con nivel fijo + curso_id inexistente -> 404")
+def _():
+    for h, quien in ((H_CO_PRIM, "co_prim"), (H_CO_SEC, "co_sec"),
+                     (H_SE_PRIM, "se_prim"), (H_SE_SEC, "se_sec")):
+        r = contexto(h, CURSO_INEXISTENTE)
+        assert r.status_code == 404, (quien, r.status_code, r.text[:250])
+        r2 = listar(h, CURSO_INEXISTENTE, LENGUA)
+        assert r2.status_code == 404, (quien, r2.status_code, r2.text[:250])
+
+
+@test("O6 mismo tenant pero nivel contrario -> sigue 403, no 404")
+def _():
+    # La distincion es el punto del patch: 404 es «no existe para ti»,
+    # 403 es «existe en tu colegio pero no es tu division».
+    r = contexto(H_CO_SEC, CUR_1A)
+    assert r.status_code == 403, (r.status_code, r.text[:250])
+    assert "división" in r.json()["error"], r.json()
+    q = contexto(H_CO_PRIM, CUR_SEC)
+    assert q.status_code == 403, (q.status_code, q.text[:250])
+    assert listar(H_CO_SEC, CUR_1A, LENGUA).status_code == 403
+
+
+@test("O7 mismo tenant y nivel correcto -> sigue permitido")
+def _():
+    assert contexto(H_CO_PRIM, CUR_1A).status_code == 200
+    assert listar(H_CO_PRIM, CUR_1A, LENGUA).status_code == 200
+    assert contexto(H_SE_PRIM, CUR_1A).status_code == 200
+    assert listar(H_SE_PRIM, CUR_1A, LENGUA).status_code == 200
+
+
+@test("O8 nivel_asignado NULL sigue siendo AMBOS niveles")
+def _():
+    assert contexto(H_CO_AMBOS, CUR_1A).status_code == 200
+    assert contexto(H_CO_AMBOS, CUR_SEC).status_code == 400   # division OK
+    assert contexto(H_SE_AMBOS, CUR_1A).status_code == 200
+    assert listar(H_CO_AMBOS, CUR_1A, LENGUA).status_code == 200
+    # Y frente a otro tenant tambien 404, no 200 ni 403.
+    assert contexto(H_CO_AMBOS, CUR_B).status_code == 404
+    assert contexto(H_SE_AMBOS, CUR_B).status_code == 404
+
+
+@test("O9 las tandas siguen sin ser criterio de autorizacion")
+def _():
+    for h, quien in ((H_CO_PRIM, "co_prim"), (H_SE_PRIM, "se_prim"),
+                     (H_CO_AMBOS, "co_ambos"), (H_DIR, "direccion")):
+        for curso, tanda in ((CUR_1A, "matutina"), (CUR_1A_VES, "vespertina")):
+            r = contexto(h, curso)
+            assert r.status_code == 200, (quien, tanda, r.status_code, r.text[:200])
+
+
+@test("O10 el 404 de otro tenant no filtra NADA del curso ajeno")
+def _():
+    # Barrido sobre todos los usuarios con lente fijo y los dos endpoints.
+    for h, quien in ((H_CO_PRIM, "co_prim"), (H_CO_SEC, "co_sec"),
+                     (H_SE_PRIM, "se_prim"), (H_SE_SEC, "se_sec")):
+        for resp, etiqueta in ((contexto(h, CUR_B), f"{quien}/contexto"),
+                               (listar(h, CUR_B, ASIG_B), f"{quien}/cualitativa")):
+            assert resp.status_code == 404, (etiqueta, resp.status_code)
+            _sin_datos_ajenos(resp, etiqueta)
+            # El cuerpo es solo el mensaje generico.
+            assert set(resp.json().keys()) == {"error"}, (etiqueta, resp.json())
+
+
+@test("O11 el guard resuelve el tenant ANTES que el nivel")
+def _():
+    import ast, inspect, textwrap
+    arbol = ast.parse(textwrap.dedent(inspect.getsource(APP._guard_division_recuperacion)))
+    cuerpo = arbol.body[0]
+    if (cuerpo.body and isinstance(cuerpo.body[0], ast.Expr)
+            and isinstance(cuerpo.body[0].value, ast.Constant)):
+        cuerpo.body = cuerpo.body[1:]
+    codigo = ast.unparse(arbol)
+    i_tenant = codigo.find("tenant_filter")
+    i_nivel = codigo.find("validar_nivel_escritura")
+    assert i_tenant != -1, "debe comprobar el tenant"
+    assert i_nivel != -1, "debe delegar en la politica de nivel"
+    assert i_tenant < i_nivel, "el tenant tiene que resolverse ANTES que el nivel"
+    assert "tanda" not in codigo.lower(), "sigue sin mirar la tanda"
+
+
+@test("O12 retirar conserva su 404 de tenant, sin cambios")
+def _():
+    # La fila ya se obtiene con tenant_filter antes del guard, asi que el
+    # contrato multitenant de este endpoint no dependia del patch.
+    rid = _ID_BASE["primera"]
+    assert retirar(H_B, rid, "x").status_code == 404
+    # Y un coordinador del nivel contrario del MISMO colegio sigue en 403.
+    assert retirar(H_CO_SEC, rid, "motivo").status_code == 403
+    assert fila(rid) is not None, "la intervencion no se toco"
+
+
 print(f"\n{B}{'=' * 62}{X}")
 if _fail:
     print(f"{R}{B}  {len(_fail)} FALLO(S) de {_total}{X}")
