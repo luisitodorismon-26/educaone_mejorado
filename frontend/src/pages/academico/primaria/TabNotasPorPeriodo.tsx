@@ -4,7 +4,7 @@ import { Save } from 'lucide-react';
 import { Button, Alert } from '../../../components/ui';
 import {
   EstudiantePrimData, CampoEditable,
-  NOMBRES_COMPETENCIAS_PRIM, UMBRAL_RP_PRIMARIA, rpHabilitado,
+  NOMBRES_COMPETENCIAS_PRIM, UMBRAL_RP_PRIMARIA, rpEditable,
   ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
   estadoPeriodoDe, ETIQUETA_ESTADO, AYUDA_NE_PRIMARIA,
 } from './tipos';
@@ -76,29 +76,54 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
     setDrafts(prev => ({ ...prev, [key(estId, compNum)]: { ...prev[key(estId, compNum)], [campo]: valor } }));
   }, []);
 
-  const cambios = useMemo(() => Object.values(drafts).filter(d => Object.keys(d).length > 0).length, [drafts]);
+  // Celdas realmente modificadas.
+  //
+  // R2-A8.1: esto solo miraba `drafts`, así que desmarcar un NE ya guardado
+  // —sin escribir ninguna nota— no encendía el botón Guardar: el docente
+  // veía la casilla desmarcada y no tenía forma de asentarlo. Ahora es la
+  // unión de notas y NE, con la misma celda contada una sola vez.
+  //
+  // Un NE se cuenta solo si DIFIERE de lo guardado: marcar y volver a
+  // desmarcar deja la celda como estaba y no debería pedir que se guarde.
+  const celdasSucias = useMemo(() => {
+    const sucias = new Set<string>();
+    for (const [k, d] of Object.entries(drafts)) {
+      if (Object.keys(d).length > 0) sucias.add(k);
+    }
+    for (const [k, d] of Object.entries(draftsNE)) {
+      const propuesto = d?.[campoNE];
+      if (propuesto === undefined) continue;
+      const [estId, compNum] = k.split('-').map(Number);
+      const est = estudiantes.find(e => e.estudiante.id === estId);
+      const guardado = Boolean(est && getComp(est, compNum)?.[campoNE]);
+      if (propuesto !== guardado) sucias.add(k);
+    }
+    return sucias;
+  }, [drafts, draftsNE, estudiantes, campoNE]);
 
+  const cambios = celdasSucias.size;
+
+  // Marcar NE NO toca los borradores de nota.
+  //
+  // R2-A8.2: antes metía `P=''` y `RP=''` para «ensear lo que va a pasar».
+  // El problema es que esos borradores sobrevivían al arrepentimiento: marcar
+  // NE, pensarlo mejor, desmarcarlo y guardar mandaba `p=null, rp=null` y
+  // borraba unas notas que nadie quiso borrar.
+  //
+  // El backend ya mantiene la invariante (NE=true limpia pN y rpN), así que
+  // el frontend no necesita fabricar nada: se limita a enseñar la celda como
+  // NE y a deshabilitarla. Si el docente desmarca antes de guardar, sus notas
+  // siguen exactamente donde estaban.
   const marcarNE = (estId: number, compNum: number, valor: boolean) => {
     const k = key(estId, compNum);
     setDraftsNE(prev => ({ ...prev, [k]: { ...(prev[k] || {}), [campoNE]: valor } }));
-    if (valor) {
-      // Marcar NE deja el período sin nota. Se refleja ya en pantalla para
-      // que el docente vea lo que va a pasar, no solo después de guardar.
-      setDrafts(prev => ({
-        ...prev,
-        [k]: { ...(prev[k] || {}), [campoP]: '', [campoRP]: '' },
-      }));
-    }
   };
 
   const guardar = async () => {
     setGuardando(true);
     setMensaje(null);
     try {
-      const aGuardar = Array.from(new Set([
-        ...Object.keys(drafts).filter(k => Object.keys(drafts[k]).length > 0),
-        ...Object.keys(draftsNE).filter(k => Object.keys(draftsNE[k]).length > 0),
-      ]));
+      const aGuardar = Array.from(celdasSucias);
       // El backend responde 200 aunque haya saltado un período cerrado: guarda
       // lo que puede y avisa de lo que no. Si no se mira esa respuesta, el
       // profesor ve "Guardado" y cree que su corrección entró cuando no entró.
@@ -106,8 +131,17 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       for (const k of aGuardar) {
         const [estId, compNum] = k.split('-').map(Number);
         const payload: any = { estudiante_id: estId, asignatura_id: asignaturaId, competencia_numero: compNum };
-        for (const [campo, val] of Object.entries(drafts[k] || {})) {
-          payload[campo] = val === '' ? null : Number(val);
+        const estFila = estudiantes.find(e => e.estudiante.id === estId);
+        const neFinal = estFila ? getNE(estFila, compNum) : Boolean(draftsNE[k]?.[campoNE]);
+        // Con NE activo no se manda ninguna nota. No es que se manden en
+        // blanco: no se mandan. Si se mandara `p=null` junto a `ne=true` el
+        // backend no sabría distinguirlo de una limpieza deliberada, y si se
+        // mandara un número ganaría la nota y el NE se caería —que es
+        // justo lo contrario de lo que el docente acaba de marcar—.
+        if (!neFinal) {
+          for (const [campo, val] of Object.entries(drafts[k] || {})) {
+            payload[campo] = val === '' ? null : Number(val);
+          }
         }
         for (const [campo, val] of Object.entries(draftsNE[k] || {})) {
           payload[campo] = val;   // booleano: el backend lo exige así
@@ -187,14 +221,20 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                 {comps.map(n => {
                   const pVal = getValor(est, n, campoP) !== '' ? Number(getValor(est, n, campoP)) : null;
                   const ne = getNE(est, n);
-                  const rpOn = rpHabilitado(pVal) && !ne;
+                  // Un RP ya asentado es LA nota del período: no puede
+                  // desaparecer de la pantalla porque la P suba de 65.
+                  const rpOn = rpEditable(
+                    pVal,
+                    getComp(est, n)?.[campoRP] as number | null | undefined,
+                    drafts[key(est.estudiante.id, n)]?.[campoRP],
+                  ) && !ne;
                   const estado = estadoDe(est, n);
                   return (
                   <Fragment key={n}>
                     <td className="px-1 py-1 text-center border-l">
                       <input
                         type="number" min={0} max={100}
-                        value={getValor(est, n, campoP)}
+                        value={ne ? '' : getValor(est, n, campoP)}
                         onChange={e => handleChange(est.estudiante.id, n, campoP, e.target.value)}
                         disabled={!puedeEditar || ne}
                         placeholder={estado === 'pendiente' ? '—' : ''}
@@ -211,7 +251,9 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                         onChange={e => handleChange(est.estudiante.id, n, campoRP, e.target.value)}
                         disabled={!puedeEditar || !rpOn}
                         placeholder={rpOn ? 'RP' : '—'}
-                        title={rpOn ? AYUDA_RP_PRIMARIA : `RP se habilita solo si P${periodo} < ${UMBRAL_RP_PRIMARIA}`}
+                        title={rpOn ? AYUDA_RP_PRIMARIA
+                          : ne ? 'Período marcado NE: no lleva nota'
+                          : `Para ABRIR una recuperación, P${periodo} debe ser menor que ${UMBRAL_RP_PRIMARIA}. Una RP ya asentada siempre se puede corregir.`}
                         className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                       />
                     </td>}

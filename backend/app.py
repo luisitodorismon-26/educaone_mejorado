@@ -7128,6 +7128,21 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             return _rechazo_nota(db, campo, 'debe estar entre 0 y 100')
         _pendientes[campo] = nota
 
+    # ¿Trae la petición algo académico de verdad?
+    #
+    # Ojo con la verdad/falsedad de Python: una nota de 0 es un dato real
+    # y `if valor:` la descartaría. Y `ne=False` NO es contenido: es el
+    # estado por defecto de un período, justo lo que manda el frontend
+    # cuando el docente desmarca un NE que nunca llegó a guardarse.
+    def _hay_contenido_academico(pendientes):
+        for campo, valor in pendientes.items():
+            if campo.startswith('ne'):
+                if valor is True:
+                    return True
+            elif valor is not None:
+                return True
+        return False
+
     # Una calificación NUEVA cuyo único contenido caía en un período cerrado no
     # llega a existir: crearla dejaría una fila académica sin ninguna nota, que
     # es peor que no tener nada. La fila EXISTENTE, en cambio, se conserva
@@ -7144,6 +7159,23 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
                 'corrección a Dirección si necesita editarlos.'
                 % ', '.join('P%d' % p for p in periodos_cerrados_ignorados)
             ),
+        }
+
+    # R2-A8: lo mismo, pero sin período cerrado de por medio. Desmarcar un
+    # NE que nunca se guardó, o mandar el período entero en blanco, llega
+    # aquí como {'ne1': False} o {'p1': None, 'rp1': None, 'ne1': False}:
+    # cero contenido académico. Si la fila aún no existe, crearla dejaría
+    # una calificación fantasma —sin una sola nota— que luego aparece en
+    # el Registro y en los conteos. Se responde 200 y no se toca nada.
+    #
+    # Sobre una fila que YA existe no se aplica: ahí el docente está
+    # corrigiendo o limpiando, y esa fila es suya. No se borra nunca.
+    if es_nueva and not _hay_contenido_academico(_pendientes) and 'competencia_nombre' not in data:
+        return {
+            'message': 'No había nada que guardar',
+            'id': None,
+            'calificacion': None,
+            'sin_cambios': True,
         }
 
     # INVARIANTE DE NE (R2-A4): un período no puede estar marcado NE y tener

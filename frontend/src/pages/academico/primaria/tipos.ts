@@ -93,6 +93,33 @@ export function rpHabilitado(pValor: number | null): boolean {
   return pValor != null && pValor < UMBRAL_RP_PRIMARIA;
 }
 
+// ¿Se puede ver y tocar la casilla RP de este período?
+//
+// R2-A8. `rpHabilitado` sola respondía a otra pregunta: «cuándo procede
+// ABRIR una recuperación». Usarla también para decidir qué se muestra era
+// inofensivo mientras RP fuera `max(P, RP)` —un RP menor no cambiaba nada—,
+// pero desde A2 la RP REEMPLAZA a la P: con P=80 y RP=50 el período vale 50
+// y la pantalla escondía justamente el 50, porque 80 >= 65. El docente veía
+// un 80 y el boletín decía 50.
+//
+// La regla queda partida en dos, que es lo que siempre fueron:
+//
+//   · CREAR una RP que no existe    -> solo si P está bajo el umbral;
+//   · VER/corregir/limpiar una que YA existe -> siempre, valga lo que valga P.
+//
+// `rpBorrador` cubre el hueco de la sesión en curso: si el docente acaba de
+// escribir una RP y en la misma pantalla sube la P por encima del umbral, la
+// casilla no puede desaparecerle con el dato dentro.
+export function rpEditable(
+  pValor: number | null,
+  rpGuardado: number | null | undefined,
+  rpBorrador?: string,
+): boolean {
+  if (rpGuardado != null) return true;
+  if (rpBorrador != null && rpBorrador !== '') return true;
+  return rpHabilitado(pValor);
+}
+
 // P2A-R1: en 1ro y 2do la recuperación pedagógica del período es CUALITATIVA,
 // así que la columna RP no existe para esos grados — ni en la pantalla ni en
 // el Informe de Aprendizaje ni en el Registro. La modalidad llega resuelta

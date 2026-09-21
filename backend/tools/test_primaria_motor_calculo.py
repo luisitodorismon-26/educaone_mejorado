@@ -681,6 +681,81 @@ def _():
     assert hasattr(APP, '_guard_division_recuperacion')
 
 
+# ══════ H · NO NACEN FILAS VACIAS (R2-A8.3) ══════
+
+def _existe_fila(est, asig, comp=1):
+    d = SessionLocal()
+    try:
+        return d.query(M.CalificacionPrimaria).filter_by(
+            estudiante_id=est, asignatura_id=asig, competencia_numero=comp).count()
+    finally:
+        d.close()
+
+
+@test("H1 fila inexistente + ne1=false -> no se crea nada")
+def _():
+    limpiar_calificaciones(E_2)
+    assert _existe_fila(E_2, MATE, 2) == 0, "precondicion"
+    r = guardar(H_PROF, E_2, MATE, comp=2, ne1=False)
+    assert r.status_code == 200, r.text[:250]
+    assert _existe_fila(E_2, MATE, 2) == 0, "nacio una calificacion fantasma"
+    assert r.json().get("sin_cambios") is True, r.json()
+    assert r.json().get("id") is None
+
+
+@test("H2 fila inexistente + p1=null + rp1=null + ne1=false -> no se crea nada")
+def _():
+    limpiar_calificaciones(E_2)
+    r = guardar(H_PROF, E_2, MATE, comp=3, p1=None, rp1=None, ne1=False)
+    assert r.status_code == 200, r.text[:250]
+    assert _existe_fila(E_2, MATE, 3) == 0, "nacio una calificacion fantasma"
+    assert r.json().get("sin_cambios") is True
+
+
+@test("H3 fila inexistente + ne1=true -> SI se crea, es un dato academico")
+def _():
+    limpiar_calificaciones(E_2)
+    r = guardar(H_PROF, E_2, MATE, comp=2, ne1=True)
+    assert r.status_code == 200, r.text[:250]
+    assert _existe_fila(E_2, MATE, 2) == 1, "un NE es informacion: deberia guardarse"
+    f = fila(E_2, MATE, 2)
+    assert f.es_ne(1) is True
+    assert f.p1 is None and f.rp1 is None
+
+
+@test("H4 el 0 es contenido: crea fila aunque sea falsy en Python")
+def _():
+    limpiar_calificaciones(E_2)
+    r = guardar(H_PROF, E_2, MATE, comp=3, p1=0)
+    assert r.status_code == 200, r.text[:250]
+    assert _existe_fila(E_2, MATE, 3) == 1, "un 0 es una nota, no una ausencia"
+    assert fila(E_2, MATE, 3).p1 == 0
+
+
+@test("H5 una fila EXISTENTE no se borra ni se toca con un envio vacio")
+def _():
+    limpiar_calificaciones(E_2)
+    guardar(H_PROF, E_2, MATE, comp=1, p1=70, p2=80)
+    assert _existe_fila(E_2, MATE, 1) == 1
+    r = guardar(H_PROF, E_2, MATE, comp=1, ne3=False)
+    assert r.status_code == 200, r.text[:250]
+    assert _existe_fila(E_2, MATE, 1) == 1, "se borro una fila existente"
+    f = fila(E_2, MATE, 1)
+    assert (f.p1, f.p2) == (70, 80), (f.p1, f.p2)
+
+
+@test("H6 el docente SI puede vaciar una fila existente (corregir no es crear)")
+def _():
+    # El candado de A8.3 es solo para filas NUEVAS. Sobre una existente el
+    # docente manda, incluso para dejarla sin notas mientras corrige.
+    r = guardar(H_PROF, E_2, MATE, comp=1, p1=None, p2=None)
+    assert r.status_code == 200, r.text[:250]
+    f = fila(E_2, MATE, 1)
+    assert f is not None, "la fila existente no debe desaparecer"
+    assert f.p1 is None and f.p2 is None
+    assert f.final_competencia is None and f.literal is None, "CF fantasma"
+
+
 print(f"\n{B}{'=' * 62}{X}")
 if _fail:
     print(f"{R}{B}  {len(_fail)} FALLO(S) de {_total}{X}")

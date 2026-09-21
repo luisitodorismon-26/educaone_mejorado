@@ -5,7 +5,7 @@ import { Button, Alert } from '../../../components/ui';
 import {
   EstudiantePrimData, CampoEditable, CAMPOS_PERIODOS,
   NOMBRES_COMPETENCIAS_PRIM, MINIMO_APROBATORIO_PRIMARIA,
-  UMBRAL_RP_PRIMARIA, rpHabilitado, promedioAcumulado, cfOficialDisponible,
+  UMBRAL_RP_PRIMARIA, rpEditable, promedioAcumulado, cfOficialDisponible,
   ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
   estadoPeriodoDe, ETIQUETA_ESTADO,
 } from './tipos';
@@ -164,7 +164,13 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                   {CAMPOS_PERIODOS.map(cp => {
                     const pVal = getValor(est, cp.p) !== '' ? Number(getValor(est, cp.p)) : null;
                     const _estado = estadoPeriodoDe(getComp(est, compSel), cp.periodo);
-                    const rpOn = rpHabilitado(pVal) && _estado !== 'ne';
+                    // Igual que en la otra pestaña: una RP ya asentada
+                    // manda sobre la P, así que no puede ocultarse (R2-A8.4).
+                    const rpOn = rpEditable(
+                      pVal,
+                      getComp(est, compSel)?.[cp.rp] as number | null | undefined,
+                      drafts[key(est.estudiante.id, compSel)]?.[cp.rp],
+                    ) && _estado !== 'ne';
                     return (
                     <Fragment key={cp.periodo}>
                       <td className="px-1 py-1 text-center">
@@ -187,7 +193,9 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                           onChange={e => handleChange(est.estudiante.id, cp.rp, e.target.value)}
                           disabled={!puedeEditar || !rpOn}
                           placeholder={rpOn ? 'RP' : '—'}
-                          title={rpOn ? AYUDA_RP_PRIMARIA : `RP se habilita solo si P${cp.periodo} < ${UMBRAL_RP_PRIMARIA}`}
+                          title={rpOn ? AYUDA_RP_PRIMARIA
+                            : _estado === 'ne' ? 'Período marcado NE: no lleva nota'
+                            : `Para ABRIR una recuperación, P${cp.periodo} debe ser menor que ${UMBRAL_RP_PRIMARIA}. Una RP ya asentada siempre se puede corregir.`}
                           className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                         />
                       </td>}
