@@ -934,22 +934,62 @@ class CalificacionPrimaria(Base):
             self.es_ne(periodo))
 
     def calcular_final(self, minimo_periodos=1):
-        """Final de la competencia = promedio de los períodos EVALUADOS.
+        """CF OFICIAL de la competencia, o None si todavía no existe.
 
-        Regla oficial MINERD primaria (Registro, pág. 85): "En caso de que un
-        estudiante tenga indicado (NE) en algún período, la calificación final
-        de la competencia se obtiene del promedio de los períodos evaluados."
-        Un período NE = valor None (no cargado). Se promedian los que sí tienen
-        valor. Requiere al menos `minimo_periodos` evaluado(s).
+        Dos reglas del Registro del Nivel Primario, que son distintas:
+
+          · la normal —hoja 78/84—: «se suma la calificación de los períodos
+            (P1+P2+P3+P4) y se divide entre 4». Divisor fijo, sin excepciones;
+          · la de NE —hoja 79/85—: «en caso de que un estudiante tenga
+            indicado (NE) en algún período, la calificación final de la
+            competencia se obtiene del promedio de los períodos evaluados».
+
+        Hasta R2 el código aplicaba SIEMPRE la segunda, porque no podía
+        distinguir un NE de un período que nadie había cargado todavía. Con
+        tres períodos cargados en marzo devolvía una CF como si el año hubiera
+        terminado.
+
+        Ahora los cuatro períodos tienen que estar RESUELTOS: cada uno con
+        valor numérico o marcado NE. Basta un PENDIENTE para que no haya CF.
+        NE sale del divisor; PENDIENTE no reduce el divisor: lo bloquea.
+
+            P1..P4 numéricos            -> promedio / 4
+            P1..P3 numéricos, P4 sin nada -> None
+            P1..P3 numéricos, NE4       -> promedio / 3
+            NE1 NE2, P3 y P4 numéricos  -> promedio / 2
+            los cuatro NE               -> None (no hay nada que promediar)
+
+        `minimo_periodos` se conserva por compatibilidad de firma, pero ya no
+        gobierna: lo que decide es que no queden períodos pendientes.
         """
         valores = []
         for p in range(1, 5):
+            if self.es_ne(p):
+                continue                      # NE: fuera del divisor
             v = self.valor_periodo(p)
-            if v is not None:
-                valores.append(v)
-        if len(valores) >= minimo_periodos and valores:
-            return round(sum(valores) / len(valores), 2)
-        return None
+            if v is None:
+                return None                   # PENDIENTE: no hay CF oficial
+            valores.append(v)
+        if not valores:
+            return None                       # los cuatro NE
+        return round(sum(valores) / len(valores), 2)
+
+    def promedio_acumulado(self):
+        """Promedio PROVISIONAL de lo evaluado hasta hoy. NO es la CF.
+
+        Existe para no perder información útil durante P1-P3: el docente
+        quiere ver cómo va el estudiante aunque el año no haya terminado.
+
+        Es un dato DERIVADO y no se persiste nunca en `final_competencia`.
+        Confundir los dos es justo lo que producía CF completas a mitad de
+        año. Ignora los períodos pendientes en vez de bloquear, y excluye los
+        NE igual que la CF.
+        """
+        valores = [v for p in range(1, 5)
+                   if not self.es_ne(p) and (v := self.valor_periodo(p)) is not None]
+        if not valores:
+            return None
+        return round(sum(valores) / len(valores), 2)
     
     def get_literal(self, nota=None):
         if nota is None:
@@ -979,6 +1019,9 @@ class CalificacionPrimaria(Base):
             # El frontend no tiene que deducirlo de la combinacion de campos.
             'estados': {n: self.estado_periodo(n) for n in (1, 2, 3, 4)},
             'final_competencia': self.final_competencia,
+            # PROVISIONAL. No es la CF y no se persiste: es lo evaluado hasta
+            # hoy, para no perder informacion util durante P1-P3.
+            'promedio_acumulado': self.promedio_acumulado(),
             'literal': self.literal
         }
 

@@ -7183,11 +7183,19 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     if es_nueva:
         db.add(calif)
 
-    # Calcular final de la competencia (C1/C2/C3) automáticamente
+    # CF oficial de la competencia (C1/C2/C3).
+    #
+    # R2-A5: la fila refleja el estado ACTUAL, exista o no CF. Antes solo se
+    # escribia cuando habia final, asi que al limpiar las notas la CF anterior
+    # se quedaba ahi: una calificacion final de una competencia sin ninguna
+    # nota. Ahora el else tambien escribe.
     final = calif.calcular_final()
     if final is not None:
         calif.final_competencia = final
         calif.literal = calif.get_literal(final)
+    else:
+        calif.final_competencia = None
+        calif.literal = None
     
     db.commit()
     cache_clear(f'stats:{current_user.colegio_id}')

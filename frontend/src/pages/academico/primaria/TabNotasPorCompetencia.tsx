@@ -5,7 +5,7 @@ import { Button, Alert } from '../../../components/ui';
 import {
   EstudiantePrimData, CampoEditable, CAMPOS_PERIODOS,
   NOMBRES_COMPETENCIAS_PRIM, MINIMO_APROBATORIO_PRIMARIA,
-  UMBRAL_RP_PRIMARIA, rpHabilitado, finalCompetencia,
+  UMBRAL_RP_PRIMARIA, rpHabilitado, promedioAcumulado, cfOficialDisponible,
   ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
   estadoPeriodoDe, ETIQUETA_ESTADO,
 } from './tipos';
@@ -61,9 +61,12 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
   );
 
   // Final en vivo (con drafts aplicados)
-  const finalEnVivo = (est: EstudiantePrimData): number | null => {
+  // Lo que se ve mientras el docente escribe. Es el PROVISIONAL: la CF
+  // oficial la decide el backend y solo existe con los cuatro períodos
+  // resueltos. `cfLista` sirve para decir en pantalla cuál de los dos es.
+  const vistaEnVivo = (est: EstudiantePrimData) => {
     const comp = getComp(est, compSel);
-    if (!comp) return null;
+    if (!comp) return { valor: null as number | null, oficial: false };
     const k = key(est.estudiante.id, compSel);
     const merged = { ...comp };
     if (drafts[k]) {
@@ -71,7 +74,7 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
         (merged as any)[campo] = val === '' ? null : Number(val);
       }
     }
-    return finalCompetencia(merged);
+    return { valor: promedioAcumulado(merged), oficial: cfOficialDisponible(merged) };
   };
 
   const guardar = async () => {
@@ -145,12 +148,15 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                   {conRp && <th className="px-2 py-2 text-center font-normal text-gray-400 text-xs">RP{cp.periodo}</th>}
                 </Fragment>
               ))}
-              <th className="px-3 py-2 text-center font-medium text-blue-700">Final</th>
+              <th className="px-3 py-2 text-center font-medium text-blue-700"
+                  title="Final solo con los cuatro períodos resueltos. Mientras tanto, promedio acumulado (provisional).">
+                Final / acum.
+              </th>
             </tr>
           </thead>
           <tbody>
             {activos.map(est => {
-              const fin = finalEnVivo(est);
+              const { valor: fin, oficial: cfLista } = vistaEnVivo(est);
               const aprobado = fin != null && fin >= MINIMO_APROBATORIO_PRIMARIA;
               return (
                 <tr key={est.estudiante.id} className="border-b hover:bg-gray-50">
@@ -190,6 +196,12 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                   })}
                   <td className={`px-3 py-1.5 text-center font-bold ${fin == null ? 'text-gray-300' : aprobado ? 'text-green-600' : 'text-red-600'}`}>
                     {fin != null ? Math.round(fin) : '—'}
+                    {fin != null && !cfLista && (
+                      <span className="ml-1 text-[10px] font-normal text-amber-600"
+                            title="Promedio acumulado: todavía hay períodos pendientes, así que no es la calificación final.">
+                        acum.
+                      </span>
+                    )}
                   </td>
                 </tr>
               );

@@ -134,13 +134,34 @@ export function valorPeriodoEfectivo(comp: CompetenciaPrim, periodo: number): nu
   return p;
 }
 
-// Final de competencia = promedio de los períodos evaluados (regla NE)
-export function finalCompetencia(comp: CompetenciaPrim): number | null {
+// PROMEDIO ACUMULADO — provisional, NO es la calificación final.
+//
+// R2-A5: esta función se llamaba `finalCompetencia` y fabricaba una CF a
+// partir de los períodos que hubiera, con lo que el frontend anunciaba una
+// «Final» en marzo que el backend no reconocía. Ahora dice lo que es:
+// el promedio de lo evaluado hasta hoy. Ignora pendientes y excluye NE,
+// igual que `promedio_acumulado()` del backend.
+//
+// La CF OFICIAL la decide el backend y llega en `final_competencia`. El
+// frontend no la calcula.
+export function promedioAcumulado(comp: CompetenciaPrim): number | null {
   const vals: number[] = [];
   for (let per = 1; per <= 4; per++) {
+    if (estadoPeriodoDe(comp, per) === 'ne') continue;
     const v = valorPeriodoEfectivo(comp, per);
     if (v != null) vals.push(v);
   }
   if (vals.length === 0) return null;
   return Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100;
+}
+
+// ¿Están los cuatro períodos RESUELTOS? Es la condición de la CF oficial.
+// Sirve para explicar en pantalla por qué todavía no hay Final; el valor
+// sigue viniendo del backend.
+export function cfOficialDisponible(comp: CompetenciaPrim | undefined): boolean {
+  if (!comp) return false;
+  for (let per = 1; per <= 4; per++) {
+    if (estadoPeriodoDe(comp, per) === 'pendiente') return false;
+  }
+  return true;
 }
