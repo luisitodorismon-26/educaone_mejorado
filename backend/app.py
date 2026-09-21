@@ -14527,7 +14527,8 @@ async def get_progreso_estudiante(id, db: Session = Depends(get_db), current_use
 
     if ano_activo and es_primaria:
         # ─── PRIMARIA: promedio del área por período a partir de sus
-        # competencias. valor_periodo() ya aplica max(P, RP).
+        # competencias. valor_periodo() aplica la regla canónica (RP
+        # reemplaza a P); ver valor_periodo_primaria en calculo_primaria.
         califs_pri = tenant_filter(
             db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
         ).filter_by(estudiante_id=id, ano_escolar_id=ano_activo.id).all()
@@ -17151,8 +17152,10 @@ async def imprimir_planilla_calificaciones(curso_id: int, asignatura_id: int, re
 
     Un solo PDF para todo el ciclo: en blanco si no hay notas, parcial si va a
     medias, constancia completa si ya se calificó. Valor mostrado = efectivo
-    del período max(P, RP), con «*» cuando la RP mejoró la nota. F y CF solo
-    con datos completos (regla MINERD: nada se autocompleta con parciales).
+    del período, con «*» cuando hubo recuperación. En Primaria ese efectivo
+    es la RP si existe (la RP reemplaza a la nota del período); Secundaria
+    conserva su max(P, RP). F y CF solo con datos completos (regla MINERD:
+    nada se autocompleta con parciales).
 
     Permisos: dirección/coordinación/secretaría cualquier curso (bajo su lente
     de división); profesor solo cursos con asignación ACTIVA.

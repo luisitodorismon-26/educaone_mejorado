@@ -8,8 +8,12 @@ CalificacionSecundaria / EvaluacionExtraSecundaria.
 
 Reglas oficiales (Registro de Grado, Nivel Primario, MINERD 2023-2024):
  - 3 competencias por área (C1, C2, C3); Inglés puede tener 2.
- - Cada competencia: P1-P4 con RP1-RP4. Valor del período = max(P, RP).
- - CF de competencia = promedio de los períodos EVALUADOS (regla NE, pág. 85).
+ - Cada competencia: P1-P4 con RP1-RP4. Valor del período = RP si existe, si
+   no P (R2: la RP REEMPLAZA a la nota del período, no compite con ella).
+ - Un período está EVALUADO, en NE o PENDIENTE. NULL a secas es PENDIENTE.
+ - CF de competencia: solo con los CUATRO períodos resueltos. Regla normal
+   (P1+P2+P3+P4)/4; con NE, promedio de los evaluados (pág. 85). Un período
+   PENDIENTE la bloquea: no hay CF oficial a mitad de año.
  - CF del área = promedio de las competencias evaluadas del área.
  - Aprobar un área = 65 puntos o más (pág. 39).
  - Recuperación Final (área < 65): suma complementaria sobre la CF del área,

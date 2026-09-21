@@ -10,7 +10,7 @@ F1 (esta versión) rellena:
   2. DATOS DE ESTUDIANTES — No., nombre, sexo, fecha de nacimiento
      (2 páginas del template: filas 1-45 y 46-90)
   3. CALIFICACIONES POR ÁREA — P1-P4 por competencia (C1/C2/C3, valor
-     efectivo max(P,RP)) + Promedio del área con LINAJE ESTRICTO
+     efectivo = RP si existe, si no P) + Promedio del área con LINAJE ESTRICTO
      (solo si las 3 finales de competencia están completas)
 
 F2 (esta versión): ASISTENCIA MENSUAL — 12 formularios (agosto-julio),

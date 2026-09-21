@@ -10,8 +10,10 @@ Estructura (hoja carta HORIZONTAL):
 - Encabezado del colegio (mismos helpers que la lista de estudiantes)
 - Línea de contexto: curso · asignatura · profesor · fecha
 - Tabla: # | Estudiante | por cada competencia: P1 P2 P3 P4 F | CF
-  * El valor mostrado es el EFECTIVO del período: max(P, RP).
-    Si la RP mejoró la nota, se marca con «*» (leyenda al pie).
+  * El valor mostrado es el EFECTIVO del período. En primaria es la RP
+    si existe y si no la P (la RP reemplaza a la nota del período);
+    secundaria conserva max(P, RP). Si hubo recuperación se marca con
+    «*» (leyenda al pie).
   * F (final de competencia): primaria = final_competencia guardado;
     secundaria = PC calculado SOLO si los 4 períodos están completos
     (regla MINERD: sin autocompletar con parciales).

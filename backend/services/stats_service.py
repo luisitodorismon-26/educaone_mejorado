@@ -742,9 +742,9 @@ def get_stats_cursos(db: Session, user, periodo: int = 0, nivel: str = None) -> 
 
     # PRIMARIA — tabla CalificacionPrimaria (una fila por competencia)
     # v2.13.51: robusto — si `final_competencia` no está guardado, se calcula
-    # desde los períodos (valor del período = max(P, RP); regla NE = se saltan
-    # los períodos sin evaluar). Antes se ignoraban esas filas y el curso
-    # aparecía con 0 aprobados / 0 reprobados.
+    # desde los períodos con la regla canónica (RP reemplaza a P; NE fuera del
+    # divisor; un período PENDIENTE deja la competencia sin CF). Antes se
+    # ignoraban esas filas y el curso aparecía con 0 aprobados / 0 reprobados.
     if est_primaria_ids:
         try:
             rows = db.query(
@@ -861,7 +861,7 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
     if es_primaria:
         # Primaria: traer competencias y derivar la "nota del período" como
         # promedio de los valores de período de cada competencia.
-        # valor_periodo MINERD: max(P, RP) si hay RP; si no, P (o RP solo).
+        # valor_periodo MINERD de Primaria: la RP, si existe; si no, la P.
         califs_pri = (
             tenant_filter(db.query(CalificacionPrimaria), CalificacionPrimaria, user)
             .filter(CalificacionPrimaria.estudiante_id.in_(est_ids),
