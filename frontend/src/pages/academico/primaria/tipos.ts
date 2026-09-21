@@ -95,11 +95,14 @@ export const NOMBRES_COMPETENCIAS_PRIM: Record<number, string> = {
   3: 'Ética y Ciudadana',
 };
 
-// Valor efectivo del período = max(P, RP)
+// Valor efectivo del período: RP REEMPLAZA a P (R2-A2).
+// La norma dice que la recuperación se asienta en su columna "siendo esta
+// última la calificación final del período": RP no compite con P, lo
+// sustituye. Antes era max(P, RP), que se desviaba en cuanto RP era menor.
+// Espejo exacto de calculo_primaria.valor_periodo_primaria del backend.
 export function valorPeriodoEfectivo(comp: CompetenciaPrim, periodo: number): number | null {
   const p = comp[`p${periodo}` as keyof CompetenciaPrim] as number | null;
   const rp = comp[`rp${periodo}` as keyof CompetenciaPrim] as number | null;
-  if (p != null && rp != null) return Math.max(p, rp);
   if (rp != null) return rp;
   return p;
 }

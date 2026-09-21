@@ -42,13 +42,26 @@ MINIMO_APROBATORIO_PRIMARIA = 65
 def valor_periodo_primaria(p, rp):
     """Valor numérico efectivo de un período de Primaria, o None.
 
-    NOTA DE R2-A1: aquí todavía se conserva `max(P, RP)`, que es lo que el
-    sistema hacía antes de esta fase. Este commit solo unifica el cálculo en
-    un sitio; el cambio de semántica —RP reemplaza a P— llega en A2, y al
-    estar centralizado será una sola línea en vez de siete.
+    RP REEMPLAZA A P. No es el mayor de los dos.
+
+    La norma dice que el resultado de la recuperación pedagógica «se sumará a
+    la obtenida en el período y se asentará en la columna correspondiente,
+    siendo esta última la calificación final del período». Es decir: RP no es
+    una nota paralela que compita con P, es LA nota del período una vez hecha
+    la recuperación. Si el docente asentó 70, el período vale 70, venga de
+    donde venga P.
+
+    Hasta R2 esto era `max(P, RP)`, que coincide mientras RP sea mayor —el
+    caso habitual, porque se recupera para subir— pero se desvía en cuanto no
+    lo es: con P=80 y RP=70 devolvía 80, ignorando lo que el docente asentó
+    como calificación final del período.
+
+        P=50  RP=70   -> 70          P=80  RP=None -> 80
+        P=80  RP=70   -> 70          P=None RP=70  -> 70
+        P=60  RP=75   -> 75          P=None RP=None -> None
+
+    Solo PRIMARIA. Secundaria conserva su propia regla.
     """
-    if p is not None and rp is not None:
-        return max(p, rp)
     if rp is not None:
         return rp
     return p

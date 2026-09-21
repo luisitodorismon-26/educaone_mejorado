@@ -650,18 +650,28 @@ def _modelo(**campos):
     return c
 
 
-@test("F1 valor_periodo = max(P, RP), y RP sola vale si no hay P")
+@test("F1 valor_periodo: RP REEMPLAZA a P (R2-A2)")
 def _():
-    assert _modelo(p1=60, rp1=75).valor_periodo(1) == 75, "la recuperacion no subio"
+    # CAMBIO DE REQUISITO ACADEMICO, no de implementacion. Hasta R2 esto era
+    # max(P, RP). La norma dice que la recuperacion se asienta en su columna
+    # "siendo esta ultima la calificacion final del periodo": RP no compite
+    # con P, lo sustituye. Los dos primeros asserts valian igual con max();
+    # los de F2 son los que cambian de resultado.
+    assert _modelo(p1=60, rp1=75).valor_periodo(1) == 75
     assert _modelo(p1=60).valor_periodo(1) == 60
     assert _modelo(rp1=75).valor_periodo(1) == 75, "RP sin P deberia valer"
     assert _modelo().valor_periodo(1) is None
+    # Casos exigidos por R2-A2
+    assert _modelo(p1=50, rp1=70).valor_periodo(1) == 70
+    assert _modelo(p1=0, rp1=0).valor_periodo(1) == 0, "0 no es ausencia"
+    assert _modelo(p1=100, rp1=90).valor_periodo(1) == 90
 
 
-@test("F2 una recuperación MENOR que la nota original no baja el período")
+@test("F2 una recuperación MENOR que la nota original SI baja el período")
 def _():
-    # Es la consecuencia de max(): recuperar peor no puede perjudicar.
-    assert _modelo(p1=80, rp1=50).valor_periodo(1) == 80
+    # Antes de R2 esto devolvia 80, por max(). Ahora manda lo que el docente
+    # asento como calificacion final del periodo.
+    assert _modelo(p1=80, rp1=50).valor_periodo(1) == 50
     assert _modelo(p1=80, rp1=80).valor_periodo(1) == 80
 
 
