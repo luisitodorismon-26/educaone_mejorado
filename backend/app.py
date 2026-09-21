@@ -6849,6 +6849,19 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
         logger.error(f"Error en calificaciones-primaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({'error': f'Error del servidor: {str(e)}'}, status_code=500)
 
+def _valor_periodo_pri(comp, periodo):
+    """Valor efectivo de un período de PRIMARIA, o None.
+
+    R2-A1: atajo para los consumidores de app.py que antes reimplementaban
+    la regla. La definición vive en `calculo_primaria`; aquí solo se leen los
+    campos del modelo. No se usa para Secundaria.
+    """
+    from calculo_primaria import valor_periodo_primaria
+    v = valor_periodo_primaria(getattr(comp, f'p{periodo}', None),
+                               getattr(comp, f'rp{periodo}', None))
+    return None if v is None else float(v)
+
+
 def _es_curso_primaria(db, curso_id: int) -> bool:
     """True solo si el curso pertenece REALMENTE al nivel primaria.
 
@@ -16093,14 +16106,9 @@ def _calcular_cuadro_honor(db, current_user, curso_id=None, umbral=90.0, nivel=N
                 vals = []
                 for c in comps.values():
                     for p in (1, 2, 3, 4):
-                        pv = getattr(c, f'p{p}', None)
-                        rv = getattr(c, f'rp{p}', None)
-                        if pv is not None and rv is not None:
-                            vals.append(float(max(pv, rv)))
-                        elif rv is not None:
-                            vals.append(float(rv))
-                        elif pv is not None:
-                            vals.append(float(pv))
+                        _v = _valor_periodo_pri(c, p)
+                        if _v is not None:
+                            vals.append(_v)
                 if not vals:
                     continue
                 nota_asig = sum(vals) / len(vals)
@@ -16358,14 +16366,9 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
                     vals = []
                     if periodo and periodo > 0:
                         for c in comps:
-                            pv = getattr(c, f'p{periodo}', None)
-                            rv = getattr(c, f'rp{periodo}', None)
-                            if pv is not None and rv is not None:
-                                vals.append(float(max(pv, rv)))
-                            elif rv is not None:
-                                vals.append(float(rv))
-                            elif pv is not None:
-                                vals.append(float(pv))
+                            _v = _valor_periodo_pri(c, periodo)
+                            if _v is not None:
+                                vals.append(_v)
                     else:
                         finals = [float(c.final_competencia) for c in comps if c.final_competencia is not None]
                         if len(finals) == len(comps) and finals:
@@ -16373,14 +16376,9 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
                         else:
                             for c in comps:
                                 for p in range(1, 5):
-                                    pv = getattr(c, f'p{p}', None)
-                                    rv = getattr(c, f'rp{p}', None)
-                                    if pv is not None and rv is not None:
-                                        vals.append(float(max(pv, rv)))
-                                    elif rv is not None:
-                                        vals.append(float(rv))
-                                    elif pv is not None:
-                                        vals.append(float(pv))
+                                    _v = _valor_periodo_pri(c, p)
+                                    if _v is not None:
+                                        vals.append(_v)
                     if vals:
                         notas_por_est[eid] = sum(vals) / len(vals)
             except Exception as e:
@@ -17094,7 +17092,14 @@ async def imprimir_planilla_calificaciones(curso_id: int, asignatura_id: int, re
             for p in (1, 2, 3, 4):
                 pv = getattr(cal, f'p{p}', None)
                 rv = getattr(cal, f'rp{p}', None)
-                if pv is not None and rv is not None:
+                # La planilla sirve a los dos niveles. Primaria usa la
+                # definición canónica; Secundaria conserva la suya intacta.
+                if nivel == 'primaria':
+                    _v = _valor_periodo_pri(cal, p)
+                    vals.append(_v)
+                    rp_flags.append(rv is not None and _v is not None
+                                    and (pv is None or float(rv) != float(pv)))
+                elif pv is not None and rv is not None:
                     vals.append(float(max(pv, rv)))
                     rp_flags.append(float(rv) > float(pv))
                 elif rv is not None:

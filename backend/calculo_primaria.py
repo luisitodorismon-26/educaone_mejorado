@@ -26,6 +26,34 @@ Corte oficial: 65.
 MINIMO_APROBATORIO_PRIMARIA = 65
 
 
+# ══════════════════════════════════════════════════════════════════════
+# EL PERÍODO — definición canónica
+#
+# Hasta R2 cada consumidor reimplementaba esto por su cuenta: el modelo, el
+# Registro, el boletín a padres, las estadísticas, el cuadro de honor, la
+# planilla y el frontend, cada uno con su copia. Siete definiciones del mismo
+# concepto es garantía de que tarde o temprano dejan de coincidir.
+#
+# A partir de aquí hay UNA. Es una función pura —números, no modelos— para
+# que la pueda usar tanto `models.py` como cualquier consumidor sin arrastrar
+# dependencias ni crear ciclos de import.
+# ══════════════════════════════════════════════════════════════════════
+
+def valor_periodo_primaria(p, rp):
+    """Valor numérico efectivo de un período de Primaria, o None.
+
+    NOTA DE R2-A1: aquí todavía se conserva `max(P, RP)`, que es lo que el
+    sistema hacía antes de esta fase. Este commit solo unifica el cálculo en
+    un sitio; el cambio de semántica —RP reemplaza a P— llega en A2, y al
+    estar centralizado será una sola línea en vez de siete.
+    """
+    if p is not None and rp is not None:
+        return max(p, rp)
+    if rp is not None:
+        return rp
+    return p
+
+
 def cf_competencia(calif, minimo_periodos=1):
     """CF de UNA competencia (objeto CalificacionPrimaria).
     Promedio de los períodos evaluados (NE = período sin valor)."""

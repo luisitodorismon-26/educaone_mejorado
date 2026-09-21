@@ -388,16 +388,14 @@ def _overlay(page, draw_func):
 
 
 def _valor_efectivo(comp_data: Dict, p: int):
-    """Valor del período: max(P, RP) — la RP nunca baja la nota."""
+    """Valor del período, según la definición canónica de Primaria."""
+    from calculo_primaria import valor_periodo_primaria
     pv = comp_data.get(f'p{p}')
     rv = comp_data.get(f'rp{p}')
-    if pv is not None and rv is not None:
-        return max(float(pv), float(rv))
-    if rv is not None:
-        return float(rv)
-    if pv is not None:
-        return float(pv)
-    return None
+    v = valor_periodo_primaria(
+        float(pv) if pv is not None else None,
+        float(rv) if rv is not None else None)
+    return None if v is None else float(v)
 
 
 # ─────────────────────────── GENERADOR ───────────────────────────

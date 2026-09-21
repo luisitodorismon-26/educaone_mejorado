@@ -249,15 +249,11 @@ def get_graficos(db: Session, user, nivel: str = None) -> dict:
         # cf de la competencia
         if row.final_competencia is not None:
             d['finals'].append(float(row.final_competencia))
-        # pc del período: max(p, rp) si hay rp, sino p
-        valP = row.p_periodo
-        valRP = row.rp_periodo
-        if valRP is not None and valP is not None:
-            d['pcs'].append(float(max(valP, valRP)))
-        elif valRP is not None:
-            d['pcs'].append(float(valRP))
-        elif valP is not None:
-            d['pcs'].append(float(valP))
+        # Valor del período, segun la definicion canonica de Primaria.
+        from calculo_primaria import valor_periodo_primaria
+        _v = valor_periodo_primaria(row.p_periodo, row.rp_periodo)
+        if _v is not None:
+            d['pcs'].append(float(_v))
     
     # Construir tuplas estilo "secundaria" para reutilizar el loop de abajo
     class _CalAdapter:
@@ -763,10 +759,7 @@ def get_stats_cursos(db: Session, user, periodo: int = 0, nivel: str = None) -> 
                 CalificacionPrimaria.estudiante_id.in_(est_primaria_ids)
             ).all()
 
-            def _valor_periodo(p, rp):
-                if p is not None and rp is not None:
-                    return max(p, rp)
-                return rp if rp is not None else p
+            from calculo_primaria import valor_periodo_primaria as _valor_periodo
 
             cf_por_area: Dict[tuple, List[float]] = {}
             for (eid, aid, fc, p1, rp1, p2, rp2, p3, rp3, p4, rp4) in rows:
@@ -882,13 +875,10 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
             comps_por_est_asig[(c.estudiante_id, c.asignatura_id)].append(c)
         
         def valor_periodo_pri(comp, p):
-            valP = getattr(comp, f'p{p}', None)
-            valRP = getattr(comp, f'rp{p}', None)
-            if valRP is not None and valP is not None:
-                return float(max(valP, valRP))
-            if valRP is not None: return float(valRP)
-            if valP is not None: return float(valP)
-            return None
+            from calculo_primaria import valor_periodo_primaria
+            v = valor_periodo_primaria(getattr(comp, f'p{p}', None),
+                                       getattr(comp, f'rp{p}', None))
+            return None if v is None else float(v)
         
         result_est = []
         for est in estudiantes:

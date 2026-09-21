@@ -53,14 +53,10 @@ def _fmt(valor) -> str:
 
 
 def _valor_periodo(comp, periodo: int):
-    """Valor efectivo del período: max(P, RP) si hay RP, si no P."""
-    p = getattr(comp, f'p{periodo}', None)
-    rp = getattr(comp, f'rp{periodo}', None)
-    if p is None:
-        return None
-    if rp is not None:
-        return max(p, rp)
-    return p
+    """Valor efectivo del período, según la definición canónica de Primaria."""
+    from calculo_primaria import valor_periodo_primaria
+    return valor_periodo_primaria(
+        getattr(comp, f'p{periodo}', None), getattr(comp, f'rp{periodo}', None))
 
 
 def _pc_competencia(comp):

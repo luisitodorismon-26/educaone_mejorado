@@ -888,17 +888,17 @@ class CalificacionPrimaria(Base):
     asignatura = relationship('Asignatura', backref='calificaciones_primaria')
     
     def valor_periodo(self, periodo):
-        """Valor final del período: max(P, RP) si hay RP, si no P"""
-        p = getattr(self, f'p{periodo}')
-        rp = getattr(self, f'rp{periodo}')
-        if rp is not None and p is not None:
-            return max(p, rp)
-        elif rp is not None:
-            return rp
-        elif p is not None:
-            return p
-        return None
-    
+        """Valor numérico efectivo del período.
+
+        R2-A1: la regla vive en `calculo_primaria.valor_periodo_primaria`, que
+        es la definición canónica del período de Primaria. Aquí solo se leen
+        los campos y se delega, para que el modelo y los seis consumidores que
+        antes tenían su propia copia no puedan volver a divergir.
+        """
+        from calculo_primaria import valor_periodo_primaria
+        return valor_periodo_primaria(
+            getattr(self, f'p{periodo}'), getattr(self, f'rp{periodo}'))
+
     def calcular_final(self, minimo_periodos=1):
         """Final de la competencia = promedio de los períodos EVALUADOS.
 
