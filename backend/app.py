@@ -12995,6 +12995,20 @@ def _sincronizar_recuperaciones_primaria(db, current_user, ano):
 
     try:
         for (est_id, asig_id), comps in grupos.items():
+            # R2-A6: segundo candado. R1 cerró el CUÁNDO —nada nace antes de
+            # cerrar P4—; esto cierra el CON QUÉ.
+            #
+            # Toda competencia del área tiene que tener CF OFICIAL. Basta que
+            # una arrastre un período pendiente para que no haya ficha: una
+            # recuperación final se decide sobre la calificación final del
+            # área, y esa no existe mientras el año siga a medio evaluar.
+            #
+            # `cf_area` ya no promedia competencias sin CF porque A5 hizo
+            # estricto `calcular_final`, pero seguiría promediando las que
+            # SÍ la tengan e ignorando a las incompletas. Aquí se exige que
+            # no haya ninguna incompleta.
+            if any(c.calcular_final() is None for c in comps):
+                continue
             _, cf_red = calc_cf_area(comps)
             if cf_red is None:
                 continue

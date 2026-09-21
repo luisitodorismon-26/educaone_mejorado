@@ -100,11 +100,41 @@ def cf_competencia(calif, minimo_periodos=1):
 
 
 def cf_area(competencias):
-    """CF del área = promedio de las CF de sus competencias evaluadas.
+    """CF del área = promedio de las CF OFICIALES de sus competencias.
 
     `competencias` = lista de objetos CalificacionPrimaria (1 por cada C1/C2/C3
-    del área). Se promedian las que tengan CF (al menos un período evaluado).
-    Devuelve (cf_exacto, cf_redondeado) o (None, None) si no hay ninguna.
+    del área). Devuelve (cf_exacto, cf_redondeado) o (None, None).
+
+    QUÉ CAMBIÓ EN R2 Y QUÉ NO
+        Desde A5, `calcular_final` solo devuelve CF cuando los cuatro períodos
+        de la competencia están resueltos, así que esta función ya no puede
+        promediar competencias a medio evaluar: las descarta.
+
+        Lo que sigue SIN resolver es cuántas competencias DEBE tener el área.
+        Si solo existen las filas de C1 y C2, aquí se promedian dos y sale un
+        número de aspecto válido. La norma dice (C1+C2+C3)/3.
+
+        Para exigirlo hace falta saber cuántas competencias se esperan, y hoy
+        no hay forma fiable de saberlo:
+
+          · `AreaCurricular.numero_competencias` dice 2 para Inglés, que
+            contradice el Registro 2026 —su página de Lenguas Extranjeras trae
+            C1, C2 y C3 igual que las demás áreas—;
+          · el lookup que lo consulta compara `AreaCurricular.nombre` con
+            `Asignatura.nombre`, y para «Inglés» nunca acierta: el catálogo lo
+            llama «Lenguas Extranjeras (Inglés)». Cae en el default 3;
+          · en el tenant 2 los grados tienen `ciclo` NULL, así que el catálogo
+            ni se consulta.
+
+        Corregir eso es R3 (catálogo Inglés 2→3 y lookup curricular), y
+        decidirlo aquí sería inventarlo. Así que esta parte queda BLOQUEADA a
+        propósito:
+
+            BLOCKED: CF_AREA_EXPECTED_COMPETENCIES_REQUIRES_R3
+
+        Mientras tanto, el candado que sí es independiente vive en
+        `_sincronizar_recuperaciones_primaria`: una ficha de recuperación
+        exige que TODAS las competencias presentes tengan CF oficial.
     """
     finales = []
     for c in competencias:
