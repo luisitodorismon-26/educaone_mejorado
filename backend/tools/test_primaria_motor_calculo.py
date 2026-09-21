@@ -100,9 +100,9 @@ def test(nombre):
     return deco
 
 
-def _modelo(**campos):
+def _modelo(comp=1, **campos):
     """CalificacionPrimaria suelta, sin sesion: para probar el motor puro."""
-    c = M.CalificacionPrimaria(estudiante_id=1, asignatura_id=1, competencia_numero=1)
+    c = M.CalificacionPrimaria(estudiante_id=1, asignatura_id=1, competencia_numero=comp)
     for k, v in campos.items():
         setattr(c, k, v)
     return c
@@ -112,12 +112,13 @@ def _modelo(**campos):
 PWD = "Prueba2026x"
 COL_A, COL_B = 1, 2
 ANO_A, ANO_B = 1, 2
-G_4TO, G_B = 14, 91
-CUR_4A, CUR_B = 24, 90
-LENGUA, MATE = 1, 2
+G_4TO, G_B, G_1RO = 14, 91, 15
+CUR_4A, CUR_B, CUR_1A = 24, 90, 25
+LENGUA, MATE, INGLES = 1, 2, 5
 ASIG_B = 9
-E_1, E_2, E_B = 101, 102, 190
+E_1, E_2, E_B, E_1RO = 101, 102, 190, 103
 PROF, PROF_SIN, DIR, COORD, SECRE, PSICO, PROF_B = 301, 302, 310, 311, 312, 313, 390
+PROF_1RO = 303
 
 
 def _u(uid, col, user, rol):
@@ -141,25 +142,45 @@ def fixture():
                            p2_cerrado=False, p3_cerrado=False, p4_cerrado=False))
     d.add(M.Grado(id=G_4TO, colegio_id=COL_A, nombre="4to Primaria", nivel="primaria",
                   ciclo="segundo_ciclo", orden=10))
+    # 1ro: R3 no puede tocar la modalidad cualitativa de P2A-R1.
+    d.add(M.Grado(id=G_1RO, colegio_id=COL_A, nombre="1ro Primaria", nivel="primaria",
+                  ciclo="primer_ciclo", orden=1))
     d.add(M.Grado(id=G_B, colegio_id=COL_B, nombre="4to Primaria", nivel="primaria",
                   ciclo="segundo_ciclo", orden=10))
     d.add(M.Curso(id=CUR_4A, colegio_id=COL_A, nombre="A", grado_id=G_4TO, ano_escolar_id=ANO_A))
+    d.add(M.Curso(id=CUR_1A, colegio_id=COL_A, nombre="A", grado_id=G_1RO, ano_escolar_id=ANO_A))
     d.add(M.Curso(id=CUR_B, colegio_id=COL_B, nombre="A", grado_id=G_B, ano_escolar_id=ANO_B))
     d.add(M.Asignatura(id=LENGUA, colegio_id=COL_A, nombre="Lengua Española", codigo="LE"))
     d.add(M.Asignatura(id=MATE, colegio_id=COL_A, nombre="Matemática", codigo="MA"))
+    # La asignatura se llama «Inglés» y el área «Lenguas Extranjeras (Inglés)»:
+    # exactamente el desajuste por el que el cruce por nombre nunca acertaba.
+    d.add(M.Asignatura(id=INGLES, colegio_id=COL_A, nombre="Inglés", codigo="IN"))
+    # Catálogo TAL Y COMO está hoy en producción, con el 2 viejo incluido: la
+    # prueba es que el motor ya no le hace caso.
+    d.add(M.AreaCurricular(id=1, colegio_id=COL_A, nombre="Lengua Española", codigo="LE",
+                           nivel="primaria", ciclo="segundo_ciclo",
+                           numero_competencias=3, orden=1))
+    d.add(M.AreaCurricular(id=2, colegio_id=COL_A, nombre="Lenguas Extranjeras (Inglés)",
+                           codigo="LEX", nivel="primaria", ciclo="segundo_ciclo",
+                           numero_competencias=2, orden=8))
     d.add(M.Asignatura(id=ASIG_B, colegio_id=COL_B, nombre="Lengua Española", codigo="LE"))
-    for eid, cur, col in ((E_1, CUR_4A, COL_A), (E_2, CUR_4A, COL_A), (E_B, CUR_B, COL_B)):
+    for eid, cur, col in ((E_1, CUR_4A, COL_A), (E_2, CUR_4A, COL_A),
+                          (E_1RO, CUR_1A, COL_A), (E_B, CUR_B, COL_B)):
         d.add(M.Estudiante(id=eid, colegio_id=col, nombre=f"Est{eid}", apellido="P",
                            curso_id=cur, activo=True, no_lista=eid - 100))
     for uid, user, rol in ((PROF, "prof", "profesor"), (PROF_SIN, "profsin", "profesor"),
+                           (PROF_1RO, "prof1ro", "profesor"),
                            (DIR, "dir", "direccion"), (COORD, "coord", "coordinador"),
                            (SECRE, "secre", "secretaria"), (PSICO, "psico", "psicologia")):
         d.add(_u(uid, COL_A, user, rol))
     d.add(_u(PROF_B, COL_B, "profb", "profesor"))
-    for asig in (LENGUA, MATE):
+    for asig in (LENGUA, MATE, INGLES):
         d.add(M.AsignacionProfesor(colegio_id=COL_A, profesor_id=PROF, curso_id=CUR_4A,
                                    asignatura_id=asig, ano_escolar_id=ANO_A,
                                    activo=True, es_titular=(asig == LENGUA)))
+    d.add(M.AsignacionProfesor(colegio_id=COL_A, profesor_id=PROF_1RO, curso_id=CUR_1A,
+                               asignatura_id=LENGUA, ano_escolar_id=ANO_A,
+                               activo=True, es_titular=True))
     d.add(M.AsignacionProfesor(colegio_id=COL_B, profesor_id=PROF_B, curso_id=CUR_B,
                                asignatura_id=ASIG_B, ano_escolar_id=ANO_B, activo=True))
     d.commit()
@@ -176,6 +197,7 @@ def _tok(u):
 
 
 H_PROF, H_SIN = _tok("prof"), _tok("profsin")
+H_PROF_1RO = _tok("prof1ro")
 H_DIR, H_COORD = _tok("dir"), _tok("coord")
 H_SECRE, H_PSICO, H_B = _tok("secre"), _tok("psico"), _tok("profb")
 
@@ -754,6 +776,117 @@ def _():
     assert f is not None, "la fila existente no debe desaparecer"
     assert f.p1 is None and f.p2 is None
     assert f.final_competencia is None and f.literal is None, "CF fantasma"
+
+
+# ══════ J · LA FUENTE CANONICA DE COMPETENCIAS (R3) ══════
+
+@test("J10 el GET devuelve las TRES competencias aunque no existan filas")
+def _():
+    limpiar_calificaciones()
+    r = client.get(f"/api/calificaciones-primaria/curso/{CUR_4A}/asignatura/{LENGUA}",
+                   headers=H_PROF)
+    assert r.status_code == 200, r.text[:250]
+    d = r.json()
+    assert d["num_competencias"] == 3, d.get("num_competencias")
+    alumno = d["calificaciones"][0]
+    assert len(alumno["competencias"]) == 3, len(alumno["competencias"])
+    assert [c["competencia_numero"] for c in alumno["competencias"]] == [1, 2, 3]
+    for c in alumno["competencias"]:
+        assert all(c["estados"][str(n)] == "pendiente" for n in (1, 2, 3, 4)), c["estados"]
+
+
+@test("J11 INGLES: el catalogo dice 2 y la pantalla sigue ensenando 3")
+def _():
+    # Esta es la prueba de R3: el area se llama distinto que la asignatura,
+    # asi que el viejo cruce por nombre no acertaba nunca; y aunque acertara,
+    # el 2 del catalogo contradice el Registro 2026 (C1/C2/C3 en 4to, 5to y
+    # 6to). El motor ya no pregunta al catalogo.
+    d = SessionLocal()
+    try:
+        assert d.query(M.AreaCurricular).filter_by(
+            codigo='LEX', colegio_id=COL_A).first().numero_competencias == 2, \
+            "la fixture debe reproducir el catalogo viejo"
+    finally:
+        d.close()
+    r = client.get(f"/api/calificaciones-primaria/curso/{CUR_4A}/asignatura/{INGLES}",
+                   headers=H_PROF)
+    assert r.status_code == 200, r.text[:250]
+    assert r.json()["num_competencias"] == 3, r.json().get("num_competencias")
+    alumno = r.json()["calificaciones"][0]
+    assert [c["competencia_numero"] for c in alumno["competencias"]] == [1, 2, 3]
+
+
+@test("J12 renombrar el area NO cambia cuantas competencias se ensenan")
+def _():
+    # `nombre` es editable desde la pantalla de Areas. La matriz oficial no
+    # puede depender de eso.
+    d = SessionLocal()
+    try:
+        area = d.query(M.AreaCurricular).filter_by(codigo='LEX', colegio_id=COL_A).first()
+        original = area.nombre
+        area.nombre = 'Inglés'          # justo el nombre que haria coincidir
+        d.commit()
+    finally:
+        d.close()
+    try:
+        r = client.get(f"/api/calificaciones-primaria/curso/{CUR_4A}/asignatura/{INGLES}",
+                       headers=H_PROF)
+        assert r.json()["num_competencias"] == 3, \
+            "con el cruce por nombre esto habria devuelto 2 y C3 desapareceria"
+    finally:
+        d = SessionLocal()
+        try:
+            a = d.query(M.AreaCurricular).filter_by(codigo='LEX', colegio_id=COL_A).first()
+            a.nombre = original
+            d.commit()
+        finally:
+            d.close()
+
+
+@test("J16 la correccion del catalogo es idempotente y solo toca LEX")
+def _():
+    # La misma sentencia que corre el lifespan, ejecutada dos veces sobre el
+    # catalogo de la fixture (que reproduce el estado de produccion: LEX=2).
+    from sqlalchemy import text as _text
+    import app as _A, re as _re, inspect as _inspect
+
+    fuente = _inspect.getsource(_A.lifespan)
+    assert "codigo = 'LEX'" in fuente, "la migracion deberia anclarse en el codigo"
+    assert "numero_competencias = 2" in fuente, "deberia tocar solo las que valen 2"
+    # Y nunca por el nombre, que es texto libre editable.
+    bloque = fuente[fuente.index('6k.'):fuente.index('6k.') + 1800]
+    assert 'nombre' not in bloque.split('logger')[0].split('WHERE')[-1], \
+        "la fila no puede identificarse por nombre"
+
+    sql = ("UPDATE areas_curriculares SET numero_competencias = 3 "
+           "WHERE codigo = 'LEX' AND nivel = 'primaria' "
+           "AND ciclo = 'segundo_ciclo' AND numero_competencias = 2")
+
+    d = SessionLocal()
+    try:
+        antes = {a.codigo: a.numero_competencias
+                 for a in d.query(M.AreaCurricular).all()}
+        assert antes.get('LEX') == 2, antes
+        assert antes.get('LE') == 3, antes
+
+        r1 = d.execute(_text(sql)); d.commit()
+        assert r1.rowcount == 1, r1.rowcount
+
+        r2 = d.execute(_text(sql)); d.commit()
+        assert r2.rowcount == 0, "la segunda pasada no deberia tocar nada"
+
+        despues = {a.codigo: a.numero_competencias
+                   for a in d.query(M.AreaCurricular).all()}
+        assert despues.get('LEX') == 3, despues
+        assert despues.get('LE') == 3, "no debe tocar las demas areas"
+        assert len(antes) == len(despues), "no crea ni borra filas"
+    finally:
+        # Se deja como estaba: J11 depende de que el catalogo diga 2.
+        a = d.query(M.AreaCurricular).filter_by(codigo='LEX').first()
+        if a:
+            a.numero_competencias = 2
+            d.commit()
+        d.close()
 
 
 print(f"\n{B}{'=' * 62}{X}")

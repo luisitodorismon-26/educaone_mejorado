@@ -846,7 +846,11 @@ class AreaCurricular(Base):
     codigo = Column(String(20))                                     # 'LE', 'MA', 'CS', etc
     nivel = Column(String(20), default='primaria')                  # 'primaria' | 'secundaria'
     ciclo = Column(String(20))                                      # 'primer_ciclo' | 'segundo_ciclo'
-    numero_competencias = Column(Integer, default=3)                # Primaria: 3, Inglés: 2
+    # Metadato de catálogo, para mostrar. NO es la fuente del motor: la
+    # matriz oficial de Primaria vive en calculo_primaria.
+    # COMPETENCIAS_OFICIALES_PRIMARIA, porque este campo y el `nombre` de
+    # al lado son editables desde la pantalla de Áreas (R3).
+    numero_competencias = Column(Integer, default=3)                # Primaria: 3 en todas las áreas
     orden = Column(Integer, default=0)
     activo = Column(Boolean, default=True)
 
@@ -2947,7 +2951,7 @@ def init_db():
                 AreaCurricular(nombre='Educación Artística', codigo='EA', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=5, colegio_id=colegio.id),
                 AreaCurricular(nombre='Educación Física', codigo='EF', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=6, colegio_id=colegio.id),
                 AreaCurricular(nombre='Formación Integral Humana y Religiosa', codigo='FIHR', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=7, colegio_id=colegio.id),
-                AreaCurricular(nombre='Lenguas Extranjeras (Inglés)', codigo='LEX', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=2, orden=8, colegio_id=colegio.id),
+                AreaCurricular(nombre='Lenguas Extranjeras (Inglés)', codigo='LEX', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=8, colegio_id=colegio.id),
             ]
             db.add_all(areas_primaria)
         

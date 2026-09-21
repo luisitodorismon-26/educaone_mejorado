@@ -894,6 +894,35 @@ async def lifespan(app):
         #
         # Rollback (Postgres):
         #   ALTER TABLE calificaciones_primaria DROP COLUMN ne1;  (ne2, ne3, ne4)
+        # === 6k. Catálogo: Inglés de Primaria pasa de 2 a 3 competencias (R3) ===
+        #
+        # El Registro de Grado 2026 trae C1/C2/C3 para Lenguas Extranjeras en
+        # 4.º, 5.º y 6.º, igual que para las demás áreas. El catálogo decía 2.
+        #
+        # Esto NO cambia ningún cálculo: desde R3 la matriz la fija
+        # COMPETENCIAS_OFICIALES_PRIMARIA y el motor no consulta esta tabla.
+        # Se corrige porque el número se enseña en la pantalla de Áreas y ahí
+        # contradecía al documento oficial.
+        #
+        # La fila se identifica por `codigo='LEX'` + nivel + ciclo, nunca por
+        # `nombre`: ese campo es texto libre editable y apuntar a él podría
+        # tocar otra área. Y solo se toca si vale 2, así que es idempotente y
+        # respeta cualquier valor que un colegio haya puesto a mano.
+        if 'areas_curriculares' in inspector.get_table_names():
+            try:
+                with engine.connect() as conn:
+                    _r = conn.execute(text(
+                        "UPDATE areas_curriculares SET numero_competencias = 3 "
+                        "WHERE codigo = 'LEX' AND nivel = 'primaria' "
+                        "AND ciclo = 'segundo_ciclo' AND numero_competencias = 2"))
+                    conn.commit()
+                    if _r.rowcount:
+                        logger.info(
+                            "✅ R3: %d área(s) LEX de Primaria corregidas a 3 "
+                            "competencias (Registro MINERD 2026)", _r.rowcount)
+            except Exception as e:
+                logger.warning("No se pudo corregir el catálogo LEX: %s", e)
+
         if 'calificaciones_primaria' in inspector.get_table_names():
             _cols_cp = {c['name'] for c in inspector.get_columns('calificaciones_primaria')}
             _faltan_ne = [c for c in ('ne1', 'ne2', 'ne3', 'ne4') if c not in _cols_cp]
@@ -6805,14 +6834,19 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
                 return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'},
                                     status_code=403)
 
-        # Determinar número de competencias (default 3)
-        num_competencias = 3
-        if grado.ciclo:
-            area = tenant_filter(db.query(AreaCurricular), AreaCurricular, current_user).filter_by(
-                nombre=asignatura.nombre, nivel='primaria', ciclo=grado.ciclo
-            ).first()
-            if area:
-                num_competencias = area.numero_competencias
+        # Cuántas competencias enseñar: las oficiales, siempre las tres.
+        #
+        # R3: antes se buscaba el área cruzando `AreaCurricular.nombre` con
+        # `Asignatura.nombre`. Con inglés no acertaba nunca —«Inglés» frente a
+        # «Lenguas Extranjeras (Inglés)»— y caía en un default que daba 3 por
+        # casualidad; si alguien hubiera renombrado el área para que coincidiera,
+        # la pantalla habría pasado a enseñar 2 y C3 habría desaparecido del
+        # flujo de calificación sin que nadie lo notara.
+        #
+        # Las competencias que faltan se devuelven igualmente, PENDIENTES: que
+        # todavía no exista la fila no significa que la competencia no exista.
+        from calculo_primaria import TOTAL_COMPETENCIAS_PRIMARIA
+        num_competencias = TOTAL_COMPETENCIAS_PRIMARIA
         
         # Incluir retirados — el profesor los ve con badge readonly
         estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(

@@ -7,7 +7,8 @@ Carril SEPARADO de secundaria. No importa ni depende de la lógica de
 CalificacionSecundaria / EvaluacionExtraSecundaria.
 
 Reglas oficiales (Registro de Grado, Nivel Primario, MINERD 2023-2024):
- - 3 competencias por área (C1, C2, C3); Inglés puede tener 2.
+ - 3 competencias por área (C1, C2, C3) en TODAS las áreas y los seis
+   grados, inglés incluido (Registros de Grado MINERD 2026).
  - Cada competencia: P1-P4 con RP1-RP4. Valor del período = RP si existe, si
    no P (R2: la RP REEMPLAZA a la nota del período, no compite con ella).
  - Un período está EVALUADO, en NE o PENDIENTE. NULL a secas es PENDIENTE.
@@ -28,6 +29,36 @@ Corte oficial: 65.
 """
 
 MINIMO_APROBATORIO_PRIMARIA = 65
+
+
+# ═══ LAS COMPETENCIAS QUE UN ÁREA DEBE TENER ═══
+#
+# Tres. Las mismas para todas las áreas oficiales del Nivel Primario y para
+# los seis grados. Comprobado hoja por hoja en los Registros de Grado 2026 del
+# MINERD, los seis: cada página de área rotula su matriz «C1 Competencia 1 /
+# C2 Competencia 2 / C3 Competencia 3», y eso incluye Lenguas Extranjeras
+# (inglés) en 4.º, 5.º y 6.º —hojas 96 de esos tres Registros—.
+#
+# POR QUÉ UNA CONSTANTE Y NO EL CATÁLOGO
+#     Hasta R3 esto se consultaba en `AreaCurricular.numero_competencias`,
+#     cruzando `AreaCurricular.nombre` con `Asignatura.nombre`. Dos problemas
+#     de distinta gravedad:
+#
+#       · el catálogo decía 2 para inglés, que contradice el Registro;
+#       · y el cruce por nombre no acertaba nunca con inglés —la asignatura se
+#         llama «Inglés» y el área «Lenguas Extranjeras (Inglés)»—, así que
+#         en la práctica caía en el default 3 y el error del catálogo quedaba
+#         tapado por un acierto accidental.
+#
+#     Lo segundo es lo que descarta el catálogo como fuente: `nombre` es un
+#     campo editable desde la pantalla de Áreas. La matriz de evaluación de
+#     Primaria no puede depender de que nadie renombre un área.
+#
+#     Si algún día un documento oficial introdujera un área de Primaria con
+#     otra estructura, esto deja de ser una constante y pasa a ser un dato por
+#     área. Hoy no hay ninguna: los seis Registros dicen lo mismo.
+COMPETENCIAS_OFICIALES_PRIMARIA = (1, 2, 3)
+TOTAL_COMPETENCIAS_PRIMARIA = len(COMPETENCIAS_OFICIALES_PRIMARIA)
 
 
 # ══════════════════════════════════════════════════════════════════════
