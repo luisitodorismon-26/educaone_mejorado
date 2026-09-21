@@ -676,21 +676,22 @@ def _():
 @test("G2 un area sin CF oficial no llega a promocion con un veredicto falso")
 def _():
     import calculo_primaria as CP
-    # cf_area de competencias incompletas es None, y situacion_area lo respeta
-    incompletas = [_modelo(p1=80, p2=80), _modelo(p1=80, p2=80), _modelo(p1=80, p2=80)]
+    # Las tres competencias existen pero ninguna tiene CF: P3 y P4 pendientes.
+    incompletas = [_modelo(comp=n, p1=80, p2=80) for n in (1, 2, 3)]
     assert cf_area(incompletas) == (None, None), cf_area(incompletas)
     assert CP.situacion_area(cf_area(incompletas)[1])['estado'] == 'sin_notas'
 
 
-@test("G3 cf_area sigue SIN exigir un numero esperado de competencias (R3)")
+@test("G3 el bloqueo de R3 esta LEVANTADO y documentado como tal")
 def _():
-    # Documenta el bloqueo: con solo C1 y C2 completas, cf_area promedia dos.
-    # No es un descuido, es la subfase que depende de R3 (Ingles 2 -> 3).
-    dos = [_modelo(p1=80, p2=80, p3=80, p4=80), _modelo(p1=60, p2=60, p3=60, p4=60)]
-    assert cf_area(dos) == (70.0, 70), cf_area(dos)
     import inspect
-    assert 'CF_AREA_EXPECTED_COMPETENCIES_REQUIRES_R3' in inspect.getdoc(cf_area), \
-        "el bloqueo deberia estar documentado en el propio codigo"
+    doc = inspect.getdoc(cf_area) or ''
+    assert 'CF_AREA_EXPECTED_COMPETENCIES_REQUIRES_R3' in doc, \
+        "cf_area deberia decir que cierra ese bloqueo"
+    # Y lo cierra de verdad: dos competencias ya no producen CF.
+    dos = [_modelo(comp=1, p1=80, p2=80, p3=80, p4=80),
+           _modelo(comp=2, p1=60, p2=60, p3=60, p4=60)]
+    assert cf_area(dos) == (None, None), cf_area(dos)
 
 
 @test("G4 la recuperacion cualitativa de P2A-R1 sigue intacta")
@@ -776,6 +777,74 @@ def _():
     assert f is not None, "la fila existente no debe desaparecer"
     assert f.p1 is None and f.p2 is None
     assert f.final_competencia is None and f.literal is None, "CF fantasma"
+
+
+# ══════ J · CF OFICIAL DEL AREA: EXIGE C1 + C2 + C3 (R3) ══════
+
+def _comp_completa(numero, nota):
+    return _modelo(comp=numero, p1=nota, p2=nota, p3=nota, p4=nota)
+
+
+@test("J1 C1+C2 sin C3 -> no hay CF del area")
+def _():
+    assert cf_area([_comp_completa(1, 80), _comp_completa(2, 80)]) == (None, None)
+
+
+@test("J2 C1+C3 sin C2 -> no hay CF del area")
+def _():
+    assert cf_area([_comp_completa(1, 80), _comp_completa(3, 80)]) == (None, None)
+
+
+@test("J3 C2+C3 sin C1 -> no hay CF del area")
+def _():
+    assert cf_area([_comp_completa(2, 80), _comp_completa(3, 80)]) == (None, None)
+
+
+@test("J4 las tres completas -> CF correcta")
+def _():
+    assert cf_area([_comp_completa(1, 90), _comp_completa(2, 80),
+                    _comp_completa(3, 70)]) == (80.0, 80)
+    # y el redondeo del entero sale del exacto, no al reves
+    assert cf_area([_comp_completa(1, 80), _comp_completa(2, 80),
+                    _comp_completa(3, 81)]) == (80.33, 80)
+
+
+@test("J5 las tres presentes pero una con un periodo PENDIENTE -> None")
+def _():
+    a_medias = _modelo(comp=3, p1=80, p2=80, p3=80)      # falta P4
+    assert cf_area([_comp_completa(1, 80), _comp_completa(2, 80), a_medias]) == (None, None)
+
+
+@test("J6 tres filas que NO son tres competencias distintas -> None")
+def _():
+    # len()==3 pero C3 no esta: validar por numero, no por longitud.
+    tres_filas = [_comp_completa(1, 80), _comp_completa(2, 80), _comp_completa(2, 90)]
+    assert cf_area(tres_filas) == (None, None), "el len() enganaria aqui"
+
+
+@test("J7 una competencia fuera del conjunto oficial no rellena el hueco")
+def _():
+    con_intrusa = [_comp_completa(1, 80), _comp_completa(2, 80), _comp_completa(4, 80)]
+    assert cf_area(con_intrusa) == (None, None), "C4 no existe en Primaria"
+
+
+@test("J8 NE dentro de una competencia no impide la CF del area")
+def _():
+    c3 = _modelo(comp=3, p1=80, p2=80, p3=80)
+    c3.ne4 = True
+    assert cf_area([_comp_completa(1, 80), _comp_completa(2, 80), c3]) == (80.0, 80)
+
+
+@test("J9 la fuente canonica es una constante del motor, no el catalogo")
+def _():
+    import calculo_primaria as CP
+    assert CP.COMPETENCIAS_OFICIALES_PRIMARIA == (1, 2, 3)
+    assert CP.TOTAL_COMPETENCIAS_PRIMARIA == 3
+    import ast as _ast, inspect as _inspect, textwrap as _tw
+    src = _ast.unparse(_ast.parse(_tw.dedent(_inspect.getsource(CP.cf_area))))
+    assert 'COMPETENCIAS_OFICIALES_PRIMARIA' in src, "cf_area no usa la constante"
+    assert 'AreaCurricular' not in src and 'numero_competencias' not in src, \
+        "cf_area no debe depender del catalogo editable"
 
 
 # ══════ J · LA FUENTE CANONICA DE COMPETENCIAS (R3) ══════
@@ -887,6 +956,54 @@ def _():
             a.numero_competencias = 2
             d.commit()
         d.close()
+
+
+@test("J13 recuperacion final NO nace con solo dos competencias")
+def _():
+    limpiar_calificaciones()
+    set_ano(p4_cerrado=False)
+    for comp in (1, 2):                      # falta C3 a proposito
+        guardar(H_PROF, E_1, LENGUA, comp=comp, p1=40, p2=40, p3=40, p4=40)
+    set_ano(p4_cerrado=True)
+    try:
+        client.get("/api/recuperaciones-primaria/pendientes", headers=H_DIR)
+        assert n_fichas() == 0, "un area de dos tercios no puede ir a recuperacion"
+    finally:
+        set_ano(p4_cerrado=False)
+
+
+@test("J14 con las tres completas y CF<65 la ficha SI nace")
+def _():
+    limpiar_calificaciones()
+    set_ano(p4_cerrado=False)
+    for comp in (1, 2, 3):
+        guardar(H_PROF, E_1, LENGUA, comp=comp, p1=40, p2=40, p3=40, p4=40)
+    set_ano(p4_cerrado=True)
+    try:
+        r = client.get("/api/recuperaciones-primaria/pendientes", headers=H_DIR)
+        assert n_fichas() == 1, "R3 no debe romper el caso que si corresponde"
+        mia = [p for p in r.json()["pendientes"]
+               if p["estudiante_id"] == E_1 and p["asignatura_id"] == LENGUA]
+        assert mia and mia[0]["cf_area"] == 40, mia
+    finally:
+        set_ano(p4_cerrado=False)
+
+
+@test("J15 1ro/2do: la recuperacion cualitativa de R1 sigue intacta")
+def _():
+    # R3 toca la CF del area, no la modalidad por grado.
+    import app as _A
+    assert _A.GRADOS_RECUPERACION_CUALITATIVA == (1, 2)
+    d = SessionLocal()
+    try:
+        g1 = M.Grado(id=777, colegio_id=COL_A, nombre='1ro Primaria',
+                     nivel='primaria', ciclo='primer_ciclo', orden=1)
+        assert _A._numero_grado_estricto(g1) == 1
+    finally:
+        d.close()
+    # y una rp numerica en 1ro se sigue rechazando
+    r = guardar(H_PROF_1RO, E_1RO, LENGUA, comp=1, rp1=70)
+    assert r.status_code == 400, (r.status_code, r.text[:200])
 
 
 print(f"\n{B}{'=' * 62}{X}")

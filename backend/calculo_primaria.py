@@ -135,49 +135,46 @@ def cf_competencia(calif, minimo_periodos=1):
 
 
 def cf_area(competencias):
-    """CF del área = promedio de las CF OFICIALES de sus competencias.
+    """CF del área = promedio de las CF OFICIALES de C1, C2 y C3.
 
-    `competencias` = lista de objetos CalificacionPrimaria (1 por cada C1/C2/C3
-    del área). Devuelve (cf_exacto, cf_redondeado) o (None, None).
+    `competencias` = objetos CalificacionPrimaria del área.
+    Devuelve (cf_exacto, cf_redondeado) o (None, None).
 
-    QUÉ CAMBIÓ EN R2 Y QUÉ NO
-        Desde A5, `calcular_final` solo devuelve CF cuando los cuatro períodos
-        de la competencia están resueltos, así que esta función ya no puede
-        promediar competencias a medio evaluar: las descarta.
+    EXIGE EL CONJUNTO COMPLETO, NO «LAS QUE HAYA»
+        La norma dice (C1+C2+C3)/3. Hasta R3 esta función promediaba las
+        competencias que encontrara: con solo C1 y C2 cargadas salía un
+        número de aspecto válido —y con él un veredicto de área, y con él una
+        ficha de recuperación— calculado sobre dos tercios del área.
 
-        Lo que sigue SIN resolver es cuántas competencias DEBE tener el área.
-        Si solo existen las filas de C1 y C2, aquí se promedian dos y sale un
-        número de aspecto válido. La norma dice (C1+C2+C3)/3.
+        Ahora se valida por `competencia_numero` contra
+        COMPETENCIAS_OFICIALES_PRIMARIA, no por `len()`: tres filas no son el
+        área completa si dos de ellas son la misma competencia, y la longitud
+        sola no distingue ese caso.
 
-        Para exigirlo hace falta saber cuántas competencias se esperan, y hoy
-        no hay forma fiable de saberlo:
+        Falta C3            -> (None, None)
+        C1 y C3 sin C2      -> (None, None)
+        Las tres, una sin CF oficial (algún período PENDIENTE) -> (None, None)
+        Las tres con CF     -> promedio de las tres.
 
-          · `AreaCurricular.numero_competencias` dice 2 para Inglés, que
-            contradice el Registro 2026 —su página de Lenguas Extranjeras trae
-            C1, C2 y C3 igual que las demás áreas—;
-          · el lookup que lo consulta compara `AreaCurricular.nombre` con
-            `Asignatura.nombre`, y para «Inglés» nunca acierta: el catálogo lo
-            llama «Lenguas Extranjeras (Inglés)». Cae en el default 3;
-          · en el tenant 2 los grados tienen `ciclo` NULL, así que el catálogo
-            ni se consulta.
-
-        Corregir eso es R3 (catálogo Inglés 2→3 y lookup curricular), y
-        decidirlo aquí sería inventarlo. Así que esta parte queda BLOQUEADA a
-        propósito:
-
-            BLOCKED: CF_AREA_EXPECTED_COMPETENCIES_REQUIRES_R3
-
-        Mientras tanto, el candado que sí es independiente vive en
-        `_sincronizar_recuperaciones_primaria`: una ficha de recuperación
-        exige que TODAS las competencias presentes tengan CF oficial.
+    Esto cierra el bloqueo que R2 dejó abierto a propósito
+    (CF_AREA_EXPECTED_COMPETENCIES_REQUIRES_R3).
     """
-    finales = []
-    for c in competencias:
-        f = cf_competencia(c)
-        if f is not None:
-            finales.append(f)
-    if not finales:
+    esperadas = set(COMPETENCIAS_OFICIALES_PRIMARIA)
+    por_numero = {}
+    for c in competencias or ():
+        numero = getattr(c, 'competencia_numero', None)
+        if numero in esperadas:
+            por_numero[numero] = c
+    if set(por_numero) != esperadas:
         return None, None
+
+    finales = []
+    for numero in sorted(esperadas):
+        final = cf_competencia(por_numero[numero])
+        if final is None:
+            return None, None       # una competencia a medias deja el área sin CF
+        finales.append(final)
+
     cf_exacto = sum(finales) / len(finales)
     return round(cf_exacto, 2), round(cf_exacto)
 
