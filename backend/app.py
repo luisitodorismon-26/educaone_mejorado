@@ -881,6 +881,39 @@ async def lifespan(app):
                     # a mano desde Configuración.
                     logger.warning(f"No se pudo ejecutar el autovínculo curricular: {e}")
 
+        # === 6j. NE por período en calificaciones de Primaria (P2A-R2) ===
+        # Cuatro columnas NUEVAS, booleanas, nullable y con DEFAULT FALSE.
+        # `Base.metadata.create_all` NO añade columnas a una tabla que ya
+        # existe, así que en producción tienen que entrar por ALTER TABLE.
+        #
+        # ADITIVA y SIN BACKFILL: las filas actuales quedan en FALSE, que es
+        # exactamente lo correcto —ninguna de ellas tiene un NE declarado— y
+        # por tanto ninguna calificación histórica se reinterpreta. El código
+        # lee con `bool(getattr(...) or False)` para tolerar el NULL de las
+        # filas anteriores a la migración.
+        #
+        # Rollback (Postgres):
+        #   ALTER TABLE calificaciones_primaria DROP COLUMN ne1;  (ne2, ne3, ne4)
+        if 'calificaciones_primaria' in inspector.get_table_names():
+            _cols_cp = {c['name'] for c in inspector.get_columns('calificaciones_primaria')}
+            _faltan_ne = [c for c in ('ne1', 'ne2', 'ne3', 'ne4') if c not in _cols_cp]
+            if _faltan_ne:
+                with engine.connect() as conn:
+                    for _col in _faltan_ne:
+                        try:
+                            conn.execute(text(
+                                f'ALTER TABLE calificaciones_primaria '
+                                f'ADD COLUMN {_col} BOOLEAN DEFAULT FALSE'))
+                            conn.commit()
+                        except Exception as e:
+                            logger.warning(
+                                f"No se pudo agregar calificaciones_primaria.{_col}: {e}")
+                            raise
+                logger.info(
+                    "✅ Migración P2A-R2: %d columna(s) NE agregadas a "
+                    "calificaciones_primaria (DEFAULT FALSE, sin backfill)",
+                    len(_faltan_ne))
+
         # === 6i. Recuperación pedagógica cualitativa de 1ro/2do (P2A-R1) ===
         # Tabla NUEVA y VACÍA. No altera ninguna tabla existente, no hace
         # backfill y no inserta ni una fila: un colegio que no use 1ro/2do no

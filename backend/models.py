@@ -874,7 +874,26 @@ class CalificacionPrimaria(Base):
     p2 = Column(Float); rp2 = Column(Float)
     p3 = Column(Float); rp3 = Column(Float)
     p4 = Column(Float); rp4 = Column(Float)
-    
+
+    # NE — «No Evaluado» (R2-A3).
+    #
+    # Un período tiene TRES estados, no dos: evaluado, NE y pendiente. Hasta
+    # R2 solo había dos columnas por período, así que un NULL tenía que
+    # significar las dos cosas a la vez, y el sistema lo resolvía tratando
+    # todo hueco como NE — con lo cual un año a medio cargar producía CF
+    # completas.
+    #
+    # NE es un acto documentado: la norma lo reserva para quien «no participe
+    # del proceso de enseñanza-aprendizaje durante uno o más períodos» por
+    # enfermedad certificada u otra causa justificada. No es «todavía no hay
+    # nota». Por eso es una marca explícita y no una inferencia.
+    #
+    # Invariante: neN=True implica pN=NULL y rpN=NULL. Nunca conviven.
+    ne1 = Column(Boolean, default=False)
+    ne2 = Column(Boolean, default=False)
+    ne3 = Column(Boolean, default=False)
+    ne4 = Column(Boolean, default=False)
+
     # Nota final de la competencia (promedio de los 4 períodos)
     final_competencia = Column(Float)                               # Esto es C1, C2 o C3
     literal = Column(String(2))
@@ -939,6 +958,8 @@ class CalificacionPrimaria(Base):
             'p2': self.p2, 'rp2': self.rp2,
             'p3': self.p3, 'rp3': self.rp3,
             'p4': self.p4, 'rp4': self.rp4,
+            'ne1': bool(self.ne1), 'ne2': bool(self.ne2),
+            'ne3': bool(self.ne3), 'ne4': bool(self.ne4),
             'final_competencia': self.final_competencia,
             'literal': self.literal
         }
