@@ -26,9 +26,36 @@ export interface CompetenciaPrim {
   p2: number | null; rp2: number | null;
   p3: number | null; rp3: number | null;
   p4: number | null; rp4: number | null;
+  // NE por periodo (R2). El backend manda ademas el estado ya resuelto.
+  ne1?: boolean; ne2?: boolean; ne3?: boolean; ne4?: boolean;
+  estados?: Record<number, EstadoPeriodo>;
   final_competencia: number | null;
   literal: string | null;
 }
+
+// Los tres estados de un periodo. PENDIENTE y NE no son lo mismo: el primero
+// dice "todavia no", el segundo dice "no se evaluo, y esta justificado".
+export type EstadoPeriodo = 'evaluado' | 'ne' | 'pendiente';
+
+export function estadoPeriodoDe(comp: CompetenciaPrim | undefined, periodo: number): EstadoPeriodo {
+  if (!comp) return 'pendiente';
+  const dado = comp.estados?.[periodo];
+  if (dado) return dado;                       // el backend es la autoridad
+  if (comp[`ne${periodo}` as keyof CompetenciaPrim]) return 'ne';
+  return valorPeriodoEfectivo(comp, periodo) != null ? 'evaluado' : 'pendiente';
+}
+
+export const ETIQUETA_ESTADO: Record<EstadoPeriodo, string> = {
+  evaluado: 'Evaluado',
+  ne: 'NE — No Evaluado',
+  pendiente: 'Pendiente de evaluar',
+};
+
+export const AYUDA_NE_PRIMARIA =
+  'NE = No Evaluado. Se marca cuando el estudiante no participo del periodo por ' +
+  'una causa justificada. No es "todavia no hay nota": un periodo sin nota y sin ' +
+  'NE queda PENDIENTE y bloquea la calificacion final. Marcar NE borra la nota ' +
+  'de ese periodo; escribir una nota retira el NE.';
 
 export interface EstudiantePrimData {
   estudiante: {

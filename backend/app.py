@@ -6844,6 +6844,10 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
                         'p2': None, 'rp2': None,
                         'p3': None, 'rp3': None,
                         'p4': None, 'rp4': None,
+                        'ne1': False, 'ne2': False, 'ne3': False, 'ne4': False,
+                        # La competencia aún no existe: sus cuatro períodos
+                        # están PENDIENTES, que no es lo mismo que NE.
+                        'estados': {n: 'pendiente' for n in (1, 2, 3, 4)},
                         'final_competencia': None,
                         'literal': None
                     })
@@ -7075,6 +7079,27 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     # LIMPIAN la nota; cualquier otra cosa tiene que ser un número de 0 a 100.
     campos_notas = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4']
     _pendientes = {}
+
+    # NE entra por el MISMO camino que la nota (R2-A4). No hay endpoint
+    # aparte, ni rol nuevo: marcar «no evaluado» es parte de calificar, y lo
+    # hace el mismo docente, con las mismas comprobaciones de asignación,
+    # tenant, curso, asignatura, período cerrado, permiso temporal y año.
+    for campo in ('ne1', 'ne2', 'ne3', 'ne4'):
+        if campo not in data:
+            continue
+        num_periodo = int(campo[-1])
+        if _periodo_esta_cerrado(num_periodo):
+            if num_periodo not in periodos_cerrados_ignorados:
+                periodos_cerrados_ignorados.append(num_periodo)
+            continue
+        valor = data[campo]
+        if valor is None or valor == '':
+            _pendientes[campo] = False
+            continue
+        if not isinstance(valor, bool):
+            return _rechazo_nota(db, campo, 'debe ser true o false')
+        _pendientes[campo] = valor
+
     for campo in campos_notas:
         if campo not in data:
             continue
@@ -7121,6 +7146,34 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             ),
         }
 
+    # INVARIANTE DE NE (R2-A4): un período no puede estar marcado NE y tener
+    # nota a la vez. En vez de rechazar la petición —que obligaría al docente
+    # a borrar a mano lo que ya no aplica— se resuelve en el mismo guardado,
+    # de forma explícita y en una sola dirección por período:
+    #
+    #   · marca NE   -> se limpian pN y rpN de ESE período;
+    #   · pone nota  -> NE de ESE período queda en False.
+    #
+    # Lo que manda es lo que el docente acaba de enviar. Si mandara las dos
+    # cosas para el mismo período, gana la nota: es el dato más específico, y
+    # NE no es un valor sino la ausencia justificada de uno.
+    _ajustes_ne = []
+    for _n in (1, 2, 3, 4):
+        _ne_nuevo = _pendientes.get(f'ne{_n}')
+        _nota_nueva = any(_pendientes.get(c) is not None
+                          for c in (f'p{_n}', f'rp{_n}') if c in _pendientes)
+        if _nota_nueva:
+            # Llega nota: el período deja de estar NE, venga o no en el cuerpo.
+            if calif.es_ne(_n) or _ne_nuevo:
+                _pendientes[f'ne{_n}'] = False
+                _ajustes_ne.append(f'P{_n}: NE retirado por nota nueva')
+        elif _ne_nuevo is True:
+            # Llega NE: el período se queda sin nota.
+            for _c in (f'p{_n}', f'rp{_n}'):
+                if getattr(calif, _c, None) is not None or _pendientes.get(_c) is not None:
+                    _pendientes[_c] = None
+                    _ajustes_ne.append(f'P{_n}: {_c} limpiado por NE')
+
     # Se aplican solo cuando TODOS los campos pasaron: si uno falla, no puede
     # quedar la mitad escrita.
     for campo, valor in _pendientes.items():
@@ -7140,6 +7193,10 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     cache_clear(f'stats:{current_user.colegio_id}')
     respuesta = {'message': 'Calificación primaria guardada', 'id': calif.id,
                  'calificacion': calif.to_dict()}
+    if _ajustes_ne:
+        # Se dice lo que el guardado tuvo que ajustar solo: callarlo dejaría
+        # al docente creyendo que su nota y su NE conviven.
+        respuesta['ajustes_ne'] = _ajustes_ne
     if periodos_cerrados_ignorados:
         # Se dice cuáles no se guardaron: callarlo haría creer al docente que su
         # corrección entró.

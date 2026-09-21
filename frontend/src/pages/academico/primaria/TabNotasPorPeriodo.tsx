@@ -6,6 +6,7 @@ import {
   EstudiantePrimData, CampoEditable,
   NOMBRES_COMPETENCIAS_PRIM, UMBRAL_RP_PRIMARIA, rpHabilitado,
   ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
+  estadoPeriodoDe, ETIQUETA_ESTADO, AYUDA_NE_PRIMARIA,
 } from './tipos';
 import { avisoPeriodoCerrado, mensajeAvisos } from './periodoCerrado';
 
@@ -25,22 +26,42 @@ interface Props {
 }
 
 // draft key: "estudianteId-competencia" -> { campo: valor }
+// El borrador guarda las notas como texto y el NE como booleano: son dos
+// tipos de dato distintos y mezclarlos en un string obligaría a adivinar.
+type CampoNE = 'ne1' | 'ne2' | 'ne3' | 'ne4';
 type Draft = Record<string, Partial<Record<CampoEditable, string>>>;
+type DraftNE = Record<string, Partial<Record<CampoNE, boolean>>>;
 
 export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, numCompetencias, puedeEditar, modalidadRecuperacion, onReload }) => {
   // En 1ro y 2do no hay columna RP: la recuperacion del periodo es cualitativa.
   const conRp = admiteRpNumerica(modalidadRecuperacion);
   const [periodo, setPeriodo] = useState(1);
   const [drafts, setDrafts] = useState<Draft>({});
+  const [draftsNE, setDraftsNE] = useState<DraftNE>({});
   const [guardando, setGuardando] = useState(false);
   const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error' | 'warning'; texto: string } | null>(null);
 
   const campoP = `p${periodo}` as CampoEditable;
   const campoRP = `rp${periodo}` as CampoEditable;
+  const campoNE = `ne${periodo}` as CampoNE;
   const key = (estId: number, comp: number) => `${estId}-${comp}`;
 
   const getComp = (est: EstudiantePrimData, compNum: number) =>
     est.competencias.find(c => c.competencia_numero === compNum);
+
+  // NE tal y como se vería tras guardar: lo del borrador si el docente ya
+  // lo tocó, si no lo que dice el servidor.
+  const getNE = (est: EstudiantePrimData, compNum: number): boolean => {
+    const k = key(est.estudiante.id, compNum);
+    const d = draftsNE[k]?.[campoNE];
+    if (d !== undefined) return d;
+    return Boolean(getComp(est, compNum)?.[campoNE]);
+  };
+
+  const estadoDe = (est: EstudiantePrimData, compNum: number) => {
+    if (getNE(est, compNum)) return 'ne' as const;
+    return estadoPeriodoDe(getComp(est, compNum), periodo);
+  };
 
   const getValor = (est: EstudiantePrimData, compNum: number, campo: CampoEditable): string => {
     const k = key(est.estudiante.id, compNum);
@@ -57,11 +78,27 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
 
   const cambios = useMemo(() => Object.values(drafts).filter(d => Object.keys(d).length > 0).length, [drafts]);
 
+  const marcarNE = (estId: number, compNum: number, valor: boolean) => {
+    const k = key(estId, compNum);
+    setDraftsNE(prev => ({ ...prev, [k]: { ...(prev[k] || {}), [campoNE]: valor } }));
+    if (valor) {
+      // Marcar NE deja el período sin nota. Se refleja ya en pantalla para
+      // que el docente vea lo que va a pasar, no solo después de guardar.
+      setDrafts(prev => ({
+        ...prev,
+        [k]: { ...(prev[k] || {}), [campoP]: '', [campoRP]: '' },
+      }));
+    }
+  };
+
   const guardar = async () => {
     setGuardando(true);
     setMensaje(null);
     try {
-      const aGuardar = Object.keys(drafts).filter(k => Object.keys(drafts[k]).length > 0);
+      const aGuardar = Array.from(new Set([
+        ...Object.keys(drafts).filter(k => Object.keys(drafts[k]).length > 0),
+        ...Object.keys(draftsNE).filter(k => Object.keys(draftsNE[k]).length > 0),
+      ]));
       // El backend responde 200 aunque haya saltado un período cerrado: guarda
       // lo que puede y avisa de lo que no. Si no se mira esa respuesta, el
       // profesor ve "Guardado" y cree que su corrección entró cuando no entró.
@@ -69,14 +106,18 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       for (const k of aGuardar) {
         const [estId, compNum] = k.split('-').map(Number);
         const payload: any = { estudiante_id: estId, asignatura_id: asignaturaId, competencia_numero: compNum };
-        for (const [campo, val] of Object.entries(drafts[k])) {
+        for (const [campo, val] of Object.entries(drafts[k] || {})) {
           payload[campo] = val === '' ? null : Number(val);
+        }
+        for (const [campo, val] of Object.entries(draftsNE[k] || {})) {
+          payload[campo] = val;   // booleano: el backend lo exige así
         }
         const response = await api.post('/calificaciones-primaria', payload);
         const aviso = avisoPeriodoCerrado(response?.data);
         if (aviso) avisos.push(aviso);
       }
       setDrafts({});
+      setDraftsNE({});
       setMensaje(avisos.length > 0
         ? { tipo: 'warning', texto: mensajeAvisos(avisos) }
         : { tipo: 'success', texto: `Guardado (${aGuardar.length} celda${aGuardar.length !== 1 ? 's' : ''})` });
@@ -124,7 +165,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
             <tr>
               <th rowSpan={2} className="px-3 py-2 text-left font-medium text-gray-600 sticky left-0 bg-gray-50 align-bottom">Estudiante</th>
               {comps.map(n => (
-                <th key={n} colSpan={conRp ? 2 : 1} className="px-2 py-1.5 text-center font-medium text-gray-600 border-l">
+                <th key={n} colSpan={conRp ? 3 : 2} className="px-2 py-1.5 text-center font-medium text-gray-600 border-l">
                   C{n} · {NOMBRES_COMPETENCIAS_PRIM[n]?.split(',')[0] || `Comp ${n}`}
                 </th>
               ))}
@@ -134,6 +175,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                 <Fragment key={n}>
                   <th className="px-1 py-1 text-center font-medium text-gray-500 border-l">P{periodo}</th>
                   {conRp && <th className="px-1 py-1 text-center font-normal text-gray-400">RP{periodo}</th>}
+                  <th className="px-1 py-1 text-center font-normal text-gray-400" title={AYUDA_NE_PRIMARIA}>NE</th>
                 </Fragment>
               ))}
             </tr>
@@ -144,7 +186,9 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                 <td className="px-3 py-1.5 font-medium text-gray-800 sticky left-0 bg-white">{est.estudiante.nombre_completo}</td>
                 {comps.map(n => {
                   const pVal = getValor(est, n, campoP) !== '' ? Number(getValor(est, n, campoP)) : null;
-                  const rpOn = rpHabilitado(pVal);
+                  const ne = getNE(est, n);
+                  const rpOn = rpHabilitado(pVal) && !ne;
+                  const estado = estadoDe(est, n);
                   return (
                   <Fragment key={n}>
                     <td className="px-1 py-1 text-center border-l">
@@ -152,8 +196,12 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                         type="number" min={0} max={100}
                         value={getValor(est, n, campoP)}
                         onChange={e => handleChange(est.estudiante.id, n, campoP, e.target.value)}
-                        disabled={!puedeEditar}
-                        className="w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50"
+                        disabled={!puedeEditar || ne}
+                        placeholder={estado === 'pendiente' ? '—' : ''}
+                        title={ETIQUETA_ESTADO[estado]}
+                        className={`w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50 ${
+                          estado === 'ne' ? 'bg-slate-100 text-slate-400' :
+                          estado === 'pendiente' ? 'border-dashed text-gray-400' : ''}`}
                       />
                     </td>
                     {conRp && <td className="px-1 py-1 text-center">
@@ -167,6 +215,16 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                         className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                       />
                     </td>}
+                    <td className="px-1 py-1 text-center">
+                      <input
+                        type="checkbox"
+                        checked={ne}
+                        onChange={e => marcarNE(est.estudiante.id, n, e.target.checked)}
+                        disabled={!puedeEditar}
+                        title={AYUDA_NE_PRIMARIA}
+                        className="h-4 w-4 accent-slate-600 disabled:opacity-40"
+                      />
+                    </td>
                   </Fragment>
                   );
                 })}
@@ -177,6 +235,17 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       </div>
 
       <p className="text-xs text-gray-500">
+        <span className="inline-flex items-center gap-1 mr-3">
+          <span className="inline-block w-3 h-3 rounded-sm border border-dashed border-gray-400" />
+          pendiente de evaluar
+        </span>
+        <span className="inline-flex items-center gap-1 mr-3">
+          <span className="inline-block w-3 h-3 rounded-sm bg-slate-100 border border-slate-300" />
+          NE — no evaluado (justificado)
+        </span>
+        <br />
+        {AYUDA_NE_PRIMARIA}
+        <br />
         {conRp
           ? `Cada celda: P${periodo} y su recuperación (RP${periodo}). ${AYUDA_RP_PRIMARIA}`
           : AVISO_RP_CUALITATIVA}

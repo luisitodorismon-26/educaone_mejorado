@@ -918,6 +918,21 @@ class CalificacionPrimaria(Base):
         return valor_periodo_primaria(
             getattr(self, f'p{periodo}'), getattr(self, f'rp{periodo}'))
 
+    def es_ne(self, periodo):
+        """True si el período está marcado NE.
+
+        El `or False` no es decorativo: las filas anteriores a la migración de
+        R2 tienen NULL en estas columnas, y NULL aquí significa «no hay NE».
+        """
+        return bool(getattr(self, f'ne{periodo}', False) or False)
+
+    def estado_periodo(self, periodo):
+        """'evaluado' | 'ne' | 'pendiente'."""
+        from calculo_primaria import estado_periodo_primaria
+        return estado_periodo_primaria(
+            getattr(self, f'p{periodo}'), getattr(self, f'rp{periodo}'),
+            self.es_ne(periodo))
+
     def calcular_final(self, minimo_periodos=1):
         """Final de la competencia = promedio de los períodos EVALUADOS.
 
@@ -958,8 +973,11 @@ class CalificacionPrimaria(Base):
             'p2': self.p2, 'rp2': self.rp2,
             'p3': self.p3, 'rp3': self.rp3,
             'p4': self.p4, 'rp4': self.rp4,
-            'ne1': bool(self.ne1), 'ne2': bool(self.ne2),
-            'ne3': bool(self.ne3), 'ne4': bool(self.ne4),
+            'ne1': self.es_ne(1), 'ne2': self.es_ne(2),
+            'ne3': self.es_ne(3), 'ne4': self.es_ne(4),
+            # Estado explicito por periodo: evaluado | ne | pendiente.
+            # El frontend no tiene que deducirlo de la combinacion de campos.
+            'estados': {n: self.estado_periodo(n) for n in (1, 2, 3, 4)},
             'final_competencia': self.final_competencia,
             'literal': self.literal
         }

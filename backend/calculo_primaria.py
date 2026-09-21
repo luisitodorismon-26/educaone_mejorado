@@ -67,6 +67,30 @@ def valor_periodo_primaria(p, rp):
     return p
 
 
+# Los tres estados de un período. `PENDIENTE` y `NE` NO son lo mismo: el
+# primero dice «todavía no», el segundo dice «no se evaluó, y está
+# justificado». Confundirlos es lo que permitía fabricar una CF a mitad de
+# año.
+PERIODO_EVALUADO = 'evaluado'
+PERIODO_NE = 'ne'
+PERIODO_PENDIENTE = 'pendiente'
+
+
+def estado_periodo_primaria(p, rp, ne=False):
+    """'evaluado' | 'ne' | 'pendiente' para un período de Primaria.
+
+    NE gana sobre la nota a propósito: si una fila quedara en el estado
+    contradictorio (nota + NE), lo que se lee es NE en vez de inventar una
+    tercera interpretación. La escritura impide que eso llegue a persistirse,
+    pero una lectura defensiva no cuesta nada.
+    """
+    if ne:
+        return PERIODO_NE
+    if valor_periodo_primaria(p, rp) is not None:
+        return PERIODO_EVALUADO
+    return PERIODO_PENDIENTE
+
+
 def cf_competencia(calif, minimo_periodos=1):
     """CF de UNA competencia (objeto CalificacionPrimaria).
     Promedio de los períodos evaluados (NE = período sin valor)."""

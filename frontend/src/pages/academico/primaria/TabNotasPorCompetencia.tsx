@@ -7,6 +7,7 @@ import {
   NOMBRES_COMPETENCIAS_PRIM, MINIMO_APROBATORIO_PRIMARIA,
   UMBRAL_RP_PRIMARIA, rpHabilitado, finalCompetencia,
   ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
+  estadoPeriodoDe, ETIQUETA_ESTADO,
 } from './tipos';
 import { avisoPeriodoCerrado, mensajeAvisos } from './periodoCerrado';
 
@@ -156,7 +157,8 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                   <td className="px-3 py-1.5 font-medium text-gray-800 sticky left-0 bg-white">{est.estudiante.nombre_completo}</td>
                   {CAMPOS_PERIODOS.map(cp => {
                     const pVal = getValor(est, cp.p) !== '' ? Number(getValor(est, cp.p)) : null;
-                    const rpOn = rpHabilitado(pVal);
+                    const _estado = estadoPeriodoDe(getComp(est, compSel), cp.periodo);
+                    const rpOn = rpHabilitado(pVal) && _estado !== 'ne';
                     return (
                     <Fragment key={cp.periodo}>
                       <td className="px-1 py-1 text-center">
@@ -164,8 +166,12 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                           type="number" min={0} max={100}
                           value={getValor(est, cp.p)}
                           onChange={e => handleChange(est.estudiante.id, cp.p, e.target.value)}
-                          disabled={!puedeEditar}
-                          className="w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50"
+                          disabled={!puedeEditar || _estado === 'ne'}
+                          placeholder={_estado === 'pendiente' ? '—' : ''}
+                          title={ETIQUETA_ESTADO[_estado]}
+                          className={`w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50 ${
+                            _estado === 'ne' ? 'bg-slate-100 text-slate-400' :
+                            _estado === 'pendiente' ? 'border-dashed text-gray-400' : ''}`}
                         />
                       </td>
                       {conRp && <td className="px-1 py-1 text-center">
