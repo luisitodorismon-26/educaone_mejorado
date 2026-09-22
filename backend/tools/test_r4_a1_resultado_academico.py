@@ -448,7 +448,7 @@ def _():
 
 @test("S14 sin fila extra + cf=85 -> APROBADA")
 def _():
-    r = RA.resolver_nota_secundaria(None, cf_original=85)
+    r = RA.resolver_nota_secundaria(None, cf_exacto=85)
     igual(r['estado'], RA.APROBADA)
     igual(r['nota_final'], 85)
     igual(r['fase'], RA.FASE_NORMAL)
@@ -457,7 +457,7 @@ def _():
 
 @test("S15 sin fila extra + cf=69 -> PENDIENTE_COMPLETIVA")
 def _():
-    r = RA.resolver_nota_secundaria(None, cf_original=69)
+    r = RA.resolver_nota_secundaria(None, cf_exacto=69)
     igual(r['estado'], RA.PENDIENTE_COMPLETIVA)
     igual(r['nota_base'], 69)
     igual(r['nota_final'], None)
@@ -466,7 +466,7 @@ def _():
 
 @test("S16 sin fila extra + cf=0 -> PENDIENTE_COMPLETIVA con nota_base 0")
 def _():
-    r = RA.resolver_nota_secundaria(None, cf_original=0)
+    r = RA.resolver_nota_secundaria(None, cf_exacto=0)
     igual(r['estado'], RA.PENDIENTE_COMPLETIVA, 'un 0 es una CF, no una ausencia')
     igual(r['nota_base'], 0)
 
@@ -478,9 +478,9 @@ def _():
           RA.APROBADA_COMPLETIVA)
 
 
-@test("S18 CF divergente -> se informa y manda la de la fila")
+@test("S18 dos CF exactas distintas -> se informa y manda la de la fila")
 def _():
-    r = RA.resolver_nota_secundaria(_Ev(cf_original=60), cf_original=80)
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=60), cf_exacto=80)
     assert RA.INCONSISTENCIA_CF_DIVERGENTE in r['inconsistencias'], \
         r['inconsistencias']
     igual(r['nota_base'], 60,
@@ -491,7 +491,7 @@ def _():
 
 @test("S19 fila con cf_original=None + cf del caller -> se usa la del caller")
 def _():
-    r = RA.resolver_nota_secundaria(_Ev(cf_original=None), cf_original=80)
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=None), cf_exacto=80)
     igual(r['estado'], RA.APROBADA)
     igual(r['nota_final'], 80)
     igual(r['inconsistencias'], (), 'no hay dos CF, no hay divergencia')
@@ -500,32 +500,126 @@ def _():
 @test("S20 ninguna CF en ningun sitio -> SIN_CALIFICAR")
 def _():
     for caso in (RA.resolver_nota_secundaria(),
-                 RA.resolver_nota_secundaria(None, cf_original=None),
+                 RA.resolver_nota_secundaria(None, cf_exacto=None),
                  RA.resolver_nota_secundaria(_Ev(), None)):
         igual(caso['estado'], RA.SIN_CALIFICAR)
         igual(caso['pendiente'], True)
 
 
-@test("S21 exacta vs redondeada NO es divergencia")
+@test("S21 la oficial del consumidor contrastada con la exacta de la fila")
 def _():
-    # El consumidor real guarda `cf` (redondeada) y `cf_exacto`. Pasar una
-    # mientras la fila tiene la otra describe la MISMA CF oficial.
-    r = RA.resolver_nota_secundaria(_Ev(cf_original=84.6), cf_original=85)
-    igual(r['inconsistencias'], (), '84.6 y 85 son la misma CF oficial')
+    # A1.2: ya NO se compara «exacta contra redondeada» como si fueran lo
+    # mismo. `cf_oficial` es una fuente distinta y se verifica como tal:
+    # debe ser el redondeo de la exacta que manda.
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=84.6), cf_oficial=85)
+    igual(r['inconsistencias'], (), 'redondear(84.6) == 85: coherente')
     igual(r['estado'], RA.APROBADA)
     igual(r['nota_final'], 85)
-    # Y al reves
-    r2 = RA.resolver_nota_secundaria(_Ev(cf_original=85), cf_original=84.6)
-    igual(r2['inconsistencias'], ())
+    igual(r['cf_exacta_disponible'], True)
 
 
 @test("S22 la divergencia se propaga tambien en las fases extra")
 def _():
-    r = RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80), cf_original=90)
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80), cf_exacto=90)
     assert RA.INCONSISTENCIA_CF_DIVERGENTE in r['inconsistencias']
     igual(r['estado'], RA.APROBADA_COMPLETIVA,
           'la completiva se calcula con la CF de la fila (50%%*60+50%%*80=70)')
     igual(r['nota_final'], 70)
+
+
+@test("S23 EL CASO DE A1.2: 68.6 vs 69.4 divergen aunque ambas den 69")
+def _():
+    # Las dos CF exactas producen la misma CF oficial, pero NO son
+    # intercambiables: las ponderaciones de completiva y extraordinaria se
+    # hacen sobre la exacta. Comparandolas redondeadas esto quedaba invisible.
+    from reglas_academicas import redondear_calificacion_final as _red
+    igual(_red(68.6), 69)
+    igual(_red(69.4), 69)
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=68.6), cf_exacto=69.4,
+                                    cf_oficial=69)
+    assert RA.INCONSISTENCIA_CF_DIVERGENTE in r['inconsistencias'], \
+        r['inconsistencias']
+    igual(r['nota_base'], 69, 'la base es la de la fila: redondear(68.6)=69')
+
+
+@test("S24 exacta de la fila == exacta del caller -> sin inconsistencia")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=84.6), cf_exacto=84.6,
+                                    cf_oficial=85)
+    igual(r['inconsistencias'], ())
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 85)
+
+
+@test("S25 fila 84.6 + solo oficial 85 -> coherente")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=84.6), cf_oficial=85)
+    igual(r['inconsistencias'], ())
+    igual(r['cf_exacta_disponible'], True, 'la fila aporta la exacta')
+
+
+@test("S26 fila 84.6 + oficial 86 -> inconsistencia")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=84.6), cf_oficial=86)
+    assert RA.INCONSISTENCIA_CF_DIVERGENTE in r['inconsistencias'], \
+        r['inconsistencias']
+
+
+@test("S27 sin fila + exacta 84.6 + oficial 85 -> APROBADA")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_exacto=84.6, cf_oficial=85)
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 85)
+    igual(r['inconsistencias'], ())
+    igual(r['cf_exacta_disponible'], True)
+
+
+@test("S28 sin fila + exacta 68.8 + oficial 69 -> PENDIENTE_COMPLETIVA")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_exacto=68.8, cf_oficial=69)
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA)
+    igual(r['nota_base'], 69)
+    igual(r['nota_final'], None)
+
+
+@test("S29 sin fila y sin exacta, solo oficial 85 -> APROBADA pero sin exacta")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_oficial=85)
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 85)
+    igual(r['cf_exacta_disponible'], False,
+          'no habria base exacta para calcular una fase futura')
+
+
+@test("S30 caller incoherente: exacta 84.6 con oficial 84")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_exacto=84.6, cf_oficial=84)
+    assert RA.INCONSISTENCIA_CF_CALLER in r['inconsistencias'], \
+        r['inconsistencias']
+    igual(r['nota_base'], 85, 'manda la exacta: redondear(84.6)=85')
+
+
+@test("S31 el 0 es una CF valida por las dos vias")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_exacto=0, cf_oficial=0)
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA, 'un 0 no es una ausencia')
+    igual(r['nota_base'], 0)
+    igual(r['inconsistencias'], ())
+    igual(r['cf_exacta_disponible'], True)
+    # Solo oficial 0
+    r2 = RA.resolver_nota_secundaria(None, cf_oficial=0)
+    igual(r2['nota_base'], 0)
+    igual(r2['estado'], RA.PENDIENTE_COMPLETIVA)
+    # Fila con 0
+    r3 = RA.resolver_nota_secundaria(_Ev(cf_original=0), cf_exacto=0, cf_oficial=0)
+    igual(r3['inconsistencias'], (), '0 == 0 no diverge')
+
+
+@test("S32 una diferencia de ruido float NO cuenta como divergencia")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=84.6),
+                                    cf_exacto=84.6 + 1e-12)
+    igual(r['inconsistencias'], (), 'la tolerancia cubre el ruido de coma flotante')
 
 
 # ══════════════════ C · CONTRATO DEL CONSUMIDOR REAL ══════════════════
@@ -537,10 +631,13 @@ print(f"\n{B}CONTRATO DEL CONSUMIDOR REAL{X}")
 
 
 def _adapter(fila):
-    """Lo que hara A3: pasar la evaluacion y la CF que el consumidor ya tiene."""
+    """Lo que hara A3: las tres fuentes que el consumidor YA tiene, cada una
+    en su sitio. `cf` es la oficial y `cf_exacto` la exacta: el contrato las
+    separa, asi que el adapter no tiene que elegir entre ellas."""
     return RA.resolver_nota_secundaria(
         evaluacion=fila.get('evaluacion_extra'),
-        cf_original=fila.get('cf_exacto', fila.get('cf')),
+        cf_exacto=fila.get('cf_exacto'),
+        cf_oficial=fila.get('cf'),
     )
 
 
@@ -565,6 +662,16 @@ def _():
                   'evaluacion_extra': _Ev(cf_original=60, cec=80)})
     igual(r['estado'], RA.APROBADA_COMPLETIVA)
     igual(r['nota_final'], 70)
+
+
+@test("C5  el adapter no confunde exacta con oficial")
+def _():
+    # 84.6 y 85 en sus argumentos correctos: coherente.
+    r = _adapter({'cf': 85, 'cf_exacto': 84.6, 'evaluacion_extra': None})
+    igual(r['inconsistencias'], ())
+    # Y si el consumidor trajera una pareja incoherente, se ve.
+    r2 = _adapter({'cf': 84, 'cf_exacto': 84.6, 'evaluacion_extra': None})
+    assert RA.INCONSISTENCIA_CF_CALLER in r2['inconsistencias'], r2
 
 
 @test("C4  asignatura sin notas -> SIN_CALIFICAR, no un falso reprobado")
@@ -706,7 +813,7 @@ def _():
             return original(self)
         M.calcular_completiva_final = espia
         _Ev.calcular_completiva_final = espia
-        RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80), cf_original=60)
+        RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80), cf_exacto=60)
         igual(len(llamadas), 1, 'no llamo al metodo del modelo')
     finally:
         M.calcular_completiva_final = original
@@ -722,14 +829,48 @@ def _():
         assert prohibido not in fuente, prohibido
 
 
+@test("Z13 el contrato publico no vuelve a ser ambiguo")
+def _():
+    import inspect
+    doc = inspect.getdoc(RA.resolver_nota_secundaria) or ''
+    # La frase que A1.2 elimina: un argumento que sea «exacta o redondeada».
+    for ambiguo in ('exacta o la oficial', 'exacta o redondeada',
+                    'exacta o la redondeada', 'da igual'):
+        assert ambiguo not in doc.lower(), ambiguo
+    firma = inspect.signature(RA.resolver_nota_secundaria)
+    assert 'cf_exacto' in firma.parameters, firma
+    assert 'cf_oficial' in firma.parameters, firma
+    assert 'cf_original' not in firma.parameters, \
+        'el argumento ambiguo no debe volver al contrato publico'
+
+
+@test("Z14 A1.2 no introdujo formulas en el resolver")
+def _():
+    import ast as _a, inspect as _i
+    arbol = _a.parse(_i.getsource(RA))
+    for nodo in _a.walk(arbol):
+        if isinstance(nodo, (_a.Module, _a.FunctionDef, _a.ClassDef)):
+            if (nodo.body and isinstance(nodo.body[0], _a.Expr)
+                    and isinstance(nodo.body[0].value, _a.Constant)
+                    and isinstance(nodo.body[0].value.value, str)):
+                nodo.body[0].value.value = ''
+    codigo = _a.unparse(arbol)
+    for prohibido in ('0.5', '0.3', '0.7', 'ponderar_y_redondear'):
+        assert prohibido not in codigo, prohibido
+    # La tolerancia es lo unico numerico nuevo, y no es una formula academica.
+    assert 'TOLERANCIA_CF_EXACTA' in codigo
+
+
 @test("Z8  el contrato trae siempre las mismas claves")
 def _():
     CLAVES = {'nivel', 'nota_base', 'fase', 'nota_final', 'estado',
               'pendiente', 'requiere_contexto_promocion',
-              'area_curricular_codigo', 'inconsistencias'}
+              'area_curricular_codigo', 'inconsistencias',
+              'cf_exacta_disponible'}
     for r in (RA.resolver_nota_primaria([]),
               RA.resolver_nota_primaria(_area(80)),
               RA.resolver_nota_secundaria(_Ev()),
+              RA.resolver_nota_secundaria(None, cf_oficial=80),
               RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=0, ceex=0))):
         igual(set(r), CLAVES)
         assert r['estado'] in RA.ESTADOS, r['estado']

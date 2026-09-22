@@ -105,6 +105,13 @@ FASE_ESPECIAL = 'especial'
 INCONSISTENCIA_ESPECIAL_EN_PRIMER_CICLO = 'ESPECIAL_NO_APLICA_EN_1RO_2DO'
 INCONSISTENCIA_GRADO_DESCONOCIDO = 'GRADO_DESCONOCIDO_ESPECIAL_NO_APLICADA'
 INCONSISTENCIA_CF_DIVERGENTE = 'CF_SECUNDARIA_DIVERGENTE'
+INCONSISTENCIA_CF_CALLER = 'CF_SECUNDARIA_CALLER_INCONSISTENTE'
+
+# Dos CF exactas se consideran la misma solo si difieren en ruido de
+# coma flotante. NO se redondean para compararlas: 68.6 y 69.4 comparten
+# CF oficial (69) y aun asi son bases distintas para las ponderaciones de
+# la completiva y la extraordinaria.
+TOLERANCIA_CF_EXACTA = 1e-9
 
 # Grados de Primaria sin Recuperación Especial. En 1.º y 2.º el Registro no
 # contempla repitencia académica automática, y la Recuperación Especial es el
@@ -114,7 +121,8 @@ GRADOS_SIN_RECUPERACION_ESPECIAL = (1, 2)
 
 def _resultado(nivel, estado, nota_base=None, nota_final=None, fase=None,
                pendiente=False, requiere_contexto_promocion=False,
-               area_curricular_codigo=None, inconsistencias=()):
+               area_curricular_codigo=None, inconsistencias=(),
+               cf_exacta_disponible=None):
     """El contrato, en un dict plano.
 
     `nota_base`  — la CF del área antes de cualquier recuperación.
@@ -141,6 +149,15 @@ def _resultado(nivel, estado, nota_base=None, nota_final=None, fase=None,
         # materias entran en la promoción. Nunca por `nombre` ni `codigo`.
         'area_curricular_codigo': area_curricular_codigo,
         'inconsistencias': tuple(inconsistencias),
+        # ¿Hay una CF EXACTA con la que calcular una fase futura?
+        #
+        # Las ponderaciones de la completiva y la extraordinaria se hacen
+        # sobre la CF exacta, no sobre la oficial. Si un consumidor solo
+        # aporta la oficial, el área se puede clasificar —aprobada o
+        # pendiente— pero NO habría base para calcular la fase siguiente.
+        # A1 no inventa una exacta a partir de la oficial: lo dice.
+        # `None` en Primaria, donde no aplica.
+        'cf_exacta_disponible': cf_exacta_disponible,
     }
 
 
@@ -231,32 +248,43 @@ def resolver_nota_primaria(competencias, recuperacion=None, grado_numero=None,
 
 # ══════════════════════════ SECUNDARIA ══════════════════════════
 
-def resolver_nota_secundaria(evaluacion=None, cf_original=None,
+def resolver_nota_secundaria(evaluacion=None, cf_exacto=None, cf_oficial=None,
                              area_curricular_codigo=None):
     """Situación de UNA asignatura de Secundaria.
 
-    `evaluacion`  — la fila `EvaluacionExtraSecundaria`, si existe.
-    `cf_original` — la CF que el consumidor ya calculó por su cuenta. Puede
-                    ser la exacta o la oficial redondeada; da igual, porque
-                    aquí se redondea antes de decidir.
+    `evaluacion`  — la fila `EvaluacionExtraSecundaria`, si existe. Su
+                    `cf_original` es SIEMPRE la CF exacta.
+    `cf_exacto`   — la CF exacta que el consumidor calculó (p. ej. 84.6).
+    `cf_oficial`  — la CF visible tras `redondear_calificacion_final`
+                    (p. ej. 85).
 
-    POR QUÉ SE ACEPTAN LAS DOS FUENTES
-        Que exista CF no implica que exista fila extra. El consumidor real,
-        `_construir_datos_boletin_secundaria`, calcula `cf` por su cuenta y
-        toma la evaluación aparte con `extras_idx.get(asig.id)`, que devuelve
-        None cuando no hay fila. Datos legacy, importaciones, fixtures y
-        reparaciones producen lo mismo. Un motor canónico que exigiera la
-        fila diría SIN_CALIFICAR de un estudiante con 85, y no se podría
-        conectar en A3.
+    LOS DOS ARGUMENTOS ESTÁN SEPARADOS A PROPÓSITO
+        A1.1 tenía un único argumento que aceptaba indistintamente las dos,
+        y eso mezclaba cosas que no son intercambiables: las ponderaciones de
+        la completiva (50/50) y la extraordinaria (30/70) se hacen sobre la CF
+        EXACTA. 68.6 y 69.4 comparten CF oficial (69) y son bases distintas;
+        comparándolas redondeadas, una divergencia real quedaba invisible.
 
-    CUÁL MANDA SI HAY DOS
-        La de `evaluacion`. No por preferencia: `calcular_completiva_final()`
-        y sus hermanas leen `self.cf_original`, así que las fases extra YA
-        están calculadas contra esa base. Usar otra CF para el umbral y esa
-        para las fases daría un resultado mezclado de dos bases distintas, y
-        forzar las fases a otra base exigiría reimplementar las fórmulas —que
-        es justo lo que R4 viene a evitar—. La discrepancia no se esconde:
-        sale en `inconsistencias` para que A2/A3 pueda bloquear o avisar.
+    POR QUÉ SE ACEPTA UNA CF DEL CONSUMIDOR
+        Que exista CF no implica que exista fila extra.
+        `_construir_datos_boletin_secundaria` calcula `cf` y `cf_exacto` por
+        su cuenta y toma la evaluación aparte con `extras_idx.get(asig.id)`,
+        que devuelve None cuando no hay fila. Datos legacy, importaciones,
+        fixtures y reparaciones producen lo mismo.
+
+    QUÉ BASE MANDA
+        1. `evaluacion.cf_original`, si existe. No por preferencia:
+           `calcular_completiva_final()` y sus hermanas leen `self.cf_original`,
+           así que las fases YA están calculadas contra esa base. Usar otra
+           daría un resultado mezclado de dos bases, y forzar las fases a otra
+           exigiría reimplementar las fórmulas.
+        2. Si no, `cf_exacto`.
+        3. Si tampoco, `cf_oficial` — sirve para clasificar el área, pero
+           entonces `cf_exacta_disponible` sale en False, porque no habría
+           base para una fase futura. A1 no inventa una exacta.
+
+    Las discrepancias no se esconden ni se corrigen: salen en
+    `inconsistencias`. No se muta ningún objeto recibido.
 
     NO se lee `evaluacion.condicion_final`: ese campo dice 'reprobado'
     también cuando falta cargar una fase, y ahí está precisamente la
@@ -265,36 +293,54 @@ def resolver_nota_secundaria(evaluacion=None, cf_original=None,
     inconsistencias = []
     cf_evaluacion = getattr(evaluacion, 'cf_original', None)
 
-    if cf_evaluacion is not None and cf_original is not None:
-        # La comparación es sobre la CF OFICIAL, no sobre el float. Un
-        # consumidor puede pasar legítimamente la redondeada (85) mientras la
-        # fila guarda la exacta (84.6): eso es la misma CF, no una
-        # divergencia. Solo se avisa cuando el número oficial difiere.
-        if (redondear_calificacion_final(cf_evaluacion)
-                != redondear_calificacion_final(cf_original)):
+    # ── Coherencia entre las fuentes ──
+    # Exacta contra exacta: comparación numérica, sin redondear.
+    if cf_evaluacion is not None and cf_exacto is not None:
+        if abs(cf_evaluacion - cf_exacto) > TOLERANCIA_CF_EXACTA:
             inconsistencias.append(INCONSISTENCIA_CF_DIVERGENTE)
 
-    cf_base = cf_evaluacion if cf_evaluacion is not None else cf_original
+    # La oficial que trae el consumidor debe ser el redondeo de SU exacta.
+    if cf_exacto is not None and cf_oficial is not None:
+        if redondear_calificacion_final(cf_exacto) != cf_oficial:
+            inconsistencias.append(INCONSISTENCIA_CF_CALLER)
 
-    if cf_base is None:
+    # Sin exacta del consumidor, la oficial se contrasta con la de la fila.
+    if (cf_evaluacion is not None and cf_exacto is None
+            and cf_oficial is not None):
+        if redondear_calificacion_final(cf_evaluacion) != cf_oficial:
+            inconsistencias.append(INCONSISTENCIA_CF_DIVERGENTE)
+
+    # ── Elección de la base ──
+    if cf_evaluacion is not None:
+        cf_base, hay_exacta = cf_evaluacion, True
+    elif cf_exacto is not None:
+        cf_base, hay_exacta = cf_exacto, True
+    elif cf_oficial is not None:
+        cf_base, hay_exacta = cf_oficial, False
+    else:
         return _resultado(NIVEL_SECUNDARIA, SIN_CALIFICAR, pendiente=True,
                           area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=False)
 
     cf_original = cf_base
+    # Se recalcula desde la base elegida: es la que manda, no la que
+    # pudiera haber pasado el consumidor.
     cf_oficial = redondear_calificacion_final(cf_original)
     if cf_oficial >= MINIMO_APROBATORIO_SECUNDARIA:
         return _resultado(NIVEL_SECUNDARIA, APROBADA, nota_base=cf_oficial,
                           nota_final=cf_oficial, fase=FASE_NORMAL,
                           area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
 
     # ── Completiva ──
     if getattr(evaluacion, 'cec', None) is None:
         return _resultado(NIVEL_SECUNDARIA, PENDIENTE_COMPLETIVA,
                           nota_base=cf_oficial, pendiente=True,
                           area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
 
     completiva = evaluacion.calcular_completiva_final()
     if completiva is not None and completiva >= MINIMO_APROBATORIO_SECUNDARIA:
@@ -302,7 +348,8 @@ def resolver_nota_secundaria(evaluacion=None, cf_original=None,
                           nota_base=cf_oficial, nota_final=completiva,
                           fase=FASE_COMPLETIVA,
                           area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
 
     # ── Extraordinaria ──
     if getattr(evaluacion, 'ceex', None) is None:
@@ -310,7 +357,8 @@ def resolver_nota_secundaria(evaluacion=None, cf_original=None,
                           nota_base=cf_oficial, nota_final=None,
                           pendiente=True,
                           area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
 
     extraordinaria = evaluacion.calcular_extraordinaria_final()
     if (extraordinaria is not None
@@ -319,7 +367,8 @@ def resolver_nota_secundaria(evaluacion=None, cf_original=None,
                           nota_base=cf_oficial, nota_final=extraordinaria,
                           fase=FASE_EXTRAORDINARIA,
                           area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
 
     # ── Especial, SOLO si ya está cargada ──
     #
@@ -335,11 +384,13 @@ def resolver_nota_secundaria(evaluacion=None, cf_original=None,
                 nota_base=cf_oficial, nota_final=especial,
                 fase=FASE_ESPECIAL,
                 area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
 
     return _resultado(NIVEL_SECUNDARIA, NO_APROBADA_TRAS_EXTRAORDINARIA,
                       nota_base=cf_oficial, nota_final=extraordinaria,
                       fase=FASE_EXTRAORDINARIA,
                       requiere_contexto_promocion=True,
                       area_curricular_codigo=area_curricular_codigo,
-                          inconsistencias=inconsistencias)
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
