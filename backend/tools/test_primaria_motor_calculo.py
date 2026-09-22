@@ -1006,6 +1006,125 @@ def _():
     assert r.status_code == 400, (r.status_code, r.text[:200])
 
 
+# ══════ K · SOLO C1, C2 y C3 SE PUEDEN ESCRIBIR (R3-A9) ══════
+
+def _n_filas_de(est, asig):
+    d = SessionLocal()
+    try:
+        return d.query(M.CalificacionPrimaria).filter_by(
+            estudiante_id=est, asignatura_id=asig).count()
+    finally:
+        d.close()
+
+
+@test("K1 C1, C2 y C3 se guardan con normalidad")
+def _():
+    limpiar_calificaciones(E_2)
+    for comp in (1, 2, 3):
+        r = guardar(H_PROF, E_2, LENGUA, comp=comp, p1=80)
+        assert r.status_code == 200, (comp, r.status_code, r.text[:200])
+        assert fila(E_2, LENGUA, comp).p1 == 80
+    assert _n_filas_de(E_2, LENGUA) == 3
+
+
+@test("K2 competencias fuera del conjunto oficial -> 400 y CERO filas nuevas")
+def _():
+    limpiar_calificaciones(E_2)
+    for valor in (4, 99, -1, 0):
+        r = guardar(H_PROF, E_2, LENGUA, comp=valor, p1=80)
+        assert r.status_code == 400, (valor, r.status_code, r.text[:200])
+        assert _n_filas_de(E_2, LENGUA) == 0, (valor, "se creo una fila")
+
+
+@test("K3 tipos que no son un entero -> 400")
+def _():
+    limpiar_calificaciones(E_2)
+    for valor in ("4", "abc", 1.5, [1], {"n": 1}):
+        r = guardar(H_PROF, E_2, LENGUA, comp=valor, p1=80)
+        assert r.status_code == 400, (valor, r.status_code, r.text[:200])
+        assert _n_filas_de(E_2, LENGUA) == 0, (valor, "se creo una fila")
+
+
+@test("K4 booleanos -> 400 (True no es la competencia 1)")
+def _():
+    limpiar_calificaciones(E_2)
+    for valor in (True, False):
+        r = guardar(H_PROF, E_2, LENGUA, comp=valor, p1=80)
+        assert r.status_code == 400, (valor, r.status_code, r.text[:200])
+        assert _n_filas_de(E_2, LENGUA) == 0, (valor, "se creo una fila")
+
+
+@test("K5 None -> 400")
+def _():
+    limpiar_calificaciones(E_2)
+    r = guardar(H_PROF, E_2, LENGUA, comp=None, p1=80)
+    assert r.status_code == 400, (r.status_code, r.text[:200])
+    assert _n_filas_de(E_2, LENGUA) == 0
+
+
+@test("K6 el error dice cuales son validas y no filtra datos del estudiante")
+def _():
+    r = guardar(H_PROF, E_2, LENGUA, comp=4, p1=80)
+    cuerpo = r.json()
+    assert cuerpo.get("competencias_validas") == [1, 2, 3], cuerpo
+    assert "competencia_numero" in cuerpo.get("error", ""), cuerpo
+    texto = r.text.lower()
+    for fuga in ("estudiante_id", "curso", "nombre", "apellido", "asignatura_id"):
+        assert fuga not in texto, (fuga, r.text[:250])
+
+
+@test("K7 un intento invalido NO toca una fila valida ya existente")
+def _():
+    limpiar_calificaciones(E_2)
+    assert guardar(H_PROF, E_2, LENGUA, comp=1, p1=80).status_code == 200
+    assert fila(E_2, LENGUA, 1).p1 == 80
+
+    assert guardar(H_PROF, E_2, LENGUA, comp=4, p1=10).status_code == 400
+    assert guardar(H_PROF, E_2, LENGUA, comp=99, p1=10, ne1=True).status_code == 400
+
+    f = fila(E_2, LENGUA, 1)
+    assert f is not None, "la fila valida desaparecio"
+    assert f.p1 == 80, ("se modifico C1", f.p1)
+    assert f.es_ne(1) is False, "se toco el NE de otra competencia"
+    assert _n_filas_de(E_2, LENGUA) == 1, "nacio una fila fuera del conjunto"
+
+
+@test("K8 el guard usa la fuente canonica y corre antes de tocar la BD")
+def _():
+    import ast as _ast, inspect as _inspect, textwrap as _tw
+    src = _tw.dedent(_inspect.getsource(APP.save_calificacion_primaria))
+    assert 'COMPETENCIAS_OFICIALES_PRIMARIA' in src, \
+        "el guard no deberia repetir la lista a mano"
+
+    arbol = _ast.parse(src)
+    fn = arbol.body[0]
+    # Posicion del guard frente al primer acceso a la BD.
+    linea_guard = None
+    linea_bd = None
+    for nodo in _ast.walk(fn):
+        if linea_guard is None and isinstance(nodo, _ast.Name) \
+                and nodo.id == 'COMPETENCIAS_OFICIALES_PRIMARIA':
+            linea_guard = nodo.lineno
+        if isinstance(nodo, _ast.Attribute) and nodo.attr in ('query', 'add', 'commit'):
+            if isinstance(nodo.value, _ast.Name) and nodo.value.id == 'db':
+                if linea_bd is None or nodo.lineno < linea_bd:
+                    linea_bd = nodo.lineno
+    assert linea_guard is not None, "no encuentro el guard"
+    assert linea_bd is not None, "no encuentro ningun acceso a la BD"
+    assert linea_guard < linea_bd, \
+        ("el guard corre despues de tocar la BD", linea_guard, linea_bd)
+
+
+@test("K9 A9 no cambio el motor: cf_area y las constantes siguen igual")
+def _():
+    import calculo_primaria as CP
+    assert CP.COMPETENCIAS_OFICIALES_PRIMARIA == (1, 2, 3)
+    assert CP.TOTAL_COMPETENCIAS_PRIMARIA == 3
+    tres = [_modelo(comp=n, p1=80, p2=80, p3=80, p4=80) for n in (1, 2, 3)]
+    assert cf_area(tres) == (80.0, 80)
+    assert cf_area(tres[:2]) == (None, None)
+
+
 print(f"\n{B}{'=' * 62}{X}")
 if _fail:
     print(f"{R}{B}  {len(_fail)} FALLO(S) de {_total}{X}")

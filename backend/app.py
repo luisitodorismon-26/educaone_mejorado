@@ -6973,8 +6973,34 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     estudiante_id = data.get('estudiante_id')
     asignatura_id = data.get('asignatura_id')
     competencia_numero = data.get('competencia_numero')
-    
-    if not all([estudiante_id, asignatura_id, competencia_numero]):
+
+    from calculo_primaria import COMPETENCIAS_OFICIALES_PRIMARIA
+
+    # La competencia tiene que ser una de las OFICIALES (R3-A9).
+    #
+    # R3 fijó C1/C2/C3 como la matriz del Nivel Primario: el GET devuelve
+    # solo esas tres y `cf_area` las exige las tres. La escritura, en
+    # cambio, seguía aceptando cualquier número. Un POST directo con
+    # `competencia_numero=4` persistía una CalificacionPrimaria que no
+    # existe académicamente: no sale en la pantalla y no entra en la CF del
+    # área, pero sí la cargan los consumidores que leen todas las filas de
+    # un estudiante.
+    #
+    # Se comprueba ANTES de buscar o crear nada: antes del query, del
+    # db.add, de tocar notas o NE y del commit. Una petición inválida no
+    # debe llegar a rozar la base de datos.
+    #
+    # `bool` se mira aparte porque en Python es subclase de `int`: sin eso,
+    # `True` entraría como la competencia 1 y `False` como la 0.
+    if isinstance(competencia_numero, bool) or \
+            not isinstance(competencia_numero, int) or \
+            competencia_numero not in COMPETENCIAS_OFICIALES_PRIMARIA:
+        return JSONResponse({
+            'error': 'competencia_numero inválido para Primaria',
+            'competencias_validas': list(COMPETENCIAS_OFICIALES_PRIMARIA),
+        }, status_code=400)
+
+    if not all([estudiante_id, asignatura_id]):
         return JSONResponse({'error': 'Faltan datos requeridos'}, status_code=400)
     
     # Validar que el nivel del curso del estudiante esté activo (siempre primaria acá)
