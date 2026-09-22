@@ -273,13 +273,50 @@ def _():
             assert palabra not in texto, (palabra, caso)
 
 
-@test("P15 grado desconocido con Especial -> se avisa que no se valido")
+@test("P15 grado desconocido con Especial -> FAIL-CLOSED, no se usa")
+def _():
+    # CAMBIO DE CONTRATO (A1.1). Antes se usaba la Especial y solo se
+    # avisaba; un caller que olvidara el grado podia aprobar a un alumno de
+    # 1ro o 2do por una fase que quiza no le corresponde. Sin grado no se
+    # puede demostrar que aplique, asi que no se aplica.
+    r = RA.resolver_nota_primaria(
+        _area(60), _Rec(recuperacion_final=62, recuperacion_especial=90))
+    assert RA.INCONSISTENCIA_GRADO_DESCONOCIDO in r['inconsistencias'], \
+        r['inconsistencias']
+    igual(r['estado'], RA.NO_APROBADA_TRAS_RECUPERACION_FINAL)
+    igual(r['nota_final'], 62, 'se conserva el resultado de la Recuperacion Final')
+    igual(r['requiere_contexto_promocion'], True)
+
+
+@test("P16 la MISMA entrada con grado=3 SI lee la Especial")
 def _():
     r = RA.resolver_nota_primaria(
-        _area(60), _Rec(recuperacion_final=62, recuperacion_especial=70))
-    assert RA.INCONSISTENCIA_GRADO_DESCONOCIDO in r['inconsistencias']
-    igual(r['estado'], RA.APROBADA_RECUPERACION_ESPECIAL,
-          'sin grado no se cambia la decision, solo se informa')
+        _area(60), _Rec(recuperacion_final=62, recuperacion_especial=90),
+        grado_numero=3)
+    igual(r['estado'], RA.APROBADA_RECUPERACION_ESPECIAL)
+    igual(r['nota_final'], 90)
+    igual(r['inconsistencias'], ())
+
+
+@test("P17 la MISMA entrada con grado=2 la ignora e informa")
+def _():
+    r = RA.resolver_nota_primaria(
+        _area(60), _Rec(recuperacion_final=62, recuperacion_especial=90),
+        grado_numero=2)
+    assert RA.INCONSISTENCIA_ESPECIAL_EN_PRIMER_CICLO in r['inconsistencias']
+    igual(r['estado'], RA.NO_APROBADA_TRAS_RECUPERACION_FINAL)
+    igual(r['nota_final'], 62)
+
+
+@test("P18 fail-closed en los cuatro grados que SI admiten Especial")
+def _():
+    # El fail-closed es por AUSENCIA de grado, no por el grado en si: con
+    # 3,4,5 o 6 explicitos la Especial se lee con normalidad.
+    for grado in (3, 4, 5, 6):
+        r = RA.resolver_nota_primaria(
+            _area(60), _Rec(recuperacion_final=62, recuperacion_especial=90),
+            grado_numero=grado)
+        igual(r['estado'], RA.APROBADA_RECUPERACION_ESPECIAL, 'grado %d' % grado)
 
 
 # ══════════════════ S · SECUNDARIA ══════════════════
@@ -409,6 +446,136 @@ def _():
         assert palabra not in texto, palabra
 
 
+@test("S14 sin fila extra + cf=85 -> APROBADA")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_original=85)
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 85)
+    igual(r['fase'], RA.FASE_NORMAL)
+    igual(r['inconsistencias'], ())
+
+
+@test("S15 sin fila extra + cf=69 -> PENDIENTE_COMPLETIVA")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_original=69)
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA)
+    igual(r['nota_base'], 69)
+    igual(r['nota_final'], None)
+    igual(r['pendiente'], True)
+
+
+@test("S16 sin fila extra + cf=0 -> PENDIENTE_COMPLETIVA con nota_base 0")
+def _():
+    r = RA.resolver_nota_secundaria(None, cf_original=0)
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA, 'un 0 es una CF, no una ausencia')
+    igual(r['nota_base'], 0)
+
+
+@test("S17 con fila extra sigue funcionando sin el argumento nuevo")
+def _():
+    igual(RA.resolver_nota_secundaria(_Ev(cf_original=70))['estado'], RA.APROBADA)
+    igual(RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80))['estado'],
+          RA.APROBADA_COMPLETIVA)
+
+
+@test("S18 CF divergente -> se informa y manda la de la fila")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=60), cf_original=80)
+    assert RA.INCONSISTENCIA_CF_DIVERGENTE in r['inconsistencias'], \
+        r['inconsistencias']
+    igual(r['nota_base'], 60,
+          'manda la CF de la fila: las fases extra se calcularon contra ella')
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA,
+          'no se aprueba con una CF que no se puede verificar')
+
+
+@test("S19 fila con cf_original=None + cf del caller -> se usa la del caller")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=None), cf_original=80)
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 80)
+    igual(r['inconsistencias'], (), 'no hay dos CF, no hay divergencia')
+
+
+@test("S20 ninguna CF en ningun sitio -> SIN_CALIFICAR")
+def _():
+    for caso in (RA.resolver_nota_secundaria(),
+                 RA.resolver_nota_secundaria(None, cf_original=None),
+                 RA.resolver_nota_secundaria(_Ev(), None)):
+        igual(caso['estado'], RA.SIN_CALIFICAR)
+        igual(caso['pendiente'], True)
+
+
+@test("S21 exacta vs redondeada NO es divergencia")
+def _():
+    # El consumidor real guarda `cf` (redondeada) y `cf_exacto`. Pasar una
+    # mientras la fila tiene la otra describe la MISMA CF oficial.
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=84.6), cf_original=85)
+    igual(r['inconsistencias'], (), '84.6 y 85 son la misma CF oficial')
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 85)
+    # Y al reves
+    r2 = RA.resolver_nota_secundaria(_Ev(cf_original=85), cf_original=84.6)
+    igual(r2['inconsistencias'], ())
+
+
+@test("S22 la divergencia se propaga tambien en las fases extra")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80), cf_original=90)
+    assert RA.INCONSISTENCIA_CF_DIVERGENTE in r['inconsistencias']
+    igual(r['estado'], RA.APROBADA_COMPLETIVA,
+          'la completiva se calcula con la CF de la fila (50%%*60+50%%*80=70)')
+    igual(r['nota_final'], 70)
+
+
+# ══════════════════ C · CONTRATO DEL CONSUMIDOR REAL ══════════════════
+#
+# El shape exacto que hoy produce `_construir_datos_boletin_secundaria`,
+# reproducido a mano para no importar app.py. Esto es lo que A3 tendra que
+# adaptar, y se prueba ahora para que A3 no descubra el hueco tarde.
+print(f"\n{B}CONTRATO DEL CONSUMIDOR REAL{X}")
+
+
+def _adapter(fila):
+    """Lo que hara A3: pasar la evaluacion y la CF que el consumidor ya tiene."""
+    return RA.resolver_nota_secundaria(
+        evaluacion=fila.get('evaluacion_extra'),
+        cf_original=fila.get('cf_exacto', fila.get('cf')),
+    )
+
+
+@test("C1  {cf:85, cf_exacto:84.6, evaluacion_extra:None} -> APROBADA")
+def _():
+    r = _adapter({'cf': 85, 'cf_exacto': 84.6, 'evaluacion_extra': None})
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 85, 'la CF oficial de 84.6 es 85')
+
+
+@test("C2  {cf:69, cf_exacto:68.8, evaluacion_extra:None} -> PENDIENTE_COMPLETIVA")
+def _():
+    r = _adapter({'cf': 69, 'cf_exacto': 68.8, 'evaluacion_extra': None})
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA)
+    igual(r['nota_final'], None)
+    igual(r['pendiente'], True)
+
+
+@test("C3  con evaluacion extra, el adapter sigue usando sus fases")
+def _():
+    r = _adapter({'cf': 60, 'cf_exacto': 60.0,
+                  'evaluacion_extra': _Ev(cf_original=60, cec=80)})
+    igual(r['estado'], RA.APROBADA_COMPLETIVA)
+    igual(r['nota_final'], 70)
+
+
+@test("C4  asignatura sin notas -> SIN_CALIFICAR, no un falso reprobado")
+def _():
+    r = _adapter({'cf': None, 'cf_exacto': None, 'evaluacion_extra': None})
+    igual(r['estado'], RA.SIN_CALIFICAR)
+    # Este es el caso que hoy divergia entre boletin individual y lote: el
+    # individual no la contaba y el lote la contaba como reprobada.
+    igual(r['nota_final'], None)
+
+
 # ══════════════════ Z · NO-DIVERGENCIA DE FORMULAS ══════════════════
 #
 # Lo que de verdad importa: que los numeros NO esten escritos aqui.
@@ -523,6 +690,36 @@ def _():
     igual(RA.resolver_nota_primaria(
         _area(MINIMO_APROBATORIO_PRIMARIA - 1))['estado'],
         RA.PENDIENTE_RECUPERACION_FINAL)
+
+
+@test("Z11 el fallback de CF no reimplementa las fases")
+def _():
+    # Si existe fila extra, el resolver TIENE que seguir llamando a sus
+    # metodos aunque el caller haya pasado tambien una CF. El fallback es
+    # solo para la CF, nunca para las fases.
+    from models import EvaluacionExtraSecundaria as M
+    original = M.calcular_completiva_final
+    llamadas = []
+    try:
+        def espia(self):
+            llamadas.append(1)
+            return original(self)
+        M.calcular_completiva_final = espia
+        _Ev.calcular_completiva_final = espia
+        RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80), cf_original=60)
+        igual(len(llamadas), 1, 'no llamo al metodo del modelo')
+    finally:
+        M.calcular_completiva_final = original
+        _Ev.calcular_completiva_final = original
+
+
+@test("Z12 sin fila extra NO se inventa una evaluacion")
+def _():
+    import ast as _a, inspect as _i
+    fuente = _i.getsource(RA)
+    for prohibido in ('EvaluacionExtraSecundaria(', 'RecuperacionPrimaria(',
+                      'setattr(', 'db.', 'session'):
+        assert prohibido not in fuente, prohibido
 
 
 @test("Z8  el contrato trae siempre las mismas claves")

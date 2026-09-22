@@ -103,7 +103,8 @@ FASE_ESPECIAL = 'especial'
 # Inconsistencias de DATOS que el resolver encuentra pero NO corrige. Se
 # informan; no se borra ni se modifica ninguna fila.
 INCONSISTENCIA_ESPECIAL_EN_PRIMER_CICLO = 'ESPECIAL_NO_APLICA_EN_1RO_2DO'
-INCONSISTENCIA_GRADO_DESCONOCIDO = 'GRADO_DESCONOCIDO_NO_SE_VALIDO_LA_ESPECIAL'
+INCONSISTENCIA_GRADO_DESCONOCIDO = 'GRADO_DESCONOCIDO_ESPECIAL_NO_APLICADA'
+INCONSISTENCIA_CF_DIVERGENTE = 'CF_SECUNDARIA_DIVERGENTE'
 
 # Grados de Primaria sin Recuperación Especial. En 1.º y 2.º el Registro no
 # contempla repitencia académica automática, y la Recuperación Especial es el
@@ -158,7 +159,10 @@ def resolver_nota_primaria(competencias, recuperacion=None, grado_numero=None,
                      Especial corresponde al grado; no cambia ninguna nota.
     """
     inconsistencias = []
-    _, cf_red = cf_area(competencias or ())
+    # `or` ni siquiera aqui: esto es una lista y no una nota, asi que no
+    # es el bug que persigue el modulo, pero el patron esta prohibido y
+    # dejarlo obliga a cada revision a pararse a comprobar que es inocuo.
+    _, cf_red = cf_area(competencias if competencias is not None else ())
 
     if cf_red is None:
         return _resultado(NIVEL_PRIMARIA, SIN_CALIFICAR, pendiente=True,
@@ -172,16 +176,22 @@ def resolver_nota_primaria(competencias, recuperacion=None, grado_numero=None,
     rec_final = getattr(recuperacion, 'recuperacion_final', None)
     rec_especial = getattr(recuperacion, 'recuperacion_especial', None)
 
-    # GUARD: la Especial no existe en 1.º y 2.º. Si aparece un dato legacy, se
-    # informa y NO se usa; la fila se deja exactamente como está.
+    # GUARD: la Especial no existe en 1.º y 2.º, y solo se usa cuando se puede
+    # DEMOSTRAR que el grado la admite. En los dos casos la fila se deja
+    # exactamente como está: se informa, no se corrige.
     if rec_especial is not None:
         if grado_numero in GRADOS_SIN_RECUPERACION_ESPECIAL:
             inconsistencias.append(INCONSISTENCIA_ESPECIAL_EN_PRIMER_CICLO)
             rec_especial = None
         elif grado_numero is None:
-            # Sin el grado no se puede comprobar. Se respeta el dato para no
-            # cambiar decisiones, pero queda dicho que no se validó.
+            # FAIL-CLOSED (A1.1). Antes se usaba el dato y solo se avisaba,
+            # con lo que un caller que olvidara pasar el grado podía aprobar
+            # a un alumno de 1.º o 2.º mediante una fase que quizá no le
+            # corresponde. Sin grado no se puede demostrar que aplique, así
+            # que no se aplica. El área se queda con el resultado de la
+            # Recuperación Final, que sí es válido en los seis grados.
             inconsistencias.append(INCONSISTENCIA_GRADO_DESCONOCIDO)
+            rec_especial = None
 
     if rec_final is None:
         return _resultado(NIVEL_PRIMARIA, PENDIENTE_RECUPERACION_FINAL,
@@ -221,49 +231,86 @@ def resolver_nota_primaria(competencias, recuperacion=None, grado_numero=None,
 
 # ══════════════════════════ SECUNDARIA ══════════════════════════
 
-def resolver_nota_secundaria(evaluacion, area_curricular_codigo=None):
+def resolver_nota_secundaria(evaluacion=None, cf_original=None,
+                             area_curricular_codigo=None):
     """Situación de UNA asignatura de Secundaria.
 
-    `evaluacion` — la fila `EvaluacionExtraSecundaria`. Todas las notas salen
-                   de sus propios métodos: `calcular_completiva_final()`,
-                   `calcular_extraordinaria_final()` y
-                   `calcular_especial_final()`. Aquí no hay ni un 0.5 ni un
-                   0.3 escritos.
+    `evaluacion`  — la fila `EvaluacionExtraSecundaria`, si existe.
+    `cf_original` — la CF que el consumidor ya calculó por su cuenta. Puede
+                    ser la exacta o la oficial redondeada; da igual, porque
+                    aquí se redondea antes de decidir.
+
+    POR QUÉ SE ACEPTAN LAS DOS FUENTES
+        Que exista CF no implica que exista fila extra. El consumidor real,
+        `_construir_datos_boletin_secundaria`, calcula `cf` por su cuenta y
+        toma la evaluación aparte con `extras_idx.get(asig.id)`, que devuelve
+        None cuando no hay fila. Datos legacy, importaciones, fixtures y
+        reparaciones producen lo mismo. Un motor canónico que exigiera la
+        fila diría SIN_CALIFICAR de un estudiante con 85, y no se podría
+        conectar en A3.
+
+    CUÁL MANDA SI HAY DOS
+        La de `evaluacion`. No por preferencia: `calcular_completiva_final()`
+        y sus hermanas leen `self.cf_original`, así que las fases extra YA
+        están calculadas contra esa base. Usar otra CF para el umbral y esa
+        para las fases daría un resultado mezclado de dos bases distintas, y
+        forzar las fases a otra base exigiría reimplementar las fórmulas —que
+        es justo lo que R4 viene a evitar—. La discrepancia no se esconde:
+        sale en `inconsistencias` para que A2/A3 pueda bloquear o avisar.
 
     NO se lee `evaluacion.condicion_final`: ese campo dice 'reprobado'
     también cuando falta cargar una fase, y ahí está precisamente la
     confusión que R4 tiene que deshacer.
     """
-    cf_original = getattr(evaluacion, 'cf_original', None)
-    if cf_original is None:
-        return _resultado(NIVEL_SECUNDARIA, SIN_CALIFICAR, pendiente=True,
-                          area_curricular_codigo=area_curricular_codigo)
+    inconsistencias = []
+    cf_evaluacion = getattr(evaluacion, 'cf_original', None)
 
+    if cf_evaluacion is not None and cf_original is not None:
+        # La comparación es sobre la CF OFICIAL, no sobre el float. Un
+        # consumidor puede pasar legítimamente la redondeada (85) mientras la
+        # fila guarda la exacta (84.6): eso es la misma CF, no una
+        # divergencia. Solo se avisa cuando el número oficial difiere.
+        if (redondear_calificacion_final(cf_evaluacion)
+                != redondear_calificacion_final(cf_original)):
+            inconsistencias.append(INCONSISTENCIA_CF_DIVERGENTE)
+
+    cf_base = cf_evaluacion if cf_evaluacion is not None else cf_original
+
+    if cf_base is None:
+        return _resultado(NIVEL_SECUNDARIA, SIN_CALIFICAR, pendiente=True,
+                          area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
+
+    cf_original = cf_base
     cf_oficial = redondear_calificacion_final(cf_original)
     if cf_oficial >= MINIMO_APROBATORIO_SECUNDARIA:
         return _resultado(NIVEL_SECUNDARIA, APROBADA, nota_base=cf_oficial,
                           nota_final=cf_oficial, fase=FASE_NORMAL,
-                          area_curricular_codigo=area_curricular_codigo)
+                          area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
 
     # ── Completiva ──
     if getattr(evaluacion, 'cec', None) is None:
         return _resultado(NIVEL_SECUNDARIA, PENDIENTE_COMPLETIVA,
                           nota_base=cf_oficial, pendiente=True,
-                          area_curricular_codigo=area_curricular_codigo)
+                          area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
 
     completiva = evaluacion.calcular_completiva_final()
     if completiva is not None and completiva >= MINIMO_APROBATORIO_SECUNDARIA:
         return _resultado(NIVEL_SECUNDARIA, APROBADA_COMPLETIVA,
                           nota_base=cf_oficial, nota_final=completiva,
                           fase=FASE_COMPLETIVA,
-                          area_curricular_codigo=area_curricular_codigo)
+                          area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
 
     # ── Extraordinaria ──
     if getattr(evaluacion, 'ceex', None) is None:
         return _resultado(NIVEL_SECUNDARIA, PENDIENTE_EXTRAORDINARIA,
                           nota_base=cf_oficial, nota_final=None,
                           pendiente=True,
-                          area_curricular_codigo=area_curricular_codigo)
+                          area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
 
     extraordinaria = evaluacion.calcular_extraordinaria_final()
     if (extraordinaria is not None
@@ -271,7 +318,8 @@ def resolver_nota_secundaria(evaluacion, area_curricular_codigo=None):
         return _resultado(NIVEL_SECUNDARIA, APROBADA_EXTRAORDINARIA,
                           nota_base=cf_oficial, nota_final=extraordinaria,
                           fase=FASE_EXTRAORDINARIA,
-                          area_curricular_codigo=area_curricular_codigo)
+                          area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
 
     # ── Especial, SOLO si ya está cargada ──
     #
@@ -286,10 +334,12 @@ def resolver_nota_secundaria(evaluacion, area_curricular_codigo=None):
                 APROBADA_ESPECIAL if aprobo else REPROBADA_DEFINITIVA,
                 nota_base=cf_oficial, nota_final=especial,
                 fase=FASE_ESPECIAL,
-                area_curricular_codigo=area_curricular_codigo)
+                area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
 
     return _resultado(NIVEL_SECUNDARIA, NO_APROBADA_TRAS_EXTRAORDINARIA,
                       nota_base=cf_oficial, nota_final=extraordinaria,
                       fase=FASE_EXTRAORDINARIA,
                       requiere_contexto_promocion=True,
-                      area_curricular_codigo=area_curricular_codigo)
+                      area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias)
