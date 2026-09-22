@@ -622,6 +622,81 @@ def _():
     igual(r['inconsistencias'], (), 'la tolerancia cubre el ruido de coma flotante')
 
 
+@test("S33 fase sin CF base + caller 60 -> PENDIENTE_COMPLETIVA, no salta")
+def _():
+    # EL CASO DE A1.3. La fila tiene CEC pero perdio su cf_original, asi que
+    # `calcular_completiva_final()` devuelve None. Antes la cascada lo leia
+    # como «completiva reprobada» y avanzaba a Extraordinaria. Una completiva
+    # que no se pudo calcular NO es una completiva reprobada.
+    ev = _Ev(cf_original=None, cec=80)
+    igual(ev.calcular_completiva_final(), None, 'precondicion: no es calculable')
+    r = RA.resolver_nota_secundaria(ev, cf_exacto=60, cf_oficial=60)
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA)
+    igual(r['nota_base'], 60)
+    igual(r['nota_final'], None)
+    igual(r['pendiente'], True)
+    assert RA.INCONSISTENCIA_FASE_SIN_BASE in r['inconsistencias'], \
+        r['inconsistencias']
+
+
+@test("S34 fase sin CF base + caller 85 -> APROBADA, con la inconsistencia")
+def _():
+    # Una fase legacy incoherente no puede invalidar una aprobacion normal:
+    # la CF alcanza por si sola. Pero queda señalada.
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=None, cec=80), cf_exacto=85)
+    igual(r['estado'], RA.APROBADA)
+    igual(r['nota_final'], 85)
+    assert RA.INCONSISTENCIA_FASE_SIN_BASE in r['inconsistencias']
+
+
+@test("S35 fase sin CF base y sin CF del caller -> SIN_CALIFICAR")
+def _():
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=None, cec=80))
+    igual(r['estado'], RA.SIN_CALIFICAR)
+    assert RA.INCONSISTENCIA_FASE_SIN_BASE in r['inconsistencias']
+    igual(r['nota_final'], None)
+
+
+@test("S36 varias fases legacy sin base -> se detiene en la PRIMERA")
+def _():
+    # CEEX=90 aprobaria de sobra si se interpretara. No se interpreta:
+    # saltarse la falta de base de la completiva para usar la extraordinaria
+    # seria peor, no mejor.
+    r = RA.resolver_nota_secundaria(
+        _Ev(cf_original=None, cec=20, ceex=90, ce=10), cf_exacto=60)
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA)
+    assert RA.INCONSISTENCIA_FASE_SIN_BASE in r['inconsistencias']
+    igual(r['nota_final'], None, 'ninguna fase legacy produjo nota')
+
+
+@test("S37 fila vacia sin fases NO es una inconsistencia de fase")
+def _():
+    # Una fila cache incompleta, sin CEC/CEEX/CE, es legitima: no hay ninguna
+    # fase que interpretar mal.
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=None), cf_exacto=60)
+    igual(r['estado'], RA.PENDIENTE_COMPLETIVA)
+    assert RA.INCONSISTENCIA_FASE_SIN_BASE not in r['inconsistencias'], \
+        r['inconsistencias']
+
+
+@test("S38 cada fase legacy por separado dispara el guard")
+def _():
+    for campo in ('cec', 'ceex', 'ce'):
+        ev = _Ev(cf_original=None, **{campo: 80})
+        r = RA.resolver_nota_secundaria(ev, cf_exacto=60)
+        assert RA.INCONSISTENCIA_FASE_SIN_BASE in r['inconsistencias'], campo
+        igual(r['estado'], RA.PENDIENTE_COMPLETIVA, campo)
+
+
+@test("S39 una fase legacy de 0 tambien cuenta como fase presente")
+def _():
+    # `0` es un valor, no una ausencia: si esta almacenado, hay una fase que
+    # no se puede interpretar.
+    r = RA.resolver_nota_secundaria(_Ev(cf_original=None, cec=0), cf_exacto=60)
+    assert RA.INCONSISTENCIA_FASE_SIN_BASE in r['inconsistencias'], \
+        'un 0 en CEC es una fase almacenada'
+
+
 # ══════════════════ C · CONTRATO DEL CONSUMIDOR REAL ══════════════════
 #
 # El shape exacto que hoy produce `_construir_datos_boletin_secundaria`,
@@ -859,6 +934,51 @@ def _():
         assert prohibido not in codigo, prohibido
     # La tolerancia es lo unico numerico nuevo, y no es una formula academica.
     assert 'TOLERANCIA_CF_EXACTA' in codigo
+
+
+@test("Z15 bajo fase-sin-base NO se llama a ningun calcular_*")
+def _():
+    # El guard tiene que ocurrir ANTES de tocar los metodos de fase. Se
+    # espian los tres y se exige que ninguno se ejecute.
+    from models import EvaluacionExtraSecundaria as M
+    originales = {n: getattr(M, n) for n in
+                  ('calcular_completiva_final', 'calcular_extraordinaria_final',
+                   'calcular_especial_final')}
+    llamados = []
+    try:
+        for nombre, original in originales.items():
+            def espia(self, _n=nombre, _o=original):
+                llamados.append(_n)
+                return _o(self)
+            setattr(M, nombre, espia)
+            setattr(_Ev, nombre, espia)
+        RA.resolver_nota_secundaria(
+            _Ev(cf_original=None, cec=20, ceex=90, ce=10), cf_exacto=60)
+        igual(llamados, [], 'se llamo a un metodo de fase sin base valida')
+    finally:
+        for nombre, original in originales.items():
+            setattr(M, nombre, original)
+            setattr(_Ev, nombre, original)
+
+
+@test("Z16 con CF base valida los metodos SI se llaman (caso normal intacto)")
+def _():
+    from models import EvaluacionExtraSecundaria as M
+    original = M.calcular_completiva_final
+    llamados = []
+    try:
+        def espia(self):
+            llamados.append(1)
+            return original(self)
+        M.calcular_completiva_final = espia
+        _Ev.calcular_completiva_final = espia
+        r = RA.resolver_nota_secundaria(_Ev(cf_original=60, cec=80))
+        igual(len(llamados), 1)
+        igual(r['estado'], RA.APROBADA_COMPLETIVA)
+        igual(r['inconsistencias'], ())
+    finally:
+        M.calcular_completiva_final = original
+        _Ev.calcular_completiva_final = original
 
 
 @test("Z8  el contrato trae siempre las mismas claves")

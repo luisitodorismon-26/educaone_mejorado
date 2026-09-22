@@ -106,6 +106,7 @@ INCONSISTENCIA_ESPECIAL_EN_PRIMER_CICLO = 'ESPECIAL_NO_APLICA_EN_1RO_2DO'
 INCONSISTENCIA_GRADO_DESCONOCIDO = 'GRADO_DESCONOCIDO_ESPECIAL_NO_APLICADA'
 INCONSISTENCIA_CF_DIVERGENTE = 'CF_SECUNDARIA_DIVERGENTE'
 INCONSISTENCIA_CF_CALLER = 'CF_SECUNDARIA_CALLER_INCONSISTENTE'
+INCONSISTENCIA_FASE_SIN_BASE = 'EVALUACION_EXTRA_SIN_CF_BASE'
 
 # Dos CF exactas se consideran la misma solo si difieren en ruido de
 # coma flotante. NO se redondean para compararlas: 68.6 y 69.4 comparten
@@ -293,6 +294,28 @@ def resolver_nota_secundaria(evaluacion=None, cf_exacto=None, cf_oficial=None,
     inconsistencias = []
     cf_evaluacion = getattr(evaluacion, 'cf_original', None)
 
+    # ── ¿Se pueden interpretar las fases de esta fila? ──
+    #
+    # CEC, CEEX y CE solo significan algo junto a la CF de SU PROPIA fila:
+    # `calcular_completiva_final()` y sus hermanas ponderan sobre
+    # `self.cf_original`. Si esa base se perdió —legacy, importación,
+    # reparación a medias—, los métodos devuelven None y la cascada se
+    # deslizaba a la fase siguiente como si la anterior se hubiera evaluado
+    # y reprobado. Una completiva que no se pudo calcular NO es una
+    # completiva reprobada.
+    #
+    # La CF que aporte el consumidor no rescata esas fases: serviría para
+    # decir si el área está aprobada o pendiente, pero reinterpretar con ella
+    # unos puntos calculados contra otra base sería inventar un resultado.
+    # Y copiarla dentro del objeto está prohibido: A1 no muta nada.
+    fases_almacenadas = [getattr(evaluacion, campo, None)
+                         for campo in ('cec', 'ceex', 'ce')]
+    fases_sin_base = (evaluacion is not None
+                      and cf_evaluacion is None
+                      and any(v is not None for v in fases_almacenadas))
+    if fases_sin_base:
+        inconsistencias.append(INCONSISTENCIA_FASE_SIN_BASE)
+
     # ── Coherencia entre las fuentes ──
     # Exacta contra exacta: comparación numérica, sin redondear.
     if cf_evaluacion is not None and cf_exacto is not None:
@@ -328,8 +351,22 @@ def resolver_nota_secundaria(evaluacion=None, cf_exacto=None, cf_oficial=None,
     # pudiera haber pasado el consumidor.
     cf_oficial = redondear_calificacion_final(cf_original)
     if cf_oficial >= MINIMO_APROBATORIO_SECUNDARIA:
+        # Una fase legacy incoherente no invalida una aprobación normal: la
+        # CF alcanza por sí sola. Pero la incoherencia queda señalada.
         return _resultado(NIVEL_SECUNDARIA, APROBADA, nota_base=cf_oficial,
                           nota_final=cf_oficial, fase=FASE_NORMAL,
+                          area_curricular_codigo=area_curricular_codigo,
+                          inconsistencias=inconsistencias,
+                          cf_exacta_disponible=hay_exacta)
+
+    # FAIL-CLOSED: con fases que no se pueden interpretar, la cascada se
+    # detiene en el primer escalón. No se llama a ningún `calcular_*`, no se
+    # lee `completiva_final` ni `nota_final` ni `condicion_final` de la fila,
+    # y no se avanza a Extraordinaria ni a Especial: saltarse la falta de
+    # base de la primera fase para usar la segunda sería peor, no mejor.
+    if fases_sin_base:
+        return _resultado(NIVEL_SECUNDARIA, PENDIENTE_COMPLETIVA,
+                          nota_base=cf_oficial, pendiente=True,
                           area_curricular_codigo=area_curricular_codigo,
                           inconsistencias=inconsistencias,
                           cf_exacta_disponible=hay_exacta)
