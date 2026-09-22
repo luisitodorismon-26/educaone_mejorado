@@ -23,13 +23,27 @@ import sys, os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for ext in ['', '-shm', '-wal']:
-    if os.path.exists(os.path.join(_BASE, 'sge.db' + ext)):
-        os.remove(os.path.join(_BASE, 'sge.db' + ext))
-if os.path.exists(os.path.join(_BASE, 'INITIAL_CREDENTIALS.txt')):
-    os.remove(os.path.join(_BASE, 'INITIAL_CREDENTIALS.txt'))
+
+# INFRA-2: esta suite ya no borra la base local.
+#
+# Antes empezaba por `os.remove` sobre backend/sge.db (mas su -wal y su
+# -shm) y sobre INITIAL_CREDENTIALS.txt, y despues dejaba que
+# `database.py` resolviera `sqlite:///sge.db` contra el directorio
+# actual: la misma ruta que acababa de borrar. Ejecutarla costaba la
+# base de datos local de quien la lanzara, y encima dejaba dentro todos
+# sus datos de prueba.
+#
+# Ahora nace sobre una SQLite temporal propia. El orden no es
+# cosmetico: `database.py` fija la URL al importarse, asi que esto tiene
+# que ir ANTES de cualquier import suyo.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_utils import (aislar_base_de_datos,        # noqa: E402
+                        verificar_engine_aislado)
+
+_TMPDIR = aislar_base_de_datos('test_conflictos_horarios_v21981')
 
 from database import engine, SessionLocal
+verificar_engine_aislado(engine, _TMPDIR)
 from models import Base, Usuario, Grado, Horario, AsignacionProfesor
 Base.metadata.create_all(bind=engine)
 from fastapi.testclient import TestClient
