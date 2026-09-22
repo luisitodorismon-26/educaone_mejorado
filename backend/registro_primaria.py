@@ -10,7 +10,7 @@ F1 (esta versión) rellena:
   2. DATOS DE ESTUDIANTES — No., nombre, sexo, fecha de nacimiento
      (2 páginas del template: filas 1-45 y 46-90)
   3. CALIFICACIONES POR ÁREA — P1-P4 por competencia (C1/C2/C3, valor
-     efectivo max(P,RP)) + Promedio del área con LINAJE ESTRICTO
+     efectivo = RP si existe, si no P) + Promedio del área con LINAJE ESTRICTO
      (solo si las 3 finales de competencia están completas)
 
 F2 (esta versión): ASISTENCIA MENSUAL — 12 formularios (agosto-julio),
@@ -388,16 +388,14 @@ def _overlay(page, draw_func):
 
 
 def _valor_efectivo(comp_data: Dict, p: int):
-    """Valor del período: max(P, RP) — la RP nunca baja la nota."""
+    """Valor del período, según la definición canónica de Primaria."""
+    from calculo_primaria import valor_periodo_primaria
     pv = comp_data.get(f'p{p}')
     rv = comp_data.get(f'rp{p}')
-    if pv is not None and rv is not None:
-        return max(float(pv), float(rv))
-    if rv is not None:
-        return float(rv)
-    if pv is not None:
-        return float(pv)
-    return None
+    v = valor_periodo_primaria(
+        float(pv) if pv is not None else None,
+        float(rv) if rv is not None else None)
+    return None if v is None else float(v)
 
 
 # ─────────────────────────── GENERADOR ───────────────────────────

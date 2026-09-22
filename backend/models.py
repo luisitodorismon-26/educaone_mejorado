@@ -846,7 +846,11 @@ class AreaCurricular(Base):
     codigo = Column(String(20))                                     # 'LE', 'MA', 'CS', etc
     nivel = Column(String(20), default='primaria')                  # 'primaria' | 'secundaria'
     ciclo = Column(String(20))                                      # 'primer_ciclo' | 'segundo_ciclo'
-    numero_competencias = Column(Integer, default=3)                # Primaria: 3, Inglés: 2
+    # Metadato de catálogo, para mostrar. NO es la fuente del motor: la
+    # matriz oficial de Primaria vive en calculo_primaria.
+    # COMPETENCIAS_OFICIALES_PRIMARIA, porque este campo y el `nombre` de
+    # al lado son editables desde la pantalla de Áreas (R3).
+    numero_competencias = Column(Integer, default=3)                # Primaria: 3 en todas las áreas
     orden = Column(Integer, default=0)
     activo = Column(Boolean, default=True)
 
@@ -874,7 +878,26 @@ class CalificacionPrimaria(Base):
     p2 = Column(Float); rp2 = Column(Float)
     p3 = Column(Float); rp3 = Column(Float)
     p4 = Column(Float); rp4 = Column(Float)
-    
+
+    # NE — «No Evaluado» (R2-A3).
+    #
+    # Un período tiene TRES estados, no dos: evaluado, NE y pendiente. Hasta
+    # R2 solo había dos columnas por período, así que un NULL tenía que
+    # significar las dos cosas a la vez, y el sistema lo resolvía tratando
+    # todo hueco como NE — con lo cual un año a medio cargar producía CF
+    # completas.
+    #
+    # NE es un acto documentado: la norma lo reserva para quien «no participe
+    # del proceso de enseñanza-aprendizaje durante uno o más períodos» por
+    # enfermedad certificada u otra causa justificada. No es «todavía no hay
+    # nota». Por eso es una marca explícita y no una inferencia.
+    #
+    # Invariante: neN=True implica pN=NULL y rpN=NULL. Nunca conviven.
+    ne1 = Column(Boolean, default=False)
+    ne2 = Column(Boolean, default=False)
+    ne3 = Column(Boolean, default=False)
+    ne4 = Column(Boolean, default=False)
+
     # Nota final de la competencia (promedio de los 4 períodos)
     final_competencia = Column(Float)                               # Esto es C1, C2 o C3
     literal = Column(String(2))
@@ -888,34 +911,89 @@ class CalificacionPrimaria(Base):
     asignatura = relationship('Asignatura', backref='calificaciones_primaria')
     
     def valor_periodo(self, periodo):
-        """Valor final del período: max(P, RP) si hay RP, si no P"""
-        p = getattr(self, f'p{periodo}')
-        rp = getattr(self, f'rp{periodo}')
-        if rp is not None and p is not None:
-            return max(p, rp)
-        elif rp is not None:
-            return rp
-        elif p is not None:
-            return p
-        return None
-    
-    def calcular_final(self, minimo_periodos=1):
-        """Final de la competencia = promedio de los períodos EVALUADOS.
+        """Valor numérico efectivo del período.
 
-        Regla oficial MINERD primaria (Registro, pág. 85): "En caso de que un
-        estudiante tenga indicado (NE) en algún período, la calificación final
-        de la competencia se obtiene del promedio de los períodos evaluados."
-        Un período NE = valor None (no cargado). Se promedian los que sí tienen
-        valor. Requiere al menos `minimo_periodos` evaluado(s).
+        R2-A1: la regla vive en `calculo_primaria.valor_periodo_primaria`, que
+        es la definición canónica del período de Primaria. Aquí solo se leen
+        los campos y se delega, para que el modelo y los seis consumidores que
+        antes tenían su propia copia no puedan volver a divergir.
+        """
+        from calculo_primaria import valor_periodo_primaria
+        return valor_periodo_primaria(
+            getattr(self, f'p{periodo}'), getattr(self, f'rp{periodo}'))
+
+    def es_ne(self, periodo):
+        """True si el período está marcado NE.
+
+        El `or False` no es decorativo: las filas anteriores a la migración de
+        R2 tienen NULL en estas columnas, y NULL aquí significa «no hay NE».
+        """
+        return bool(getattr(self, f'ne{periodo}', False) or False)
+
+    def estado_periodo(self, periodo):
+        """'evaluado' | 'ne' | 'pendiente'."""
+        from calculo_primaria import estado_periodo_primaria
+        return estado_periodo_primaria(
+            getattr(self, f'p{periodo}'), getattr(self, f'rp{periodo}'),
+            self.es_ne(periodo))
+
+    def calcular_final(self, minimo_periodos=1):
+        """CF OFICIAL de la competencia, o None si todavía no existe.
+
+        Dos reglas del Registro del Nivel Primario, que son distintas:
+
+          · la normal —hoja 78/84—: «se suma la calificación de los períodos
+            (P1+P2+P3+P4) y se divide entre 4». Divisor fijo, sin excepciones;
+          · la de NE —hoja 79/85—: «en caso de que un estudiante tenga
+            indicado (NE) en algún período, la calificación final de la
+            competencia se obtiene del promedio de los períodos evaluados».
+
+        Hasta R2 el código aplicaba SIEMPRE la segunda, porque no podía
+        distinguir un NE de un período que nadie había cargado todavía. Con
+        tres períodos cargados en marzo devolvía una CF como si el año hubiera
+        terminado.
+
+        Ahora los cuatro períodos tienen que estar RESUELTOS: cada uno con
+        valor numérico o marcado NE. Basta un PENDIENTE para que no haya CF.
+        NE sale del divisor; PENDIENTE no reduce el divisor: lo bloquea.
+
+            P1..P4 numéricos            -> promedio / 4
+            P1..P3 numéricos, P4 sin nada -> None
+            P1..P3 numéricos, NE4       -> promedio / 3
+            NE1 NE2, P3 y P4 numéricos  -> promedio / 2
+            los cuatro NE               -> None (no hay nada que promediar)
+
+        `minimo_periodos` se conserva por compatibilidad de firma, pero ya no
+        gobierna: lo que decide es que no queden períodos pendientes.
         """
         valores = []
         for p in range(1, 5):
+            if self.es_ne(p):
+                continue                      # NE: fuera del divisor
             v = self.valor_periodo(p)
-            if v is not None:
-                valores.append(v)
-        if len(valores) >= minimo_periodos and valores:
-            return round(sum(valores) / len(valores), 2)
-        return None
+            if v is None:
+                return None                   # PENDIENTE: no hay CF oficial
+            valores.append(v)
+        if not valores:
+            return None                       # los cuatro NE
+        return round(sum(valores) / len(valores), 2)
+
+    def promedio_acumulado(self):
+        """Promedio PROVISIONAL de lo evaluado hasta hoy. NO es la CF.
+
+        Existe para no perder información útil durante P1-P3: el docente
+        quiere ver cómo va el estudiante aunque el año no haya terminado.
+
+        Es un dato DERIVADO y no se persiste nunca en `final_competencia`.
+        Confundir los dos es justo lo que producía CF completas a mitad de
+        año. Ignora los períodos pendientes en vez de bloquear, y excluye los
+        NE igual que la CF.
+        """
+        valores = [v for p in range(1, 5)
+                   if not self.es_ne(p) and (v := self.valor_periodo(p)) is not None]
+        if not valores:
+            return None
+        return round(sum(valores) / len(valores), 2)
     
     def get_literal(self, nota=None):
         if nota is None:
@@ -939,7 +1017,15 @@ class CalificacionPrimaria(Base):
             'p2': self.p2, 'rp2': self.rp2,
             'p3': self.p3, 'rp3': self.rp3,
             'p4': self.p4, 'rp4': self.rp4,
+            'ne1': self.es_ne(1), 'ne2': self.es_ne(2),
+            'ne3': self.es_ne(3), 'ne4': self.es_ne(4),
+            # Estado explicito por periodo: evaluado | ne | pendiente.
+            # El frontend no tiene que deducirlo de la combinacion de campos.
+            'estados': {n: self.estado_periodo(n) for n in (1, 2, 3, 4)},
             'final_competencia': self.final_competencia,
+            # PROVISIONAL. No es la CF y no se persiste: es lo evaluado hasta
+            # hoy, para no perder informacion util durante P1-P3.
+            'promedio_acumulado': self.promedio_acumulado(),
             'literal': self.literal
         }
 
@@ -2865,7 +2951,7 @@ def init_db():
                 AreaCurricular(nombre='Educación Artística', codigo='EA', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=5, colegio_id=colegio.id),
                 AreaCurricular(nombre='Educación Física', codigo='EF', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=6, colegio_id=colegio.id),
                 AreaCurricular(nombre='Formación Integral Humana y Religiosa', codigo='FIHR', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=7, colegio_id=colegio.id),
-                AreaCurricular(nombre='Lenguas Extranjeras (Inglés)', codigo='LEX', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=2, orden=8, colegio_id=colegio.id),
+                AreaCurricular(nombre='Lenguas Extranjeras (Inglés)', codigo='LEX', nivel='primaria', ciclo='segundo_ciclo', numero_competencias=3, orden=8, colegio_id=colegio.id),
             ]
             db.add_all(areas_primaria)
         

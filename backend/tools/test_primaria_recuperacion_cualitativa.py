@@ -755,16 +755,20 @@ def _():
 
 @test("I4 en 4to la recuperacion especial sigue igual que antes")
 def _():
-    for comp in (1, 2, 3):
-        calificar(H_PROF, E_4A, MATE, comp=comp, p1=40, p2=40, p3=40, p4=40)
     d = SessionLocal()
     try:
         d.add(_asig(COL_A, PROF, CUR_4A, MATE, ANO_A))
         d.commit()
     finally:
         d.close()
+    # I1 dejo P4 cerrado. Hay que ABRIRLO para poder cargar las notas y
+    # volver a cerrarlo: desde R2-A5 un P4 sin nota queda PENDIENTE y
+    # bloquea la CF, asi que cargar con el periodo cerrado ya no sirve.
+    set_ano(p4_cerrado=False)
     for comp in (1, 2, 3):
-        calificar(H_PROF, E_4A, MATE, comp=comp, p1=40, p2=40, p3=40, p4=40)
+        assert calificar(H_PROF, E_4A, MATE, comp=comp,
+                         p1=40, p2=40, p3=40, p4=40).status_code == 200
+    set_ano(p4_cerrado=True)
     client.get("/api/recuperaciones-primaria/pendientes", headers=H_DIR)
     q = client.post("/api/recuperaciones-primaria", headers=H_PROF, json={
         "estudiante_id": E_4A, "asignatura_id": MATE, "tipo": "final", "puntos": 10})
@@ -963,6 +967,8 @@ def _():
 @test("M5 con p4_cerrado=True se conserva la sincronizacion de siempre")
 def _():
     assert n_fichas_final() == 0, "M1 dejo la tabla vacia"
+    # M1-M4 dejaron los cuatro periodos cargados, asi que la CF oficial de
+    # E_2A/LENGUA existe y su area puede entrar a recuperacion.
     set_ano(p4_cerrado=True)
     try:
         r = abrir_pendientes()

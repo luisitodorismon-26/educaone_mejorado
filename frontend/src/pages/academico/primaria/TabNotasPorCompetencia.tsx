@@ -5,8 +5,9 @@ import { Button, Alert } from '../../../components/ui';
 import {
   EstudiantePrimData, CampoEditable, CAMPOS_PERIODOS,
   NOMBRES_COMPETENCIAS_PRIM, MINIMO_APROBATORIO_PRIMARIA,
-  UMBRAL_RP_PRIMARIA, rpHabilitado, finalCompetencia,
+  UMBRAL_RP_PRIMARIA, rpEditable, promedioAcumulado, cfOficialDisponible,
   ModalidadRecuperacion, admiteRpNumerica, AYUDA_RP_PRIMARIA, AVISO_RP_CUALITATIVA,
+  estadoPeriodoDe, ETIQUETA_ESTADO,
 } from './tipos';
 import { avisoPeriodoCerrado, mensajeAvisos } from './periodoCerrado';
 
@@ -60,9 +61,12 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
   );
 
   // Final en vivo (con drafts aplicados)
-  const finalEnVivo = (est: EstudiantePrimData): number | null => {
+  // Lo que se ve mientras el docente escribe. Es el PROVISIONAL: la CF
+  // oficial la decide el backend y solo existe con los cuatro períodos
+  // resueltos. `cfLista` sirve para decir en pantalla cuál de los dos es.
+  const vistaEnVivo = (est: EstudiantePrimData) => {
     const comp = getComp(est, compSel);
-    if (!comp) return null;
+    if (!comp) return { valor: null as number | null, oficial: false };
     const k = key(est.estudiante.id, compSel);
     const merged = { ...comp };
     if (drafts[k]) {
@@ -70,7 +74,7 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
         (merged as any)[campo] = val === '' ? null : Number(val);
       }
     }
-    return finalCompetencia(merged);
+    return { valor: promedioAcumulado(merged), oficial: cfOficialDisponible(merged) };
   };
 
   const guardar = async () => {
@@ -144,19 +148,29 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                   {conRp && <th className="px-2 py-2 text-center font-normal text-gray-400 text-xs">RP{cp.periodo}</th>}
                 </Fragment>
               ))}
-              <th className="px-3 py-2 text-center font-medium text-blue-700">Final</th>
+              <th className="px-3 py-2 text-center font-medium text-blue-700"
+                  title="Final solo con los cuatro períodos resueltos. Mientras tanto, promedio acumulado (provisional).">
+                Final / acum.
+              </th>
             </tr>
           </thead>
           <tbody>
             {activos.map(est => {
-              const fin = finalEnVivo(est);
+              const { valor: fin, oficial: cfLista } = vistaEnVivo(est);
               const aprobado = fin != null && fin >= MINIMO_APROBATORIO_PRIMARIA;
               return (
                 <tr key={est.estudiante.id} className="border-b hover:bg-gray-50">
                   <td className="px-3 py-1.5 font-medium text-gray-800 sticky left-0 bg-white">{est.estudiante.nombre_completo}</td>
                   {CAMPOS_PERIODOS.map(cp => {
                     const pVal = getValor(est, cp.p) !== '' ? Number(getValor(est, cp.p)) : null;
-                    const rpOn = rpHabilitado(pVal);
+                    const _estado = estadoPeriodoDe(getComp(est, compSel), cp.periodo);
+                    // Igual que en la otra pestaña: una RP ya asentada
+                    // manda sobre la P, así que no puede ocultarse (R2-A8.4).
+                    const rpOn = rpEditable(
+                      pVal,
+                      getComp(est, compSel)?.[cp.rp] as number | null | undefined,
+                      drafts[key(est.estudiante.id, compSel)]?.[cp.rp],
+                    ) && _estado !== 'ne';
                     return (
                     <Fragment key={cp.periodo}>
                       <td className="px-1 py-1 text-center">
@@ -164,8 +178,12 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                           type="number" min={0} max={100}
                           value={getValor(est, cp.p)}
                           onChange={e => handleChange(est.estudiante.id, cp.p, e.target.value)}
-                          disabled={!puedeEditar}
-                          className="w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50"
+                          disabled={!puedeEditar || _estado === 'ne'}
+                          placeholder={_estado === 'pendiente' ? '—' : ''}
+                          title={ETIQUETA_ESTADO[_estado]}
+                          className={`w-14 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 disabled:bg-gray-50 ${
+                            _estado === 'ne' ? 'bg-slate-100 text-slate-400' :
+                            _estado === 'pendiente' ? 'border-dashed text-gray-400' : ''}`}
                         />
                       </td>
                       {conRp && <td className="px-1 py-1 text-center">
@@ -175,7 +193,9 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                           onChange={e => handleChange(est.estudiante.id, cp.rp, e.target.value)}
                           disabled={!puedeEditar || !rpOn}
                           placeholder={rpOn ? 'RP' : '—'}
-                          title={rpOn ? AYUDA_RP_PRIMARIA : `RP se habilita solo si P${cp.periodo} < ${UMBRAL_RP_PRIMARIA}`}
+                          title={rpOn ? AYUDA_RP_PRIMARIA
+                            : _estado === 'ne' ? 'Período marcado NE: no lleva nota'
+                            : `Para ABRIR una recuperación, P${cp.periodo} debe ser menor que ${UMBRAL_RP_PRIMARIA}. Una RP ya asentada siempre se puede corregir.`}
                           className={`w-12 px-1 py-1 text-center border rounded text-xs focus:ring-1 focus:ring-amber-400 disabled:bg-gray-100 disabled:text-gray-300 ${rpOn ? 'bg-amber-50/40' : ''}`}
                         />
                       </td>}
@@ -184,6 +204,12 @@ export const TabNotasPorCompetencia: React.FC<Props> = ({ estudiantes, asignatur
                   })}
                   <td className={`px-3 py-1.5 text-center font-bold ${fin == null ? 'text-gray-300' : aprobado ? 'text-green-600' : 'text-red-600'}`}>
                     {fin != null ? Math.round(fin) : '—'}
+                    {fin != null && !cfLista && (
+                      <span className="ml-1 text-[10px] font-normal text-amber-600"
+                            title="Promedio acumulado: todavía hay períodos pendientes, así que no es la calificación final.">
+                        acum.
+                      </span>
+                    )}
                   </td>
                 </tr>
               );

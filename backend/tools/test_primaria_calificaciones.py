@@ -650,18 +650,28 @@ def _modelo(**campos):
     return c
 
 
-@test("F1 valor_periodo = max(P, RP), y RP sola vale si no hay P")
+@test("F1 valor_periodo: RP REEMPLAZA a P (R2-A2)")
 def _():
-    assert _modelo(p1=60, rp1=75).valor_periodo(1) == 75, "la recuperacion no subio"
+    # CAMBIO DE REQUISITO ACADEMICO, no de implementacion. Hasta R2 esto era
+    # max(P, RP). La norma dice que la recuperacion se asienta en su columna
+    # "siendo esta ultima la calificacion final del periodo": RP no compite
+    # con P, lo sustituye. Los dos primeros asserts valian igual con max();
+    # los de F2 son los que cambian de resultado.
+    assert _modelo(p1=60, rp1=75).valor_periodo(1) == 75
     assert _modelo(p1=60).valor_periodo(1) == 60
     assert _modelo(rp1=75).valor_periodo(1) == 75, "RP sin P deberia valer"
     assert _modelo().valor_periodo(1) is None
+    # Casos exigidos por R2-A2
+    assert _modelo(p1=50, rp1=70).valor_periodo(1) == 70
+    assert _modelo(p1=0, rp1=0).valor_periodo(1) == 0, "0 no es ausencia"
+    assert _modelo(p1=100, rp1=90).valor_periodo(1) == 90
 
 
-@test("F2 una recuperación MENOR que la nota original no baja el período")
+@test("F2 una recuperación MENOR que la nota original SI baja el período")
 def _():
-    # Es la consecuencia de max(): recuperar peor no puede perjudicar.
-    assert _modelo(p1=80, rp1=50).valor_periodo(1) == 80
+    # Antes de R2 esto devolvia 80, por max(). Ahora manda lo que el docente
+    # asento como calificacion final del periodo.
+    assert _modelo(p1=80, rp1=50).valor_periodo(1) == 50
     assert _modelo(p1=80, rp1=80).valor_periodo(1) == 80
 
 
@@ -676,11 +686,26 @@ def _():
     assert c.calcular_final() == 80.25
 
 
-@test("F4 CF con períodos NE: promedia SOLO los evaluados (regla MINERD)")
+@test("F4 CF oficial: PENDIENTE la bloquea, NE sale del divisor (R2-A5)")
 def _():
-    assert _modelo(p1=80, p2=90).calcular_final() == 85.0, "no promedio solo los evaluados"
-    assert _modelo(p1=90).calcular_final() == 90.0
+    # CAMBIO DE REQUISITO ACADEMICO. Hasta R2 este caso devolvia 85: el codigo
+    # aplicaba siempre la regla de excepcion de NE porque no sabia distinguir
+    # un NE de un periodo que nadie habia cargado todavia. La norma tiene DOS
+    # reglas: la normal divide entre 4, y la de NE promedia "los periodos
+    # evaluados". Un hueco sin marcar no es NE: es PENDIENTE, y bloquea.
+    assert _modelo(p1=80, p2=90).calcular_final() is None, \
+        "tres pendientes no pueden producir CF"
+    assert _modelo(p1=90).calcular_final() is None
     assert _modelo().calcular_final() is None, "sin ningun periodo no hay CF"
+    # Con los cuatro resueltos si existe.
+    assert _modelo(p1=80, p2=90, p3=80, p4=90).calcular_final() == 85.0
+    # NE sale del divisor.
+    c = _modelo(p1=80, p2=90)
+    c.ne3 = True
+    c.ne4 = True
+    assert c.calcular_final() == 85.0, "NE deberia salir del divisor"
+    # Lo provisional sigue disponible, pero se llama por su nombre.
+    assert _modelo(p1=80, p2=90).promedio_acumulado() == 85.0
 
 
 @test("F5 la CF usa el valor recuperado del período, no la nota original")
@@ -835,8 +860,9 @@ def _():
     c = _calif(E_PRIM, INGLES)
     assert c["p1"] == 80, ("se aplico p1 pese al fallo de p2", c)
     assert c["p2"] == 70, ("se toco p2", c)
-    # y la CF no se movio
-    assert c["final"] == 75.0, c
+    # La CF no existe porque P3 y P4 estan PENDIENTES (R2-A5). Lo que este
+    # caso comprueba es la atomicidad del guardado, no el valor de la CF.
+    assert c["final"] is None, c
 
 
 # ==========================================================================

@@ -881,6 +881,68 @@ async def lifespan(app):
                     # a mano desde Configuración.
                     logger.warning(f"No se pudo ejecutar el autovínculo curricular: {e}")
 
+        # === 6j. NE por período en calificaciones de Primaria (P2A-R2) ===
+        # Cuatro columnas NUEVAS, booleanas, nullable y con DEFAULT FALSE.
+        # `Base.metadata.create_all` NO añade columnas a una tabla que ya
+        # existe, así que en producción tienen que entrar por ALTER TABLE.
+        #
+        # ADITIVA y SIN BACKFILL: las filas actuales quedan en FALSE, que es
+        # exactamente lo correcto —ninguna de ellas tiene un NE declarado— y
+        # por tanto ninguna calificación histórica se reinterpreta. El código
+        # lee con `bool(getattr(...) or False)` para tolerar el NULL de las
+        # filas anteriores a la migración.
+        #
+        # Rollback (Postgres):
+        #   ALTER TABLE calificaciones_primaria DROP COLUMN ne1;  (ne2, ne3, ne4)
+        # === 6k. Catálogo: Inglés de Primaria pasa de 2 a 3 competencias (R3) ===
+        #
+        # El Registro de Grado 2026 trae C1/C2/C3 para Lenguas Extranjeras en
+        # 4.º, 5.º y 6.º, igual que para las demás áreas. El catálogo decía 2.
+        #
+        # Esto NO cambia ningún cálculo: desde R3 la matriz la fija
+        # COMPETENCIAS_OFICIALES_PRIMARIA y el motor no consulta esta tabla.
+        # Se corrige porque el número se enseña en la pantalla de Áreas y ahí
+        # contradecía al documento oficial.
+        #
+        # La fila se identifica por `codigo='LEX'` + nivel + ciclo, nunca por
+        # `nombre`: ese campo es texto libre editable y apuntar a él podría
+        # tocar otra área. Y solo se toca si vale 2, así que es idempotente y
+        # respeta cualquier valor que un colegio haya puesto a mano.
+        if 'areas_curriculares' in inspector.get_table_names():
+            try:
+                with engine.connect() as conn:
+                    _r = conn.execute(text(
+                        "UPDATE areas_curriculares SET numero_competencias = 3 "
+                        "WHERE codigo = 'LEX' AND nivel = 'primaria' "
+                        "AND ciclo = 'segundo_ciclo' AND numero_competencias = 2"))
+                    conn.commit()
+                    if _r.rowcount:
+                        logger.info(
+                            "✅ R3: %d área(s) LEX de Primaria corregidas a 3 "
+                            "competencias (Registro MINERD 2026)", _r.rowcount)
+            except Exception as e:
+                logger.warning("No se pudo corregir el catálogo LEX: %s", e)
+
+        if 'calificaciones_primaria' in inspector.get_table_names():
+            _cols_cp = {c['name'] for c in inspector.get_columns('calificaciones_primaria')}
+            _faltan_ne = [c for c in ('ne1', 'ne2', 'ne3', 'ne4') if c not in _cols_cp]
+            if _faltan_ne:
+                with engine.connect() as conn:
+                    for _col in _faltan_ne:
+                        try:
+                            conn.execute(text(
+                                f'ALTER TABLE calificaciones_primaria '
+                                f'ADD COLUMN {_col} BOOLEAN DEFAULT FALSE'))
+                            conn.commit()
+                        except Exception as e:
+                            logger.warning(
+                                f"No se pudo agregar calificaciones_primaria.{_col}: {e}")
+                            raise
+                logger.info(
+                    "✅ Migración P2A-R2: %d columna(s) NE agregadas a "
+                    "calificaciones_primaria (DEFAULT FALSE, sin backfill)",
+                    len(_faltan_ne))
+
         # === 6i. Recuperación pedagógica cualitativa de 1ro/2do (P2A-R1) ===
         # Tabla NUEVA y VACÍA. No altera ninguna tabla existente, no hace
         # backfill y no inserta ni una fila: un colegio que no use 1ro/2do no
@@ -6772,14 +6834,19 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
                 return JSONResponse({'error': 'No tiene asignación para este curso/asignatura'},
                                     status_code=403)
 
-        # Determinar número de competencias (default 3)
-        num_competencias = 3
-        if grado.ciclo:
-            area = tenant_filter(db.query(AreaCurricular), AreaCurricular, current_user).filter_by(
-                nombre=asignatura.nombre, nivel='primaria', ciclo=grado.ciclo
-            ).first()
-            if area:
-                num_competencias = area.numero_competencias
+        # Cuántas competencias enseñar: las oficiales, siempre las tres.
+        #
+        # R3: antes se buscaba el área cruzando `AreaCurricular.nombre` con
+        # `Asignatura.nombre`. Con inglés no acertaba nunca —«Inglés» frente a
+        # «Lenguas Extranjeras (Inglés)»— y caía en un default que daba 3 por
+        # casualidad; si alguien hubiera renombrado el área para que coincidiera,
+        # la pantalla habría pasado a enseñar 2 y C3 habría desaparecido del
+        # flujo de calificación sin que nadie lo notara.
+        #
+        # Las competencias que faltan se devuelven igualmente, PENDIENTES: que
+        # todavía no exista la fila no significa que la competencia no exista.
+        from calculo_primaria import TOTAL_COMPETENCIAS_PRIMARIA
+        num_competencias = TOTAL_COMPETENCIAS_PRIMARIA
         
         # Incluir retirados — el profesor los ve con badge readonly
         estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
@@ -6811,6 +6878,10 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
                         'p2': None, 'rp2': None,
                         'p3': None, 'rp3': None,
                         'p4': None, 'rp4': None,
+                        'ne1': False, 'ne2': False, 'ne3': False, 'ne4': False,
+                        # La competencia aún no existe: sus cuatro períodos
+                        # están PENDIENTES, que no es lo mismo que NE.
+                        'estados': {n: 'pendiente' for n in (1, 2, 3, 4)},
                         'final_competencia': None,
                         'literal': None
                     })
@@ -6848,6 +6919,19 @@ async def get_calificaciones_primaria(curso_id: int, asignatura_id: int, db: Ses
         import traceback
         logger.error(f"Error en calificaciones-primaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({'error': f'Error del servidor: {str(e)}'}, status_code=500)
+
+def _valor_periodo_pri(comp, periodo):
+    """Valor efectivo de un período de PRIMARIA, o None.
+
+    R2-A1: atajo para los consumidores de app.py que antes reimplementaban
+    la regla. La definición vive en `calculo_primaria`; aquí solo se leen los
+    campos del modelo. No se usa para Secundaria.
+    """
+    from calculo_primaria import valor_periodo_primaria
+    v = valor_periodo_primaria(getattr(comp, f'p{periodo}', None),
+                               getattr(comp, f'rp{periodo}', None))
+    return None if v is None else float(v)
+
 
 def _es_curso_primaria(db, curso_id: int) -> bool:
     """True solo si el curso pertenece REALMENTE al nivel primaria.
@@ -6889,8 +6973,34 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     estudiante_id = data.get('estudiante_id')
     asignatura_id = data.get('asignatura_id')
     competencia_numero = data.get('competencia_numero')
-    
-    if not all([estudiante_id, asignatura_id, competencia_numero]):
+
+    from calculo_primaria import COMPETENCIAS_OFICIALES_PRIMARIA
+
+    # La competencia tiene que ser una de las OFICIALES (R3-A9).
+    #
+    # R3 fijó C1/C2/C3 como la matriz del Nivel Primario: el GET devuelve
+    # solo esas tres y `cf_area` las exige las tres. La escritura, en
+    # cambio, seguía aceptando cualquier número. Un POST directo con
+    # `competencia_numero=4` persistía una CalificacionPrimaria que no
+    # existe académicamente: no sale en la pantalla y no entra en la CF del
+    # área, pero sí la cargan los consumidores que leen todas las filas de
+    # un estudiante.
+    #
+    # Se comprueba ANTES de buscar o crear nada: antes del query, del
+    # db.add, de tocar notas o NE y del commit. Una petición inválida no
+    # debe llegar a rozar la base de datos.
+    #
+    # `bool` se mira aparte porque en Python es subclase de `int`: sin eso,
+    # `True` entraría como la competencia 1 y `False` como la 0.
+    if isinstance(competencia_numero, bool) or \
+            not isinstance(competencia_numero, int) or \
+            competencia_numero not in COMPETENCIAS_OFICIALES_PRIMARIA:
+        return JSONResponse({
+            'error': 'competencia_numero inválido para Primaria',
+            'competencias_validas': list(COMPETENCIAS_OFICIALES_PRIMARIA),
+        }, status_code=400)
+
+    if not all([estudiante_id, asignatura_id]):
         return JSONResponse({'error': 'Faltan datos requeridos'}, status_code=400)
     
     # Validar que el nivel del curso del estudiante esté activo (siempre primaria acá)
@@ -7029,6 +7139,27 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     # LIMPIAN la nota; cualquier otra cosa tiene que ser un número de 0 a 100.
     campos_notas = ['p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4']
     _pendientes = {}
+
+    # NE entra por el MISMO camino que la nota (R2-A4). No hay endpoint
+    # aparte, ni rol nuevo: marcar «no evaluado» es parte de calificar, y lo
+    # hace el mismo docente, con las mismas comprobaciones de asignación,
+    # tenant, curso, asignatura, período cerrado, permiso temporal y año.
+    for campo in ('ne1', 'ne2', 'ne3', 'ne4'):
+        if campo not in data:
+            continue
+        num_periodo = int(campo[-1])
+        if _periodo_esta_cerrado(num_periodo):
+            if num_periodo not in periodos_cerrados_ignorados:
+                periodos_cerrados_ignorados.append(num_periodo)
+            continue
+        valor = data[campo]
+        if valor is None or valor == '':
+            _pendientes[campo] = False
+            continue
+        if not isinstance(valor, bool):
+            return _rechazo_nota(db, campo, 'debe ser true o false')
+        _pendientes[campo] = valor
+
     for campo in campos_notas:
         if campo not in data:
             continue
@@ -7057,6 +7188,21 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             return _rechazo_nota(db, campo, 'debe estar entre 0 y 100')
         _pendientes[campo] = nota
 
+    # ¿Trae la petición algo académico de verdad?
+    #
+    # Ojo con la verdad/falsedad de Python: una nota de 0 es un dato real
+    # y `if valor:` la descartaría. Y `ne=False` NO es contenido: es el
+    # estado por defecto de un período, justo lo que manda el frontend
+    # cuando el docente desmarca un NE que nunca llegó a guardarse.
+    def _hay_contenido_academico(pendientes):
+        for campo, valor in pendientes.items():
+            if campo.startswith('ne'):
+                if valor is True:
+                    return True
+            elif valor is not None:
+                return True
+        return False
+
     # Una calificación NUEVA cuyo único contenido caía en un período cerrado no
     # llega a existir: crearla dejaría una fila académica sin ninguna nota, que
     # es peor que no tener nada. La fila EXISTENTE, en cambio, se conserva
@@ -7075,6 +7221,51 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             ),
         }
 
+    # R2-A8: lo mismo, pero sin período cerrado de por medio. Desmarcar un
+    # NE que nunca se guardó, o mandar el período entero en blanco, llega
+    # aquí como {'ne1': False} o {'p1': None, 'rp1': None, 'ne1': False}:
+    # cero contenido académico. Si la fila aún no existe, crearla dejaría
+    # una calificación fantasma —sin una sola nota— que luego aparece en
+    # el Registro y en los conteos. Se responde 200 y no se toca nada.
+    #
+    # Sobre una fila que YA existe no se aplica: ahí el docente está
+    # corrigiendo o limpiando, y esa fila es suya. No se borra nunca.
+    if es_nueva and not _hay_contenido_academico(_pendientes) and 'competencia_nombre' not in data:
+        return {
+            'message': 'No había nada que guardar',
+            'id': None,
+            'calificacion': None,
+            'sin_cambios': True,
+        }
+
+    # INVARIANTE DE NE (R2-A4): un período no puede estar marcado NE y tener
+    # nota a la vez. En vez de rechazar la petición —que obligaría al docente
+    # a borrar a mano lo que ya no aplica— se resuelve en el mismo guardado,
+    # de forma explícita y en una sola dirección por período:
+    #
+    #   · marca NE   -> se limpian pN y rpN de ESE período;
+    #   · pone nota  -> NE de ESE período queda en False.
+    #
+    # Lo que manda es lo que el docente acaba de enviar. Si mandara las dos
+    # cosas para el mismo período, gana la nota: es el dato más específico, y
+    # NE no es un valor sino la ausencia justificada de uno.
+    _ajustes_ne = []
+    for _n in (1, 2, 3, 4):
+        _ne_nuevo = _pendientes.get(f'ne{_n}')
+        _nota_nueva = any(_pendientes.get(c) is not None
+                          for c in (f'p{_n}', f'rp{_n}') if c in _pendientes)
+        if _nota_nueva:
+            # Llega nota: el período deja de estar NE, venga o no en el cuerpo.
+            if calif.es_ne(_n) or _ne_nuevo:
+                _pendientes[f'ne{_n}'] = False
+                _ajustes_ne.append(f'P{_n}: NE retirado por nota nueva')
+        elif _ne_nuevo is True:
+            # Llega NE: el período se queda sin nota.
+            for _c in (f'p{_n}', f'rp{_n}'):
+                if getattr(calif, _c, None) is not None or _pendientes.get(_c) is not None:
+                    _pendientes[_c] = None
+                    _ajustes_ne.append(f'P{_n}: {_c} limpiado por NE')
+
     # Se aplican solo cuando TODOS los campos pasaron: si uno falla, no puede
     # quedar la mitad escrita.
     for campo, valor in _pendientes.items():
@@ -7084,16 +7275,28 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     if es_nueva:
         db.add(calif)
 
-    # Calcular final de la competencia (C1/C2/C3) automáticamente
+    # CF oficial de la competencia (C1/C2/C3).
+    #
+    # R2-A5: la fila refleja el estado ACTUAL, exista o no CF. Antes solo se
+    # escribia cuando habia final, asi que al limpiar las notas la CF anterior
+    # se quedaba ahi: una calificacion final de una competencia sin ninguna
+    # nota. Ahora el else tambien escribe.
     final = calif.calcular_final()
     if final is not None:
         calif.final_competencia = final
         calif.literal = calif.get_literal(final)
+    else:
+        calif.final_competencia = None
+        calif.literal = None
     
     db.commit()
     cache_clear(f'stats:{current_user.colegio_id}')
     respuesta = {'message': 'Calificación primaria guardada', 'id': calif.id,
                  'calificacion': calif.to_dict()}
+    if _ajustes_ne:
+        # Se dice lo que el guardado tuvo que ajustar solo: callarlo dejaría
+        # al docente creyendo que su nota y su NE conviven.
+        respuesta['ajustes_ne'] = _ajustes_ne
     if periodos_cerrados_ignorados:
         # Se dice cuáles no se guardaron: callarlo haría creer al docente que su
         # corrección entró.
@@ -12884,6 +13087,20 @@ def _sincronizar_recuperaciones_primaria(db, current_user, ano):
 
     try:
         for (est_id, asig_id), comps in grupos.items():
+            # R2-A6: segundo candado. R1 cerró el CUÁNDO —nada nace antes de
+            # cerrar P4—; esto cierra el CON QUÉ.
+            #
+            # Toda competencia del área tiene que tener CF OFICIAL. Basta que
+            # una arrastre un período pendiente para que no haya ficha: una
+            # recuperación final se decide sobre la calificación final del
+            # área, y esa no existe mientras el año siga a medio evaluar.
+            #
+            # `cf_area` ya no promedia competencias sin CF porque A5 hizo
+            # estricto `calcular_final`, pero seguiría promediando las que
+            # SÍ la tengan e ignorando a las incompletas. Aquí se exige que
+            # no haya ninguna incompleta.
+            if any(c.calcular_final() is None for c in comps):
+                continue
             _, cf_red = calc_cf_area(comps)
             if cf_red is None:
                 continue
@@ -14402,7 +14619,8 @@ async def get_progreso_estudiante(id, db: Session = Depends(get_db), current_use
 
     if ano_activo and es_primaria:
         # ─── PRIMARIA: promedio del área por período a partir de sus
-        # competencias. valor_periodo() ya aplica max(P, RP).
+        # competencias. valor_periodo() aplica la regla canónica (RP
+        # reemplaza a P); ver valor_periodo_primaria en calculo_primaria.
         califs_pri = tenant_filter(
             db.query(CalificacionPrimaria), CalificacionPrimaria, current_user
         ).filter_by(estudiante_id=id, ano_escolar_id=ano_activo.id).all()
@@ -16093,14 +16311,9 @@ def _calcular_cuadro_honor(db, current_user, curso_id=None, umbral=90.0, nivel=N
                 vals = []
                 for c in comps.values():
                     for p in (1, 2, 3, 4):
-                        pv = getattr(c, f'p{p}', None)
-                        rv = getattr(c, f'rp{p}', None)
-                        if pv is not None and rv is not None:
-                            vals.append(float(max(pv, rv)))
-                        elif rv is not None:
-                            vals.append(float(rv))
-                        elif pv is not None:
-                            vals.append(float(pv))
+                        _v = _valor_periodo_pri(c, p)
+                        if _v is not None:
+                            vals.append(_v)
                 if not vals:
                     continue
                 nota_asig = sum(vals) / len(vals)
@@ -16358,14 +16571,9 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
                     vals = []
                     if periodo and periodo > 0:
                         for c in comps:
-                            pv = getattr(c, f'p{periodo}', None)
-                            rv = getattr(c, f'rp{periodo}', None)
-                            if pv is not None and rv is not None:
-                                vals.append(float(max(pv, rv)))
-                            elif rv is not None:
-                                vals.append(float(rv))
-                            elif pv is not None:
-                                vals.append(float(pv))
+                            _v = _valor_periodo_pri(c, periodo)
+                            if _v is not None:
+                                vals.append(_v)
                     else:
                         finals = [float(c.final_competencia) for c in comps if c.final_competencia is not None]
                         if len(finals) == len(comps) and finals:
@@ -16373,14 +16581,9 @@ async def get_estadisticas_asignaturas(request: Request, db: Session = Depends(g
                         else:
                             for c in comps:
                                 for p in range(1, 5):
-                                    pv = getattr(c, f'p{p}', None)
-                                    rv = getattr(c, f'rp{p}', None)
-                                    if pv is not None and rv is not None:
-                                        vals.append(float(max(pv, rv)))
-                                    elif rv is not None:
-                                        vals.append(float(rv))
-                                    elif pv is not None:
-                                        vals.append(float(pv))
+                                    _v = _valor_periodo_pri(c, p)
+                                    if _v is not None:
+                                        vals.append(_v)
                     if vals:
                         notas_por_est[eid] = sum(vals) / len(vals)
             except Exception as e:
@@ -17041,8 +17244,10 @@ async def imprimir_planilla_calificaciones(curso_id: int, asignatura_id: int, re
 
     Un solo PDF para todo el ciclo: en blanco si no hay notas, parcial si va a
     medias, constancia completa si ya se calificó. Valor mostrado = efectivo
-    del período max(P, RP), con «*» cuando la RP mejoró la nota. F y CF solo
-    con datos completos (regla MINERD: nada se autocompleta con parciales).
+    del período, con «*» cuando hubo recuperación. En Primaria ese efectivo
+    es la RP si existe (la RP reemplaza a la nota del período); Secundaria
+    conserva su max(P, RP). F y CF solo con datos completos (regla MINERD:
+    nada se autocompleta con parciales).
 
     Permisos: dirección/coordinación/secretaría cualquier curso (bajo su lente
     de división); profesor solo cursos con asignación ACTIVA.
@@ -17094,7 +17299,14 @@ async def imprimir_planilla_calificaciones(curso_id: int, asignatura_id: int, re
             for p in (1, 2, 3, 4):
                 pv = getattr(cal, f'p{p}', None)
                 rv = getattr(cal, f'rp{p}', None)
-                if pv is not None and rv is not None:
+                # La planilla sirve a los dos niveles. Primaria usa la
+                # definición canónica; Secundaria conserva la suya intacta.
+                if nivel == 'primaria':
+                    _v = _valor_periodo_pri(cal, p)
+                    vals.append(_v)
+                    rp_flags.append(rv is not None and _v is not None
+                                    and (pv is None or float(rv) != float(pv)))
+                elif pv is not None and rv is not None:
                     vals.append(float(max(pv, rv)))
                     rp_flags.append(float(rv) > float(pv))
                 elif rv is not None:
