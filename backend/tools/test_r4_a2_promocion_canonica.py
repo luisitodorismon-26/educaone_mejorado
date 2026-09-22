@@ -527,6 +527,129 @@ def _():
         igual(r['condicion'], PA.EN_PROCESO, 'la inconsistencia bloquea')
 
 
+# ══════════ L · ORDEN NORMATIVO DE LA ALFABETIZACION (A2.3) ══════════
+#
+# La norma pide repitencia en 3.o por alfabetizacion no lograda «luego de
+# haber participado en TODOS los procesos de recuperacion pedagogica y
+# especial». Mientras al estudiante le falte la Especial, la alfabetizacion
+# todavia no decide: ni lo reprueba ni lo esconde detras de un EN_PROCESO.
+print(f"\n{B}TERCERO: LA ALFABETIZACION LLEGA DESPUES DE LA ESPECIAL{X}")
+
+# Un 3.o al que le falta la Recuperacion Especial: 1 area caida tras la Final.
+def _aplazado_3ro():
+    return con_fallos(1, RA.NO_APROBADA_TRAS_RECUPERACION_FINAL)
+
+
+# Un 3.o que YA hizo la Especial y la supero en las dos areas que cayeron.
+def _especial_superada_3ro():
+    return con_fallos(2, RA.APROBADA_RECUPERACION_ESPECIAL)
+
+
+@test("L1  APLAZADO + alfabetizacion False -> sigue APLAZADO, NO REPROBADO")
+def _():
+    r = prim(3, _aplazado_3ro(), {'alfabetizacion_inicial': False})
+    igual(r['condicion'], PA.APLAZADO,
+          'reprobarlo aqui le quita la Especial a la que tiene derecho')
+    igual(r['es_definitiva'], False)
+    igual(r['requiere_recuperacion_especial'], True)
+    assert PA.ADV_ALFABETIZACION_NO_LOGRADA_ESPECIAL_PENDIENTE \
+        in r['advertencias'], r['advertencias']
+    igual(r['motivo'], PA.MOTIVO_ELEGIBLE_ESPECIAL)
+
+
+@test("L2  APLAZADO + alfabetizacion None -> sigue APLAZADO, NO EN_PROCESO")
+def _():
+    r = prim(3, _aplazado_3ro(), {'alfabetizacion_inicial': None})
+    igual(r['condicion'], PA.APLAZADO,
+          'un EN_PROCESO aqui esconde que le falta la Especial')
+    igual(r['requiere_recuperacion_especial'], True)
+    igual(r['bloqueos'], ())
+    assert PA.ADV_ALFABETIZACION_PENDIENTE_REVISION in r['advertencias'], \
+        r['advertencias']
+
+
+@test("L3  APLAZADO + alfabetizacion True -> sigue APLAZADO")
+def _():
+    r = prim(3, _aplazado_3ro(), {'alfabetizacion_inicial': True})
+    igual(r['condicion'], PA.APLAZADO,
+          'la alfabetizacion lograda tampoco adelanta el final del proceso')
+    igual(r['requiere_recuperacion_especial'], True)
+    igual(r['bloqueos'], ())
+
+
+@test("L4  Especial superada + alfabetizacion True -> PROMOVIDO")
+def _():
+    r = prim(3, _especial_superada_3ro(), {'alfabetizacion_inicial': True})
+    igual(r['condicion'], PA.PROMOVIDO)
+    igual(r['motivo'], PA.MOTIVO_ESPECIAL_SUPERADA)
+    igual(r['es_definitiva'], True)
+
+
+@test("L5  Especial superada + alfabetizacion False -> REPROBADO")
+def _():
+    r = prim(3, _especial_superada_3ro(), {'alfabetizacion_inicial': False})
+    igual(r['condicion'], PA.REPROBADO,
+          'agotado el proceso academico, ahora si decide la alfabetizacion')
+    igual(r['motivo'], PA.MOTIVO_ALFABETIZACION_NO_LOGRADA)
+    igual(r['es_definitiva'], True)
+
+
+@test("L6  Especial superada + alfabetizacion None -> EN_PROCESO")
+def _():
+    r = prim(3, _especial_superada_3ro(), {'alfabetizacion_inicial': None})
+    igual(r['condicion'], PA.EN_PROCESO,
+          'a punto de promover no se certifica sin el dato')
+    assert PA.BLOQUEO_ALFABETIZACION_NO_INFORMADA in r['bloqueos'], \
+        r['bloqueos']
+    igual(r['es_definitiva'], False)
+
+
+@test("L7  sin Especial que hacer + alfabetizacion False -> REPROBADO")
+def _():
+    r = prim(3, todas(), {'alfabetizacion_inicial': False})
+    igual(r['condicion'], PA.REPROBADO,
+          'no hay proceso pendiente: la alfabetizacion es el ultimo gate')
+    igual(r['motivo'], PA.MOTIVO_ALFABETIZACION_NO_LOGRADA)
+
+
+@test("L8  REPROBADO por 4+ areas + alfabetizacion None -> REPROBADO")
+def _():
+    r = prim(3, con_fallos(4, RA.NO_APROBADA_TRAS_RECUPERACION_FINAL),
+             {'alfabetizacion_inicial': None})
+    igual(r['condicion'], PA.REPROBADO)
+    igual(r['motivo'], PA.MOTIVO_DEMASIADAS_NO_APROBADAS)
+    assert PA.ADV_ALFABETIZACION_NO_INFORMADA in r['advertencias']
+    igual(r['bloqueos'], (), 'el dato que falta no abre un proceso ya cerrado')
+
+
+@test("L9  REPROBADO tras la Especial + alfabetizacion True -> REPROBADO")
+def _():
+    r = prim(3, con_fallos(1, RA.REPROBADA_DEFINITIVA),
+             {'alfabetizacion_inicial': True})
+    igual(r['condicion'], PA.REPROBADO,
+          'la alfabetizacion lograda no rescata una Especial fallida')
+    igual(r['motivo'], PA.MOTIVO_ESPECIAL_NO_SUPERADA)
+
+
+@test("L10 APLAZADO + alfabetizacion 'NO' -> EN_PROCESO por dato invalido")
+def _():
+    r = prim(3, _aplazado_3ro(), {'alfabetizacion_inicial': 'NO'})
+    igual(r['condicion'], PA.EN_PROCESO,
+          'el tipo invalido sigue siendo inconsistencia de entrada (A2.1)')
+    assert PA.INC_ALFABETIZACION_VALOR_INVALIDO in r['inconsistencias']
+    assert PA.BLOQUEO_DATOS_INCONSISTENTES in r['bloqueos']
+
+
+@test("L11 los valores invalidos NO se relajan en ningun escenario de 3ro")
+def _():
+    for escenario in (todas(), _aplazado_3ro(), _especial_superada_3ro(),
+                      con_fallos(4, RA.NO_APROBADA_TRAS_RECUPERACION_FINAL)):
+        for malo in ('NO', 0, 1, [], {}, 1.0, 'True'):
+            r = prim(3, escenario, {'alfabetizacion_inicial': malo})
+            igual(r['condicion'], PA.EN_PROCESO, repr(malo))
+            assert PA.BLOQUEO_DATOS_INCONSISTENTES in r['bloqueos'], repr(malo)
+
+
 # ══════════════════ S · SECUNDARIA ══════════════════
 print(f"\n{B}SECUNDARIA{X}")
 
@@ -1417,6 +1540,44 @@ def _():
         if r['bloqueos']:
             igual(r['condicion'], PA.EN_PROCESO, str(r['bloqueos']))
             igual(r['es_definitiva'], False)
+
+
+@test("Z8  una sola funcion cambia la condicion por alfabetizacion")
+def _():
+    # A2.3 elimino el GATE 12 duplicado. Si alguien vuelve a decidir por
+    # alfabetizacion en otro sitio, las dos reglas se separan en silencio.
+    import ast as _ast
+    import inspect
+    arbol = _ast.parse(inspect.getsource(PA))
+    decisorias = {
+        'BLOQUEO_ALFABETIZACION_NO_INFORMADA',
+        'MOTIVO_ALFABETIZACION_NO_LOGRADA',
+        'ADV_ALFABETIZACION_NO_INFORMADA',
+        'ADV_ALFABETIZACION_NO_LOGRADA_ESPECIAL_PENDIENTE',
+        'ADV_ALFABETIZACION_PENDIENTE_REVISION',
+    }
+    usuarias = []
+    for nodo in arbol.body:
+        if not isinstance(nodo, _ast.FunctionDef):
+            continue
+        nombres = {n.id for n in _ast.walk(nodo) if isinstance(n, _ast.Name)}
+        if nombres & decisorias:
+            usuarias.append(nodo.name)
+    igual(sorted(usuarias), ['_gate_alfabetizacion'],
+          'la semantica de alfabetizacion vive en un solo sitio')
+
+
+@test("Z9  el orden de gates de 3ro esta escrito, no solo implicito")
+def _():
+    import inspect
+    ini = inspect.getsource(PA).index('def _gate_alfabetizacion')
+    cuerpo = inspect.getsource(PA)[ini:]
+    cuerpo = cuerpo[:cuerpo.index('\ndef ', 10)]
+    # Las tres condiciones de entrada se tratan por separado y en ese orden.
+    assert cuerpo.index('condicion == APLAZADO') \
+        < cuerpo.index('condicion == REPROBADO'), \
+        'el aplazamiento se resuelve antes que nada'
+    assert 'PROMOVIDO' in cuerpo or 'Candidato' in cuerpo
 
 
 print("\n" + "=" * 70)

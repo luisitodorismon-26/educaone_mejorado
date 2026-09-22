@@ -115,6 +115,12 @@ ADV_PROMOCION_ASISTIDA = 'PROMOCION_ASISTIDA'
 ADV_TITULACION_PENDIENTE = 'REQUIERE_PROCESO_DE_TITULACION_PRUEBAS_NACIONALES'
 ADV_ASISTENCIA_NO_REVISADA = 'ASISTENCIA_NO_REVISADA_CAUSA_ACADEMICA_SUFICIENTE'
 ADV_ALFABETIZACION_NO_INFORMADA = 'ALFABETIZACION_NO_INFORMADA_CAUSA_SUFICIENTE'
+# El estudiante de 3.o todavia tiene la Recuperacion Especial por delante. La
+# alfabetizacion no puede cerrarle el ano antes de que agote ese proceso, asi
+# que se anota lo que se sabe y el aplazamiento sigue a la vista.
+ADV_ALFABETIZACION_NO_LOGRADA_ESPECIAL_PENDIENTE = (
+    'ALFABETIZACION_NO_LOGRADA_PROCESO_ESPECIAL_PENDIENTE')
+ADV_ALFABETIZACION_PENDIENTE_REVISION = 'ALFABETIZACION_PENDIENTE_DE_REVISION'
 # El proceso academico sigue abierto: la revision de asistencia todavia no
 # toca. Se anota para que no se olvide, no para frenar el aplazamiento.
 ADV_ASISTENCIA_PENDIENTE_DE_REVISION = 'ASISTENCIA_PENDIENTE_DE_REVISION'
@@ -546,13 +552,12 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
     if nuevas and BLOQUEO_DATOS_INCONSISTENTES not in bloqueos:
         bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
 
-    # ── GATE 12 · alfabetización de 3.º sin declarar ──
-    if (nivel == NIVEL_PRIMARIA and grado_numero == GRADO_ALFABETIZACION_INICIAL
-            and condicion != REPROBADO
-            and contexto.get('alfabetizacion_inicial') is None):
-        bloqueos.append(BLOQUEO_ALFABETIZACION_NO_INFORMADA)
+    # La alfabetización de 3.º ya quedó resuelta DENTRO del gate anterior,
+    # que es el único sitio que la interpreta. Aquí había un segundo gate que
+    # bloqueaba con `condicion != REPROBADO`: esa condición incluía APLAZADO y
+    # escondía a un estudiante al que solo le faltaba la Especial.
 
-    # ── GATE 13 · asistencia, en su momento normativo ──
+    # ── GATE 12 · asistencia, en su momento normativo ──
     #
     # La Ordenanza 04-2023 plantea el análisis del exceso de ausencias para el
     # estudiante que YA logró las competencias esperadas. Por eso el gate solo
@@ -574,7 +579,7 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
     if bloqueos:
         return salida(EN_PROCESO, MOTIVO_PROCESO_ABIERTO)
 
-    # ── GATE 14 · 6.º de Secundaria: la titulación es otra fase ──
+    # ── GATE 13 · 6.º de Secundaria: la titulación es otra fase ──
     if (nivel == NIVEL_SECUNDARIA and grado_numero == 6
             and condicion == PROMOVIDO):
         if ADV_TITULACION_PENDIENTE not in advertencias:
@@ -690,23 +695,57 @@ def _situacion_primaria(grado_numero, oficiales, no_aprobados, contexto,
     # ── Alfabetización inicial: solo 3.º, y solo declarada ──
     if grado_numero == GRADO_ALFABETIZACION_INICIAL:
         condicion, motivo = _gate_alfabetizacion(
-            contexto, condicion, motivo, advertencias)
+            contexto, condicion, motivo, advertencias, bloqueos)
     elif contexto.get('alfabetizacion_inicial') is not None:
         inconsistencias.append(INC_ALFABETIZACION_FUERA_DE_TERCERO)
 
     return (condicion, motivo, extra)
 
 
-def _gate_alfabetizacion(contexto, condicion, motivo, advertencias):
-    """La alfabetización inicial de 3.º: condición adicional e independiente.
+def _gate_alfabetizacion(contexto, condicion, motivo, advertencias,
+                         bloqueos):
+    """La alfabetización inicial de 3.º: el ÚLTIMO gate, no el primero.
 
     Nunca se infiere de Lengua, de Matemática, de la CF, de la edad ni de la
     asistencia. O llega declarada o no se sabe.
+
+    EL ORDEN IMPORTA, y es lo que corrige A2.3. La norma pide la repitencia
+    del estudiante de 3.º que no complete la alfabetización inicial «luego de
+    haber participado en todos los procesos de recuperación pedagógica y
+    especial». Ese «luego» es una condición, no un adorno:
+
+      · APLAZADO  — el proceso académico NO ha terminado; le queda la
+                    Recuperación Especial. La alfabetización no decide aún.
+                    Antes, un `False` lo convertía en REPROBADO definitivo
+                    —con `requiere_recuperacion_especial=True` en la misma
+                    salida, que se contradecía sola— y un `None` lo escondía
+                    detrás de un EN_PROCESO. Ahora el aplazamiento se
+                    mantiene y lo que se sabe se anota.
+      · PROMOVIDO — aquí sí decide: certifica, reprueba o frena por falta
+                    del dato.
+      · REPROBADO — ya hay causa suficiente. La alfabetización no lo
+                    revierte en ningún caso.
+
+    Esta es la ÚNICA función que cambia la condición por alfabetización.
     """
     alfabetizacion = contexto.get('alfabetizacion_inicial')
     if alfabetizacion is not None and not isinstance(alfabetizacion, bool):
         # Un valor que no es booleano ya genero su bloqueo en la validacion
         # del contexto. Aqui no se interpreta de ninguna manera.
+        return (condicion, motivo)
+
+    if condicion == APLAZADO:
+        # Todavía no es el momento normativo. Se deja constancia sin tocar la
+        # condición, para que no se pierda de vista ni la alfabetización ni la
+        # Especial que le falta.
+        if alfabetizacion is False:
+            aviso = ADV_ALFABETIZACION_NO_LOGRADA_ESPECIAL_PENDIENTE
+        elif alfabetizacion is None:
+            aviso = ADV_ALFABETIZACION_PENDIENTE_REVISION
+        else:
+            return (condicion, motivo)
+        if aviso not in advertencias:
+            advertencias.append(aviso)
         return (condicion, motivo)
 
     if condicion == REPROBADO:
@@ -716,6 +755,7 @@ def _gate_alfabetizacion(contexto, condicion, motivo, advertencias):
             advertencias.append(ADV_ALFABETIZACION_NO_INFORMADA)
         return (condicion, motivo)
 
+    # ── Candidato a PROMOVIDO: agotado el proceso académico, ahora sí ──
     if alfabetizacion is True:
         return (condicion, motivo)
     if alfabetizacion is False:
@@ -723,7 +763,10 @@ def _gate_alfabetizacion(contexto, condicion, motivo, advertencias):
         # inicial luego de haber participado en los procesos de recuperación
         # pedagógica oportunamente repite el grado» (Registro 3.º, hoja 40).
         return (REPROBADO, MOTIVO_ALFABETIZACION_NO_LOGRADA)
-    return (condicion, motivo)     # None: lo resuelve el bloqueo del llamador
+    # None y a punto de promover: no se certifica sin el dato.
+    if BLOQUEO_ALFABETIZACION_NO_INFORMADA not in bloqueos:
+        bloqueos.append(BLOQUEO_ALFABETIZACION_NO_INFORMADA)
+    return (condicion, motivo)
 
 
 # ══════════════════════════ SECUNDARIA ══════════════════════════
