@@ -77,6 +77,8 @@ BLOQUEO_ANTECEDENTE_EXCEPCION_2DO = (
 BLOQUEO_REPETIR_NO_APLICA_1RO = 'DECISION_ASISTENCIA_REPETIR_NO_APLICA_1RO'
 BLOQUEO_REPETIR_2DO_REQUIERE_EXCEPCION = (
     'DECISION_ASISTENCIA_REPETIR_2DO_REQUIERE_EXCEPCION_COLEGIADA')
+BLOQUEO_RESULTADOS_INVALIDOS = 'RESULTADOS_INVALIDOS'
+BLOQUEO_CONTEXTO_INVALIDO = 'CONTEXTO_INVALIDO'
 
 # ═══════════════════ INCONSISTENCIAS ═══════════════════
 # Datos que no encajan. Se informan; no se corrigen ni se borran.
@@ -92,6 +94,11 @@ INC_ALFABETIZACION_VALOR_INVALIDO = 'ALFABETIZACION_3RO_VALOR_INVALIDO'
 INC_EXCEPCION_SEGUNDO_INVALIDA = 'DECISION_EXCEPCIONAL_SEGUNDO_INVALIDA'
 INC_EXCEPCION_SEGUNDO_YA_UTILIZADA = (
     'REPETICION_EXCEPCIONAL_SEGUNDO_YA_UTILIZADA')
+INC_ANTECEDENTE_EXCEPCION_INVALIDO = (
+    'ANTECEDENTE_REPETICION_EXCEPCIONAL_2DO_INVALIDO')
+INC_ANTECEDENTE_SIN_DECISION = 'ANTECEDENTE_EXCEPCION_2DO_SIN_DECISION'
+INC_ESTADO_INCOMPATIBLE_CON_NIVEL = 'ESTADO_A1_INCOMPATIBLE_CON_NIVEL'
+INC_ESTADO_FASE_INCOHERENTE = 'ESTADO_Y_FASE_A1_INCOHERENTES'
 
 # Estas dos NO frenan la certificacion. Acompanan a un REPROBADO que ya
 # es definitivo por el numero de areas caidas: describen que en la base
@@ -170,6 +177,48 @@ GRADOS_VALIDOS = (1, 2, 3, 4, 5, 6)
 # excepcion no se haya usado antes— y se niega si falta cualquiera.
 DECISION_EXCEPCIONAL_REPETIR = 'repetir'
 
+# ══════════ EL CONTRATO QUE A1 PRODUCE ══════════
+#
+# Extraído de las salidas reales de `resultado_academico`, no inventado: cada
+# par (estado -> fase) corresponde a un `return _resultado(...)` de A1.
+#
+# A2 depende de `fase` para reconstruir cuántas áreas llegaron al proceso
+# especial. Un par incoherente no es un detalle cosmético: una
+# REPROBADA_DEFINITIVA sin fase se clasificaba como no aprobada pero NO se
+# contaba entre las caídas, y el estudiante salía PROMOVIDO con un área
+# definitivamente reprobada.
+
+CONTRATO_ESTADO_FASE = {
+    NIVEL_PRIMARIA: {
+        RA.SIN_CALIFICAR: None,
+        RA.APROBADA: RA.FASE_NORMAL,
+        RA.PENDIENTE_RECUPERACION_FINAL: None,
+        RA.APROBADA_RECUPERACION_FINAL: RA.FASE_RECUPERACION_FINAL,
+        RA.NO_APROBADA_TRAS_RECUPERACION_FINAL: RA.FASE_RECUPERACION_FINAL,
+        RA.APROBADA_RECUPERACION_ESPECIAL: RA.FASE_RECUPERACION_ESPECIAL,
+        RA.REPROBADA_DEFINITIVA: RA.FASE_RECUPERACION_ESPECIAL,
+    },
+    NIVEL_SECUNDARIA: {
+        RA.SIN_CALIFICAR: None,
+        RA.APROBADA: RA.FASE_NORMAL,
+        RA.PENDIENTE_COMPLETIVA: None,
+        RA.APROBADA_COMPLETIVA: RA.FASE_COMPLETIVA,
+        RA.PENDIENTE_EXTRAORDINARIA: None,
+        RA.APROBADA_EXTRAORDINARIA: RA.FASE_EXTRAORDINARIA,
+        RA.NO_APROBADA_TRAS_EXTRAORDINARIA: RA.FASE_EXTRAORDINARIA,
+        RA.APROBADA_ESPECIAL: RA.FASE_ESPECIAL,
+        RA.REPROBADA_DEFINITIVA: RA.FASE_ESPECIAL,
+    },
+}
+
+# Qué estados puede producir A1 para cada nivel. Que un estado exista en
+# RA.ESTADOS no significa que pertenezca a este nivel: APROBADA_COMPLETIVA es
+# de Secundaria y APROBADA_RECUPERACION_FINAL es de Primaria.
+ESTADOS_POR_NIVEL = {
+    nivel: tuple(matriz) for nivel, matriz in CONTRATO_ESTADO_FASE.items()
+}
+
+
 # ── Estados de A1, agrupados por lo que significan para el estudiante ──
 
 ESTADOS_APROBADOS = (
@@ -186,6 +235,31 @@ ESTADOS_PENDIENTES = (
     RA.PENDIENTE_COMPLETIVA,
     RA.PENDIENTE_EXTRAORDINARIA,
 )
+
+
+def _es_mapping(valor):
+    """¿Se puede leer con .get() sin reventar?
+
+    Un motor puro no debe lanzar AttributeError porque alguien le pase
+    `[None]`. Se comprueba, se bloquea y se dice.
+    """
+    return hasattr(valor, 'get') and hasattr(valor, '__getitem__')
+
+
+def _materializar(valor):
+    """Convierte un iterable en tupla UNA sola vez.
+
+    Con un generator, validarlo y luego recorrerlo otra vez lo deja vacío en
+    la segunda pasada. Devuelve (tupla, ok).
+    """
+    if valor is None:
+        return (), True
+    if isinstance(valor, (str, bytes)):
+        return (), False       # una cadena no es una lista de materias
+    try:
+        return tuple(valor), True
+    except TypeError:
+        return (), False
 
 
 def _es_entero_real(valor):
@@ -206,19 +280,14 @@ def _es_numero_real(valor):
     return valor == valor and valor not in (float('inf'), float('-inf'))
 
 
-def _curriculo_utilizable(codigos):
-    """Una coleccion de codigos, no una cadena.
+def _codigos_utilizables(codigos_ya_materializados):
+    """Los elementos del currículo, ya materializados, ¿sirven?
 
-    `'LE'` es iterable y se desharia en 'L' y 'E': un currículo de dos áreas
-    inexistentes. Por eso se rechazan str y bytes explícitamente.
+    `'LE'` no llega hasta aquí: `_materializar` rechaza str y bytes, porque
+    una cadena iterable se desharía en 'L' y 'E' —un currículo de dos áreas
+    inexistentes—.
     """
-    if isinstance(codigos, (str, bytes)):
-        return False
-    try:
-        elementos = list(codigos)
-    except TypeError:
-        return False
-    for c in elementos:
+    for c in codigos_ya_materializados:
         if not isinstance(c, str) or not c.strip():
             return False
     return True
@@ -293,11 +362,27 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
 
     Nada de lo recibido se modifica.
     """
-    contexto = dict(contexto) if contexto else {}
-    resultados = list(resultados) if resultados else []
-
     bloqueos, advertencias, inconsistencias = [], [], []
     conteos, codigos = _vacio()
+
+    # ── GATE 0 · la entrada, antes de tocarla ──
+    #
+    # Un motor puro no puede reventar con `[None]` ni con un contexto que sea
+    # una cadena. Todo se materializa UNA vez y se comprueba.
+    if contexto is None:
+        contexto = {}
+    elif _es_mapping(contexto):
+        contexto = dict(contexto)
+    else:
+        return _resultado(nivel, grado_numero, EN_PROCESO,
+                          MOTIVO_PROCESO_ABIERTO, conteos, codigos,
+                          bloqueos=[BLOQUEO_CONTEXTO_INVALIDO])
+
+    resultados, ok = _materializar(resultados)
+    if not ok or any(not _es_mapping(r) for r in resultados):
+        return _resultado(nivel, grado_numero, EN_PROCESO,
+                          MOTIVO_PROCESO_ABIERTO, conteos, codigos,
+                          bloqueos=[BLOQUEO_RESULTADOS_INVALIDOS])
 
     def cortar(*bloqueos_nuevos):
         return _resultado(nivel, grado_numero, EN_PROCESO,
@@ -319,10 +404,13 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
     # ── GATE 3 · el currículo esperado, declarado y utilizable ──
     if codigos_oficiales_esperados is None:
         return cortar(BLOQUEO_CURRICULO_NO_DECLARADO)
-    if not _curriculo_utilizable(codigos_oficiales_esperados):
+    # Materializado UNA vez: con un generator, validarlo y luego contarlo lo
+    # dejaba vacío en la segunda pasada y el currículo parecía inexistente.
+    curriculo, ok = _materializar(codigos_oficiales_esperados)
+    if not ok or not _codigos_utilizables(curriculo):
         return cortar(BLOQUEO_CURRICULO_INVALIDO)
 
-    esperados = Counter(codigos_oficiales_esperados)
+    esperados = Counter(curriculo)
     if not esperados:
         return cortar(BLOQUEO_SIN_CURRICULO_OFICIAL)
 
@@ -359,17 +447,33 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
         bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
 
     # ── GATE 6 · cada área esperada, validada ──
+    contrato_nivel = CONTRATO_ESTADO_FASE[nivel]
     for r in oficiales_esperadas:
         if r.get('nivel') != nivel:
             # Un resultado de Secundaria no puede decidir un grado de
             # Primaria: los cortes y las fases son otros.
             if INC_NIVEL_INCOMPATIBLE not in inconsistencias:
                 inconsistencias.append(INC_NIVEL_INCOMPATIBLE)
-        if r.get('estado') not in RA.ESTADOS:
+
+        estado = r.get('estado')
+        if estado not in RA.ESTADOS:
             # Un estado que A2 no conoce NO es una reprobación. Antes caía en
             # `no_aprobados` y podía hacer repetir a alguien.
             if INC_ESTADO_A1_DESCONOCIDO not in inconsistencias:
                 inconsistencias.append(INC_ESTADO_A1_DESCONOCIDO)
+        elif estado not in contrato_nivel:
+            # El estado existe, pero es del OTRO nivel:
+            # APROBADA_COMPLETIVA en Primaria, o
+            # APROBADA_RECUPERACION_FINAL en Secundaria.
+            if INC_ESTADO_INCOMPATIBLE_CON_NIVEL not in inconsistencias:
+                inconsistencias.append(INC_ESTADO_INCOMPATIBLE_CON_NIVEL)
+        elif r.get('fase') != contrato_nivel[estado]:
+            # Estado y fase tienen que ser los que A1 emite juntos. Este es el
+            # gate que impide que una REPROBADA_DEFINITIVA sin fase se cuele:
+            # se clasificaba como no aprobada pero NO se contaba entre las
+            # caídas, y el estudiante salía PROMOVIDO.
+            if INC_ESTADO_FASE_INCOHERENTE not in inconsistencias:
+                inconsistencias.append(INC_ESTADO_FASE_INCOHERENTE)
 
     # ── GATE 7 · clasificar SOLO las esperadas ──
     aprobados, pendientes_cod, no_aprobados = [], [], []
@@ -386,7 +490,7 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
             aprobados.append(cod)
         elif estado in ESTADOS_PENDIENTES:
             pendientes_cod.append(cod)
-        elif estado in RA.ESTADOS:
+        elif estado in contrato_nivel:
             no_aprobados.append(cod)
         # Un estado desconocido no se clasifica en ninguna parte: ya generó
         # su inconsistencia en el gate 6.
@@ -408,8 +512,11 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
                           codigos_no_oficiales=codigos_no_oficiales, **extra)
 
     # ── GATE 8 · inconsistencias heredadas o detectadas ──
-    if hubo_inconsistencia_de_area or INC_NIVEL_INCOMPATIBLE in inconsistencias \
-            or INC_ESTADO_A1_DESCONOCIDO in inconsistencias:
+    _de_contrato = (INC_NIVEL_INCOMPATIBLE, INC_ESTADO_A1_DESCONOCIDO,
+                    INC_ESTADO_INCOMPATIBLE_CON_NIVEL,
+                    INC_ESTADO_FASE_INCOHERENTE)
+    if hubo_inconsistencia_de_area or any(i in inconsistencias
+                                          for i in _de_contrato):
         if BLOQUEO_DATOS_INCONSISTENTES not in bloqueos:
             bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
 
@@ -491,10 +598,31 @@ def _validar_contexto(nivel, grado_numero, contexto, bloqueos, inconsistencias):
                 inconsistencias.append(INC_ALFABETIZACION_VALOR_INVALIDO)
                 bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
 
-    # Excepción de 2.º: solo None o 'repetir'.
+    # ── La excepción de 2.º, entera ──
     decision = contexto.get('decision_excepcional_segundo')
+    antecedente_presente = 'repeticion_excepcional_segundo_ya_utilizada' in contexto
+    antecedente = contexto.get('repeticion_excepcional_segundo_ya_utilizada')
+
     if decision is not None and decision != DECISION_EXCEPCIONAL_REPETIR:
         inconsistencias.append(INC_EXCEPCION_SEGUNDO_INVALIDA)
+        bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
+
+    if decision == DECISION_EXCEPCIONAL_REPETIR:
+        # La excepción existe SOLO en 2.º de Primaria. En 1.º, en 3.º-6.º y en
+        # cualquier grado de Secundaria es un dato fuera de lugar, y dejarlo
+        # pasar en silencio sería aceptar un contexto que nadie revisó.
+        if nivel != NIVEL_PRIMARIA or grado_numero != GRADO_EXCEPCION_COLEGIADA:
+            inconsistencias.append(INC_EXCEPCION_SEGUNDO_FUERA_DE_LUGAR)
+            bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
+        elif antecedente is not None and not isinstance(antecedente, bool):
+            # Solo True, False o ausencia. Un `1` no es `True`: con
+            # `is True` caía por la rama del else y AUTORIZABA la repetición.
+            inconsistencias.append(INC_ANTECEDENTE_EXCEPCION_INVALIDO)
+            bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
+    elif antecedente_presente and antecedente is not None:
+        # Un antecedente sin decisión es un contexto mal construido o viejo.
+        # No se usa, pero tampoco desaparece.
+        inconsistencias.append(INC_ANTECEDENTE_SIN_DECISION)
         bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
 
     # Porcentaje de ausencias: número real entre 0 y 100.
@@ -526,23 +654,22 @@ def _situacion_primaria(grado_numero, oficiales, no_aprobados, contexto,
 
     # ── 1.º y 2.º: la norma no contempla repitencia ──
     if grado_numero in GRADOS_SIN_REPITENCIA:
-        decision = contexto.get('decision_excepcional_segundo')
-        if decision == DECISION_EXCEPCIONAL_REPETIR:
-            if grado_numero != GRADO_EXCEPCION_COLEGIADA:
-                inconsistencias.append(INC_EXCEPCION_SEGUNDO_FUERA_DE_LUGAR)
+        # Aquí solo llegan casos ya validados: `_validar_contexto` bloqueó
+        # una decisión fuera de 2.º y un antecedente que no fuera booleano.
+        if contexto.get('decision_excepcional_segundo') == \
+                DECISION_EXCEPCIONAL_REPETIR:
+            # La repetición excepcional de 2.º es una decisión colegiada, no
+            # un cálculo, y la norma la permite UNA SOLA VEZ. A2 no tiene
+            # historial y no lo va a inventar: si no le dicen si ya se usó,
+            # no certifica.
+            ya_usada = contexto.get(
+                'repeticion_excepcional_segundo_ya_utilizada')
+            if ya_usada is True:
+                inconsistencias.append(INC_EXCEPCION_SEGUNDO_YA_UTILIZADA)
+            elif ya_usada is False:
+                return (REPROBADO, MOTIVO_EXCEPCION_SEGUNDO, {})
             else:
-                # La repetición excepcional de 2.º es una decisión colegiada,
-                # no un cálculo, y la norma la permite UNA SOLA VEZ. A2 no
-                # tiene historial y no lo va a inventar: si no le dicen si ya
-                # se usó, no certifica.
-                ya_usada = contexto.get(
-                    'repeticion_excepcional_segundo_ya_utilizada')
-                if ya_usada is True:
-                    inconsistencias.append(INC_EXCEPCION_SEGUNDO_YA_UTILIZADA)
-                elif ya_usada is None:
-                    bloqueos.append(BLOQUEO_ANTECEDENTE_EXCEPCION_2DO)
-                else:
-                    return (REPROBADO, MOTIVO_EXCEPCION_SEGUNDO, {})
+                bloqueos.append(BLOQUEO_ANTECEDENTE_EXCEPCION_2DO)
 
         if no_aprobados:
             # El motor numérico no puede inventar una repitencia que la norma

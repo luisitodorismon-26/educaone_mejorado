@@ -62,8 +62,20 @@ def igual(obtenido, esperado, msg=''):
 
 
 # ── builders de resultados A1 ────────────────────────────────────────
-def area(codigo, estado, fase=None, nota_final=None, inconsistencias=(),
-         nivel=RA.NIVEL_PRIMARIA):
+# Centinela: permite pedir explicitamente `fase=None` para los casos de
+# incoherencia, sin que se confunda con «no me importa la fase».
+_FASE_DEL_CONTRATO = object()
+
+
+def area(codigo, estado, fase=_FASE_DEL_CONTRATO, nota_final=None,
+         inconsistencias=(), nivel=RA.NIVEL_PRIMARIA):
+    """Un resultado de A1. Por defecto, con la fase QUE A1 EMITIRIA.
+
+    Antes ponia `fase=None` siempre, lo que producia pares que A1 nunca
+    genera —APROBADA sin fase normal— y que A2.2 rechaza con razon.
+    """
+    if fase is _FASE_DEL_CONTRATO:
+        fase = PA.CONTRATO_ESTADO_FASE.get(nivel, {}).get(estado)
     return {
         'nivel': nivel, 'nota_base': None, 'fase': fase,
         'nota_final': nota_final, 'estado': estado, 'pendiente': False,
@@ -85,7 +97,7 @@ def todas(estado=RA.APROBADA, curriculo=None, nivel=RA.NIVEL_PRIMARIA):
     return [area(c, estado, nivel=nivel) for c in (curriculo or CURRICULO_PRIM)]
 
 
-def con_fallos(n, estado_fallo, fase=None, curriculo=None,
+def con_fallos(n, estado_fallo, fase=_FASE_DEL_CONTRATO, curriculo=None,
                nivel=RA.NIVEL_PRIMARIA):
     """Currículo completo con `n` áreas en el estado de fallo indicado."""
     curriculo = curriculo or CURRICULO_PRIM
@@ -523,7 +535,7 @@ def sec_todas(estado=RA.APROBADA):
     return todas(estado, CURRICULO_SEC, nivel=RA.NIVEL_SECUNDARIA)
 
 
-def sec_fallos(n, estado, fase=None):
+def sec_fallos(n, estado, fase=_FASE_DEL_CONTRATO):
     return con_fallos(n, estado, fase, CURRICULO_SEC,
                       nivel=RA.NIVEL_SECUNDARIA)
 
@@ -1002,6 +1014,303 @@ def _():
     igual(resultados, a, 'resultados mutados')
     igual(curriculo, b, 'curriculo mutado')
     igual(contexto, c, 'contexto mutado')
+
+
+# ══════════════════ X · EXCEPCION DE 2.o, ESTRICTA (A2.2) ══════════════════
+print(f"\n{B}EXCEPCION DE 2.o: TIPOS Y AMBITO{X}")
+
+
+def _exc(grado=2, nivel=RA.NIVEL_PRIMARIA, **ctx):
+    base = dict(OK_ASIST)
+    base.update(ctx)
+    curr = CURRICULO_PRIM if nivel == RA.NIVEL_PRIMARIA else CURRICULO_SEC
+    return PA.resolver_situacion_estudiante(
+        nivel, grado, todas(curriculo=curr, nivel=nivel), curr, base)
+
+
+@test("X1  ya_utilizada=False -> la repeticion excepcional es valida")
+def _():
+    r = _exc(decision_excepcional_segundo='repetir',
+             repeticion_excepcional_segundo_ya_utilizada=False)
+    igual(r['condicion'], PA.REPROBADO)
+    igual(r['motivo'], PA.MOTIVO_EXCEPCION_SEGUNDO)
+
+
+@test("X2  ya_utilizada=True -> bloqueada, no hay segunda vez")
+def _():
+    r = _exc(decision_excepcional_segundo='repetir',
+             repeticion_excepcional_segundo_ya_utilizada=True)
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.INC_EXCEPCION_SEGUNDO_YA_UTILIZADA in r['inconsistencias']
+
+
+@test("X3  ya_utilizada=None -> antecedente no informado")
+def _():
+    r = _exc(decision_excepcional_segundo='repetir',
+             repeticion_excepcional_segundo_ya_utilizada=None)
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_ANTECEDENTE_EXCEPCION_2DO in r['bloqueos'], r['bloqueos']
+
+
+@test("X4-X7 un antecedente que no sea bool NO autoriza nada")
+def _():
+    # EL BUG: `1 is True` es False, asi que un 1 caia por la rama del else y
+    # AUTORIZABA la repeticion.
+    for valor in (1, 0, 'no', 'false', 'true', [], {}, 1.0):
+        r = _exc(decision_excepcional_segundo='repetir',
+                 repeticion_excepcional_segundo_ya_utilizada=valor)
+        igual(r['condicion'], PA.EN_PROCESO, repr(valor))
+        assert PA.INC_ANTECEDENTE_EXCEPCION_INVALIDO in r['inconsistencias'], \
+            repr(valor)
+
+
+@test("X8  decision de 2.o en Primaria 3.o-6.o -> EN_PROCESO")
+def _():
+    for grado in (1, 3, 4, 5, 6):
+        r = _exc(grado=grado, decision_excepcional_segundo='repetir',
+                 repeticion_excepcional_segundo_ya_utilizada=False)
+        igual(r['condicion'], PA.EN_PROCESO, 'grado %d' % grado)
+        assert PA.INC_EXCEPCION_SEGUNDO_FUERA_DE_LUGAR in r['inconsistencias'], \
+            grado
+
+
+@test("X9  decision de 2.o en cualquier grado de Secundaria -> EN_PROCESO")
+def _():
+    for grado in (1, 2, 3, 4, 5, 6):
+        r = _exc(grado=grado, nivel=RA.NIVEL_SECUNDARIA,
+                 decision_excepcional_segundo='repetir',
+                 repeticion_excepcional_segundo_ya_utilizada=False)
+        igual(r['condicion'], PA.EN_PROCESO, 'secundaria %d' % grado)
+        assert PA.INC_EXCEPCION_SEGUNDO_FUERA_DE_LUGAR in r['inconsistencias']
+
+
+@test("X10 un antecedente SIN decision no desaparece en silencio")
+def _():
+    for valor in (True, False):
+        r = _exc(repeticion_excepcional_segundo_ya_utilizada=valor)
+        igual(r['condicion'], PA.EN_PROCESO, repr(valor))
+        assert PA.INC_ANTECEDENTE_SIN_DECISION in r['inconsistencias'], repr(valor)
+    # None explicito no es un contexto stale: no molesta.
+    r = _exc(repeticion_excepcional_segundo_ya_utilizada=None)
+    igual(r['condicion'], PA.PROMOVIDO)
+
+
+# ══════════════════ Y · CONTRATO A1 -> A2 (A2.2) ══════════════════
+print(f"\n{B}CONTRATO A1 -> A2{X}")
+
+
+@test("Y1  estado exclusivo de Secundaria en Primaria -> EN_PROCESO")
+def _():
+    for estado in (RA.APROBADA_COMPLETIVA, RA.PENDIENTE_COMPLETIVA,
+                   RA.APROBADA_EXTRAORDINARIA, RA.PENDIENTE_EXTRAORDINARIA,
+                   RA.NO_APROBADA_TRAS_EXTRAORDINARIA, RA.APROBADA_ESPECIAL):
+        res = todas()
+        res[0] = area('LE', estado, nivel=RA.NIVEL_PRIMARIA)
+        r = prim(4, res)
+        igual(r['condicion'], PA.EN_PROCESO, estado)
+        assert PA.INC_ESTADO_INCOMPATIBLE_CON_NIVEL in r['inconsistencias'], estado
+
+
+@test("Y2  estado exclusivo de Primaria en Secundaria -> EN_PROCESO")
+def _():
+    for estado in (RA.APROBADA_RECUPERACION_FINAL,
+                   RA.PENDIENTE_RECUPERACION_FINAL,
+                   RA.NO_APROBADA_TRAS_RECUPERACION_FINAL,
+                   RA.APROBADA_RECUPERACION_ESPECIAL):
+        res = sec_todas()
+        res[0] = area('LE', estado, nivel=RA.NIVEL_SECUNDARIA)
+        r = sec(3, res)
+        igual(r['condicion'], PA.EN_PROCESO, estado)
+        assert PA.INC_ESTADO_INCOMPATIBLE_CON_NIVEL in r['inconsistencias'], estado
+
+
+@test("Y3  EL BUG: REPROBADA_DEFINITIVA sin fase NO puede promover")
+def _():
+    # Se clasificaba como no aprobada, pero `_fallo_tras_extraordinaria`
+    # devolvia False, asi que `caidas` quedaba vacia y salia PROMOVIDO con un
+    # area definitivamente reprobada.
+    res = sec_todas()
+    res[0] = area('LE', RA.REPROBADA_DEFINITIVA, fase=None,
+                  nivel=RA.NIVEL_SECUNDARIA)
+    r = sec(3, res)
+    igual(r['condicion'], PA.EN_PROCESO, 'jamas PROMOVIDO')
+    assert PA.INC_ESTADO_FASE_INCOHERENTE in r['inconsistencias'], \
+        r['inconsistencias']
+
+
+@test("Y4  lo mismo en Primaria")
+def _():
+    res = todas()
+    res[0] = area('LE', RA.REPROBADA_DEFINITIVA, fase=None)
+    r = prim(4, res)
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.INC_ESTADO_FASE_INCOHERENTE in r['inconsistencias']
+
+
+@test("Y5  los pares incoherentes de Secundaria")
+def _():
+    for estado, fase in ((RA.APROBADA_ESPECIAL, None),
+                         (RA.APROBADA_COMPLETIVA, RA.FASE_ESPECIAL),
+                         (RA.NO_APROBADA_TRAS_EXTRAORDINARIA, None),
+                         (RA.APROBADA, RA.FASE_ESPECIAL),
+                         (RA.SIN_CALIFICAR, RA.FASE_NORMAL)):
+        res = sec_todas()
+        res[0] = area('LE', estado, fase=fase, nivel=RA.NIVEL_SECUNDARIA)
+        r = sec(3, res)
+        igual(r['condicion'], PA.EN_PROCESO, '%s + %s' % (estado, fase))
+        assert PA.INC_ESTADO_FASE_INCOHERENTE in r['inconsistencias'], \
+            '%s + %s' % (estado, fase)
+
+
+@test("Y6  los pares incoherentes de Primaria")
+def _():
+    for estado, fase in ((RA.APROBADA_RECUPERACION_ESPECIAL, None),
+                         (RA.NO_APROBADA_TRAS_RECUPERACION_FINAL, None),
+                         (RA.APROBADA_RECUPERACION_FINAL, RA.FASE_NORMAL),
+                         (RA.APROBADA, RA.FASE_RECUPERACION_ESPECIAL),
+                         (RA.PENDIENTE_RECUPERACION_FINAL, RA.FASE_NORMAL)):
+        res = todas()
+        res[0] = area('LE', estado, fase=fase)
+        r = prim(4, res)
+        igual(r['condicion'], PA.EN_PROCESO, '%s + %s' % (estado, fase))
+        assert PA.INC_ESTADO_FASE_INCOHERENTE in r['inconsistencias'], \
+            '%s + %s' % (estado, fase)
+
+
+@test("Y7  TODOS los pares legitimos de A1 pasan la validacion")
+def _():
+    # Si A2 rechazara una salida legitima de A1, esto lo detecta.
+    for nivel, matriz in PA.CONTRATO_ESTADO_FASE.items():
+        curr = CURRICULO_PRIM if nivel == RA.NIVEL_PRIMARIA else CURRICULO_SEC
+        for estado, fase in matriz.items():
+            res = todas(curriculo=curr, nivel=nivel)
+            res[0] = area('LE', estado, fase=fase, nivel=nivel)
+            r = PA.resolver_situacion_estudiante(
+                nivel, 4, res, curr,
+                dict(OK_ASIST, alfabetizacion_inicial=True))
+            assert PA.INC_ESTADO_FASE_INCOHERENTE not in r['inconsistencias'], \
+                '%s %s + %s' % (nivel, estado, fase)
+            assert PA.INC_ESTADO_INCOMPATIBLE_CON_NIVEL not in r['inconsistencias'], \
+                '%s %s' % (nivel, estado)
+
+
+@test("Y8  la matriz cubre exactamente los estados de cada nivel")
+def _():
+    todos = set()
+    for matriz in PA.CONTRATO_ESTADO_FASE.values():
+        todos |= set(matriz)
+    igual(todos, set(RA.ESTADOS), 'la matriz debe cubrir todos los estados de A1')
+    # REPROBADA_DEFINITIVA y SIN_CALIFICAR y APROBADA son de los dos niveles.
+    comunes = (set(PA.CONTRATO_ESTADO_FASE[RA.NIVEL_PRIMARIA])
+               & set(PA.CONTRATO_ESTADO_FASE[RA.NIVEL_SECUNDARIA]))
+    igual(comunes, {RA.SIN_CALIFICAR, RA.APROBADA, RA.REPROBADA_DEFINITIVA})
+
+
+# ══════════════════ V · ENTRADAS MALFORMADAS (A2.2) ══════════════════
+print(f"\n{B}ENTRADAS MALFORMADAS{X}")
+
+
+@test("V1  items de `resultados` que no son mappings -> bloqueo, sin traceback")
+def _():
+    for entrada in ([None], ['texto'], [5], [[]], [None, {}]):
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, entrada,
+                                             CURRICULO_PRIM, OK_ASIST)
+        igual(r['condicion'], PA.EN_PROCESO, repr(entrada))
+        assert PA.BLOQUEO_RESULTADOS_INVALIDOS in r['bloqueos'], repr(entrada)
+
+
+@test("V2  `resultados` que no es una coleccion de materias -> bloqueo")
+def _():
+    for entrada in ('texto', b'bytes', 123, 4.5):
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, entrada,
+                                             CURRICULO_PRIM, OK_ASIST)
+        igual(r['condicion'], PA.EN_PROCESO, repr(entrada))
+        assert PA.BLOQUEO_RESULTADOS_INVALIDOS in r['bloqueos'], repr(entrada)
+
+
+@test("V3  `resultados` vacio o None no revienta")
+def _():
+    for entrada in (None, [], ()):
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, entrada,
+                                             CURRICULO_PRIM, OK_ASIST)
+        igual(r['condicion'], PA.EN_PROCESO, repr(entrada))
+        assert PA.BLOQUEO_CURRICULO_INCOMPLETO in r['bloqueos']
+
+
+@test("V4  `resultados` como generator se consume UNA vez")
+def _():
+    gen = (a for a in todas())
+    r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, gen,
+                                         CURRICULO_PRIM, OK_ASIST)
+    igual(r['condicion'], PA.PROMOVIDO)
+    igual(r['total_oficiales'], 8)
+
+
+@test("V5  un dict vacio como item no es valido academicamente pero no rompe")
+def _():
+    r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, [{}],
+                                         CURRICULO_PRIM, OK_ASIST)
+    igual(r['condicion'], PA.EN_PROCESO)
+    # Sin codigo curricular es una materia interna: no bloquea por si misma,
+    # pero el curriculo queda incompleto.
+    assert PA.BLOQUEO_CURRICULO_INCOMPLETO in r['bloqueos'], r['bloqueos']
+
+
+@test("V6  `contexto` malformado -> bloqueo, sin traceback")
+def _():
+    for ctx in ('texto', [1, 2], 123, 4.5, b'x'):
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, todas(),
+                                             CURRICULO_PRIM, ctx)
+        igual(r['condicion'], PA.EN_PROCESO, repr(ctx))
+        assert PA.BLOQUEO_CONTEXTO_INVALIDO in r['bloqueos'], repr(ctx)
+
+
+@test("V7  `contexto` None o vacio se tratan igual")
+def _():
+    for ctx in (None, {}):
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, todas(),
+                                             CURRICULO_PRIM, ctx)
+        igual(r['condicion'], PA.EN_PROCESO, repr(ctx))
+        assert PA.BLOQUEO_ASISTENCIA_NO_EVALUADA in r['bloqueos']
+
+
+@test("V8  EL GENERATOR DE CURRICULO se consume UNA vez")
+def _():
+    # Antes `_curriculo_utilizable` lo vaciaba y `Counter` recibia nada, asi
+    # que el curriculo parecia inexistente.
+    gen = (c for c in CURRICULO_PRIM)
+    r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, todas(),
+                                         gen, OK_ASIST)
+    igual(r['condicion'], PA.PROMOVIDO)
+    assert PA.BLOQUEO_SIN_CURRICULO_OFICIAL not in r['bloqueos']
+    # Identico a pasarlo como lista.
+    r2 = prim(4, todas())
+    igual(r['condicion'], r2['condicion'])
+    igual(r['total_oficiales'], r2['total_oficiales'])
+
+
+@test("V9  materias internas no necesitan el contrato academico completo")
+def _():
+    # Sin codigo curricular no participan: que su estado no encaje da igual.
+    res = todas() + [{'area_curricular_codigo': None, 'estado': 'LO_QUE_SEA',
+                      'nivel': 'otro', 'fase': 'rara', 'inconsistencias': ()}]
+    r = prim(4, res)
+    igual(r['condicion'], PA.PROMOVIDO)
+    igual(len(r['codigos_no_oficiales']), 1)
+
+
+@test("V10 nada de lo recibido se muta, tampoco un generator materializado")
+def _():
+    resultados = todas()
+    curriculo = list(CURRICULO_PRIM)
+    contexto = dict(OK_ASIST)
+    a, b, c = (copy.deepcopy(resultados), copy.deepcopy(curriculo),
+               copy.deepcopy(contexto))
+    PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, resultados,
+                                     curriculo, contexto)
+    igual(resultados, a)
+    igual(curriculo, b)
+    igual(contexto, c)
 
 
 # ══════════════════ Z · PUREZA Y NO-DIVERGENCIA ══════════════════
