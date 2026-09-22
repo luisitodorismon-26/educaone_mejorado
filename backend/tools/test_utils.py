@@ -40,6 +40,20 @@ EL ORDEN IMPORTA
     engine: seguiría apuntando a la base real. Por eso `aislar_base_de_datos`
     se niega a trabajar si `database`, `models` o `app` ya están importados,
     en vez de dar una falsa sensación de aislamiento.
+
+DOS COSAS QUE SE ENDURECIERON DESPUÉS (A1)
+    La primera versión de los guards funcionaba para el caso real, pero era
+    más laxa de lo que decía ser, y ambas cosas se comprobaron fallando:
+
+      · el cleanup aceptaba CUALQUIER ruta bajo el TEMP del sistema, así que
+        podía borrar el temporal de otro programa que no tenía nada que ver.
+        Ahora solo borra rutas que este mismo módulo creó, y lo sabe porque
+        las lleva apuntadas;
+
+      · la verificación del engine comparaba la URL como TEXTO, de modo que
+        un temporal `…/eo_test_123_otro` pasaba por estar dentro de
+        `…/eo_test_123`. Ahora se compara la ruta real del fichero por
+        componentes, no por prefijo de cadena.
 """
 import atexit
 import os
@@ -54,25 +68,78 @@ BASES_REALES = ('sge.db', 'educaone.db')
 # Módulos que congelan la URL al importarse.
 MODULOS_QUE_FIJAN_EL_ENGINE = ('database', 'models', 'app')
 
+# Temporales creados POR ESTE MÓDULO. Es la única autorización de borrado:
+# estar dentro del TEMP del sistema no convierte un directorio en nuestro.
+_TEMPORALES_PROPIOS = set()
 
-def _ruta_segura_para_borrar(ruta):
-    """¿Está `ruta` realmente dentro del temp del sistema?
 
-    El guard mira rutas REALES (resueltos los symlinks) y compara por
-    componentes, no por texto: así `/tmp/eo` no cuenta como padre de
-    `/tmp/eo_otro`.
+def _clave(ruta):
+    """Forma canónica de una ruta para comparar y para el registro.
+
+    `realpath` resuelve symlinks y `normcase` iguala mayúsculas y
+    separadores, que en Windows hacen falta para que dos formas de escribir
+    la misma ruta cuenten como la misma.
+    """
+    return os.path.normcase(os.path.realpath(os.path.abspath(ruta)))
+
+
+def _esta_dentro_de(hijo, padre):
+    """¿`hijo` cuelga de `padre`, comparando por COMPONENTES?
+
+    No vale `hijo.startswith(padre)`: con eso `/tmp/eo_1_otro` parecería
+    estar dentro de `/tmp/eo_1`. `commonpath` compara tramo a tramo.
+    Lanza ValueError si están en unidades distintas (Windows), y eso
+    significa que no cuelga: no es un error, es un «no».
     """
     try:
-        objetivo = os.path.realpath(ruta)
-        raiz_tmp = os.path.realpath(tempfile.gettempdir())
+        return os.path.commonpath([hijo, padre]) == padre
+    except ValueError:
+        return False
+
+
+def _ruta_segura_para_borrar(ruta):
+    """¿Puede esta ruta borrarse? Solo si la creamos nosotros.
+
+    Las cinco condiciones, en orden:
+      1. está registrada como temporal propio;
+      2. cuelga del TEMP del sistema;
+      3. no es la raíz del TEMP;
+      4. no es —ni contiene— el repositorio;
+      5. no es padre de otro temporal propio.
+    """
+    objetivo = _clave(ruta)
+
+    # 1. Propiedad explícita. Es la condición que de verdad decide.
+    if objetivo not in _TEMPORALES_PROPIOS:
+        return False
+
+    try:
+        raiz_tmp = _clave(tempfile.gettempdir())
     except OSError:
         return False
+
+    # 3. Nunca el TEMP entero.
     if objetivo == raiz_tmp:
-        return False                      # nunca el temp entero
-    try:
-        return os.path.commonpath([objetivo, raiz_tmp]) == raiz_tmp
-    except ValueError:
-        return False                      # unidades distintas en Windows
+        return False
+
+    # 2. Dentro del TEMP, por componentes.
+    if not _esta_dentro_de(objetivo, raiz_tmp):
+        return False
+
+    # 4. Nunca el repositorio, ni un directorio que lo contenga. Esto no
+    #    debería poder pasar si 1 y 2 se cumplen, pero un temporal es barato
+    #    y un repositorio no.
+    repo = _clave(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if objetivo == repo or _esta_dentro_de(repo, objetivo):
+        return False
+
+    # 5. No borrar un directorio que contenga OTRO temporal propio: sería
+    #    llevarse por delante el aislamiento de otra suite.
+    for otro in _TEMPORALES_PROPIOS:
+        if otro != objetivo and _esta_dentro_de(otro, objetivo):
+            return False
+
+    return True
 
 
 def _cerrar_engine():
@@ -92,17 +159,21 @@ def _cerrar_engine():
 
 
 def _limpiar(tmpdir):
-    """Borra el temporal de la suite, y solo eso.
+    """Borra un temporal PROPIO, y solo eso.
 
     A propósito SIN `ignore_errors`: una limpieza que falla en silencio es
     peor que ninguna, porque deja creer que el temporal desapareció. Si no
     se puede borrar, se dice.
     """
+    objetivo = _clave(tmpdir)
+
     if not _ruta_segura_para_borrar(tmpdir):
-        # Un test no tiene por qué borrar nada fuera de su propio temporal.
+        if not os.path.exists(tmpdir):
+            _TEMPORALES_PROPIOS.discard(objetivo)   # ya no está: solo olvidarlo
+            return
         sys.stderr.write(
-            '[test_utils] NO se borra %r: esta fuera del directorio temporal\n'
-            % (tmpdir,))
+            '[test_utils] NO se borra %r: no es un temporal creado por este '
+            'modulo\n' % (tmpdir,))
         return
 
     _cerrar_engine()
@@ -110,8 +181,10 @@ def _limpiar(tmpdir):
     for intento in range(5):
         try:
             shutil.rmtree(tmpdir)
+            _TEMPORALES_PROPIOS.discard(objetivo)
             return
         except FileNotFoundError:
+            _TEMPORALES_PROPIOS.discard(objetivo)
             return
         except OSError as e:
             ultimo_error = e
@@ -136,6 +209,7 @@ def aislar_base_de_datos(prefijo='eo_test'):
             % ', '.join(ya_importados))
 
     tmpdir = tempfile.mkdtemp(prefix='%s_' % prefijo)
+    _TEMPORALES_PROPIOS.add(_clave(tmpdir))
     ruta = os.path.join(tmpdir, 'test.db')
     # SQLAlchemy quiere barras normales incluso en Windows.
     os.environ['DATABASE_URL'] = 'sqlite:///' + ruta.replace('\\', '/')
@@ -144,23 +218,42 @@ def aislar_base_de_datos(prefijo='eo_test'):
 
 
 def verificar_engine_aislado(engine, tmpdir):
-    """Aborta si el engine no quedó dentro del temporal de la suite.
+    """Aborta si el fichero del engine no está DENTRO del temporal indicado.
 
     Se comprueba DESPUÉS del import porque es lo único que demuestra que el
     aislamiento funcionó de verdad: la variable de entorno por sí sola no
     prueba nada si algún módulo se había importado antes.
+
+    La pertenencia se decide sobre la ruta real del fichero, tomada de
+    `engine.url.database` —SQLAlchemy ya la tiene parseada, no hay por qué
+    volver a trocear la URL a mano— y comparada por componentes.
     """
-    url = str(engine.url).replace('\\', '/')
-    esperado = tmpdir.replace('\\', '/')
     problemas = []
-    if esperado not in url:
-        problemas.append('la URL no apunta al temporal de la suite')
-    for real in BASES_REALES:
-        if real in url:
-            problemas.append('la URL menciona la base real %r' % real)
+    esperado = _clave(tmpdir)
+
+    backend = engine.url.get_backend_name()
+    if backend != 'sqlite':
+        problemas.append('el engine no es SQLite sino %r' % backend)
+
+    db = engine.url.database
+    if not db:
+        problemas.append('el engine no tiene fichero (¿base en memoria?)')
+        db_real = None
+    else:
+        db_real = _clave(db)
+        if os.path.basename(db_real) in [n.lower() for n in BASES_REALES]:
+            problemas.append('apunta a una base real (%s)'
+                             % os.path.basename(db))
+        if db_real == esperado:
+            problemas.append('la ruta de la base es el propio directorio')
+        elif not _esta_dentro_de(db_real, esperado):
+            problemas.append('la base NO cuelga del temporal de la suite')
+
     if problemas:
         sys.stderr.write(
-            '[test_utils] AISLAMIENTO ROTO: %s\n  url      = %s\n  esperado = %s\n'
-            % ('; '.join(problemas), url, esperado))
+            '[test_utils] AISLAMIENTO ROTO: %s\n'
+            '  base     = %s\n'
+            '  esperado = %s\n'
+            % ('; '.join(problemas), db_real or engine.url, esperado))
         raise SystemExit(9)
     return True
