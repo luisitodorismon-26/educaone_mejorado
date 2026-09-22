@@ -44,6 +44,9 @@ load_dotenv()
 
 from database import engine, SessionLocal, get_db, Base
 from reglas_academicas import redondear_calificacion_final
+# R4-A3: el puente a los motores canonicos A1/A2. No decide nada por su
+# cuenta; traduce filas ORM a lo que A1 y A2 esperan.
+import resultado_academico_consumidores as RAC
 from models import (
     Colegio, ConfiguracionColegio, AnoEscolar, Grado, Tanda, Recreo,
     Asignatura, Curso, Estudiante, AsignacionProfesor, Horario, Calificacion,
@@ -12698,6 +12701,177 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
     return StreamingResponse(out, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
+
+# ═══════════════ R4-A3 · PUENTE A LOS MOTORES CANONICOS ═══════════════
+#
+# Antes de A3 cada documento respondia por su cuenta a «¿este estudiante
+# promueve?», y no coincidian: el boletin individual armaba la nota con una
+# cadena `nota_final or especial_final or ...` —que se come un 0 legitimo— y
+# contaba `reprobadas > 2`; el lote usaba `(cf or 0) >= 70` y escribia
+# "PENDIENTE/REPITENTE"; Primaria llamaba a `condicion_final_estudiante`, que
+# no sabe en que grado esta el estudiante y por eso hacia repetir a un 1.o.
+#
+# Desde aqui todos preguntan lo mismo. La decision es de A1/A2; estas
+# funciones solo LEEN filas y se las pasan.
+
+
+def _precarga_curso_canonica(db, current_user, curso, ano):
+    """Lo que es igual para todos los estudiantes del curso.
+
+    El lote lo calcula UNA vez: sin esto serian dos consultas por estudiante
+    para obtener siempre las mismas asignaturas.
+    """
+    asignaciones = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, ano_escolar_id=ano.id, activo=True).all()
+
+    asig_ids = {a.asignatura_id for a in asignaciones if a.asignatura_id}
+    asignaturas = []
+    if asig_ids:
+        asignaturas = tenant_filter(
+            db.query(Asignatura), Asignatura, current_user
+        ).filter(Asignatura.id.in_(asig_ids)).all()
+
+    grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
+    grado_numero, diag_grado = RAC.numero_de_grado(grado)
+    return {
+        'asignaciones': asignaciones,
+        'asignaturas': asignaturas,
+        'asignaturas_por_id': {a.id: a for a in asignaturas},
+        'grado': grado,
+        'grado_numero': grado_numero,
+        'diag_grado': diag_grado,
+        'dias_trabajados': RAC.sumar_dias_trabajados(ano),
+    }
+
+
+def _datos_academicos_estudiantes(db, current_user, estudiante_ids, ano, modelo):
+    """Filas de `modelo` de VARIOS estudiantes, indexadas por (est, asignatura).
+
+    Una sola consulta para todo el curso en vez de una por estudiante.
+    """
+    if not estudiante_ids:
+        return {}
+    filas = tenant_filter(db.query(modelo), modelo, current_user).filter(
+        modelo.estudiante_id.in_(list(estudiante_ids)),
+        modelo.ano_escolar_id == ano.id,
+    ).all()
+    indice = {}
+    for f in filas:
+        indice.setdefault(f.estudiante_id, {}).setdefault(f.asignatura_id, []).append(f)
+    return indice
+
+
+def _asistencias_estudiantes(db, current_user, estudiante_ids, ano):
+    if not estudiante_ids:
+        return {}
+    filas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+        Asistencia.estudiante_id.in_(list(estudiante_ids))
+    ).all()
+    indice = {}
+    for f in filas:
+        indice.setdefault(f.estudiante_id, []).append(f)
+    return indice
+
+
+def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano):
+    """El contexto de A2 con lo que REALMENTE hay en la base."""
+    diagnosticos = []
+    if precarga['diag_grado']:
+        diagnosticos.append(precarga['diag_grado'])
+
+    ausencias = RAC.dias_no_justificados(
+        asistencias_estudiante,
+        getattr(ano, 'fecha_inicio', None), getattr(ano, 'fecha_fin', None))
+    porcentaje, diag_asist = RAC.porcentaje_ausencias(
+        ausencias, precarga['dias_trabajados'])
+    if diag_asist:
+        diagnosticos.append(diag_asist)
+
+    contexto = RAC.construir_contexto(
+        precarga['grado_numero'], nivel, porcentaje, diagnosticos)
+    return contexto, diagnosticos
+
+
+def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
+                                   competencias_por_asig=None,
+                                   extras_por_asig=None,
+                                   asistencias=None):
+    """La situacion academica de UN estudiante de Secundaria.
+
+    La usan el boletin individual y el de lote, sin variantes: si alguna vez
+    vuelven a discrepar sera porque alguien dejo de llamar aqui, y la suite
+    R4-A3 lo detecta.
+    """
+    if competencias_por_asig is None:
+        competencias_por_asig = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, CalificacionSecundaria
+        ).get(estudiante.id, {})
+    if extras_por_asig is None:
+        extras = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, EvaluacionExtraSecundaria
+        ).get(estudiante.id, {})
+        extras_por_asig = {k: v[0] for k, v in extras.items() if v}
+    if asistencias is None:
+        asistencias = _asistencias_estudiantes(
+            db, current_user, [estudiante.id], ano).get(estudiante.id, [])
+
+    curriculo, diag_curr = RAC.curriculo_desde_asignaciones(
+        precarga['asignaciones'], precarga['asignaturas_por_id'])
+    resultados = RAC.resultados_secundaria(
+        precarga['asignaturas'], competencias_por_asig, extras_por_asig,
+        _calcular_cf_secundaria)
+
+    contexto, diagnosticos = _contexto_canonico(
+        precarga, RAC.RA.NIVEL_SECUNDARIA, asistencias, ano)
+    if diag_curr:
+        diagnosticos.append(diag_curr)
+
+    return RAC.construir_situacion_estudiante(
+        RAC.RA.NIVEL_SECUNDARIA, precarga['grado_numero'], resultados,
+        curriculo, contexto, diagnosticos=diagnosticos)
+
+
+def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
+                                 competencias_por_asig=None,
+                                 recuperaciones_por_asig=None,
+                                 asistencias=None):
+    """La situacion academica de UN estudiante de Primaria.
+
+    Sustituye a `calculo_primaria.condicion_final_estudiante` en los caminos
+    documentales. Aquella contaba areas sin saber el grado: en 1.o y 2.o
+    anunciaba una repitencia que la Ordenanza 04-2023 no contempla, y en 3.o
+    ignoraba la alfabetizacion inicial.
+    """
+    if competencias_por_asig is None:
+        competencias_por_asig = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, CalificacionPrimaria
+        ).get(estudiante.id, {})
+    if recuperaciones_por_asig is None:
+        recs = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, RecuperacionPrimaria
+        ).get(estudiante.id, {})
+        recuperaciones_por_asig = {k: v[0] for k, v in recs.items() if v}
+    if asistencias is None:
+        asistencias = _asistencias_estudiantes(
+            db, current_user, [estudiante.id], ano).get(estudiante.id, [])
+
+    curriculo, diag_curr = RAC.curriculo_desde_asignaciones(
+        precarga['asignaciones'], precarga['asignaturas_por_id'])
+    resultados = RAC.resultados_primaria(
+        precarga['asignaturas'], competencias_por_asig,
+        recuperaciones_por_asig, precarga['grado_numero'])
+
+    contexto, diagnosticos = _contexto_canonico(
+        precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano)
+    if diag_curr:
+        diagnosticos.append(diag_curr)
+
+    return RAC.construir_situacion_estudiante(
+        RAC.RA.NIVEL_PRIMARIA, precarga['grado_numero'], resultados,
+        curriculo, contexto, diagnosticos=diagnosticos)
+
+
 def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano):
     """Helper que arma el dict calificaciones_por_asig esperado por
     generar_boletin_secundaria_minerd, leyendo de la BD las
@@ -12953,8 +13127,6 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
     al de siempre — un boletín individual no cambia en nada.
     """
     from boletin_primaria import generar_boletin_primaria
-    from calculo_primaria import situacion_area, condicion_final_estudiante
-
     curso = estudiante.curso
     _ck = ('grado', curso.id) if curso else None
     if _cache_curso is not None and _ck in _cache_curso:
@@ -13006,22 +13178,29 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
             if prof:
                 docente_nombre = f"{prof.nombre} {prof.apellido}".strip()
 
-    # v2.14.1 BUGFIX: la portada nunca marcaba la X de Promovido/Aplazado/
-    # Repitente ni escribía la condición — el motor ya lo calcula, solo había
-    # que pasárselo (ahora considerando también las recuperaciones cargadas).
-    situaciones = [
-        situacion_area(d.get('cf_area'), d.get('recuperacion_final'),
-                       d.get('recuperacion_especial'))
-        for d in areas.values()
-    ]
+    # ── R4-A3 · La condición sale del motor canónico ──
+    #
+    # Aquí se llamaba a `calculo_primaria.condicion_final_estudiante`, que
+    # cuenta áreas reprobadas y nada más: no sabe en qué grado está el
+    # estudiante. En 1.º y 2.º anunciaba una repitencia que la Ordenanza
+    # 04-2023 no contempla, y en 3.º ignoraba la alfabetización inicial.
+    #
+    # La X de la portada se marca SOLO si A2 certificó algo. Un EN_PROCESO no
+    # marca ninguna casilla: el documento no puede afirmar lo que el motor se
+    # negó a afirmar.
     situacion_final = None
     condicion_texto = ''
-    if situaciones:
-        cond = condicion_final_estudiante(situaciones)
-        condicion_texto = cond.get('detalle') or ''
-        mapa_x = {'promovido': 'promovido', 'repite': 'repitente',
-                  'repitente_condicional': 'aplazado'}
-        situacion_final = mapa_x.get(cond.get('condicion'))  # en_proceso → sin X
+    if curso is not None:
+        _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
+        _paquete = _situacion_canonica_primaria(
+            db, current_user, estudiante, ano, _precarga)
+        situacion_final = RAC.MARCA_BOLETIN_PRIMARIA.get(
+            _paquete['situacion']['condicion'])
+        condicion_texto = RAC.texto_situacion(_paquete['situacion'])
+        _detalle = RAC.detalle_situacion(_paquete['situacion'],
+                                         _paquete['diagnosticos'])
+        if _detalle:
+            condicion_texto = '%s — %s' % (condicion_texto, _detalle)
 
     return generar_boletin_primaria(
         estudiante=estudiante,
@@ -13852,8 +14031,10 @@ async def boletin_primaria_estudiante_json(
     Carril separado del JSON de secundaria: devuelve por área las 3
     competencias con P1-P4/RP1-RP4, su CF, la CF del área y la situación.
     """
+    # `situacion_area` sigue aquí a propósito: alimenta el `estado` y la
+    # `nota_final` que se muestran POR ÁREA, que es dato de presentación y no
+    # la decisión global. Esa la toma A2 más abajo.
     from calculo_primaria import (cf_area as calc_cf_area, situacion_area,
-                                  condicion_final_estudiante,
                                   MINIMO_APROBATORIO_PRIMARIA)
 
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
@@ -13941,7 +14122,27 @@ async def boletin_primaria_estudiante_json(
             'nota_final': sit['nota_final'],
         })
 
-    condicion = condicion_final_estudiante(situaciones) if situaciones else None
+    # ── R4-A3 · La condición sale del motor canónico ──
+    #
+    # La FORMA de la respuesta no cambia: el frontend lee
+    # {'condicion', 'detalle', 'areas_reprobadas', 'areas_pendientes'} y
+    # reconoce los valores 'promovido' | 'repitente_condicional' | 'repite' |
+    # 'en_proceso'. Lo que cambia es QUIÉN decide, no cómo se llama.
+    condicion = None
+    if situaciones and curso is not None:
+        _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
+        _paquete = _situacion_canonica_primaria(
+            db, current_user, estudiante, ano, _precarga)
+        _sit = _paquete['situacion']
+        _detalle = RAC.detalle_situacion(_sit, _paquete['diagnosticos'])
+        condicion = {
+            'condicion': RAC.CONDICION_LEGACY_PRIMARIA.get(_sit['condicion'],
+                                                           'en_proceso'),
+            'detalle': (RAC.texto_situacion(_sit)
+                        + (' — %s' % _detalle if _detalle else '')),
+            'areas_reprobadas': _sit['no_aprobadas'],
+            'areas_pendientes': _sit['pendientes'],
+        }
     asistencia = _construir_asistencias_boletin(db, id, current_user, ano)
     # v2.14.1 BUGFIX: se sumaba .get('presentes') sobre un dict cuyas claves
     # reales son 'asistencia'/'ausencia' — la asistencia de la vista previa
@@ -14136,37 +14337,23 @@ async def generar_boletin_minerd_v2(
             'error': f'{estudiante.nombre_completo} no tiene calificaciones completas (las 4 competencias) en ninguna asignatura. Verificá que los profesores hayan cargado todas las competencias.'
         }, status_code=400)
     
-    # Situación final (calculada a partir de notas)
-    aprobadas = 0
-    reprobadas = 0
-    for asig_id, data in califs_por_asig.items():
-        ev = data.get('evaluacion_extra')
-        nota_final = None
-        if ev:
-            nota_final = (getattr(ev, 'nota_final', None) or
-                          getattr(ev, 'especial_final', None) or
-                          getattr(ev, 'extraordinaria_final', None) or
-                          getattr(ev, 'completiva_final', None))
-        if nota_final is None:
-            nota_final = data.get('cf')
-        if nota_final is not None:
-            if nota_final >= 70:
-                aprobadas += 1
-            else:
-                reprobadas += 1
+    # ── R4-A3 · La situación sale del motor canónico ──
+    #
+    # Aquí había una regla propia: una cadena `nota_final or especial_final or
+    # extraordinaria_final or completiva_final` y un `reprobadas > 2`. La
+    # cadena se comía un 0 legítimo —`0 or 75` da 75— y el contador no
+    # distinguía un área que agotó la cascada de otra que ni la empezó.
+    #
+    # Ya no se decide aquí. Lo que sigue es lectura y presentación.
+    _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
+    _paquete = _situacion_canonica_secundaria(
+        db, current_user, estudiante, ano, _precarga)
+    situacion = RAC.situacion_boletin_secundaria(
+        _paquete['situacion'], _paquete['diagnosticos'])
     
-    promovido = reprobadas == 0 and aprobadas > 0
-    repitente = reprobadas > 2  # MINERD: más de 2 reprobadas → repitente
-    
-    situacion = {
-        'promovido': promovido,
-        'repitente': repitente,
-        'condicion': request.query_params.get('condicion', 
-            'APROBADO/A — Promovido' if promovido else
-            ('REPITENTE — Debe repetir el grado' if repitente else 
-             'PENDIENTE — Evaluaciones extra en curso'))
-    }
-    
+    # `condicion` ya no se lee del query string: una situación académica
+    # oficial no puede depender de lo que alguien escriba en la URL. Ningún
+    # cliente lo mandaba (se comprobó en el frontend antes de retirarlo).
     observaciones = request.query_params.get('observaciones', '')
     
     # v2.13.18: docente encargado del grado = profesor titular del curso
@@ -14273,22 +14460,34 @@ async def generar_boletines_curso_minerd_v2(
     except Exception as e:
         logger.warning(f"No se pudo obtener docente titular del curso {curso_id}: {e}")
     
+    # ── R4-A3 · Todo lo que es igual para el curso, una sola vez ──
+    _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
+    _ids = [e.id for e in estudiantes]
+    _comps = _datos_academicos_estudiantes(
+        db, current_user, _ids, ano, CalificacionSecundaria)
+    _extras = _datos_academicos_estudiantes(
+        db, current_user, _ids, ano, EvaluacionExtraSecundaria)
+    _asist_idx = _asistencias_estudiantes(db, current_user, _ids, ano)
+
     for est in estudiantes:
         try:
             califs = _construir_datos_boletin_secundaria(db, est, curso, current_user, ano)
             asist = _construir_asistencias_boletin(db, est.id, current_user, ano)
             if not califs:
                 continue  # skip si no tiene notas cargadas
-            # Situación
-            aprobadas = sum(1 for d in califs.values() 
-                           if (d.get('cf') or 0) >= 70 or 
-                              (d.get('evaluacion_extra') and (getattr(d['evaluacion_extra'], 'nota_final', None) or 0) >= 70))
-            reprobadas = len(califs) - aprobadas
-            situacion = {
-                'promovido': reprobadas == 0,
-                'repitente': reprobadas > 2,
-                'condicion': 'APROBADO/A — Promovido' if reprobadas == 0 else 'PENDIENTE/REPITENTE',
-            }
+            # ── R4-A3 · El MISMO helper que el boletín individual ──
+            #
+            # Antes esto era una comprensión aparte —`(cf or 0) >= 70`— con su
+            # propio texto por defecto. Dos estudiantes idénticos podían salir
+            # con condiciones distintas según por dónde se pidiera el PDF.
+            _paquete = _situacion_canonica_secundaria(
+                db, current_user, est, ano, _precarga,
+                competencias_por_asig=_comps.get(est.id, {}),
+                extras_por_asig={k: v[0] for k, v
+                                 in (_extras.get(est.id) or {}).items() if v},
+                asistencias=_asist_idx.get(est.id, []))
+            situacion = RAC.situacion_boletin_secundaria(
+                _paquete['situacion'], _paquete['diagnosticos'])
             buf = generar_boletin_secundaria_minerd(
                 estudiante=est, curso=curso,
                 calificaciones_por_asig=califs,
@@ -17761,7 +17960,6 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
     Carril primaria puro: RecuperacionPrimaria + calculo_primaria.
     """
     from registro_primaria import area_canonica
-    from calculo_primaria import situacion_area, condicion_final_estudiante
 
     recuperaciones, condiciones = {}, {}
     if not estudiantes_db:
@@ -17787,20 +17985,33 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
 
     ETIQUETA = {'promovido': 'Promovido(a)', 'repite': 'Repitente',
                 'repitente_condicional': 'Repitente condicional', 'en_proceso': 'En proceso'}
-    for idx in idx_por_id.values():
-        situaciones = []
-        for nombre_asig, area_data in (calificaciones_por_area or {}).items():
-            comps = area_data.get(idx) or {}
-            finales = [(comps.get(c) or {}).get('final_competencia') for c in (1, 2, 3)]
-            # Linaje estricto: sin las 3 competencias, el área no vota
-            if not all(f is not None for f in finales):
+    # ── R4-A3 · El acta usa el mismo motor que el boletín ──
+    #
+    # Antes rearmaba la CF desde `final_competencia` y llamaba a
+    # `condicion_final_estudiante`. Eran dos rutas distintas hacia la misma
+    # pregunta, y la del acta tampoco sabía el grado.
+    _curso_acta = getattr(estudiantes_db[0], 'curso', None)
+    if _curso_acta is not None and ano_act is not None:
+        _precarga = _precarga_curso_canonica(db, current_user, _curso_acta, ano_act)
+        _ids = list(idx_por_id.keys())
+        _comps = _datos_academicos_estudiantes(
+            db, current_user, _ids, ano_act, CalificacionPrimaria)
+        _recs = _datos_academicos_estudiantes(
+            db, current_user, _ids, ano_act, RecuperacionPrimaria)
+        _asist = _asistencias_estudiantes(db, current_user, _ids, ano_act)
+        for est in estudiantes_db:
+            idx = idx_por_id.get(est.id)
+            if idx is None:
                 continue
-            cf = round(sum(float(f) for f in finales) / 3)
-            rec = (recuperaciones.get(idx) or {}).get(area_canonica(nombre_asig) or '') or {}
-            situaciones.append(situacion_area(cf, rec.get('final'), rec.get('especial')))
-        if situaciones:
-            cond = condicion_final_estudiante(situaciones)
-            condiciones[idx] = ETIQUETA.get(cond.get('condicion'), cond.get('condicion', ''))
+            _paquete = _situacion_canonica_primaria(
+                db, current_user, est, ano_act, _precarga,
+                competencias_por_asig=_comps.get(est.id, {}),
+                recuperaciones_por_asig={k: v[0] for k, v
+                                         in (_recs.get(est.id) or {}).items() if v},
+                asistencias=_asist.get(est.id, []))
+            condiciones[idx] = ETIQUETA.get(
+                RAC.CONDICION_LEGACY_PRIMARIA.get(
+                    _paquete['situacion']['condicion']), '')
     return recuperaciones, condiciones
 
 
