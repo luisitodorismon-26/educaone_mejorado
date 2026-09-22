@@ -69,6 +69,14 @@ BLOQUEO_ASISTENCIA_NO_EVALUADA = 'ASISTENCIA_NO_EVALUADA'
 BLOQUEO_REVISION_ASISTENCIA = 'REVISION_ASISTENCIA_REQUERIDA'
 BLOQUEO_REPROBAR_ASIGNATURAS_SIN_NORMA = (
     'DECISION_REPROBAR_ASIGNATURAS_SIN_SOPORTE_NORMATIVO')
+BLOQUEO_GRADO_INVALIDO = 'GRADO_INVALIDO'
+BLOQUEO_CURRICULO_INVALIDO = 'CURRICULO_OFICIAL_INVALIDO'
+BLOQUEO_ASISTENCIA_INVALIDA = 'PORCENTAJE_ASISTENCIA_INVALIDO'
+BLOQUEO_ANTECEDENTE_EXCEPCION_2DO = (
+    'ANTECEDENTE_REPETICION_EXCEPCIONAL_2DO_NO_INFORMADO')
+BLOQUEO_REPETIR_NO_APLICA_1RO = 'DECISION_ASISTENCIA_REPETIR_NO_APLICA_1RO'
+BLOQUEO_REPETIR_2DO_REQUIERE_EXCEPCION = (
+    'DECISION_ASISTENCIA_REPETIR_2DO_REQUIERE_EXCEPCION_COLEGIADA')
 
 # ═══════════════════ INCONSISTENCIAS ═══════════════════
 # Datos que no encajan. Se informan; no se corrigen ni se borran.
@@ -77,6 +85,13 @@ INC_ESPECIAL_NO_ELEGIBLE_PRIMARIA = 'RECUPERACION_ESPECIAL_NO_ELEGIBLE_4_MAS'
 INC_ESPECIAL_NO_ELEGIBLE_SECUNDARIA = 'EVALUACION_ESPECIAL_NO_ELEGIBLE_3_MAS'
 INC_EXCEPCION_SEGUNDO_FUERA_DE_LUGAR = 'EXCEPCION_SEGUNDO_NO_APLICA_A_ESTE_GRADO'
 INC_ALFABETIZACION_FUERA_DE_TERCERO = 'ALFABETIZACION_SOLO_APLICA_EN_3RO'
+INC_AREAS_OFICIALES_NO_ESPERADAS = 'AREAS_OFICIALES_NO_ESPERADAS'
+INC_NIVEL_INCOMPATIBLE = 'RESULTADO_A1_NIVEL_INCOMPATIBLE'
+INC_ESTADO_A1_DESCONOCIDO = 'ESTADO_A1_DESCONOCIDO'
+INC_ALFABETIZACION_VALOR_INVALIDO = 'ALFABETIZACION_3RO_VALOR_INVALIDO'
+INC_EXCEPCION_SEGUNDO_INVALIDA = 'DECISION_EXCEPCIONAL_SEGUNDO_INVALIDA'
+INC_EXCEPCION_SEGUNDO_YA_UTILIZADA = (
+    'REPETICION_EXCEPCIONAL_SEGUNDO_YA_UTILIZADA')
 
 # Estas dos NO frenan la certificacion. Acompanan a un REPROBADO que ya
 # es definitivo por el numero de areas caidas: describen que en la base
@@ -93,6 +108,9 @@ ADV_PROMOCION_ASISTIDA = 'PROMOCION_ASISTIDA'
 ADV_TITULACION_PENDIENTE = 'REQUIERE_PROCESO_DE_TITULACION_PRUEBAS_NACIONALES'
 ADV_ASISTENCIA_NO_REVISADA = 'ASISTENCIA_NO_REVISADA_CAUSA_ACADEMICA_SUFICIENTE'
 ADV_ALFABETIZACION_NO_INFORMADA = 'ALFABETIZACION_NO_INFORMADA_CAUSA_SUFICIENTE'
+# El proceso academico sigue abierto: la revision de asistencia todavia no
+# toca. Se anota para que no se olvide, no para frenar el aplazamiento.
+ADV_ASISTENCIA_PENDIENTE_DE_REVISION = 'ASISTENCIA_PENDIENTE_DE_REVISION'
 
 # ═══════════════════ MOTIVOS ═══════════════════
 
@@ -141,6 +159,17 @@ DECISIONES_ASISTENCIA = (ASISTENCIA_PERMITIR_APROBACION,
                          ASISTENCIA_REPETIR_GRADO,
                          ASISTENCIA_REPROBAR_ASIGNATURAS)
 
+GRADOS_VALIDOS = (1, 2, 3, 4, 5, 6)
+
+# Lo unico que el caller puede pasar para la repeticion excepcional de 2.o.
+#
+# A2 NO determina si el equipo de gestion, psicologia, el docente, el
+# tecnico distrital y la familia cumplieron el procedimiento colegiado: eso
+# pertenece al flujo que capture la decision. A2 solo comprueba tres cosas
+# —que el grado sea 2.o, que la decision venga declarada, y que la
+# excepcion no se haya usado antes— y se niega si falta cualquiera.
+DECISION_EXCEPCIONAL_REPETIR = 'repetir'
+
 # ── Estados de A1, agrupados por lo que significan para el estudiante ──
 
 ESTADOS_APROBADOS = (
@@ -157,6 +186,42 @@ ESTADOS_PENDIENTES = (
     RA.PENDIENTE_COMPLETIVA,
     RA.PENDIENTE_EXTRAORDINARIA,
 )
+
+
+def _es_entero_real(valor):
+    """int de verdad. `True` es un int en Python y aqui no puede pasar por 1."""
+    return isinstance(valor, int) and not isinstance(valor, bool)
+
+
+def _es_numero_real(valor):
+    """int o float utilizables. Sin bool, sin NaN, sin infinitos, sin strings.
+
+    `"20"` no se convierte: convertir en silencio es como se cuelan los datos
+    que nadie valido.
+    """
+    if isinstance(valor, bool):
+        return False
+    if not isinstance(valor, (int, float)):
+        return False
+    return valor == valor and valor not in (float('inf'), float('-inf'))
+
+
+def _curriculo_utilizable(codigos):
+    """Una coleccion de codigos, no una cadena.
+
+    `'LE'` es iterable y se desharia en 'L' y 'E': un currículo de dos áreas
+    inexistentes. Por eso se rechazan str y bytes explícitamente.
+    """
+    if isinstance(codigos, (str, bytes)):
+        return False
+    try:
+        elementos = list(codigos)
+    except TypeError:
+        return False
+    for c in elementos:
+        if not isinstance(c, str) or not c.strip():
+            return False
+    return True
 
 
 def _resultado(nivel, grado_numero, condicion, motivo, conteos, codigos,
@@ -214,15 +279,17 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
     """Situación académica global de UN estudiante.
 
     `nivel`        — 'primaria' | 'secundaria'.
-    `grado_numero` — 1..6. Hace falta siempre: la norma es distinta por grado
-                     y sin él no se puede decidir nada.
-    `resultados`   — la lista de salidas de `resolver_nota_primaria` /
+    `grado_numero` — un entero de 1 a 6. Hace falta siempre y tiene que ser
+                     válido: la norma cambia por grado y no hay regla
+                     aplicable a un 0, a un 7 ni a la cadena '3'.
+    `resultados`   — las salidas de `resolver_nota_primaria` /
                      `resolver_nota_secundaria`, una por asignatura.
     `codigos_oficiales_esperados` — los bloques curriculares que el grado DEBE
-                     tener. Se compara como multiconjunto, no como set.
-    `contexto`     — datos que no salen de las notas y que nadie puede
-                     inferir: alfabetización inicial, porcentaje de ausencias
-                     no justificadas, decisiones del equipo de gestión.
+                     tener, como colección (no como cadena). Se compara y se
+                     SELECCIONA como multiconjunto.
+    `contexto`     — lo que no sale de las notas y nadie puede inferir:
+                     alfabetización inicial, ausencias no justificadas,
+                     decisiones del equipo de gestión.
 
     Nada de lo recibido se modifica.
     """
@@ -232,65 +299,85 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
     bloqueos, advertencias, inconsistencias = [], [], []
     conteos, codigos = _vacio()
 
-    # ── GATE 1 · nivel y grado ──
+    def cortar(*bloqueos_nuevos):
+        return _resultado(nivel, grado_numero, EN_PROCESO,
+                          MOTIVO_PROCESO_ABIERTO, conteos, codigos,
+                          bloqueos=list(bloqueos_nuevos))
+
+    # ── GATE 1 · nivel ──
     if nivel not in (NIVEL_PRIMARIA, NIVEL_SECUNDARIA):
-        return _resultado(nivel, grado_numero, EN_PROCESO, MOTIVO_PROCESO_ABIERTO,
-                          conteos, codigos,
-                          bloqueos=[BLOQUEO_NIVEL_NO_RECONOCIDO])
+        return cortar(BLOQUEO_NIVEL_NO_RECONOCIDO)
+
+    # ── GATE 2 · grado ──
     if grado_numero is None:
-        # Sin grado no se puede aplicar ninguna regla: 1.º y 6.º no comparten
-        # ni la repitencia ni la alfabetización ni el número de áreas.
-        return _resultado(nivel, grado_numero, EN_PROCESO, MOTIVO_PROCESO_ABIERTO,
-                          conteos, codigos,
-                          bloqueos=[BLOQUEO_GRADO_NO_DECLARADO])
+        return cortar(BLOQUEO_GRADO_NO_DECLARADO)
+    if not _es_entero_real(grado_numero) or grado_numero not in GRADOS_VALIDOS:
+        # 0, 7, -1, '3', True y 3.5 no son grados. Sin un grado real no se
+        # puede aplicar ninguna regla, y adivinar sería peor que parar.
+        return cortar(BLOQUEO_GRADO_INVALIDO)
 
-    # ── GATE 2 · separar currículo oficial del interno ──
-    oficiales = [r for r in resultados if _codigo(r) is not None]
-    no_oficiales = tuple(
-        r.get('area_curricular_codigo') for r in resultados
-        if _codigo(r) is None)
-    # Las internas no tienen código; se cuentan, no se nombran por texto.
-    codigos_no_oficiales = tuple(['(sin codigo oficial)'] * len(no_oficiales))
-
-    presentes = Counter(_codigo(r) for r in oficiales)
-
-    # ── GATE 3 · el currículo esperado tiene que venir declarado ──
+    # ── GATE 3 · el currículo esperado, declarado y utilizable ──
     if codigos_oficiales_esperados is None:
-        return _resultado(nivel, grado_numero, EN_PROCESO, MOTIVO_PROCESO_ABIERTO,
-                          conteos, codigos,
-                          bloqueos=[BLOQUEO_CURRICULO_NO_DECLARADO],
-                          codigos_no_oficiales=codigos_no_oficiales)
+        return cortar(BLOQUEO_CURRICULO_NO_DECLARADO)
+    if not _curriculo_utilizable(codigos_oficiales_esperados):
+        return cortar(BLOQUEO_CURRICULO_INVALIDO)
 
     esperados = Counter(codigos_oficiales_esperados)
     if not esperados:
-        return _resultado(nivel, grado_numero, EN_PROCESO, MOTIVO_PROCESO_ABIERTO,
-                          conteos, codigos,
-                          bloqueos=[BLOQUEO_SIN_CURRICULO_OFICIAL],
-                          codigos_no_oficiales=codigos_no_oficiales)
+        return cortar(BLOQUEO_SIN_CURRICULO_OFICIAL)
 
-    # ── GATE 4 · completitud del currículo ──
+    # ── GATE 4 · separar currículo oficial del interno ──
+    oficiales = [r for r in resultados if _codigo(r) is not None]
+    internas = [r for r in resultados if _codigo(r) is None]
+    codigos_no_oficiales = tuple(['(sin codigo oficial)'] * len(internas))
+
+    # ── GATE 5 · SELECCIÓN EXACTA del multiconjunto esperado ──
     #
-    # Evaluar «las materias que aparecieron» fue uno de los bugs originales:
-    # un estudiante con dos áreas cargadas de ocho salía promovido. Falta una
-    # comparación de multiconjuntos, no de conjuntos: un grado podría declarar
-    # dos veces el mismo bloque y ambas tienen que estar.
-    faltan = esperados - presentes
-    if faltan:
-        bloqueos.append(BLOQUEO_CURRICULO_INCOMPLETO)
-
-    # A partir de aquí solo cuentan las oficiales ESPERADAS. Una oficial de
-    # más no hace repetir a nadie, pero se deja ver como inconsistencia.
-    sobran = presentes - esperados
-    if sobran:
-        inconsistencias.append('AREAS_OFICIALES_NO_ESPERADAS')
-
-    # ── Clasificar ──
-    aprobados, pendientes_cod, no_aprobados = [], [], []
-    por_area_inconsistente = False
+    # No basta con «está en los esperados»: si el grado declara LE dos veces y
+    # llegan tres LE, solo dos participan. Se va consumiendo el Counter.
+    #
+    # Lo que sobra NO entra en ningún conteo ni en ninguna regla. Antes sí
+    # entraba, y una materia oficial no esperada podía subir el total, contar
+    # como reprobada y convertir un PROMOVIDO en APLAZADO.
+    restante = Counter(esperados)
+    oficiales_esperadas, sobrantes = [], []
     for r in oficiales:
         cod = _codigo(r)
+        if restante.get(cod, 0) > 0:
+            restante[cod] -= 1
+            oficiales_esperadas.append(r)
+        else:
+            sobrantes.append(r)
+
+    faltan = {c: n for c, n in restante.items() if n > 0}
+    if faltan:
+        bloqueos.append(BLOQUEO_CURRICULO_INCOMPLETO)
+    if sobrantes:
+        # Tampoco se ignora en silencio: la configuración curricular o los
+        # datos tienen que revisarse antes de certificar nada.
+        inconsistencias.append(INC_AREAS_OFICIALES_NO_ESPERADAS)
+        bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
+
+    # ── GATE 6 · cada área esperada, validada ──
+    for r in oficiales_esperadas:
+        if r.get('nivel') != nivel:
+            # Un resultado de Secundaria no puede decidir un grado de
+            # Primaria: los cortes y las fases son otros.
+            if INC_NIVEL_INCOMPATIBLE not in inconsistencias:
+                inconsistencias.append(INC_NIVEL_INCOMPATIBLE)
+        if r.get('estado') not in RA.ESTADOS:
+            # Un estado que A2 no conoce NO es una reprobación. Antes caía en
+            # `no_aprobados` y podía hacer repetir a alguien.
+            if INC_ESTADO_A1_DESCONOCIDO not in inconsistencias:
+                inconsistencias.append(INC_ESTADO_A1_DESCONOCIDO)
+
+    # ── GATE 7 · clasificar SOLO las esperadas ──
+    aprobados, pendientes_cod, no_aprobados = [], [], []
+    hubo_inconsistencia_de_area = False
+    for r in oficiales_esperadas:
+        cod = _codigo(r)
         if r.get('inconsistencias'):
-            por_area_inconsistente = True
+            hubo_inconsistencia_de_area = True
             for inc in r['inconsistencias']:
                 if inc not in inconsistencias:
                     inconsistencias.append(inc)
@@ -299,11 +386,13 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
             aprobados.append(cod)
         elif estado in ESTADOS_PENDIENTES:
             pendientes_cod.append(cod)
-        else:
+        elif estado in RA.ESTADOS:
             no_aprobados.append(cod)
+        # Un estado desconocido no se clasifica en ninguna parte: ya generó
+        # su inconsistencia en el gate 6.
 
     conteos = {
-        'total': len(oficiales),
+        'total': len(oficiales_esperadas),
         'aprobadas': len(aprobados),
         'pendientes': len(pendientes_cod),
         'no_aprobadas': len(no_aprobados),
@@ -318,70 +407,101 @@ def resolver_situacion_estudiante(nivel, grado_numero, resultados,
                           inconsistencias=inconsistencias,
                           codigos_no_oficiales=codigos_no_oficiales, **extra)
 
-    # ── GATE 5 · inconsistencias de A1 ──
-    #
-    # Fail-closed: si un área trae un dato que no encaja —una Especial donde
-    # no aplica, una fase sin CF base, dos CF distintas—, no se certifica
-    # nada hasta que alguien lo mire.
-    if por_area_inconsistente:
-        bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
+    # ── GATE 8 · inconsistencias heredadas o detectadas ──
+    if hubo_inconsistencia_de_area or INC_NIVEL_INCOMPATIBLE in inconsistencias \
+            or INC_ESTADO_A1_DESCONOCIDO in inconsistencias:
+        if BLOQUEO_DATOS_INCONSISTENTES not in bloqueos:
+            bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
 
-    # ── GATE 6 · áreas sin resolver ──
+    # ── GATE 9 · áreas sin resolver ──
     if pendientes_cod:
         bloqueos.append(BLOQUEO_AREAS_PENDIENTES)
+
+    # ── GATE 10 · el contexto, validado antes de usarlo ──
+    _validar_contexto(nivel, grado_numero, contexto, bloqueos, inconsistencias)
 
     if bloqueos:
         return salida(EN_PROCESO, MOTIVO_PROCESO_ABIERTO)
 
-    # ── GATE 7 · reglas por nivel y grado ──
-    #
-    # Las reglas de nivel pueden descubrir inconsistencias que no se veian
-    # antes (una Especial no elegible, una excepcion de 2.o en otro grado).
-    # Se cuentan para volver a aplicar el mismo criterio fail-closed.
+    # ── GATE 11 · reglas por nivel y grado ──
     _inc_antes = len(inconsistencias)
     if nivel == NIVEL_PRIMARIA:
         condicion, motivo, extra = _situacion_primaria(
-            grado_numero, oficiales, no_aprobados, contexto,
-            advertencias, inconsistencias)
+            grado_numero, oficiales_esperadas, no_aprobados, contexto,
+            advertencias, inconsistencias, bloqueos)
     else:
         condicion, motivo, extra = _situacion_secundaria(
-            grado_numero, oficiales, no_aprobados, contexto,
+            grado_numero, oficiales_esperadas, no_aprobados, contexto,
             advertencias, inconsistencias)
 
     nuevas = [i for i in inconsistencias[_inc_antes:]
               if i not in INCONSISTENCIAS_INFORMATIVAS]
-    if nuevas:
+    if nuevas and BLOQUEO_DATOS_INCONSISTENTES not in bloqueos:
         bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
 
-    # Alfabetizacion de 3.o sin declarar: no se puede certificar.
+    # ── GATE 12 · alfabetización de 3.º sin declarar ──
     if (nivel == NIVEL_PRIMARIA and grado_numero == GRADO_ALFABETIZACION_INICIAL
             and condicion != REPROBADO
             and contexto.get('alfabetizacion_inicial') is None):
         bloqueos.append(BLOQUEO_ALFABETIZACION_NO_INFORMADA)
 
-    # ── GATE 8 · asistencia ──
+    # ── GATE 13 · asistencia, en su momento normativo ──
     #
-    # Solo puede frenar una promoción o un aplazamiento. Si el estudiante ya
-    # resultó REPROBADO por las áreas, la falta del dato de asistencia no
-    # cambia nada: ya existe causa suficiente, y bloquear aquí solo dejaría
-    # sin certificar algo que la revisión de asistencia no podría revertir.
-    if condicion != REPROBADO:
-        freno = _gate_asistencia(contexto, bloqueos, advertencias)
+    # La Ordenanza 04-2023 plantea el análisis del exceso de ausencias para el
+    # estudiante que YA logró las competencias esperadas. Por eso el gate solo
+    # corre cuando el candidato académico es PROMOVIDO:
+    #
+    #   · APLAZADO significa que el proceso académico NO ha terminado. Frenar
+    #     ahí por una revisión de asistencia que todavía no toca convertiría
+    #     un aplazamiento legítimo en un limbo y escondería que al estudiante
+    #     le queda una Especial por hacer.
+    #   · REPROBADO ya tiene causa suficiente; la revisión no la revertiría.
+    if condicion == PROMOVIDO:
+        freno = _gate_asistencia(grado_numero, contexto, bloqueos,
+                                 advertencias, inconsistencias)
         if freno is not None:
             condicion, motivo, extra = freno
     else:
-        _anotar_asistencia_pendiente(contexto, advertencias)
+        _anotar_asistencia_pendiente(condicion, contexto, advertencias)
 
     if bloqueos:
         return salida(EN_PROCESO, MOTIVO_PROCESO_ABIERTO)
 
-    # ── GATE 9 · 6.º de Secundaria: la titulación es otra fase ──
+    # ── GATE 14 · 6.º de Secundaria: la titulación es otra fase ──
     if (nivel == NIVEL_SECUNDARIA and grado_numero == 6
             and condicion == PROMOVIDO):
         if ADV_TITULACION_PENDIENTE not in advertencias:
             advertencias.append(ADV_TITULACION_PENDIENTE)
 
     return salida(condicion, motivo, **extra)
+
+
+def _validar_contexto(nivel, grado_numero, contexto, bloqueos, inconsistencias):
+    """El contexto no se interpreta: se valida o se rechaza.
+
+    Un `"NO"` de alfabetización no es `False` ni es `None`, y sin esta
+    comprobación un 3.º podía salir PROMOVIDO con la alfabetización marcada
+    como no lograda en la cabeza de quien la escribió.
+    """
+    # Alfabetización: solo True, False o None.
+    if 'alfabetizacion_inicial' in contexto:
+        valor = contexto['alfabetizacion_inicial']
+        if valor is not None and not isinstance(valor, bool):
+            if grado_numero == GRADO_ALFABETIZACION_INICIAL:
+                inconsistencias.append(INC_ALFABETIZACION_VALOR_INVALIDO)
+                bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
+
+    # Excepción de 2.º: solo None o 'repetir'.
+    decision = contexto.get('decision_excepcional_segundo')
+    if decision is not None and decision != DECISION_EXCEPCIONAL_REPETIR:
+        inconsistencias.append(INC_EXCEPCION_SEGUNDO_INVALIDA)
+        bloqueos.append(BLOQUEO_DATOS_INCONSISTENTES)
+
+    # Porcentaje de ausencias: número real entre 0 y 100.
+    if 'porcentaje_ausencias_no_justificadas' in contexto:
+        p = contexto['porcentaje_ausencias_no_justificadas']
+        if p is not None and (not _es_numero_real(p) or p < 0 or p > 100):
+            bloqueos.append(BLOQUEO_ASISTENCIA_INVALIDA)
 
 
 # ═══════════════════════════ PRIMARIA ═══════════════════════════
@@ -399,7 +519,7 @@ def _fallo_tras_recuperacion_final(r):
 
 
 def _situacion_primaria(grado_numero, oficiales, no_aprobados, contexto,
-                        advertencias, inconsistencias):
+                        advertencias, inconsistencias, bloqueos):
     caidas = [r for r in oficiales if _fallo_tras_recuperacion_final(r)]
     en_especial = [r for r in caidas
                    if r.get('fase') == RA.FASE_RECUPERACION_ESPECIAL]
@@ -407,13 +527,22 @@ def _situacion_primaria(grado_numero, oficiales, no_aprobados, contexto,
     # ── 1.º y 2.º: la norma no contempla repitencia ──
     if grado_numero in GRADOS_SIN_REPITENCIA:
         decision = contexto.get('decision_excepcional_segundo')
-        if decision == 'repetir':
-            if grado_numero == GRADO_EXCEPCION_COLEGIADA:
+        if decision == DECISION_EXCEPCIONAL_REPETIR:
+            if grado_numero != GRADO_EXCEPCION_COLEGIADA:
+                inconsistencias.append(INC_EXCEPCION_SEGUNDO_FUERA_DE_LUGAR)
+            else:
                 # La repetición excepcional de 2.º es una decisión colegiada,
-                # no un cálculo. A2 la acepta si viene declarada; no la deduce
-                # jamás de una nota.
-                return (REPROBADO, MOTIVO_EXCEPCION_SEGUNDO, {})
-            inconsistencias.append(INC_EXCEPCION_SEGUNDO_FUERA_DE_LUGAR)
+                # no un cálculo, y la norma la permite UNA SOLA VEZ. A2 no
+                # tiene historial y no lo va a inventar: si no le dicen si ya
+                # se usó, no certifica.
+                ya_usada = contexto.get(
+                    'repeticion_excepcional_segundo_ya_utilizada')
+                if ya_usada is True:
+                    inconsistencias.append(INC_EXCEPCION_SEGUNDO_YA_UTILIZADA)
+                elif ya_usada is None:
+                    bloqueos.append(BLOQUEO_ANTECEDENTE_EXCEPCION_2DO)
+                else:
+                    return (REPROBADO, MOTIVO_EXCEPCION_SEGUNDO, {})
 
         if no_aprobados:
             # El motor numérico no puede inventar una repitencia que la norma
@@ -448,6 +577,10 @@ def _gate_alfabetizacion(contexto, condicion, motivo, advertencias):
     asistencia. O llega declarada o no se sabe.
     """
     alfabetizacion = contexto.get('alfabetizacion_inicial')
+    if alfabetizacion is not None and not isinstance(alfabetizacion, bool):
+        # Un valor que no es booleano ya genero su bloqueo en la validacion
+        # del contexto. Aqui no se interpreta de ninguna manera.
+        return (condicion, motivo)
 
     if condicion == REPROBADO:
         # Ya hay causa suficiente de repitencia. Que falte el dato no puede
@@ -529,14 +662,22 @@ def _cascada_especial(caidas, en_especial, no_aprobados, maximo_elegible,
 
 # ═══════════════════════ ASISTENCIA ═══════════════════════
 
-def _anotar_asistencia_pendiente(contexto, advertencias):
+def _anotar_asistencia_pendiente(condicion, contexto, advertencias):
+    """El proceso no ha terminado o ya hay causa suficiente: se anota y se sigue."""
     porcentaje = contexto.get('porcentaje_ausencias_no_justificadas')
-    if porcentaje is None or porcentaje > MAX_AUSENCIAS_NO_JUSTIFICADAS:
-        if ADV_ASISTENCIA_NO_REVISADA not in advertencias:
-            advertencias.append(ADV_ASISTENCIA_NO_REVISADA)
+    pendiente = (porcentaje is None
+                 or not _es_numero_real(porcentaje)
+                 or porcentaje > MAX_AUSENCIAS_NO_JUSTIFICADAS)
+    if not pendiente:
+        return
+    aviso = (ADV_ASISTENCIA_NO_REVISADA if condicion == REPROBADO
+             else ADV_ASISTENCIA_PENDIENTE_DE_REVISION)
+    if aviso not in advertencias:
+        advertencias.append(aviso)
 
 
-def _gate_asistencia(contexto, bloqueos, advertencias):
+def _gate_asistencia(grado_numero, contexto, bloqueos, advertencias,
+                     inconsistencias):
     """Ordenanza 04-2023: el 80% de asistencia es requisito, pero pasarse del
     20% de ausencias NO justificadas no reprueba por sí solo.
 
@@ -564,6 +705,17 @@ def _gate_asistencia(contexto, bloqueos, advertencias):
         return None
 
     if decision == ASISTENCIA_REPETIR_GRADO:
+        # 1.º no contempla repitencia: ninguna vía, tampoco esta, puede
+        # producirla. Se para y se dice.
+        if grado_numero == 1:
+            bloqueos.append(BLOQUEO_REPETIR_NO_APLICA_1RO)
+            return None
+        # En 2.º la única repetición posible es la excepcional, colegiada y
+        # por una sola vez. La vía genérica de asistencia no puede saltársela:
+        # hay que formalizarla por el contexto de la excepción.
+        if grado_numero == GRADO_EXCEPCION_COLEGIADA:
+            bloqueos.append(BLOQUEO_REPETIR_2DO_REQUIERE_EXCEPCION)
+            return None
         return (REPROBADO, MOTIVO_DECISION_ASISTENCIA, {})
 
     if decision == ASISTENCIA_REPROBAR_ASIGNATURAS:

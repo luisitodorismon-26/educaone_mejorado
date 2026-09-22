@@ -326,12 +326,39 @@ def _():
           'ni con las ocho areas caidas se repite sin decision humana')
 
 
-@test("A6  2do con decision colegiada explicita -> REPROBADO")
+@test("A6  2do con decision colegiada + antecedente -> REPROBADO")
 def _():
-    r = prim(2, todas(), {'decision_excepcional_segundo': 'repetir'})
+    # CAMBIO DE CONTRATO (A2.1): la norma permite la repeticion excepcional
+    # de 2do UNA SOLA VEZ, asi que hace falta saber si ya se uso.
+    r = prim(2, todas(), {'decision_excepcional_segundo': 'repetir',
+                          'repeticion_excepcional_segundo_ya_utilizada': False})
     igual(r['condicion'], PA.REPROBADO)
     igual(r['motivo'], PA.MOTIVO_EXCEPCION_SEGUNDO)
     igual(r['es_definitiva'], True)
+
+
+@test("A6b 2do con decision pero SIN antecedente -> EN_PROCESO")
+def _():
+    r = prim(2, todas(), {'decision_excepcional_segundo': 'repetir'})
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_ANTECEDENTE_EXCEPCION_2DO in r['bloqueos'], r['bloqueos']
+
+
+@test("A6c 2do con la excepcion YA utilizada -> no se repite otra vez")
+def _():
+    r = prim(2, todas(), {'decision_excepcional_segundo': 'repetir',
+                          'repeticion_excepcional_segundo_ya_utilizada': True})
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.INC_EXCEPCION_SEGUNDO_YA_UTILIZADA in r['inconsistencias'], \
+        r['inconsistencias']
+
+
+@test("A6d un valor invalido de la excepcion NO se ignora")
+def _():
+    for valor in ('REPETIR', 'si', 1, True, [], {}):
+        r = prim(2, todas(), {'decision_excepcional_segundo': valor})
+        igual(r['condicion'], PA.EN_PROCESO, repr(valor))
+        assert PA.INC_EXCEPCION_SEGUNDO_INVALIDA in r['inconsistencias'], valor
 
 
 @test("A7  la excepcion de 2do NO se admite en 1ro")
@@ -733,6 +760,248 @@ def _():
           False)
     r = sec(6, sec_fallos(3, RA.NO_APROBADA_TRAS_EXTRAORDINARIA))
     igual(PA.ADV_TITULACION_PENDIENTE in r['advertencias'], False)
+
+
+# ══════════════════ W · GATES ENDURECIDOS (A2.1) ══════════════════
+print(f"\n{B}GATES ENDURECIDOS (A2.1){X}")
+
+CUATRO = ['LE', 'MAT', 'CS', 'CN']
+
+
+@test("W1  EL BUG: una oficial SOBRANTE no altera la decision")
+def _():
+    # Cuatro esperadas aprobadas + una oficial NO esperada reprobada.
+    # Antes subia total_oficiales a 5, contaba como reprobada y convertia
+    # el PROMOVIDO en APLAZADO.
+    res = [area(c, RA.APROBADA) for c in CUATRO]
+    res.append(area('EF', RA.NO_APROBADA_TRAS_RECUPERACION_FINAL))
+    r = prim(4, res, curriculo=CUATRO)
+    igual(r['total_oficiales'], 4, 'la sobrante no cuenta')
+    igual(r['no_aprobadas'], 0, 'la sobrante no puede aparecer como reprobada')
+    igual(r['aprobadas'], 4)
+    assert 'EF' not in r['codigos_no_aprobados'], r['codigos_no_aprobados']
+    assert PA.INC_AREAS_OFICIALES_NO_ESPERADAS in r['inconsistencias']
+    igual(r['condicion'], PA.EN_PROCESO, 'tampoco se promueve en silencio')
+    assert PA.BLOQUEO_DATOS_INCONSISTENTES in r['bloqueos']
+
+
+@test("W2  una sobrante APROBADA tambien bloquea")
+def _():
+    res = [area(c, RA.APROBADA) for c in CUATRO] + [area('EF', RA.APROBADA)]
+    r = prim(4, res, curriculo=CUATRO)
+    igual(r['total_oficiales'], 4)
+    igual(r['aprobadas'], 4, 'la sobrante no infla el conteo')
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.INC_AREAS_OFICIALES_NO_ESPERADAS in r['inconsistencias']
+
+
+@test("W3  seleccion EXACTA del multiconjunto: LE, LE, MAT con tres LE")
+def _():
+    res = [area('LE', RA.APROBADA), area('LE', RA.APROBADA),
+           area('LE', RA.NO_APROBADA_TRAS_RECUPERACION_FINAL),
+           area('MAT', RA.APROBADA)]
+    r = prim(4, res, curriculo=['LE', 'LE', 'MAT'])
+    igual(r['total_oficiales'], 3, 'participan LE, LE y MAT; la tercera LE no')
+    igual(r['no_aprobadas'], 0, 'la LE sobrante no entra')
+    assert PA.INC_AREAS_OFICIALES_NO_ESPERADAS in r['inconsistencias']
+
+
+@test("W4  sin sobrantes, el multiconjunto repetido funciona con normalidad")
+def _():
+    res = [area('LE', RA.APROBADA), area('LE', RA.APROBADA),
+           area('MAT', RA.APROBADA)]
+    r = prim(4, res, curriculo=['LE', 'LE', 'MAT'])
+    igual(r['condicion'], PA.PROMOVIDO)
+    igual(r['total_oficiales'], 3)
+    igual(r['inconsistencias'], ())
+
+
+@test("W5  grado invalido -> EN_PROCESO en los seis casos")
+def _():
+    for grado in (0, 7, -1, '3', True, 3.5):
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, grado, todas(),
+                                             CURRICULO_PRIM, OK_ASIST)
+        igual(r['condicion'], PA.EN_PROCESO, repr(grado))
+        igual(r['es_definitiva'], False, repr(grado))
+        assert PA.BLOQUEO_GRADO_INVALIDO in r['bloqueos'], repr(grado)
+
+
+@test("W6  los grados 1..6 se aceptan")
+def _():
+    for grado in (1, 2, 3, 4, 5, 6):
+        ctx = {'alfabetizacion_inicial': True} if grado == 3 else {}
+        r = prim(grado, todas(), ctx)
+        assert PA.BLOQUEO_GRADO_INVALIDO not in r['bloqueos'], grado
+        igual(r['condicion'], PA.PROMOVIDO, 'grado %d' % grado)
+
+
+@test("W7  nivel de A1 incompatible -> fail-closed")
+def _():
+    res = todas()
+    res[0] = area('LE', RA.APROBADA, nivel=RA.NIVEL_SECUNDARIA)
+    r = prim(4, res)
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.INC_NIVEL_INCOMPATIBLE in r['inconsistencias'], r['inconsistencias']
+    assert PA.BLOQUEO_DATOS_INCONSISTENTES in r['bloqueos']
+
+
+@test("W8  estado A1 desconocido NO se interpreta como reprobacion")
+def _():
+    for estado in (None, '', 'XYZ', 'aprobada', 123):
+        res = todas()
+        res[0] = area('LE', estado)
+        r = prim(4, res)
+        igual(r['condicion'], PA.EN_PROCESO, repr(estado))
+        igual(r['no_aprobadas'], 0,
+              'un estado desconocido no puede hacer repetir: %r' % (estado,))
+        assert PA.INC_ESTADO_A1_DESCONOCIDO in r['inconsistencias'], repr(estado)
+
+
+@test("W9  alfabetizacion con valor invalido -> EN_PROCESO, no PROMOVIDO")
+def _():
+    # «NO» no es False ni None: sin esto, 3ro salia PROMOVIDO.
+    for valor in ('NO', 'SI', 0, 1, [], {}, 'False'):
+        r = prim(3, todas(), {'alfabetizacion_inicial': valor})
+        igual(r['condicion'], PA.EN_PROCESO, repr(valor))
+        assert PA.INC_ALFABETIZACION_VALOR_INVALIDO in r['inconsistencias'], \
+            repr(valor)
+
+
+@test("W10 los tres valores validos de alfabetizacion siguen funcionando")
+def _():
+    igual(prim(3, todas(), {'alfabetizacion_inicial': True})['condicion'],
+          PA.PROMOVIDO)
+    igual(prim(3, todas(), {'alfabetizacion_inicial': False})['condicion'],
+          PA.REPROBADO)
+    igual(prim(3, todas(), {'alfabetizacion_inicial': None})['condicion'],
+          PA.EN_PROCESO)
+
+
+@test("W11 porcentaje de asistencia invalido -> EN_PROCESO")
+def _():
+    for valor in ('20', [], True, -1, 100.1, float('nan'), float('inf'), {}):
+        r = PA.resolver_situacion_estudiante(
+            RA.NIVEL_PRIMARIA, 4, todas(), CURRICULO_PRIM,
+            {'porcentaje_ausencias_no_justificadas': valor})
+        igual(r['condicion'], PA.EN_PROCESO, repr(valor))
+        assert PA.BLOQUEO_ASISTENCIA_INVALIDA in r['bloqueos'], repr(valor)
+
+
+@test("W12 porcentajes validos en los bordes")
+def _():
+    for valor in (0, 0.0, 20, 20.0, 100):
+        r = PA.resolver_situacion_estudiante(
+            RA.NIVEL_PRIMARIA, 4, todas(), CURRICULO_PRIM,
+            {'porcentaje_ausencias_no_justificadas': valor,
+             'decision_asistencia': PA.ASISTENCIA_PERMITIR_APROBACION})
+        assert PA.BLOQUEO_ASISTENCIA_INVALIDA not in r['bloqueos'], repr(valor)
+
+
+@test("W13 curriculo esperado como CADENA -> invalido, no se deshace en letras")
+def _():
+    r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, todas(),
+                                         'LE', OK_ASIST)
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_CURRICULO_INVALIDO in r['bloqueos'], r['bloqueos']
+
+
+@test("W14 elementos invalidos del curriculo -> bloqueo")
+def _():
+    for curr in ([''], ['  '], [None], ['LE', 3], ['LE', b'MAT']):
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, todas(),
+                                             curr, OK_ASIST)
+        igual(r['condicion'], PA.EN_PROCESO, repr(curr))
+        assert PA.BLOQUEO_CURRICULO_INVALIDO in r['bloqueos'], repr(curr)
+
+
+# ── El momento normativo de la asistencia ──
+@test("W15 APLAZADO sin asistencia sigue APLAZADO, no EN_PROCESO")
+def _():
+    # El proceso academico NO ha terminado: la revision de asistencia todavia
+    # no toca, y esconder el aplazamiento ocultaria que queda una Especial.
+    r = PA.resolver_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 4,
+        con_fallos(1, RA.NO_APROBADA_TRAS_RECUPERACION_FINAL),
+        CURRICULO_PRIM, {})
+    igual(r['condicion'], PA.APLAZADO)
+    igual(r['requiere_recuperacion_especial'], True)
+    assert PA.ADV_ASISTENCIA_PENDIENTE_DE_REVISION in r['advertencias']
+
+
+@test("W16 SECUNDARIA: APLAZADO sin asistencia sigue APLAZADO")
+def _():
+    r = PA.resolver_situacion_estudiante(
+        RA.NIVEL_SECUNDARIA, 2,
+        con_fallos(1, RA.NO_APROBADA_TRAS_EXTRAORDINARIA,
+                   curriculo=CURRICULO_SEC, nivel=RA.NIVEL_SECUNDARIA),
+        CURRICULO_SEC, {})
+    igual(r['condicion'], PA.APLAZADO)
+    igual(r['requiere_evaluacion_especial'], True)
+
+
+@test("W17 al pasar a PROMOVIDO, la asistencia SI se exige")
+def _():
+    # Misma area, ya superada la Especial: ahora el gate corresponde.
+    r = PA.resolver_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 4,
+        con_fallos(1, RA.APROBADA_RECUPERACION_ESPECIAL,
+                   fase=RA.FASE_RECUPERACION_ESPECIAL),
+        CURRICULO_PRIM, {})
+    igual(r['condicion'], PA.EN_PROCESO, 'ahora si toca revisar la asistencia')
+    assert PA.BLOQUEO_ASISTENCIA_NO_EVALUADA in r['bloqueos']
+
+
+@test("W18 1ro NO puede repetir por la via generica de asistencia")
+def _():
+    r = PA.resolver_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 1, todas(), CURRICULO_PRIM,
+        {'porcentaje_ausencias_no_justificadas': 25,
+         'decision_asistencia': PA.ASISTENCIA_REPETIR_GRADO})
+    igual(r['condicion'], PA.EN_PROCESO, 'en 1ro no se contempla la repitencia')
+    assert PA.BLOQUEO_REPETIR_NO_APLICA_1RO in r['bloqueos'], r['bloqueos']
+
+
+@test("W19 2do exige formalizar por la excepcion colegiada")
+def _():
+    r = PA.resolver_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 2, todas(), CURRICULO_PRIM,
+        {'porcentaje_ausencias_no_justificadas': 25,
+         'decision_asistencia': PA.ASISTENCIA_REPETIR_GRADO})
+    igual(r['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_REPETIR_2DO_REQUIERE_EXCEPCION in r['bloqueos'], \
+        r['bloqueos']
+
+
+@test("W20 3ro-6to y Secundaria SI aceptan REPETIR_GRADO por asistencia")
+def _():
+    for grado in (3, 4, 5, 6):
+        ctx = {'porcentaje_ausencias_no_justificadas': 25,
+               'decision_asistencia': PA.ASISTENCIA_REPETIR_GRADO}
+        if grado == 3:
+            ctx['alfabetizacion_inicial'] = True
+        r = PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, grado, todas(),
+                                             CURRICULO_PRIM, ctx)
+        igual(r['condicion'], PA.REPROBADO, 'grado %d' % grado)
+        igual(r['motivo'], PA.MOTIVO_DECISION_ASISTENCIA)
+    r2 = PA.resolver_situacion_estudiante(
+        RA.NIVEL_SECUNDARIA, 3, sec_todas(), CURRICULO_SEC,
+        {'porcentaje_ausencias_no_justificadas': 25,
+         'decision_asistencia': PA.ASISTENCIA_REPETIR_GRADO})
+    igual(r2['condicion'], PA.REPROBADO)
+
+
+@test("W21 nada de lo recibido se muta, ni el curriculo")
+def _():
+    resultados = todas()
+    curriculo = list(CURRICULO_PRIM)
+    contexto = dict(OK_ASIST)
+    a, b, c = (copy.deepcopy(resultados), copy.deepcopy(curriculo),
+               copy.deepcopy(contexto))
+    PA.resolver_situacion_estudiante(RA.NIVEL_PRIMARIA, 4, resultados,
+                                     curriculo, contexto)
+    igual(resultados, a, 'resultados mutados')
+    igual(curriculo, b, 'curriculo mutado')
+    igual(contexto, c, 'contexto mutado')
 
 
 # ══════════════════ Z · PUREZA Y NO-DIVERGENCIA ══════════════════
