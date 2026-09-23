@@ -3,9 +3,17 @@
 Autovinculación de asignaturas a su bloque curricular oficial (R2.1E).
 
 R2.1C dejó `Asignatura.area_curricular_codigo` como la ÚNICA identidad válida
-hacia los 9 bloques del Registro de Secundaria, y obliga a que la configure
-Dirección. En la práctica eso pide configurar a mano materias que no tienen
-ninguna ambigüedad: "Inglés" es LEI en todos los colegios del país.
+hacia los 9 bloques curriculares oficiales del MINERD, y obliga a que la
+configure Dirección. En la práctica eso pide configurar a mano materias que no
+tienen ninguna ambigüedad: "Inglés" es LEI en todos los colegios del país.
+
+R4-A3.3: esa identidad vale ahora para los DOS niveles —los ocho bloques del
+Nivel Primario comparten código y nombre oficial con sus equivalentes de
+Secundaria—. Este módulo NO cambia por eso: sigue cubriendo exactamente los
+mismos nombres inequívocos y sigue sin inferir nada que no sea una
+coincidencia exacta. La tabla de alias se deja intacta a propósito: tocarla
+haría que el backfill de arranque pudiera escribir relaciones nuevas en el
+próximo deploy, y A3.3 no introduce ninguna escritura.
 
 Este módulo cubre solo ese caso: nombres OFICIALES INEQUÍVOCOS. Es un atajo de
 alta, no una fuente de verdad.

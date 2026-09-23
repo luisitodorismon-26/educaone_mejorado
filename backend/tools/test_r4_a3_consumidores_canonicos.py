@@ -85,10 +85,12 @@ GRADO_SEC_REF = 3
 AREAS_SEC = list(AD.curriculo_oficial_esperado(
     RA.NIVEL_SECUNDARIA, GRADO_SEC_REF)[0])
 
-# Primaria no tiene catalogo equivalente (ver CUR7-CUR9). Para las pruebas
-# que fijan el comportamiento de A2 en Primaria se declara el curriculo
-# explicitamente, como hara el dia que exista una fuente oficial.
-AREAS_PRIM = ['LE', 'MAT', 'CS', 'CN', 'EA', 'EF', 'FIHR', 'LEI']
+# R4-A3.3: Primaria ya tiene catalogo propio (PRI-2023), y las areas se LEEN
+# de el. El grado de referencia es de SEGUNDO ciclo para que las pruebas
+# generales trabajen con el curriculo completo —ocho areas, Ingles incluido—.
+GRADO_PRIM_REF = 4
+AREAS_PRIM = list(AD.curriculo_oficial_esperado(
+    RA.NIVEL_PRIMARIA, GRADO_PRIM_REF)[0])
 
 
 def asignatura(id_, codigo, nombre=None):
@@ -181,22 +183,35 @@ def recuperacion(asig_id, cf_area, final=None, especial=None):
         cf_area=cf_area, recuperacion_final=final, recuperacion_especial=especial)
 
 
-def caidas_tras_final(n, nota=50, recuperada=55):
+def caidas_tras_final(n, nota=50, recuperada=55, grado_numero=4):
     """`n` areas que YA hicieron la Recuperacion Final y siguieron por debajo.
 
     Sin la fila de `RecuperacionPrimaria` el area esta PENDIENTE de la Final,
     no reprobada: A2 responderia EN_PROCESO, y con razon. Para probar una
     cascada hay que haber llegado hasta ella.
     """
-    notas = {AREAS_PRIM[i]: nota for i in range(n)}
+    areas = areas_del_grado(grado_numero)
+    notas = {areas[i]: nota for i in range(n)}
     recs = {i + 1: recuperacion(i + 1, nota, final=recuperada) for i in range(n)}
     return notas, recs
 
 
+def areas_del_grado(grado_numero):
+    """Las areas que el catalogo de Primaria espera para ese grado."""
+    return list(AD.curriculo_oficial_esperado(
+        RA.NIVEL_PRIMARIA, grado_numero)[0])
+
+
 def situacion_prim(notas_por_area, grado_numero, recuperaciones=None,
-                   contexto=None, internas=None):
+                   contexto=None, internas=None, extras=()):
+    """El camino canonico de Primaria, con el curriculo REAL del grado.
+
+    `extras` son materias con identidad curricular valida que NO pertenecen a
+    este grado —Ingles en 1.o es el caso real—: se cargan como las demas y la
+    capa A3 es la que decide que no participan.
+    """
     asignaturas, comps, asignaciones = [], {}, []
-    for i, codigo in enumerate(AREAS_PRIM, start=1):
+    for i, codigo in enumerate(areas_del_grado(grado_numero), start=1):
         asignaturas.append(asignatura(i, codigo))
         asignaciones.append(asignacion(i))
         comps[i] = comps_prim(i, notas_por_area.get(codigo, 90))
@@ -204,20 +219,27 @@ def situacion_prim(notas_por_area, grado_numero, recuperaciones=None,
         asignaturas.append(asignatura(j, None, nombre))
         asignaciones.append(asignacion(j))
         comps[j] = comps_prim(j, nota)
-    # Primaria no tiene fuente curricular oficial (CUR7-CUR9): aqui se
-    # declara para poder fijar lo que hace A2 por grado. El camino REAL
-    # devuelve el GAP, y eso se comprueba aparte.
-    curriculo = tuple(AREAS_PRIM)
-    resultados = AD.resultados_primaria(asignaturas, comps,
-                                        dict(recuperaciones or {}), grado_numero)
+    for k, codigo in enumerate(extras or (), start=201):
+        asignaturas.append(asignatura(k, codigo))
+        asignaciones.append(asignacion(k))
+        comps[k] = comps_prim(k, notas_por_area.get(codigo, 90))
+
+    # R4-A3.3: el curriculo sale del catalogo del grado, no de una lista fija.
+    curriculo, fuente_prim, _d = AD.curriculo_oficial_esperado(
+        RA.NIVEL_PRIMARIA, grado_numero)
+    resultados, adicionales = AD.resultados_primaria(
+        asignaturas, comps, dict(recuperaciones or {}), grado_numero,
+        codigos_oficiales_esperados=curriculo)
     # `construir_contexto` ANOTA en la lista que recibe: es la misma que luego
     # viaja al paquete. Quedarse con una copia vacia perdia el diagnostico.
     diagnosticos = []
     ctx = AD.construir_contexto(grado_numero, RA.NIVEL_PRIMARIA, 5, diagnosticos)
     ctx.update(contexto or {})
-    return AD.construir_situacion_estudiante(
+    paquete = AD.construir_situacion_estudiante(
         RA.NIVEL_PRIMARIA, grado_numero, resultados, curriculo, ctx,
-        diagnosticos=diagnosticos)
+        diagnosticos=diagnosticos, fuente_curriculo=fuente_prim)
+    paquete['adicionales'] = tuple(adicionales)
+    return paquete
 
 
 def codigo_efectivo(fuente):
@@ -720,12 +742,15 @@ def _():
     # `catalogo_indicadores` lee un JSON versionado del repositorio. No abre
     # base de datos, no tiene sesion y ningun tenant lo edita: es una
     # constante, como los otros dos modulos.
-    igual(mods, ['catalogo_indicadores', 'promocion_academica', 're',
-                 'resultado_academico'])
+    igual(mods, ['catalogo_indicadores', 'catalogo_primaria',
+                 'promocion_academica', 're', 'resultado_academico'])
     import catalogo_indicadores as _cat
-    fuente_cat = inspect.getsource(_cat)
-    for prohibido in ('sqlalchemy', 'session', 'db.', 'models'):
-        assert prohibido not in fuente_cat, prohibido
+    import catalogo_primaria as _cpri
+    for _mod in (_cat, _cpri):
+        fuente_cat = inspect.getsource(_mod)
+        for prohibido in ('sqlalchemy', 'session', 'db.', 'models',
+                          'commit', 'flush'):
+            assert prohibido not in fuente_cat, (_mod.__name__, prohibido)
 
 
 @test("S5  el adaptador no escribe ni nombra una sesion")
@@ -1150,25 +1175,31 @@ def _():
         assert codigos, 'grado %d sin areas' % g
 
 
-@test("CUR8 Primaria: GAP declarado en los seis grados, no un apaño")
+@test("CUR8 Primaria: el GAP se cerro, ahora hay catalogo en los seis grados")
 def _():
     for g in range(1, 7):
         codigos, fuente, diag = AD.curriculo_oficial_esperado(
             RA.NIVEL_PRIMARIA, g)
-        igual(codigos, None, 'grado %d' % g)
-        igual(fuente, None)
-        igual(diag, AD.DIAG_GAP_CURRICULO_ESPERADO, 'grado %d' % g)
+        igual(diag, None, 'grado %d' % g)
+        igual(fuente, AD.FUENTE_CATALOGO_PRIMARIA, 'grado %d' % g)
+        assert codigos, 'grado %d sin areas' % g
 
 
-@test("CUR9 el GAP de Primaria bloquea; NO usa las asignaciones de reserva")
+@test("CUR9 un curriculo no declarado sigue bloqueando")
 def _():
+    # El GAP ya no lo produce Primaria, pero el camino tiene que seguir
+    # existiendo: un nivel desconocido o un grado ilegible no certifican.
+    for nivel, grado in ((RA.NIVEL_PRIMARIA, None), ('inicial', 3),
+                         (RA.NIVEL_SECUNDARIA, 0)):
+        codigos, fuente, diag = AD.curriculo_oficial_esperado(nivel, grado)
+        igual(codigos, None, '%s %r' % (nivel, grado))
+        assert diag, '%s %r' % (nivel, grado)
     s = AD.construir_situacion_estudiante(
         RA.NIVEL_PRIMARIA, 4, [], None,
         {'porcentaje_ausencias_no_justificadas': 5},
         diagnosticos=[AD.DIAG_GAP_CURRICULO_ESPERADO])
     igual(s['situacion']['condicion'], PA.EN_PROCESO)
     assert PA.BLOQUEO_CURRICULO_NO_DECLARADO in s['situacion']['bloqueos']
-    assert AD.DIAG_GAP_CURRICULO_ESPERADO in s['diagnosticos']
 
 
 @test("CUR10 `curriculo_oficial_esperado` no acepta nada del docente")
@@ -1237,6 +1268,342 @@ def _():
         assert 'curriculo_desde_asignaciones' not in cuerpo, nombre
     precarga = fuente_migrada('_precarga_curso_canonica')
     assert 'curriculo_oficial_esperado' in precarga
+
+
+
+
+# ═══════════ PRIM · CURRICULO CANONICO DE PRIMARIA (A3.3) ═══════════
+#
+# IDENTIDAD NO ES PARTICIPACION, y esta seccion existe sobre todo por eso.
+#
+# `Asignatura.area_curricular_codigo` dice QUE area oficial representa una
+# materia. No dice que esa area cuente en TODOS los grados. Un colegio privado
+# que ensena Ingles en 1.o tiene una asignatura con identidad LEI correcta, y
+# aun asi LEI no esta en el curriculo oficial de 1.o: hacerla participar
+# reprobaria a un nino de primero por una materia que la norma no le exige.
+print(f"\n{B}PRIM · PRIMARIA: CURRICULO POR CICLO E IDENTIDAD vs PARTICIPACION{X}")
+
+import catalogo_primaria as CPRI                                  # noqa: E402
+
+PRIMER_CICLO = ('LE', 'MAT', 'CS', 'CN', 'EF', 'FIHR', 'EA')
+
+
+def _curriculo(grado):
+    return AD.curriculo_oficial_esperado(RA.NIVEL_PRIMARIA, grado)
+
+
+@test("PRIM1 1.o espera exactamente 7 areas, sin Ingles")
+def _():
+    codigos, fuente, diag = _curriculo(1)
+    igual(diag, None)
+    igual(len(codigos), 7)
+    igual(sorted(codigos), sorted(PRIMER_CICLO))
+    assert 'LEI' not in codigos, codigos
+    igual(fuente, AD.FUENTE_CATALOGO_PRIMARIA)
+
+
+@test("PRIM2 2.o espera exactamente 7, sin Ingles")
+def _():
+    codigos, _f, diag = _curriculo(2)
+    igual(diag, None)
+    igual(len(codigos), 7)
+    assert 'LEI' not in codigos, codigos
+
+
+@test("PRIM3 3.o espera exactamente 7, sin Ingles")
+def _():
+    codigos, _f, diag = _curriculo(3)
+    igual(diag, None)
+    igual(len(codigos), 7)
+    assert 'LEI' not in codigos, codigos
+
+
+@test("PRIM4 4.o espera 8, con Ingles")
+def _():
+    codigos, _f, diag = _curriculo(4)
+    igual(diag, None)
+    igual(len(codigos), 8)
+    assert 'LEI' in codigos, codigos
+    igual(sorted(set(codigos) - {'LEI'}), sorted(PRIMER_CICLO))
+
+
+@test("PRIM5 5.o espera 8, con Ingles")
+def _():
+    codigos, _f, diag = _curriculo(5)
+    igual(len(codigos), 8)
+    assert 'LEI' in codigos, codigos
+
+
+@test("PRIM6 6.o espera 8, con Ingles")
+def _():
+    codigos, _f, diag = _curriculo(6)
+    igual(len(codigos), 8)
+    assert 'LEI' in codigos, codigos
+
+
+@test("PRIM7 Frances NUNCA se espera en Primaria, en ningun grado")
+def _():
+    for g in range(1, 7):
+        codigos, _f, _d = _curriculo(g)
+        assert 'LEF' not in codigos, 'grado %d: %s' % (g, codigos)
+    assert not CPRI.area_valida('LEF'), 'LEF no es area del Nivel Primario'
+
+
+@test("PRIM8 sin profesores, el curriculo esperado es identico")
+def _():
+    # La funcion ni siquiera acepta algo del docente: se comprueba por firma
+    # y por comportamiento.
+    import inspect
+    firma = inspect.signature(CPRI.codigos_por_grado).parameters
+    igual(sorted(firma), ['grado_numero', 'version'])
+    for g in range(1, 7):
+        primera = _curriculo(g)[0]
+        segunda = _curriculo(g)[0]
+        igual(primera, segunda, 'grado %d' % g)
+    cuerpo = codigo_efectivo(inspect.getsource(CPRI))
+    for prohibido in ('AsignacionProfesor', 'profesor', 'activo', 'asignatura',
+                      'calificacion', 'horario', 'db', 'session'):
+        assert prohibido not in cuerpo, prohibido
+
+
+@test("PRIM8b sin docentes, el curriculo de Primaria NO cambia (camino real)")
+def _():
+    # PRIM8 comprueba que el CATALOGO es puro. Esto comprueba el CABLEADO:
+    # que `_precarga_curso_canonica` lo use y no vuelva a derivar el
+    # curriculo de las asignaciones, que es el defecto que cerro A3.1.
+    db = SessionLocal()
+    col = M.Colegio(nombre='P8', codigo='P8TEST', activo=True)
+    db.add(col); db.flush()
+    ano = M.AnoEscolar(colegio_id=col.id, nombre='2025-2026', activo=True)
+    grd = M.Grado(colegio_id=col.id, nombre='5to Primaria', nivel='primaria',
+                  orden=11, activo=True)
+    db.add_all([ano, grd]); db.flush()
+    curso = M.Curso(colegio_id=col.id, nombre='A', grado_id=grd.id,
+                    ano_escolar_id=ano.id, activo=True)
+    prof = M.Usuario(colegio_id=col.id, nombre='P', username='p8u',
+                     password_hash='x', role='profesor', activo=True)
+    db.add_all([curso, prof]); db.flush()
+    est = M.Estudiante(colegio_id=col.id, matricula='P8-1', nombre='E',
+                       apellido='S', curso_id=curso.id, activo=True)
+    db.add(est); db.flush()
+    for codigo in areas_del_grado(5):
+        a = M.Asignatura(colegio_id=col.id, nombre=codigo, codigo=codigo[:10],
+                         area='X', area_curricular_codigo=codigo, activo=True)
+        db.add(a); db.flush()
+        db.add(M.AsignacionProfesor(colegio_id=col.id, profesor_id=prof.id,
+                                    curso_id=curso.id, asignatura_id=a.id,
+                                    ano_escolar_id=ano.id, activo=True))
+    db.commit()
+
+    class Usr:
+        colegio_id = col.id
+        role = 'direccion'
+        id = 1
+
+    usr = Usr()
+    con = APP._precarga_curso_canonica(db, usr, curso, ano,
+                                       estudiante_ids=[est.id])
+    igual(sorted(con['curriculo_esperado']), sorted(areas_del_grado(5)))
+    igual(con['fuente_curriculo'], AD.FUENTE_CATALOGO_PRIMARIA)
+
+    db.query(M.AsignacionProfesor).filter_by(curso_id=curso.id).delete()
+    db.commit()
+    sin = APP._precarga_curso_canonica(db, usr, curso, ano,
+                                       estudiante_ids=[est.id])
+    igual(sorted(sin['curriculo_esperado']), sorted(con['curriculo_esperado']),
+          'una vacante docente no puede cambiar el curriculo del grado')
+    igual(sin['fuente_curriculo'], AD.FUENTE_CATALOGO_PRIMARIA)
+
+
+@test("PRIM9 falta una area esperada -> CURRICULO_OFICIAL_INCOMPLETO")
+def _():
+    for grado, faltante in ((2, 'MAT'), (5, 'LE')):
+        areas = [c for c in areas_del_grado(grado) if c != faltante]
+        asigs, comps = [], {}
+        for i, codigo in enumerate(areas, start=1):
+            asigs.append(asignatura(i, codigo))
+            comps[i] = comps_prim(i, 90)
+        curriculo, fuente, _d = _curriculo(grado)
+        resultados, _ad = AD.resultados_primaria(
+            asigs, comps, {}, grado, codigos_oficiales_esperados=curriculo)
+        paq = AD.construir_situacion_estudiante(
+            RA.NIVEL_PRIMARIA, grado, resultados, curriculo,
+            {'porcentaje_ausencias_no_justificadas': 5},
+            fuente_curriculo=fuente)
+        igual(paq['situacion']['condicion'], PA.EN_PROCESO,
+              'grado %d sin %s' % (grado, faltante))
+        assert PA.BLOQUEO_CURRICULO_INCOMPLETO in paq['situacion']['bloqueos'], \
+            paq['situacion']['bloqueos']
+
+
+@test("PRIM10 una asignatura con codigo NULL no se infiere por su nombre")
+def _():
+    # Se llama "Matematica" y no tiene identidad. No puede entrar a promocion.
+    areas = [c for c in areas_del_grado(2) if c != 'MAT']
+    asigs, comps = [], {}
+    for i, codigo in enumerate(areas, start=1):
+        asigs.append(asignatura(i, codigo))
+        comps[i] = comps_prim(i, 90)
+    huerfana = asignatura(99, None, 'Matemática')
+    asigs.append(huerfana)
+    comps[99] = comps_prim(99, 90)
+
+    curriculo, fuente, _d = _curriculo(2)
+    resultados, adicionales = AD.resultados_primaria(
+        asigs, comps, {}, 2, codigos_oficiales_esperados=curriculo)
+    codigos = {r['area_curricular_codigo'] for r in resultados}
+    assert 'MAT' not in codigos, 'el nombre no puede dar identidad'
+    igual(adicionales, [], 'una NULL no es "adicional": no tiene identidad')
+    paq = AD.construir_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 2, resultados, curriculo,
+        {'porcentaje_ausencias_no_justificadas': 5}, fuente_curriculo=fuente)
+    igual(paq['situacion']['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_CURRICULO_INCOMPLETO in paq['situacion']['bloqueos']
+
+
+@test("PRIM11 una MISMA Asignatura MAT sirve en Primaria y en Secundaria")
+def _():
+    compartida = asignatura(7, 'MAT', 'Matemática')
+
+    # 4.o de Primaria
+    prim = [asignatura(i, c) for i, c in enumerate(areas_del_grado(4), start=1)
+            if c != 'MAT'] + [compartida]
+    comps_p = {a.id: comps_prim(a.id, 90) for a in prim}
+    cur_p, f_p, _ = _curriculo(4)
+    res_p, _ad = AD.resultados_primaria(prim, comps_p, {}, 4,
+                                        codigos_oficiales_esperados=cur_p)
+    paq_p = AD.construir_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 4, res_p, cur_p,
+        {'porcentaje_ausencias_no_justificadas': 5}, fuente_curriculo=f_p)
+    igual(paq_p['situacion']['condicion'], PA.PROMOVIDO, 'primaria')
+    assert 'MAT' in {r['area_curricular_codigo'] for r in res_p}
+
+    # 4.o de Secundaria, la MISMA fila
+    sec = [asignatura(i, c) for i, c in enumerate(AREAS_SEC, start=1)
+           if c != 'MAT'] + [compartida]
+    comps_s = {a.id: comps_sec(a.id, 90) for a in sec}
+    paq_s = situacion_sec(sec, comps_s, {}, [], grado_numero=4)
+    igual(paq_s['situacion']['condicion'], PA.PROMOVIDO, 'secundaria')
+    assert 'MAT' in {r['area_curricular_codigo'] for r in paq_s['resultados']}
+
+
+@test("PRIM12 renombrar Matematica -> Math NO cambia su area")
+def _():
+    a = asignatura(1, 'MAT', 'Matemática')
+    antes = a.area_curricular_codigo
+    a.nombre = 'Math'
+    igual(a.area_curricular_codigo, antes)
+    resultados, _ad = AD.resultados_primaria(
+        [a], {1: comps_prim(1, 90)}, {}, 2,
+        codigos_oficiales_esperados=_curriculo(2)[0])
+    igual([r['area_curricular_codigo'] for r in resultados], ['MAT'])
+
+
+@test("PRIM13 el catalogo se consulta POR GRADO; test falsificable")
+def _():
+    # Como en CUR13: con un catalogo sintetico donde los ciclos difieren, una
+    # mutacion que ignorara el grado se veria.
+    original = AD.CPRI.codigos_por_grado
+    falso = {1: ('LE',), 2: ('LE', 'MAT'), 3: ('MAT',),
+             4: ('LE', 'MAT', 'CS'), 5: ('CS',), 6: ('LE', 'CS')}
+
+    def codigos_por_grado(grado_numero, version=None):
+        return falso[int(grado_numero)]
+
+    AD.CPRI.codigos_por_grado = codigos_por_grado
+    try:
+        for g, esperado in falso.items():
+            codigos, _f, diag = _curriculo(g)
+            igual(diag, None, 'grado %d' % g)
+            igual(tuple(codigos), esperado,
+                  'el grado %d debe leer SU fila del catalogo' % g)
+    finally:
+        AD.CPRI.codigos_por_grado = original
+
+    igual(_curriculo(1)[0], PRIMER_CICLO, 'el catalogo real vuelve a mandar')
+
+
+@test("PRIM14 1.o con Ingles adicional: NO bloquea y NO cuenta")
+def _():
+    con = situacion_prim({}, 1, extras=('LEI',))
+    sin = situacion_prim({}, 1)
+    igual(con['situacion']['condicion'], PA.PROMOVIDO,
+          'una materia que la norma no exige en 1.o no puede frenar nada')
+    igual(con['situacion']['condicion'], sin['situacion']['condicion'])
+    igual(len(con['resultados']), len(sin['resultados']),
+          'el Ingles de 1.o no produce resultado oficial')
+    igual(con['adicionales'], ('LEI',))
+    igual(con['situacion']['bloqueos'], ())
+    igual(con['situacion']['inconsistencias'], ())
+
+
+@test("PRIM15 4.o con Ingles: SI cuenta; si falta, bloquea")
+def _():
+    completo = situacion_prim({}, 4)
+    assert 'LEI' in {r['area_curricular_codigo'] for r in completo['resultados']}
+    igual(completo['situacion']['condicion'], PA.PROMOVIDO)
+    igual(completo['adicionales'], ())
+
+    # Y con Ingles reprobado, el area SI arrastra.
+    caido = situacion_prim({'LEI': 40}, 4)
+    assert caido['situacion']['condicion'] != PA.PROMOVIDO, \
+        'en 4.o el Ingles es oficial y pesa'
+
+
+@test("PRIM16 Frances en Primaria: adicional, no participa y no bloquea")
+def _():
+    for g in (1, 4, 6):
+        con = situacion_prim({}, g, extras=('LEF',))
+        sin = situacion_prim({}, g)
+        igual(con['situacion']['condicion'], sin['situacion']['condicion'],
+              'grado %d' % g)
+        igual(con['adicionales'], ('LEF',), 'grado %d' % g)
+        igual(len(con['resultados']), len(sin['resultados']), 'grado %d' % g)
+        igual(con['situacion']['bloqueos'], (), 'grado %d' % g)
+
+
+@test("PRIM17 dos asignaturas MAT en el mismo curso NO se deduplican")
+def _():
+    areas = areas_del_grado(2)
+    asigs, comps = [], {}
+    for i, codigo in enumerate(areas, start=1):
+        asigs.append(asignatura(i, codigo))
+        comps[i] = comps_prim(i, 90)
+    # La segunda Matematica del curso: un error de configuracion real.
+    asigs.append(asignatura(50, 'MAT', 'Matemática II'))
+    comps[50] = comps_prim(50, 90)
+
+    curriculo, fuente, _d = _curriculo(2)
+    resultados, adicionales = AD.resultados_primaria(
+        asigs, comps, {}, 2, codigos_oficiales_esperados=curriculo)
+    igual(len(resultados), len(areas) + 1,
+          'las DOS llegan a A2; silenciar una esconderia el problema')
+    igual(adicionales, [], 'MAT si pertenece al curriculo: no es adicional')
+
+    paq = AD.construir_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 2, resultados, curriculo,
+        {'porcentaje_ausencias_no_justificadas': 5}, fuente_curriculo=fuente)
+    igual(paq['situacion']['condicion'], PA.EN_PROCESO,
+          'A2 detecta la sobrante y no certifica')
+    assert paq['situacion']['inconsistencias'] or paq['situacion']['bloqueos'], \
+        paq['situacion']
+
+
+@test("PRIM18 el catalogo de Primaria es fail-closed con grados imposibles")
+def _():
+    for malo in (True, False, 0, 7, -1, None, '3', 3.0):
+        codigos, fuente, diag = _curriculo(malo)
+        igual(codigos, None, repr(malo))
+        igual(fuente, None, repr(malo))
+        assert diag, repr(malo)
+
+
+@test("PRIM19 una version curricular desconocida no inventa un curriculo")
+def _():
+    codigos, fuente, diag = AD.curriculo_oficial_esperado(
+        RA.NIVEL_PRIMARIA, 3, version='PRI-2099')
+    igual(codigos, None)
+    igual(diag, AD.DIAG_GAP_CURRICULO_ESPERADO)
 
 
 print("\n" + "=" * 70)

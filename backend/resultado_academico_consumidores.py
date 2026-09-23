@@ -43,6 +43,7 @@ CÓMO SE USA
 import re
 
 import catalogo_indicadores as CAT
+import catalogo_primaria as CPRI
 import promocion_academica as PA
 import resultado_academico as RA
 
@@ -61,10 +62,17 @@ DIAG_GAP_CURRICULO_ESPERADO = 'GAP_CURRICULO_ESPERADO_POR_CURSO'
 DIAG_CATALOGO_SIN_GRADO = 'CATALOGO_CURRICULAR_SIN_ENTRADAS_PARA_EL_GRADO'
 DIAG_NIVEL_DESCONOCIDO = 'NIVEL_NO_RECONOCIDO'
 DIAG_AREAS_ESPERADAS_SIN_ASIGNATURA = 'AREAS_OFICIALES_SIN_ASIGNATURA_CONFIGURADA'
+# INFORMATIVO, nunca bloqueo: una materia con identidad curricular valida que
+# no pertenece al curriculo de ESTE grado. El caso real es el colegio privado
+# que ensena Ingles en 1.o: la identidad LEI es correcta y la materia sigue
+# con su profesor, su horario, sus notas y su boletin; solo no participa en la
+# promocion de un grado donde el curriculo oficial no la contempla.
+DIAG_AREAS_ADICIONALES = 'AREAS_ADICIONALES_NO_PARTICIPAN_EN_PROMOCION'
 
 # De donde salio el curriculo. Viaja en el paquete para que una auditoria
 # posterior no tenga que adivinarlo.
 FUENTE_CATALOGO_SECUNDARIA = 'CATALOGO_INDICADORES_' + CAT.VERSION_ACTUAL
+FUENTE_CATALOGO_PRIMARIA = 'CATALOGO_PRIMARIA_' + CPRI.VERSION_ACTUAL
 DIAG_DIAS_TRABAJADOS_NO_DECLARADOS = 'DIAS_TRABAJADOS_NO_DECLARADOS'
 DIAG_ASISTENCIA_INCOHERENTE = 'AUSENCIAS_SUPERAN_LOS_DIAS_TRABAJADOS'
 DIAG_ALFABETIZACION_SIN_FUENTE = 'ALFABETIZACION_3RO_SIN_FUENTE_PERSISTIDA'
@@ -183,26 +191,22 @@ def curriculo_oficial_esperado(nivel, grado_numero, version=None):
         algo que este módulo dé por supuesto. Si una versión futura cambiara
         el reparto, esta función cambia con ella sin tocar una línea.
 
-    PRIMARIA — un GAP declarado, no un apaño
-        No hay fuente equivalente, y conviene decir por qué en vez de
-        improvisar una:
+    PRIMARIA — el catálogo PRI-2023, por ciclo
+        `catalogo_primaria` recoge la matriz de la Adecuación Curricular del
+        Nivel Primario: siete áreas en 1.º-3.º y las mismas siete más Inglés
+        en 4.º-6.º. Igual que el de Secundaria, es una constante versionada
+        del repositorio: no pertenece a ningún tenant y nadie la edita desde
+        la aplicación.
 
-          · no existe `catalogos/indicadores_primaria_*.json`;
-          · `registro_primaria.AREAS_CANON` es un normalizador de NOMBRES
-            («ingles» → «lenguas extranjeras»), sin dimensión de grado y con
-            claves que no son códigos de área;
-          · `AreaCurricular` sí tiene estructura por ciclo, pero es una tabla
-            por colegio, con `activo`, y usa OTRO vocabulario (`MA`, `LEX`)
-            que no es el de `Asignatura.area_curricular_codigo`;
-          · y ese campo, según su propia validación
-            (`_area_curricular_desde_payload`), es «la ÚNICA identidad válida
-            hacia los 9 bloques del Registro de SECUNDARIA». Una asignatura de
-            Primaria creada por la vía normal lo tiene en NULL.
+        A3.1 devolvía aquí un GAP porque faltaba resolver la IDENTIDAD —qué
+        `Asignatura` del colegio representa cada área—. A3.2 comprobó que esa
+        identidad ya existe y no hacía falta inventarla: los ocho códigos de
+        Primaria son los mismos que los de Secundaria, con el mismo nombre
+        oficial, así que `Asignatura.area_curricular_codigo` vale para los dos
+        niveles sin un segundo campo.
 
-        Así que para Primaria se devuelve None con el GAP explícito, A2
-        responde CURRICULO_OFICIAL_NO_DECLARADO y el documento no certifica.
-        Es lo que ya ocurría de hecho —el currículo salía vacío—, solo que
-        ahora se dice por qué en vez de parecer un descuido.
+        Francés (LEF) no aparece: tiene currículo propio en los seis grados de
+        Secundaria, no en Primaria.
     """
     if not _es_entero_de_grado(grado_numero):
         return None, None, DIAG_GRADO_FUERA_DE_RANGO
@@ -220,7 +224,14 @@ def curriculo_oficial_esperado(nivel, grado_numero, version=None):
         return tuple(codigos), fuente, None
 
     if nivel == RA.NIVEL_PRIMARIA:
-        return None, None, DIAG_GAP_CURRICULO_ESPERADO
+        try:
+            codigos = CPRI.codigos_por_grado(grado_numero, version=version)
+        except CPRI.CatalogoPrimariaError:
+            return None, None, DIAG_GAP_CURRICULO_ESPERADO
+        if not codigos:
+            return None, None, DIAG_GAP_CURRICULO_ESPERADO
+        fuente = 'CATALOGO_PRIMARIA_' + (version or CPRI.VERSION_ACTUAL)
+        return tuple(codigos), fuente, None
 
     return None, None, DIAG_NIVEL_DESCONOCIDO
 
@@ -361,26 +372,55 @@ def resultados_secundaria(asignaturas, competencias_por_asig, extras_por_asig,
     return resultados
 
 
+def _participa_en_promocion(codigo, codigos_esperados):
+    """¿Este bloque cuenta para la promoción de ESTE grado?
+
+    IDENTIDAD NO ES PARTICIPACIÓN, y confundirlas hace daño en las dos
+    direcciones. Un colegio privado que enseña Inglés en 1.º tiene una
+    asignatura con identidad LEI perfectamente correcta; lo que pasa es que
+    LEI no está en el currículo oficial de 1.º. Hacerla participar reprobaría
+    a un niño de primero por una materia que la norma no le exige.
+
+    Cuando no hay currículo declarado —`None`— no se deja pasar nada: sin
+    saber qué se espera, no se puede decir qué participa, y A2 bloquea de
+    todos modos por currículo no declarado.
+    """
+    if not codigos_esperados:
+        return False
+    return codigo in set(codigos_esperados)
+
+
 def resultados_primaria(asignaturas, competencias_por_asig,
-                        recuperaciones_por_asig, grado_numero):
-    """Un resultado de A1 por cada área OFICIAL del curso.
+                        recuperaciones_por_asig, grado_numero,
+                        codigos_oficiales_esperados=None):
+    """`(resultados, adicionales)` — los que participan y los que no.
 
     Las competencias se pasan tal cual: A1 llama a `cf_area()`, que ya exige
     el conjunto oficial completo. Aquí no se recalcula CF, ni RP, ni
     Recuperación Final, ni Especial.
+
+    NO SE DEDUPLICA. Si el curso tiene DOS asignaturas con MAT y MAT es
+    esperada, las dos llegan a A2: su selección por multiconjunto es la que
+    tiene que detectar el área sobrante. Silenciar una aquí escondería un
+    problema de configuración real. Eso es distinto de una materia cuyo
+    código no pertenece al currículo del grado, que sí se aparta.
     """
-    resultados = []
+    resultados, adicionales = [], []
     for asignatura in asignaturas:
         codigo = getattr(asignatura, 'area_curricular_codigo', None)
         if not (isinstance(codigo, str) and codigo.strip()):
+            continue    # materia interna: nunca tuvo identidad oficial
+        codigo = codigo.strip()
+        if not _participa_en_promocion(codigo, codigos_oficiales_esperados):
+            adicionales.append(codigo)
             continue
         resultados.append(RA.resolver_nota_primaria(
             competencias=competencias_por_asig.get(asignatura.id) or [],
             recuperacion=recuperaciones_por_asig.get(asignatura.id),
             grado_numero=grado_numero,
-            area_curricular_codigo=codigo.strip(),
+            area_curricular_codigo=codigo,
         ))
-    return resultados
+    return resultados, adicionales
 
 
 # ══════════════════════════ CONTEXTO ══════════════════════════

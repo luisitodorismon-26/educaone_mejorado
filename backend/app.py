@@ -3346,6 +3346,10 @@ def _area_curricular_desde_payload(data, actual):
     Devuelve `(valor, error)`. Ausente = no se toca. Explícitamente null/'' =
     desvincular. Cualquier otra cosa debe ser uno de los 9 códigos oficiales;
     los nombres ("Lenguas", "Inglés") se rechazan con 400.
+
+    R4-A3.3: el campo es la identidad curricular oficial de la asignatura en
+    AMBOS niveles. Qué áreas participan en la promoción de un grado concreto
+    lo deciden los catálogos por grado, no esta validación.
     """
     import catalogo_indicadores as _cat
     if 'area_curricular_codigo' not in data:
@@ -3358,7 +3362,8 @@ def _area_curricular_desde_payload(data, actual):
         validos = ', '.join(_cat.codigos_area_validos())
         return None, (
             f"Área curricular desconocida: {codigo!r}. Debe ser uno de: {validos}, "
-            f"o vacío si la asignatura no pertenece al Registro de Secundaria."
+            f"o vacío si la asignatura no representa un área curricular oficial "
+            f"del MINERD."
         )
     return codigo, None
 
@@ -3395,10 +3400,16 @@ async def get_asignaturas(request: Request, db: Session = Depends(get_db), curre
 @app.get("/api/asignaturas/areas-curriculares")
 async def get_areas_curriculares(request: Request, current_user: Usuario = Depends(get_current_user)):
     """
-    Las 9 áreas oficiales para el selector de Dirección.
+    Las 9 áreas curriculares oficiales para el selector de Dirección.
 
     Sale del catálogo versionado, no de una segunda lista: si el catálogo
     cambia, el selector cambia con él.
+
+    R4-A3.3: NO se filtra por nivel ni por grado a propósito. Este selector
+    configura la IDENTIDAD de la asignatura, y `Asignatura` es del colegio, no
+    de un nivel: la misma fila puede darse en Primaria y en Secundaria. Qué
+    áreas participan en la promoción de un grado lo deciden los catálogos por
+    grado, cuando llega el momento de decidir.
     """
     import catalogo_indicadores as _cat
     return {
@@ -12906,17 +12917,25 @@ def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
         asistencias = _asistencias_estudiantes(
             db, current_user, [estudiante.id], ano).get(estudiante.id, [])
 
-    resultados = RAC.resultados_primaria(
+    # R4-A3.3: `adicionales` son materias con identidad curricular valida que
+    # NO pertenecen al curriculo de este grado —Ingles en 1.o es el caso real—.
+    # Se anotan para que se vean, pero no participan ni bloquean.
+    resultados, adicionales = RAC.resultados_primaria(
         precarga['asignaturas'], competencias_por_asig,
-        recuperaciones_por_asig, precarga['grado_numero'])
+        recuperaciones_por_asig, precarga['grado_numero'],
+        codigos_oficiales_esperados=precarga['curriculo_esperado'])
 
     contexto, diagnosticos = _contexto_canonico(
         precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano)
+    diagnosticos = _diagnosticos_curriculo(precarga, resultados, diagnosticos)
+    if adicionales:
+        diagnosticos.append('%s: %s' % (
+            RAC.DIAG_AREAS_ADICIONALES, ', '.join(sorted(set(adicionales)))))
 
     return RAC.construir_situacion_estudiante(
         RAC.RA.NIVEL_PRIMARIA, precarga['grado_numero'], resultados,
         precarga['curriculo_esperado'], contexto,
-        diagnosticos=_diagnosticos_curriculo(precarga, resultados, diagnosticos),
+        diagnosticos=diagnosticos,
         fuente_curriculo=precarga['fuente_curriculo'])
 
 

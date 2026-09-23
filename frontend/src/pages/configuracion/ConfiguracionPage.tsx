@@ -1206,15 +1206,18 @@ export const ConfiguracionPage = () => {
           </div>
           <div>
             <Select
-              label="Área curricular MINERD — Secundaria"
+              label="Área curricular MINERD"
               value={asignaturaForm.area_curricular_codigo}
               onChange={e => setAsignaturaForm({ ...asignaturaForm, area_curricular_codigo: e.target.value })}
               options={areasCurriculares.map(a => ({ value: a.codigo, label: `${a.nombre} (${a.codigo})` }))}
               placeholder="No vinculada al Registro"
             />
             <p className="mt-1 text-xs text-gray-500">
-              Solo selecciona un área si esta asignatura corresponde a uno de los bloques
-              oficiales del Registro Escolar de Secundaria. Las materias adicionales del colegio
+              Vincula esta asignatura con el área curricular oficial del MINERD que
+              representa. El sistema decide por sí solo si esa área participa en la
+              promoción, según el nivel y el grado: por ejemplo, Inglés es oficial en
+              4.º–6.º de Primaria y en toda Secundaria, y es una materia adicional en
+              1.º–3.º de Primaria. Las materias que no representan un área oficial
               pueden permanecer como <strong>No vinculada al Registro</strong> y seguir
               funcionando normalmente en boletines, notas, horarios y reportes.
             </p>
