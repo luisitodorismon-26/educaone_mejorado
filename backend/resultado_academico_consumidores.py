@@ -42,6 +42,7 @@ CÓMO SE USA
 """
 import re
 
+import catalogo_indicadores as CAT
 import promocion_academica as PA
 import resultado_academico as RA
 
@@ -56,6 +57,14 @@ DIAG_GRADO_FUERA_DE_RANGO = 'GRADO_FUERA_DEL_RANGO_1_6'
 DIAG_GRADO_INCOHERENTE = 'GRADO_CON_NOMBRE_Y_ORDEN_CONTRADICTORIOS'
 DIAG_CURRICULO_SIN_ASIGNACIONES = 'CURSO_SIN_ASIGNACIONES_ACTIVAS'
 DIAG_CURRICULO_SIN_AREAS = 'NINGUNA_ASIGNATURA_DEL_CURSO_TIENE_AREA_CURRICULAR'
+DIAG_GAP_CURRICULO_ESPERADO = 'GAP_CURRICULO_ESPERADO_POR_CURSO'
+DIAG_CATALOGO_SIN_GRADO = 'CATALOGO_CURRICULAR_SIN_ENTRADAS_PARA_EL_GRADO'
+DIAG_NIVEL_DESCONOCIDO = 'NIVEL_NO_RECONOCIDO'
+DIAG_AREAS_ESPERADAS_SIN_ASIGNATURA = 'AREAS_OFICIALES_SIN_ASIGNATURA_CONFIGURADA'
+
+# De donde salio el curriculo. Viaja en el paquete para que una auditoria
+# posterior no tenga que adivinarlo.
+FUENTE_CATALOGO_SECUNDARIA = 'CATALOGO_INDICADORES_' + CAT.VERSION_ACTUAL
 DIAG_DIAS_TRABAJADOS_NO_DECLARADOS = 'DIAS_TRABAJADOS_NO_DECLARADOS'
 DIAG_ASISTENCIA_INCOHERENTE = 'AUSENCIAS_SUPERAN_LOS_DIAS_TRABAJADOS'
 DIAG_ALFABETIZACION_SIN_FUENTE = 'ALFABETIZACION_3RO_SIN_FUENTE_PERSISTIDA'
@@ -136,40 +145,106 @@ def nivel_de_grado(grado):
 
 
 # ══════════════════════════ CURRÍCULO OFICIAL ══════════════════════════
+#
+# CURRÍCULO NO ES PLANTILLA DOCENTE
+#
+# A3 derivaba el currículo esperado de `AsignacionProfesor(activo=True)`, y
+# eso estaba mal. Esa tabla dice QUIÉN imparte, no QUÉ áreas debe tener el
+# grado, y cambia por motivos que no son académicos:
+#
+#   · la edición masiva de asignaciones pone `fila.activo = False`;
+#   · `DELETE /api/asignaciones/{id}` hace `db.delete(asig)`;
+#   · el reemplazo de profesor desactiva la del saliente y crea la del nuevo;
+#   · `clonar-cursos` crea los cursos del año siguiente SIN asignaciones.
+#
+# Con la versión anterior, retirar al profesor de Matemática hacía que
+# Matemática desapareciera del currículo esperado, A2 no la echaba de menos y
+# el estudiante salía PROMOVIDO sin un solo bloqueo. Una vacante docente
+# borraba una materia del expediente.
+#
+# Ahora el currículo sale de una fuente que no sabe quién da clase.
 
-def curriculo_desde_asignaciones(asignaciones, asignaturas_por_id):
-    """Los códigos de área oficiales del curso, o `(None, diagnóstico)`.
 
-    LA FUENTE
-        No existe en EducaOne una tabla curso↔asignatura: `Asignatura` no
-        tiene `curso_id` ni `grado_id`. El ÚNICO vínculo estructural es
-        `AsignacionProfesor(curso_id, asignatura_id, ano_escolar_id, activo)`,
-        y es el que se usa.
+def curriculo_oficial_esperado(nivel, grado_numero, version=None):
+    """Qué bloques oficiales espera este grado. `(codigos, fuente, diag)`.
 
-        NO se usan todas las Asignatura del tenant —que es lo que hacía
-        `_construir_datos_boletin_secundaria`—: eso mete en el currículo de un
-        curso materias que se dan en otro, y A2 pediría áreas que a este
-        estudiante nunca le tocaron.
+    No recibe profesor, ni asignación, ni horario, ni notas: si cambiara con
+    cualquiera de esas cosas, no sería un currículo.
 
-    QUÉ ENTRA
-        Solo las asignaturas con `area_curricular_codigo` no nulo. Música y
-        las demás materias internas del colegio se quedan fuera de la
-        promoción oficial, que es exactamente lo que dice
-        `indicadores_curriculares.area_de_asignatura`: un NULL ahí no es un
-        error de configuración, es el estado normal de una complementaria.
+    SECUNDARIA — el catálogo versionado
+        `catalogo_indicadores` carga `catalogos/indicadores_secundaria_2023.json`,
+        extraído OFFLINE de los seis Registros oficiales del MINERD (uno por
+        grado) y versionado junto al código. No pertenece a ningún tenant,
+        nadie lo edita desde la aplicación y ya es la fuente única que valida
+        `Asignatura.area_curricular_codigo`.
 
-        El área NO se infiere de `nombre`, `codigo` ni `area`: en producción
-        `area` vale "Lenguas" para Lengua Española, Inglés y Francés a la vez.
+        Los códigos se leen POR GRADO, no de la cabecera: que los nueve
+        bloques aparezcan en los seis grados es algo que el catálogo dice, no
+        algo que este módulo dé por supuesto. Si una versión futura cambiara
+        el reparto, esta función cambia con ella sin tocar una línea.
 
-    Devuelve una TUPLA, que puede tener repetidos si el curso tiene dos
-    asignaturas del mismo bloque: A2 compara multiconjuntos, no conjuntos.
+    PRIMARIA — un GAP declarado, no un apaño
+        No hay fuente equivalente, y conviene decir por qué en vez de
+        improvisar una:
+
+          · no existe `catalogos/indicadores_primaria_*.json`;
+          · `registro_primaria.AREAS_CANON` es un normalizador de NOMBRES
+            («ingles» → «lenguas extranjeras»), sin dimensión de grado y con
+            claves que no son códigos de área;
+          · `AreaCurricular` sí tiene estructura por ciclo, pero es una tabla
+            por colegio, con `activo`, y usa OTRO vocabulario (`MA`, `LEX`)
+            que no es el de `Asignatura.area_curricular_codigo`;
+          · y ese campo, según su propia validación
+            (`_area_curricular_desde_payload`), es «la ÚNICA identidad válida
+            hacia los 9 bloques del Registro de SECUNDARIA». Una asignatura de
+            Primaria creada por la vía normal lo tiene en NULL.
+
+        Así que para Primaria se devuelve None con el GAP explícito, A2
+        responde CURRICULO_OFICIAL_NO_DECLARADO y el documento no certifica.
+        Es lo que ya ocurría de hecho —el currículo salía vacío—, solo que
+        ahora se dice por qué en vez de parecer un descuido.
     """
-    if not asignaciones:
-        return None, DIAG_CURRICULO_SIN_ASIGNACIONES
+    if not _es_entero_de_grado(grado_numero):
+        return None, None, DIAG_GRADO_FUERA_DE_RANGO
 
-    codigos = []
+    if nivel == RA.NIVEL_SECUNDARIA:
+        try:
+            entradas = CAT.listar_por(version=version, grado=grado_numero)
+        except Exception:
+            return None, None, DIAG_CATALOGO_SIN_GRADO
+        codigos = sorted({e['area_codigo'] for e in entradas
+                          if e.get('area_codigo')})
+        if not codigos:
+            return None, None, DIAG_CATALOGO_SIN_GRADO
+        fuente = 'CATALOGO_INDICADORES_' + (version or CAT.VERSION_ACTUAL)
+        return tuple(codigos), fuente, None
+
+    if nivel == RA.NIVEL_PRIMARIA:
+        return None, None, DIAG_GAP_CURRICULO_ESPERADO
+
+    return None, None, DIAG_NIVEL_DESCONOCIDO
+
+
+def _es_entero_de_grado(valor):
+    return (isinstance(valor, int) and not isinstance(valor, bool)
+            and valor in GRADOS_VALIDOS)
+
+
+def asignaturas_configuradas(asignaciones, asignaturas_por_id):
+    """Qué Asignatura CONCRETA del colegio representa cada bloque.
+
+    Esto sí es trabajo de `AsignacionProfesor`, y sigue siéndolo: sirve para
+    saber qué filas institucionales hay que leer. Lo que ya NO hace es
+    decidir qué códigos DEBEN existir.
+
+    Devuelve `{codigo_area: [asignaturas]}` más la lista de las internas, que
+    quedan fuera de la promoción oficial. Un NULL en
+    `area_curricular_codigo` no es un error de configuración: es el estado
+    normal de una materia complementaria como Música.
+    """
+    por_area, internas = {}, []
     vistas = set()
-    for a in asignaciones:
+    for a in asignaciones or ():
         asig_id = getattr(a, 'asignatura_id', None)
         if asig_id is None or asig_id in vistas:
             continue
@@ -179,11 +254,10 @@ def curriculo_desde_asignaciones(asignaciones, asignaturas_por_id):
             continue
         codigo = getattr(asignatura, 'area_curricular_codigo', None)
         if isinstance(codigo, str) and codigo.strip():
-            codigos.append(codigo.strip())
-
-    if not codigos:
-        return None, DIAG_CURRICULO_SIN_AREAS
-    return tuple(codigos), None
+            por_area.setdefault(codigo.strip(), []).append(asignatura)
+        else:
+            internas.append(asignatura)
+    return por_area, internas
 
 
 # ══════════════════════════ ASISTENCIA ══════════════════════════
@@ -347,7 +421,7 @@ def construir_contexto(grado_numero, nivel, porcentaje, diagnosticos):
 
 def construir_situacion_estudiante(nivel, grado_numero, resultados,
                                    codigos_oficiales_esperados, contexto,
-                                   diagnosticos=None):
+                                   diagnosticos=None, fuente_curriculo=None):
     """Lo que consume CUALQUIER documento. Una sola forma, un solo motor.
 
     Devuelve el paquete entero —resultados por área, currículo esperado,
@@ -364,6 +438,7 @@ def construir_situacion_estudiante(nivel, grado_numero, resultados,
         'grado_numero': grado_numero,
         'resultados': tuple(resultados),
         'codigos_oficiales_esperados': codigos_oficiales_esperados,
+        'fuente_curriculo': fuente_curriculo,
         'contexto': dict(contexto),
         'situacion': situacion,
         'diagnosticos': tuple(diagnosticos or ()),

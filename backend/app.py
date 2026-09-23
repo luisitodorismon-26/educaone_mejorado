@@ -12715,17 +12715,43 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
 # funciones solo LEEN filas y se las pasan.
 
 
-def _precarga_curso_canonica(db, current_user, curso, ano):
+def _precarga_curso_canonica(db, current_user, curso, ano, estudiante_ids=None):
     """Lo que es igual para todos los estudiantes del curso.
 
     El lote lo calcula UNA vez: sin esto serian dos consultas por estudiante
     para obtener siempre las mismas asignaturas.
+
+    R4-A3.1 · DOS COSAS DISTINTAS
+        `curriculo_esperado` sale del catalogo curricular versionado y NO
+        depende de que haya profesor. `asignaturas` son las filas concretas
+        del colegio que hay que LEER, y esas si salen de las asignaciones...
+        mas las que el estudiante tenga calificadas este ano aunque su
+        asignacion ya no exista.
+
+        Sin ese segundo conjunto, retirar al docente de Matematica dejaba sus
+        notas fuera del boletin. Una nota cargada es un hecho academico; que
+        el profesor se haya ido es un hecho administrativo.
     """
     asignaciones = tenant_filter(
         db.query(AsignacionProfesor), AsignacionProfesor, current_user
     ).filter_by(curso_id=curso.id, ano_escolar_id=ano.id, activo=True).all()
 
     asig_ids = {a.asignatura_id for a in asignaciones if a.asignatura_id}
+
+    # Asignaturas con notas del ano para estos estudiantes, tengan o no
+    # docente asignado ahora mismo. Una consulta por modelo para todo el
+    # curso, no una por estudiante.
+    if estudiante_ids:
+        _ids = list(estudiante_ids)
+        for _modelo in (CalificacionSecundaria, CalificacionPrimaria):
+            filas = tenant_filter(
+                db.query(_modelo.asignatura_id), _modelo, current_user
+            ).filter(
+                _modelo.estudiante_id.in_(_ids),
+                _modelo.ano_escolar_id == ano.id,
+            ).distinct().all()
+            asig_ids.update(f[0] for f in filas if f[0])
+
     asignaturas = []
     if asig_ids:
         asignaturas = tenant_filter(
@@ -12734,13 +12760,20 @@ def _precarga_curso_canonica(db, current_user, curso, ano):
 
     grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
     grado_numero, diag_grado = RAC.numero_de_grado(grado)
+    nivel = RAC.nivel_de_grado(grado)
+    curriculo, fuente, diag_curriculo = RAC.curriculo_oficial_esperado(
+        nivel, grado_numero)
     return {
         'asignaciones': asignaciones,
         'asignaturas': asignaturas,
         'asignaturas_por_id': {a.id: a for a in asignaturas},
         'grado': grado,
         'grado_numero': grado_numero,
+        'nivel': nivel,
         'diag_grado': diag_grado,
+        'curriculo_esperado': curriculo,
+        'fuente_curriculo': fuente,
+        'diag_curriculo': diag_curriculo,
         'dias_trabajados': RAC.sumar_dias_trabajados(ano),
     }
 
@@ -12793,6 +12826,25 @@ def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano):
     return contexto, diagnosticos
 
 
+def _diagnosticos_curriculo(precarga, resultados, diagnosticos):
+    """Anade al parte lo que falta del curriculo, sin decidir nada.
+
+    A2 ya bloquea por su cuenta cuando espera un area y no la recibe. Esto
+    solo dice CUALES, para que quien mire el boletin sepa si falta configurar
+    una materia o si al estudiante le falta cargar notas.
+    """
+    if precarga['diag_curriculo']:
+        diagnosticos.append(precarga['diag_curriculo'])
+        return diagnosticos
+    esperados = precarga['curriculo_esperado'] or ()
+    recibidos = {r.get('area_curricular_codigo') for r in resultados}
+    faltan = sorted(set(esperados) - recibidos)
+    if faltan:
+        diagnosticos.append('%s: %s' % (
+            RAC.DIAG_AREAS_ESPERADAS_SIN_ASIGNATURA, ', '.join(faltan)))
+    return diagnosticos
+
+
 def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
                                    competencias_por_asig=None,
                                    extras_por_asig=None,
@@ -12816,20 +12868,18 @@ def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
         asistencias = _asistencias_estudiantes(
             db, current_user, [estudiante.id], ano).get(estudiante.id, [])
 
-    curriculo, diag_curr = RAC.curriculo_desde_asignaciones(
-        precarga['asignaciones'], precarga['asignaturas_por_id'])
     resultados = RAC.resultados_secundaria(
         precarga['asignaturas'], competencias_por_asig, extras_por_asig,
         _calcular_cf_secundaria)
 
     contexto, diagnosticos = _contexto_canonico(
         precarga, RAC.RA.NIVEL_SECUNDARIA, asistencias, ano)
-    if diag_curr:
-        diagnosticos.append(diag_curr)
 
     return RAC.construir_situacion_estudiante(
         RAC.RA.NIVEL_SECUNDARIA, precarga['grado_numero'], resultados,
-        curriculo, contexto, diagnosticos=diagnosticos)
+        precarga['curriculo_esperado'], contexto,
+        diagnosticos=_diagnosticos_curriculo(precarga, resultados, diagnosticos),
+        fuente_curriculo=precarga['fuente_curriculo'])
 
 
 def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
@@ -12856,20 +12906,18 @@ def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
         asistencias = _asistencias_estudiantes(
             db, current_user, [estudiante.id], ano).get(estudiante.id, [])
 
-    curriculo, diag_curr = RAC.curriculo_desde_asignaciones(
-        precarga['asignaciones'], precarga['asignaturas_por_id'])
     resultados = RAC.resultados_primaria(
         precarga['asignaturas'], competencias_por_asig,
         recuperaciones_por_asig, precarga['grado_numero'])
 
     contexto, diagnosticos = _contexto_canonico(
         precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano)
-    if diag_curr:
-        diagnosticos.append(diag_curr)
 
     return RAC.construir_situacion_estudiante(
         RAC.RA.NIVEL_PRIMARIA, precarga['grado_numero'], resultados,
-        curriculo, contexto, diagnosticos=diagnosticos)
+        precarga['curriculo_esperado'], contexto,
+        diagnosticos=_diagnosticos_curriculo(precarga, resultados, diagnosticos),
+        fuente_curriculo=precarga['fuente_curriculo'])
 
 
 def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano):
@@ -13191,7 +13239,8 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
     situacion_final = None
     condicion_texto = ''
     if curso is not None:
-        _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
+        _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                             estudiante_ids=[estudiante.id])
         _paquete = _situacion_canonica_primaria(
             db, current_user, estudiante, ano, _precarga)
         situacion_final = RAC.MARCA_BOLETIN_PRIMARIA.get(
@@ -14130,7 +14179,8 @@ async def boletin_primaria_estudiante_json(
     # 'en_proceso'. Lo que cambia es QUIÉN decide, no cómo se llama.
     condicion = None
     if situaciones and curso is not None:
-        _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
+        _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                             estudiante_ids=[estudiante.id])
         _paquete = _situacion_canonica_primaria(
             db, current_user, estudiante, ano, _precarga)
         _sit = _paquete['situacion']
@@ -14345,7 +14395,8 @@ async def generar_boletin_minerd_v2(
     # distinguía un área que agotó la cascada de otra que ni la empezó.
     #
     # Ya no se decide aquí. Lo que sigue es lectura y presentación.
-    _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
+    _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                         estudiante_ids=[estudiante.id])
     _paquete = _situacion_canonica_secundaria(
         db, current_user, estudiante, ano, _precarga)
     situacion = RAC.situacion_boletin_secundaria(
@@ -14461,8 +14512,9 @@ async def generar_boletines_curso_minerd_v2(
         logger.warning(f"No se pudo obtener docente titular del curso {curso_id}: {e}")
     
     # ── R4-A3 · Todo lo que es igual para el curso, una sola vez ──
-    _precarga = _precarga_curso_canonica(db, current_user, curso, ano)
     _ids = [e.id for e in estudiantes]
+    _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                         estudiante_ids=_ids)
     _comps = _datos_academicos_estudiantes(
         db, current_user, _ids, ano, CalificacionSecundaria)
     _extras = _datos_academicos_estudiantes(
@@ -17992,8 +18044,9 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
     # pregunta, y la del acta tampoco sabía el grado.
     _curso_acta = getattr(estudiantes_db[0], 'curso', None)
     if _curso_acta is not None and ano_act is not None:
-        _precarga = _precarga_curso_canonica(db, current_user, _curso_acta, ano_act)
         _ids = list(idx_por_id.keys())
+        _precarga = _precarga_curso_canonica(db, current_user, _curso_acta,
+                                             ano_act, estudiante_ids=_ids)
         _comps = _datos_academicos_estudiantes(
             db, current_user, _ids, ano_act, CalificacionPrimaria)
         _recs = _datos_academicos_estudiantes(

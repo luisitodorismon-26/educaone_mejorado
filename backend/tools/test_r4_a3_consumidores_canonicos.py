@@ -77,7 +77,17 @@ def igual(obtenido, esperado, msg=''):
 
 # ═══════════════════ FIXTURES EN MEMORIA ═══════════════════
 
-AREAS_SEC = ['LE', 'MAT', 'CS', 'CN', 'EA', 'EF', 'FIHR', 'LEI']
+# R4-A3.1: las areas de Secundaria se LEEN del catalogo versionado, que es
+# la misma fuente que usa el adaptador. Escribirlas a mano aqui haria que el
+# test pasara aunque el catalogo cambiara, que es justo lo contrario de lo
+# que hace falta.
+GRADO_SEC_REF = 3
+AREAS_SEC = list(AD.curriculo_oficial_esperado(
+    RA.NIVEL_SECUNDARIA, GRADO_SEC_REF)[0])
+
+# Primaria no tiene catalogo equivalente (ver CUR7-CUR9). Para las pruebas
+# que fijan el comportamiento de A2 en Primaria se declara el curriculo
+# explicitamente, como hara el dia que exista una fuente oficial.
 AREAS_PRIM = ['LE', 'MAT', 'CS', 'CN', 'EA', 'EF', 'FIHR', 'LEI']
 
 
@@ -150,15 +160,19 @@ def escenario_secundaria(notas_por_area, extras=None, internas=None):
 
 def situacion_sec(asignaturas, comps, extras, asignaciones, grado_numero=3,
                   contexto=None):
-    """El camino canonico entero, tal y como lo usan los dos boletines."""
-    por_id = {a.id: a for a in asignaturas}
-    curriculo, diag = AD.curriculo_desde_asignaciones(asignaciones, por_id)
+    """El camino canonico entero, tal y como lo usan los dos boletines.
+
+    `asignaciones` ya no decide el curriculo —ese es el bug que cierra
+    A3.1— pero se sigue recibiendo porque determina que filas se leen.
+    """
+    curriculo, fuente, diag = AD.curriculo_oficial_esperado(
+        RA.NIVEL_SECUNDARIA, grado_numero)
     resultados = AD.resultados_secundaria(asignaturas, comps, extras, CF)
     ctx = {'porcentaje_ausencias_no_justificadas': 5}
     ctx.update(contexto or {})
     return AD.construir_situacion_estudiante(
         RA.NIVEL_SECUNDARIA, grado_numero, resultados, curriculo, ctx,
-        diagnosticos=[d for d in (diag,) if d])
+        diagnosticos=[d for d in (diag,) if d], fuente_curriculo=fuente)
 
 
 def recuperacion(asig_id, cf_area, final=None, especial=None):
@@ -190,13 +204,15 @@ def situacion_prim(notas_por_area, grado_numero, recuperaciones=None,
         asignaturas.append(asignatura(j, None, nombre))
         asignaciones.append(asignacion(j))
         comps[j] = comps_prim(j, nota)
-    por_id = {a.id: a for a in asignaturas}
-    curriculo, diag = AD.curriculo_desde_asignaciones(asignaciones, por_id)
+    # Primaria no tiene fuente curricular oficial (CUR7-CUR9): aqui se
+    # declara para poder fijar lo que hace A2 por grado. El camino REAL
+    # devuelve el GAP, y eso se comprueba aparte.
+    curriculo = tuple(AREAS_PRIM)
     resultados = AD.resultados_primaria(asignaturas, comps,
                                         dict(recuperaciones or {}), grado_numero)
     # `construir_contexto` ANOTA en la lista que recibe: es la misma que luego
     # viaja al paquete. Quedarse con una copia vacia perdia el diagnostico.
-    diagnosticos = [d for d in (diag,) if d]
+    diagnosticos = []
     ctx = AD.construir_contexto(grado_numero, RA.NIVEL_PRIMARIA, 5, diagnosticos)
     ctx.update(contexto or {})
     return AD.construir_situacion_estudiante(
@@ -306,7 +322,11 @@ def _():
     extras = {1: extra(1, cf_original=50.0, cec=40.0, completiva_final=55.0,
                        ceex=40.0, extraordinaria_final=60.0,
                        ce=80.0, especial_final=70.0)}
-    asigs, comps, ex, asigns = escenario_secundaria({'LE': 50}, extras=extras)
+    # El area es AREAS_SEC[0], no 'LE': el catalogo devuelve los codigos
+    # ordenados y la fixture indexa por posicion. Fijar 'LE' a mano ataba el
+    # test a un orden que no es suyo.
+    asigs, comps, ex, asigns = escenario_secundaria({AREAS_SEC[0]: 50},
+                                                    extras=extras)
     s = situacion_sec(asigs, comps, ex, asigns)
     igual(s['situacion']['condicion'], PA.PROMOVIDO)
     igual(s['situacion']['motivo'], PA.MOTIVO_ESPECIAL_SUPERADA)
@@ -319,16 +339,16 @@ print(f"\n{B}G-H · QUE ENTRA EN LA PROMOCION OFICIAL{X}")
 @test("G   curriculo incompleto -> EN_PROCESO, nunca promocion por omision")
 def _():
     asigs, comps, ex, asigns = escenario_secundaria({})
-    # El estudiante solo tiene notas de 3 de las 8 areas del curso.
+    # El estudiante solo tiene notas de 3 de las areas del curso.
     comps_parciales = {i: comps[i] for i in (1, 2, 3)}
-    por_id = {a.id: a for a in asigs}
-    curriculo, _ = AD.curriculo_desde_asignaciones(asigns, por_id)
     resultados = AD.resultados_secundaria(asigs[:3], comps_parciales, ex, CF)
+    curriculo, _f, _d = AD.curriculo_oficial_esperado(RA.NIVEL_SECUNDARIA, 3)
     s = AD.construir_situacion_estudiante(
         RA.NIVEL_SECUNDARIA, 3, resultados, curriculo,
         {'porcentaje_ausencias_no_justificadas': 5})
     igual(s['situacion']['condicion'], PA.EN_PROCESO)
-    assert s['situacion']['bloqueos'], s['situacion']
+    assert PA.BLOQUEO_CURRICULO_INCOMPLETO in s['situacion']['bloqueos'], \
+        s['situacion']['bloqueos']
 
 
 @test("H   Musica reprobada no cambia la promocion oficial")
@@ -342,25 +362,23 @@ def _():
           'una materia interna no produce resultado oficial')
 
 
-@test("H2  el curriculo sale del curso, no de todas las asignaturas del tenant")
+@test("H2  el curriculo no incluye materias que el catalogo no reconoce")
 def _():
-    asigs, comps, ex, asigns = escenario_secundaria({})
-    otra = asignatura(999, 'OPT', 'De otro curso')
-    por_id = {a.id: a for a in asigs + [otra]}
-    curriculo, _ = AD.curriculo_desde_asignaciones(asigns, por_id)
+    curriculo, _f, _d = AD.curriculo_oficial_esperado(RA.NIVEL_SECUNDARIA, 3)
+    import catalogo_indicadores as _cat
+    for codigo in curriculo:
+        assert _cat.area_valida(codigo), codigo
     assert 'OPT' not in curriculo, curriculo
-    igual(len(curriculo), len(AREAS_SEC))
+    assert 'MUS' not in curriculo, curriculo
 
 
-@test("H3  un curso sin asignaciones activas es un GAP declarado")
+@test("H3  un curriculo no declarado bloquea, no promueve")
 def _():
-    curriculo, diag = AD.curriculo_desde_asignaciones([], {})
-    igual(curriculo, None)
-    igual(diag, AD.DIAG_CURRICULO_SIN_ASIGNACIONES)
     s = AD.construir_situacion_estudiante(
         RA.NIVEL_SECUNDARIA, 3, [], None,
         {'porcentaje_ausencias_no_justificadas': 5})
     igual(s['situacion']['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_CURRICULO_NO_DECLARADO in s['situacion']['bloqueos']
 
 
 # ═══════════════ I-M · PRIMARIA ═══════════════
@@ -699,7 +717,15 @@ def _():
                    for n in ast.walk(arbol) if isinstance(n, ast.Import)}
                   | {n.module.split('.')[0] for n in ast.walk(arbol)
                      if isinstance(n, ast.ImportFrom) and n.module})
-    igual(mods, ['promocion_academica', 're', 'resultado_academico'])
+    # `catalogo_indicadores` lee un JSON versionado del repositorio. No abre
+    # base de datos, no tiene sesion y ningun tenant lo edita: es una
+    # constante, como los otros dos modulos.
+    igual(mods, ['catalogo_indicadores', 'promocion_academica', 're',
+                 'resultado_academico'])
+    import catalogo_indicadores as _cat
+    fuente_cat = inspect.getsource(_cat)
+    for prohibido in ('sqlalchemy', 'session', 'db.', 'models'):
+        assert prohibido not in fuente_cat, prohibido
 
 
 @test("S5  el adaptador no escribe ni nombra una sesion")
@@ -843,11 +869,16 @@ def _():
     igual(p['grado_numero'], 3)
     igual(p['diag_grado'], None)
     igual(len(p['asignaciones']), len(AREAS_SEC) + 1, 'Musica tambien se asigna')
-    curriculo, diag = AD.curriculo_desde_asignaciones(
+    # R4-A3.1: el curriculo NO sale de las asignaciones sino del catalogo.
+    igual(p['diag_curriculo'], None)
+    igual(sorted(p['curriculo_esperado']), sorted(AREAS_SEC))
+    igual(p['fuente_curriculo'], AD.FUENTE_CATALOGO_SECUNDARIA)
+    assert 'MUS' not in p['curriculo_esperado'], p['curriculo_esperado']
+    por_area, internas = AD.asignaturas_configuradas(
         p['asignaciones'], p['asignaturas_por_id'])
-    igual(diag, None)
-    igual(sorted(curriculo), sorted(AREAS_SEC),
-          'Musica no tiene area curricular: fuera de la promocion oficial')
+    igual(sorted(por_area), sorted(AREAS_SEC),
+          'las asignaciones dicen QUE fila leer, no que codigos esperar')
+    igual([a.nombre for a in internas], ['Musica'])
 
 
 @test("T2  la situacion canonica se resuelve de punta a punta")
@@ -936,6 +967,276 @@ def _():
     assert comps.get(_EST.id), 'la precarga trajo las competencias'
     igual(extras, {})
     igual(asist, {})
+
+
+
+
+# ═══════════ CUR · CURRICULO ESPERADO vs PLANTILLA DOCENTE ═══════════
+#
+# El defecto que cierra A3.1: A3 derivaba `codigos_oficiales_esperados` de
+# `AsignacionProfesor(activo=True)`. Retirar al profesor de Matematica hacia
+# que Matematica desapareciera del curriculo, A2 no la echaba de menos y el
+# estudiante salia PROMOVIDO sin un solo bloqueo.
+#
+# Una vacante docente es un hecho administrativo. No puede borrar una materia
+# del expediente de nadie.
+print(f"\n{B}CUR · EL CURRICULO NO SABE QUIEN DA CLASE{X}")
+
+
+def _curso_secundaria_sembrado(sufijo, grado_nombre='3ro Secundaria',
+                               orden=3, con_notas=True):
+    """Un curso real con todas las areas del catalogo y un profesor por area."""
+    db = SessionLocal()
+    col = M.Colegio(nombre='CUR', codigo='CUR%s' % sufijo, activo=True)
+    db.add(col); db.flush()
+    ano = M.AnoEscolar(colegio_id=col.id, nombre='2025-2026', activo=True)
+    ano.set_dias_trabajados({'ago': 20, 'sep': 20, 'oct': 20, 'nov': 20,
+                             'dic': 15, 'ene': 20, 'feb': 18, 'mar': 20,
+                             'abr': 18, 'may': 20, 'jun': 15})
+    grd = M.Grado(colegio_id=col.id, nombre=grado_nombre, nivel='secundaria',
+                  orden=orden, activo=True)
+    db.add_all([ano, grd]); db.flush()
+    curso = M.Curso(colegio_id=col.id, nombre='A', grado_id=grd.id,
+                    ano_escolar_id=ano.id, activo=True)
+    prof = M.Usuario(colegio_id=col.id, nombre='P', username='u%s' % sufijo,
+                     password_hash='x', role='profesor', activo=True)
+    db.add_all([curso, prof]); db.flush()
+    est = M.Estudiante(colegio_id=col.id, matricula='M%s' % sufijo, nombre='E',
+                       apellido='S', curso_id=curso.id, activo=True)
+    db.add(est); db.flush()
+    asigs = {}
+    for codigo in AREAS_SEC:
+        a = M.Asignatura(colegio_id=col.id, nombre=codigo, codigo=codigo[:10],
+                         area='X', area_curricular_codigo=codigo, activo=True)
+        db.add(a); db.flush()
+        asigs[codigo] = a
+        db.add(M.AsignacionProfesor(colegio_id=col.id, profesor_id=prof.id,
+                                    curso_id=curso.id, asignatura_id=a.id,
+                                    ano_escolar_id=ano.id, activo=True))
+        if con_notas:
+            for n in range(1, 5):
+                db.add(M.CalificacionSecundaria(
+                    colegio_id=col.id, estudiante_id=est.id,
+                    asignatura_id=a.id, ano_escolar_id=ano.id,
+                    competencia_numero=n, p1=90, p2=90, p3=90, p4=90))
+    db.commit()
+
+    class Usr:
+        colegio_id = col.id
+        role = 'direccion'
+        id = 1
+
+    return db, Usr(), ano, curso, est, asigs
+
+
+def _paquete(db, usr, ano, curso, est):
+    p = APP._precarga_curso_canonica(db, usr, curso, ano,
+                                     estudiante_ids=[est.id])
+    return APP._situacion_canonica_secundaria(db, usr, est, ano, p)
+
+
+@test("CUR1 una materia oficial sin profesor NO desaparece del curriculo")
+def _():
+    db, usr, ano, curso, est, asigs = _curso_secundaria_sembrado('1')
+    antes = _paquete(db, usr, ano, curso, est)
+    assert 'MAT' in antes['codigos_oficiales_esperados']
+
+    fila = db.query(M.AsignacionProfesor).filter_by(
+        curso_id=curso.id, asignatura_id=asigs['MAT'].id).first()
+    fila.activo = False
+    db.commit()
+
+    despues = _paquete(db, usr, ano, curso, est)
+    igual(sorted(despues['codigos_oficiales_esperados']),
+          sorted(antes['codigos_oficiales_esperados']),
+          'retirar al docente no puede cambiar el curriculo del grado')
+    assert 'MAT' in despues['codigos_oficiales_esperados']
+    assert despues['situacion']['condicion'] != PA.PROMOVIDO or \
+        'MAT' in {r['area_curricular_codigo'] for r in despues['resultados']}, \
+        'nunca PROMOVIDO por omision de una materia oficial'
+
+
+@test("CUR2 sin resultado de la materia esperada -> CURRICULO_OFICIAL_INCOMPLETO")
+def _():
+    db, usr, ano, curso, est, asigs = _curso_secundaria_sembrado('2')
+    # La materia existe en el curriculo pero el estudiante no tiene notas
+    # suyas y ademas se retira la asignacion: no hay por donde recuperarla.
+    db.query(M.CalificacionSecundaria).filter_by(
+        asignatura_id=asigs['MAT'].id).delete()
+    db.query(M.AsignacionProfesor).filter_by(
+        asignatura_id=asigs['MAT'].id).delete()
+    db.commit()
+
+    paq = _paquete(db, usr, ano, curso, est)
+    assert 'MAT' in paq['codigos_oficiales_esperados']
+    igual(paq['situacion']['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_CURRICULO_INCOMPLETO in paq['situacion']['bloqueos'], \
+        paq['situacion']['bloqueos']
+    assert any(AD.DIAG_AREAS_ESPERADAS_SIN_ASIGNATURA in str(d)
+               for d in paq['diagnosticos']), paq['diagnosticos']
+    assert any('MAT' in str(d) for d in paq['diagnosticos']), \
+        'el parte dice CUAL falta'
+
+
+@test("CUR3 DELETE de la asignacion no cambia la lista de codigos esperados")
+def _():
+    db, usr, ano, curso, est, asigs = _curso_secundaria_sembrado('3')
+    antes = _paquete(db, usr, ano, curso, est)['codigos_oficiales_esperados']
+
+    fila = db.query(M.AsignacionProfesor).filter_by(
+        curso_id=curso.id, asignatura_id=asigs['MAT'].id).first()
+    db.delete(fila)
+    db.commit()
+
+    despues = _paquete(db, usr, ano, curso, est)['codigos_oficiales_esperados']
+    igual(sorted(despues), sorted(antes),
+          'borrar la relacion profesor-asignatura no borra una materia')
+
+
+@test("CUR4 curso recien clonado (sin docentes) no tiene curriculo vacio")
+def _():
+    db, usr, ano, curso, est, asigs = _curso_secundaria_sembrado('4')
+    # `clonar-cursos` crea el Curso y nada mas.
+    db.query(M.AsignacionProfesor).filter_by(curso_id=curso.id).delete()
+    db.commit()
+
+    paq = _paquete(db, usr, ano, curso, est)
+    igual(sorted(paq['codigos_oficiales_esperados']), sorted(AREAS_SEC),
+          'el curriculo del grado existe aunque todavia no haya profesores')
+    igual(paq['fuente_curriculo'], AD.FUENTE_CATALOGO_SECUNDARIA)
+    assert paq['situacion']['condicion'] != PA.PROMOVIDO or \
+        len(paq['resultados']) == len(AREAS_SEC)
+
+
+@test("CUR5 notas historicas: la materia se lee aunque el docente se fuera")
+def _():
+    db, usr, ano, curso, est, asigs = _curso_secundaria_sembrado('5')
+    db.query(M.AsignacionProfesor).filter_by(
+        asignatura_id=asigs['MAT'].id).delete()
+    db.commit()
+
+    paq = _paquete(db, usr, ano, curso, est)
+    codigos = {r['area_curricular_codigo'] for r in paq['resultados']}
+    assert 'MAT' in codigos, \
+        'una nota cargada es un hecho academico; la vacante no la borra'
+    igual(len(paq['resultados']), len(AREAS_SEC))
+
+
+@test("CUR6 el curriculo de Secundaria es identico con y sin staffing")
+def _():
+    for escenario, sufijo in (('completo', '6a'), ('sin docentes', '6b')):
+        db, usr, ano, curso, est, asigs = _curso_secundaria_sembrado(sufijo)
+        if escenario == 'sin docentes':
+            db.query(M.AsignacionProfesor).filter_by(curso_id=curso.id).delete()
+            db.commit()
+        paq = _paquete(db, usr, ano, curso, est)
+        igual(sorted(paq['codigos_oficiales_esperados']), sorted(AREAS_SEC),
+              escenario)
+
+
+@test("CUR7 Secundaria 1..6: el curriculo sale del catalogo, por grado")
+def _():
+    import catalogo_indicadores as _cat
+    for g in range(1, 7):
+        codigos, fuente, diag = AD.curriculo_oficial_esperado(
+            RA.NIVEL_SECUNDARIA, g)
+        igual(diag, None, 'grado %d' % g)
+        igual(fuente, AD.FUENTE_CATALOGO_SECUNDARIA)
+        # Se compara contra el catalogo REAL, no contra una lista escrita
+        # aqui: si el catalogo cambiara, este test cambia con el.
+        esperado = sorted({e['area_codigo']
+                           for e in _cat.listar_por(grado=g)})
+        igual(sorted(codigos), esperado, 'grado %d' % g)
+        assert codigos, 'grado %d sin areas' % g
+
+
+@test("CUR8 Primaria: GAP declarado en los seis grados, no un apaño")
+def _():
+    for g in range(1, 7):
+        codigos, fuente, diag = AD.curriculo_oficial_esperado(
+            RA.NIVEL_PRIMARIA, g)
+        igual(codigos, None, 'grado %d' % g)
+        igual(fuente, None)
+        igual(diag, AD.DIAG_GAP_CURRICULO_ESPERADO, 'grado %d' % g)
+
+
+@test("CUR9 el GAP de Primaria bloquea; NO usa las asignaciones de reserva")
+def _():
+    s = AD.construir_situacion_estudiante(
+        RA.NIVEL_PRIMARIA, 4, [], None,
+        {'porcentaje_ausencias_no_justificadas': 5},
+        diagnosticos=[AD.DIAG_GAP_CURRICULO_ESPERADO])
+    igual(s['situacion']['condicion'], PA.EN_PROCESO)
+    assert PA.BLOQUEO_CURRICULO_NO_DECLARADO in s['situacion']['bloqueos']
+    assert AD.DIAG_GAP_CURRICULO_ESPERADO in s['diagnosticos']
+
+
+@test("CUR10 `curriculo_oficial_esperado` no acepta nada del docente")
+def _():
+    import inspect
+    firma = inspect.signature(AD.curriculo_oficial_esperado).parameters
+    igual(sorted(firma), ['grado_numero', 'nivel', 'version'])
+    cuerpo = codigo_efectivo(inspect.getsource(AD.curriculo_oficial_esperado))
+    for prohibido in ('AsignacionProfesor', 'asignacion', 'profesor', 'activo',
+                      'horario', 'calificacion', 'nota'):
+        assert prohibido not in cuerpo, prohibido
+
+
+@test("CUR13 el catalogo se lee POR GRADO, no en bloque")
+def _():
+    # En SEC-2023 los seis grados tienen las mismas nueve areas, asi que
+    # ningun caso real distingue "filtrar por grado" de "no filtrar": una
+    # mutacion que quitara el filtro pasaria desapercibida. Se comprueba con
+    # un catalogo sintetico donde los grados SI difieren.
+    original = AD.CAT.listar_por
+    falso = {1: ['LE', 'MAT'], 2: ['LE', 'MAT', 'CN'],
+             3: ['LE'], 4: ['LE', 'MAT', 'CN', 'CS'],
+             5: ['MAT'], 6: ['LE', 'CS']}
+
+    def listar_por(version=None, grado=None, area=None):
+        if grado is None:
+            # Sin filtro: la union de todo, que es lo que devolveria una
+            # lectura en bloque.
+            codigos = sorted({c for v in falso.values() for c in v})
+        else:
+            codigos = falso[int(grado)]
+        return [{'area_codigo': c, 'grado_numero': grado} for c in codigos]
+
+    AD.CAT.listar_por = listar_por
+    try:
+        for g, esperado in falso.items():
+            codigos, _f, diag = AD.curriculo_oficial_esperado(
+                RA.NIVEL_SECUNDARIA, g)
+            igual(diag, None, 'grado %d' % g)
+            igual(sorted(codigos), sorted(esperado),
+                  'el grado %d debe leer SU fila del catalogo' % g)
+    finally:
+        AD.CAT.listar_por = original
+
+    # Y despues del monkeypatch, el catalogo real sigue respondiendo.
+    codigos, fuente, diag = AD.curriculo_oficial_esperado(RA.NIVEL_SECUNDARIA, 3)
+    igual(diag, None)
+    igual(sorted(codigos), sorted(AREAS_SEC))
+
+
+@test("CUR11 el adaptador ya no deriva curriculo de las asignaciones")
+def _():
+    assert not hasattr(AD, 'curriculo_desde_asignaciones'), \
+        'la funcion que causaba el defecto no puede seguir disponible'
+    import inspect
+    cuerpo = codigo_efectivo(inspect.getsource(AD.asignaturas_configuradas))
+    # Sigue existiendo, pero ahora devuelve FILAS, no un curriculo.
+    assert 'curriculo' not in cuerpo.lower(), cuerpo
+
+
+@test("CUR12 nada en app.py deriva el curriculo de las asignaciones")
+def _():
+    for nombre in ('_precarga_curso_canonica', '_situacion_canonica_secundaria',
+                   '_situacion_canonica_primaria'):
+        cuerpo = fuente_migrada(nombre)
+        assert 'curriculo_desde_asignaciones' not in cuerpo, nombre
+    precarga = fuente_migrada('_precarga_curso_canonica')
+    assert 'curriculo_oficial_esperado' in precarga
 
 
 print("\n" + "=" * 70)
