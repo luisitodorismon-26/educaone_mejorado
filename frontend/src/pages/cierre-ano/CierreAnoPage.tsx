@@ -22,20 +22,51 @@ interface ResumenCurso {
   promedio: number;
 }
 
+// R4-A4: la condicion la decide el motor canonico (A2) y llega ya resuelta.
+// Son CUATRO estados, no dos. Un APLAZADO no es un reprobado: es alguien que
+// todavia tiene derecho a un proceso de recuperacion, y la pantalla no puede
+// adelantar ese resultado en ninguna de las dos direcciones.
+type CondicionCanonica = 'promovido' | 'aplazado' | 'reprobado' | 'en_proceso';
+
 interface EstudiantePromocion {
   id: number;
   nombre_completo: string;
   matricula: string;
-  curso: string;
-  curso_id: number;
-  promedio_general: number;
+  curso: string | null;
+  curso_id: number | null;
+  // `null` cuando no hay ninguna nota final numerica. NO es 0: un 0 es una
+  // nota, y pintar de rojo a quien no tiene notas cargadas seria mentir.
+  promedio_general: number | null;
   asignaturas_aprobadas: number;
+  asignaturas_pendientes: number;
+  asignaturas_no_aprobadas: number;
+  // Alias de display del backend; mismo numero que asignaturas_no_aprobadas.
   asignaturas_reprobadas: number;
   total_asignaturas: number;
-  asistencia_porcentaje: number;
-  condicion: 'promovido' | 'reprobado' | 'pendiente';
+  // `null` cuando el colegio no declaro dias trabajados y no hay denominador
+  // fiable. La pantalla dice "—", no finge un 0%.
+  porcentaje_ausencias_no_justificadas: number | null;
+  condicion: CondicionCanonica;
+  condicion_canonica: string;
+  motivo: string | null;
+  bloqueos: string[];
+  advertencias: string[];
+  diagnosticos: string[];
   nuevo_grado: string | null;
+  destino_diagnostico: string | null;
+  // Que accion propone el motor ANTES de que Direccion toque nada. `null`
+  // para aplazado y en proceso: no estan listos para decidirse.
+  accion_sugerida: 'promueve' | 'repite' | null;
+  listo_para_decidir: boolean;
 }
+
+const CONDICION_BADGE: Record<CondicionCanonica,
+  { variant: 'success' | 'warning' | 'danger' | 'default'; texto: string }> = {
+  promovido: { variant: 'success', texto: 'Promovido' },
+  aplazado: { variant: 'warning', texto: 'Aplazado' },
+  reprobado: { variant: 'danger', texto: 'Reprobado' },
+  en_proceso: { variant: 'default', texto: 'En proceso' },
+};
 
 export const CierreAnoPage = () => {
   const [anoEscolar, setAnoEscolar] = useState<AnoEscolar | null>(null);
@@ -86,7 +117,16 @@ export const CierreAnoPage = () => {
     setLoadingPromocion(true);
     try {
       const res = await api.get('/cierre-ano/promocion');
-      setEstudiantesPromocion(res.data.estudiantes || []);
+      const lista: EstudiantePromocion[] = res.data.estudiantes || [];
+      setEstudiantesPromocion(lista);
+      // La accion por defecto YA NO es "promueve" para todos. Un reprobado
+      // aparece preseleccionado para repetir, y un aplazado o un en proceso no
+      // aparecen preseleccionados en absoluto.
+      const iniciales: Record<number, 'promueve' | 'repite' | 'retira'> = {};
+      lista.forEach(e => {
+        if (e.accion_sugerida) iniciales[e.id] = e.accion_sugerida;
+      });
+      setAcciones(iniciales);
     } catch (e) {
       console.error(e);
       setMessage({ type: 'error', text: 'Error al cargar datos de promoción' });
@@ -365,10 +405,10 @@ export const CierreAnoPage = () => {
           ) : estudiantesPromocion.length > 0 ? (
             <>
               {/* Resumen según lo marcado */}
-              <div className="grid grid-cols-4 gap-4 p-4">
+              <div className="grid grid-cols-5 gap-4 p-4">
                 <div className="bg-emerald-50 rounded-lg p-3 text-center">
                   <p className="text-2xl font-bold text-emerald-600">
-                    {estudiantesPromocion.filter(e => (acciones[e.id] || 'promueve') === 'promueve').length}
+                    {estudiantesPromocion.filter(e => acciones[e.id] === 'promueve').length}
                   </p>
                   <p className="text-sm text-emerald-700">Promueven</p>
                 </div>
@@ -384,6 +424,12 @@ export const CierreAnoPage = () => {
                   </p>
                   <p className="text-sm text-red-700">Se retiran</p>
                 </div>
+                <div className="bg-slate-50 rounded-lg p-3 text-center">
+                  <p className="text-2xl font-bold text-slate-600">
+                    {estudiantesPromocion.filter(e => !e.listo_para_decidir).length}
+                  </p>
+                  <p className="text-sm text-slate-700">Sin decidir</p>
+                </div>
                 <div className="bg-blue-50 rounded-lg p-3 text-center">
                   <p className="text-2xl font-bold text-blue-600">{estudiantesPromocion.length}</p>
                   <p className="text-sm text-blue-700">Total</p>
@@ -398,7 +444,7 @@ export const CierreAnoPage = () => {
                       <th className="px-4 py-3 text-center font-medium text-gray-600">Curso Actual</th>
                       <th className="px-4 py-3 text-center font-medium text-gray-600">Promedio</th>
                       <th className="px-4 py-3 text-center font-medium text-gray-600">Asignaturas</th>
-                      <th className="px-4 py-3 text-center font-medium text-gray-600">Asistencia</th>
+                      <th className="px-4 py-3 text-center font-medium text-gray-600">Ausencias injustif.</th>
                       <th className="px-4 py-3 text-center font-medium text-gray-600">Condición</th>
                       <th className="px-4 py-3 text-center font-medium text-gray-600">Nuevo Grado</th>
                       <th className="px-4 py-3 text-center font-medium text-gray-600">Acción</th>
@@ -412,36 +458,56 @@ export const CierreAnoPage = () => {
                           <p className="text-xs text-gray-400">{est.matricula}</p>
                         </td>
                         <td className="px-4 py-3 text-center">{est.curso}</td>
-                        <td className="px-4 py-3 text-center">
-                          <span className={est.promedio_general >= 70 ? 'text-emerald-600 font-bold' : 'text-red-600 font-bold'}>
-                            {est.promedio_general.toFixed(1)}
-                          </span>
+                        {/* El promedio es INFORMACION, no un veredicto: se
+                            muestra neutro. La condicion la decide el motor. */}
+                        <td className="px-4 py-3 text-center text-gray-700">
+                          {est.promedio_general !== null
+                            ? est.promedio_general.toFixed(1)
+                            : <span className="text-gray-400">—</span>}
                         </td>
                         <td className="px-4 py-3 text-center">
-                          <span className="text-emerald-600">{est.asignaturas_aprobadas}</span>
+                          <span className="text-emerald-600" title="Aprobadas">{est.asignaturas_aprobadas}</span>
                           <span className="text-gray-400">/</span>
-                          <span className="text-red-600">{est.asignaturas_reprobadas}</span>
-                          <span className="text-gray-400">/{est.total_asignaturas}</span>
+                          <span className="text-amber-600" title="Pendientes">{est.asignaturas_pendientes}</span>
+                          <span className="text-gray-400">/</span>
+                          <span className="text-red-600" title="No aprobadas">{est.asignaturas_no_aprobadas}</span>
+                          <span className="text-gray-400" title="Total oficiales">/{est.total_asignaturas}</span>
                         </td>
-                        <td className="px-4 py-3 text-center">{est.asistencia_porcentaje.toFixed(0)}%</td>
+                        <td className="px-4 py-3 text-center text-gray-700">
+                          {est.porcentaje_ausencias_no_justificadas !== null
+                            ? `${est.porcentaje_ausencias_no_justificadas.toFixed(0)}%`
+                            : <span className="text-gray-400" title="Sin dias trabajados declarados">—</span>}
+                        </td>
                         <td className="px-4 py-3 text-center">
-                          <Badge variant={est.condicion === 'promovido' ? 'success' : 'danger'}>
-                            {est.condicion === 'promovido' ? 'Promovido' : 'Reprobado'}
+                          <Badge variant={CONDICION_BADGE[est.condicion].variant}>
+                            {CONDICION_BADGE[est.condicion].texto}
                           </Badge>
+                          {!est.listo_para_decidir && (
+                            <p className="mt-1 text-[10px] text-gray-500">
+                              {est.bloqueos[0]
+                                ? est.bloqueos[0].replace(/_/g, ' ').toLowerCase()
+                                : 'proceso académico abierto'}
+                            </p>
+                          )}
                         </td>
                         <td className="px-4 py-3 text-center font-medium text-blue-600">
-                          {(acciones[est.id] || 'promueve') === 'retira'
+                          {acciones[est.id] === 'retira'
                             ? <span className="text-red-500">Se retira</span>
-                            : (acciones[est.id] || 'promueve') === 'repite'
+                            : acciones[est.id] === 'repite'
                               ? <span className="text-amber-600">Repite {est.curso}</span>
-                              : (est.nuevo_grado || '-')}
+                              : (est.nuevo_grado || <span className="text-gray-400">—</span>)}
                         </td>
                         <td className="px-4 py-3 text-center">
+                          {/* Un aplazado o un en proceso no tienen accion por
+                              defecto: el proceso academico no ha terminado y la
+                              pantalla no puede decidir por Direccion. */}
                           <select
-                            value={acciones[est.id] || 'promueve'}
+                            value={acciones[est.id] || ''}
+                            disabled={!est.listo_para_decidir}
                             onChange={e => setAcciones(prev => ({ ...prev, [est.id]: e.target.value as any }))}
-                            className="px-2 py-1.5 border border-gray-300 rounded-lg text-xs focus:ring-2 focus:ring-blue-500"
+                            className="px-2 py-1.5 border border-gray-300 rounded-lg text-xs focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100 disabled:text-gray-400 disabled:cursor-not-allowed"
                           >
+                            <option value="">Pendiente</option>
                             <option value="promueve">Promover</option>
                             <option value="repite">Repite el grado</option>
                             <option value="retira">Se retira</option>
@@ -461,14 +527,26 @@ export const CierreAnoPage = () => {
             </div>
           )}
 
-          <div className="p-4 border-t flex justify-end gap-3">
-            <Button variant="secondary" onClick={() => setPaso(3)}>← Volver</Button>
-            <Button 
-              onClick={() => setShowConfirmPromocion(true)}
-              icon={<GraduationCap size={18} />}
-            >
-              Ejecutar Promoción
-            </Button>
+          <div className="p-4 border-t flex items-center justify-between gap-3">
+            {/* Guard de interfaz: mientras quede un proceso academico abierto,
+                la promocion no se puede lanzar. La validacion definitiva del
+                POST es de Cierre de Ano; esta solo evita el clic. */}
+            <p className="text-xs text-amber-700">
+              {estudiantesPromocion.some(e => !e.listo_para_decidir)
+                ? 'Hay estudiantes con proceso académico pendiente.'
+                : ''}
+            </p>
+            <div className="flex gap-3">
+              <Button variant="secondary" onClick={() => setPaso(3)}>← Volver</Button>
+              <Button
+                onClick={() => setShowConfirmPromocion(true)}
+                disabled={estudiantesPromocion.length === 0
+                  || estudiantesPromocion.some(e => !e.listo_para_decidir)}
+                icon={<GraduationCap size={18} />}
+              >
+                Ejecutar Promoción
+              </Button>
+            </div>
           </div>
         </div>
       )}
@@ -595,7 +673,7 @@ export const CierreAnoPage = () => {
         <div className="space-y-4">
           <p>Se realizarán las siguientes acciones:</p>
           <ul className="list-disc list-inside space-y-1 text-gray-600 text-sm">
-            <li><strong className="text-emerald-600">{estudiantesPromocion.filter(e => (acciones[e.id] || 'promueve') === 'promueve').length}</strong> estudiantes pasan al grado siguiente (los de último grado egresan)</li>
+            <li><strong className="text-emerald-600">{estudiantesPromocion.filter(e => acciones[e.id] === 'promueve').length}</strong> estudiantes pasan al grado siguiente</li>
             <li><strong className="text-amber-600">{estudiantesPromocion.filter(e => acciones[e.id] === 'repite').length}</strong> estudiantes repiten el grado actual</li>
             <li><strong className="text-red-600">{estudiantesPromocion.filter(e => acciones[e.id] === 'retira').length}</strong> estudiantes se retiran del colegio</li>
           </ul>
