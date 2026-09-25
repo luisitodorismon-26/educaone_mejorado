@@ -44,6 +44,9 @@ load_dotenv()
 
 from database import engine, SessionLocal, get_db, Base
 from reglas_academicas import redondear_calificacion_final
+# R4-A3: el puente a los motores canonicos A1/A2. No decide nada por su
+# cuenta; traduce filas ORM a lo que A1 y A2 esperan.
+import resultado_academico_consumidores as RAC
 from models import (
     Colegio, ConfiguracionColegio, AnoEscolar, Grado, Tanda, Recreo,
     Asignatura, Curso, Estudiante, AsignacionProfesor, Horario, Calificacion,
@@ -3343,6 +3346,10 @@ def _area_curricular_desde_payload(data, actual):
     Devuelve `(valor, error)`. Ausente = no se toca. Explícitamente null/'' =
     desvincular. Cualquier otra cosa debe ser uno de los 9 códigos oficiales;
     los nombres ("Lenguas", "Inglés") se rechazan con 400.
+
+    R4-A3.3: el campo es la identidad curricular oficial de la asignatura en
+    AMBOS niveles. Qué áreas participan en la promoción de un grado concreto
+    lo deciden los catálogos por grado, no esta validación.
     """
     import catalogo_indicadores as _cat
     if 'area_curricular_codigo' not in data:
@@ -3355,7 +3362,8 @@ def _area_curricular_desde_payload(data, actual):
         validos = ', '.join(_cat.codigos_area_validos())
         return None, (
             f"Área curricular desconocida: {codigo!r}. Debe ser uno de: {validos}, "
-            f"o vacío si la asignatura no pertenece al Registro de Secundaria."
+            f"o vacío si la asignatura no representa un área curricular oficial "
+            f"del MINERD."
         )
     return codigo, None
 
@@ -3392,10 +3400,16 @@ async def get_asignaturas(request: Request, db: Session = Depends(get_db), curre
 @app.get("/api/asignaturas/areas-curriculares")
 async def get_areas_curriculares(request: Request, current_user: Usuario = Depends(get_current_user)):
     """
-    Las 9 áreas oficiales para el selector de Dirección.
+    Las 9 áreas curriculares oficiales para el selector de Dirección.
 
     Sale del catálogo versionado, no de una segunda lista: si el catálogo
     cambia, el selector cambia con él.
+
+    R4-A3.3: NO se filtra por nivel ni por grado a propósito. Este selector
+    configura la IDENTIDAD de la asignatura, y `Asignatura` es del colegio, no
+    de un nivel: la misma fila puede darse en Primaria y en Secundaria. Qué
+    áreas participan en la promoción de un grado lo deciden los catálogos por
+    grado, cuando llega el momento de decidir.
     """
     import catalogo_indicadores as _cat
     return {
@@ -12698,6 +12712,233 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
     return StreamingResponse(out, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
+
+# ═══════════════ R4-A3 · PUENTE A LOS MOTORES CANONICOS ═══════════════
+#
+# Antes de A3 cada documento respondia por su cuenta a «¿este estudiante
+# promueve?», y no coincidian: el boletin individual armaba la nota con una
+# cadena `nota_final or especial_final or ...` —que se come un 0 legitimo— y
+# contaba `reprobadas > 2`; el lote usaba `(cf or 0) >= 70` y escribia
+# "PENDIENTE/REPITENTE"; Primaria llamaba a `condicion_final_estudiante`, que
+# no sabe en que grado esta el estudiante y por eso hacia repetir a un 1.o.
+#
+# Desde aqui todos preguntan lo mismo. La decision es de A1/A2; estas
+# funciones solo LEEN filas y se las pasan.
+
+
+def _precarga_curso_canonica(db, current_user, curso, ano, estudiante_ids=None):
+    """Lo que es igual para todos los estudiantes del curso.
+
+    El lote lo calcula UNA vez: sin esto serian dos consultas por estudiante
+    para obtener siempre las mismas asignaturas.
+
+    R4-A3.1 · DOS COSAS DISTINTAS
+        `curriculo_esperado` sale del catalogo curricular versionado y NO
+        depende de que haya profesor. `asignaturas` son las filas concretas
+        del colegio que hay que LEER, y esas si salen de las asignaciones...
+        mas las que el estudiante tenga calificadas este ano aunque su
+        asignacion ya no exista.
+
+        Sin ese segundo conjunto, retirar al docente de Matematica dejaba sus
+        notas fuera del boletin. Una nota cargada es un hecho academico; que
+        el profesor se haya ido es un hecho administrativo.
+    """
+    asignaciones = tenant_filter(
+        db.query(AsignacionProfesor), AsignacionProfesor, current_user
+    ).filter_by(curso_id=curso.id, ano_escolar_id=ano.id, activo=True).all()
+
+    asig_ids = {a.asignatura_id for a in asignaciones if a.asignatura_id}
+
+    # Asignaturas con notas del ano para estos estudiantes, tengan o no
+    # docente asignado ahora mismo. Una consulta por modelo para todo el
+    # curso, no una por estudiante.
+    if estudiante_ids:
+        _ids = list(estudiante_ids)
+        for _modelo in (CalificacionSecundaria, CalificacionPrimaria):
+            filas = tenant_filter(
+                db.query(_modelo.asignatura_id), _modelo, current_user
+            ).filter(
+                _modelo.estudiante_id.in_(_ids),
+                _modelo.ano_escolar_id == ano.id,
+            ).distinct().all()
+            asig_ids.update(f[0] for f in filas if f[0])
+
+    asignaturas = []
+    if asig_ids:
+        asignaturas = tenant_filter(
+            db.query(Asignatura), Asignatura, current_user
+        ).filter(Asignatura.id.in_(asig_ids)).all()
+
+    grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
+    grado_numero, diag_grado = RAC.numero_de_grado(grado)
+    nivel = RAC.nivel_de_grado(grado)
+    curriculo, fuente, diag_curriculo = RAC.curriculo_oficial_esperado(
+        nivel, grado_numero)
+    return {
+        'asignaciones': asignaciones,
+        'asignaturas': asignaturas,
+        'asignaturas_por_id': {a.id: a for a in asignaturas},
+        'grado': grado,
+        'grado_numero': grado_numero,
+        'nivel': nivel,
+        'diag_grado': diag_grado,
+        'curriculo_esperado': curriculo,
+        'fuente_curriculo': fuente,
+        'diag_curriculo': diag_curriculo,
+        'dias_trabajados': RAC.sumar_dias_trabajados(ano),
+    }
+
+
+def _datos_academicos_estudiantes(db, current_user, estudiante_ids, ano, modelo):
+    """Filas de `modelo` de VARIOS estudiantes, indexadas por (est, asignatura).
+
+    Una sola consulta para todo el curso en vez de una por estudiante.
+    """
+    if not estudiante_ids:
+        return {}
+    filas = tenant_filter(db.query(modelo), modelo, current_user).filter(
+        modelo.estudiante_id.in_(list(estudiante_ids)),
+        modelo.ano_escolar_id == ano.id,
+    ).all()
+    indice = {}
+    for f in filas:
+        indice.setdefault(f.estudiante_id, {}).setdefault(f.asignatura_id, []).append(f)
+    return indice
+
+
+def _asistencias_estudiantes(db, current_user, estudiante_ids, ano):
+    if not estudiante_ids:
+        return {}
+    filas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+        Asistencia.estudiante_id.in_(list(estudiante_ids))
+    ).all()
+    indice = {}
+    for f in filas:
+        indice.setdefault(f.estudiante_id, []).append(f)
+    return indice
+
+
+def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano):
+    """El contexto de A2 con lo que REALMENTE hay en la base."""
+    diagnosticos = []
+    if precarga['diag_grado']:
+        diagnosticos.append(precarga['diag_grado'])
+
+    ausencias = RAC.dias_no_justificados(
+        asistencias_estudiante,
+        getattr(ano, 'fecha_inicio', None), getattr(ano, 'fecha_fin', None))
+    porcentaje, diag_asist = RAC.porcentaje_ausencias(
+        ausencias, precarga['dias_trabajados'])
+    if diag_asist:
+        diagnosticos.append(diag_asist)
+
+    contexto = RAC.construir_contexto(
+        precarga['grado_numero'], nivel, porcentaje, diagnosticos)
+    return contexto, diagnosticos
+
+
+def _diagnosticos_curriculo(precarga, resultados, diagnosticos):
+    """Anade al parte lo que falta del curriculo, sin decidir nada.
+
+    A2 ya bloquea por su cuenta cuando espera un area y no la recibe. Esto
+    solo dice CUALES, para que quien mire el boletin sepa si falta configurar
+    una materia o si al estudiante le falta cargar notas.
+    """
+    if precarga['diag_curriculo']:
+        diagnosticos.append(precarga['diag_curriculo'])
+        return diagnosticos
+    esperados = precarga['curriculo_esperado'] or ()
+    recibidos = {r.get('area_curricular_codigo') for r in resultados}
+    faltan = sorted(set(esperados) - recibidos)
+    if faltan:
+        diagnosticos.append('%s: %s' % (
+            RAC.DIAG_AREAS_ESPERADAS_SIN_ASIGNATURA, ', '.join(faltan)))
+    return diagnosticos
+
+
+def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
+                                   competencias_por_asig=None,
+                                   extras_por_asig=None,
+                                   asistencias=None):
+    """La situacion academica de UN estudiante de Secundaria.
+
+    La usan el boletin individual y el de lote, sin variantes: si alguna vez
+    vuelven a discrepar sera porque alguien dejo de llamar aqui, y la suite
+    R4-A3 lo detecta.
+    """
+    if competencias_por_asig is None:
+        competencias_por_asig = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, CalificacionSecundaria
+        ).get(estudiante.id, {})
+    if extras_por_asig is None:
+        extras = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, EvaluacionExtraSecundaria
+        ).get(estudiante.id, {})
+        extras_por_asig = {k: v[0] for k, v in extras.items() if v}
+    if asistencias is None:
+        asistencias = _asistencias_estudiantes(
+            db, current_user, [estudiante.id], ano).get(estudiante.id, [])
+
+    resultados = RAC.resultados_secundaria(
+        precarga['asignaturas'], competencias_por_asig, extras_por_asig,
+        _calcular_cf_secundaria)
+
+    contexto, diagnosticos = _contexto_canonico(
+        precarga, RAC.RA.NIVEL_SECUNDARIA, asistencias, ano)
+
+    return RAC.construir_situacion_estudiante(
+        RAC.RA.NIVEL_SECUNDARIA, precarga['grado_numero'], resultados,
+        precarga['curriculo_esperado'], contexto,
+        diagnosticos=_diagnosticos_curriculo(precarga, resultados, diagnosticos),
+        fuente_curriculo=precarga['fuente_curriculo'])
+
+
+def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
+                                 competencias_por_asig=None,
+                                 recuperaciones_por_asig=None,
+                                 asistencias=None):
+    """La situacion academica de UN estudiante de Primaria.
+
+    Sustituye a `calculo_primaria.condicion_final_estudiante` en los caminos
+    documentales. Aquella contaba areas sin saber el grado: en 1.o y 2.o
+    anunciaba una repitencia que la Ordenanza 04-2023 no contempla, y en 3.o
+    ignoraba la alfabetizacion inicial.
+    """
+    if competencias_por_asig is None:
+        competencias_por_asig = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, CalificacionPrimaria
+        ).get(estudiante.id, {})
+    if recuperaciones_por_asig is None:
+        recs = _datos_academicos_estudiantes(
+            db, current_user, [estudiante.id], ano, RecuperacionPrimaria
+        ).get(estudiante.id, {})
+        recuperaciones_por_asig = {k: v[0] for k, v in recs.items() if v}
+    if asistencias is None:
+        asistencias = _asistencias_estudiantes(
+            db, current_user, [estudiante.id], ano).get(estudiante.id, [])
+
+    # R4-A3.3: `adicionales` son materias con identidad curricular valida que
+    # NO pertenecen al curriculo de este grado —Ingles en 1.o es el caso real—.
+    # Se anotan para que se vean, pero no participan ni bloquean.
+    resultados, adicionales = RAC.resultados_primaria(
+        precarga['asignaturas'], competencias_por_asig,
+        recuperaciones_por_asig, precarga['grado_numero'],
+        codigos_oficiales_esperados=precarga['curriculo_esperado'])
+
+    contexto, diagnosticos = _contexto_canonico(
+        precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano)
+    diagnosticos = _diagnosticos_curriculo(precarga, resultados, diagnosticos)
+    if adicionales:
+        diagnosticos.append('%s: %s' % (
+            RAC.DIAG_AREAS_ADICIONALES, ', '.join(sorted(set(adicionales)))))
+
+    return RAC.construir_situacion_estudiante(
+        RAC.RA.NIVEL_PRIMARIA, precarga['grado_numero'], resultados,
+        precarga['curriculo_esperado'], contexto,
+        diagnosticos=diagnosticos,
+        fuente_curriculo=precarga['fuente_curriculo'])
+
+
 def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano):
     """Helper que arma el dict calificaciones_por_asig esperado por
     generar_boletin_secundaria_minerd, leyendo de la BD las
@@ -12953,8 +13194,6 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
     al de siempre — un boletín individual no cambia en nada.
     """
     from boletin_primaria import generar_boletin_primaria
-    from calculo_primaria import situacion_area, condicion_final_estudiante
-
     curso = estudiante.curso
     _ck = ('grado', curso.id) if curso else None
     if _cache_curso is not None and _ck in _cache_curso:
@@ -13006,22 +13245,30 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
             if prof:
                 docente_nombre = f"{prof.nombre} {prof.apellido}".strip()
 
-    # v2.14.1 BUGFIX: la portada nunca marcaba la X de Promovido/Aplazado/
-    # Repitente ni escribía la condición — el motor ya lo calcula, solo había
-    # que pasárselo (ahora considerando también las recuperaciones cargadas).
-    situaciones = [
-        situacion_area(d.get('cf_area'), d.get('recuperacion_final'),
-                       d.get('recuperacion_especial'))
-        for d in areas.values()
-    ]
+    # ── R4-A3 · La condición sale del motor canónico ──
+    #
+    # Aquí se llamaba a `calculo_primaria.condicion_final_estudiante`, que
+    # cuenta áreas reprobadas y nada más: no sabe en qué grado está el
+    # estudiante. En 1.º y 2.º anunciaba una repitencia que la Ordenanza
+    # 04-2023 no contempla, y en 3.º ignoraba la alfabetización inicial.
+    #
+    # La X de la portada se marca SOLO si A2 certificó algo. Un EN_PROCESO no
+    # marca ninguna casilla: el documento no puede afirmar lo que el motor se
+    # negó a afirmar.
     situacion_final = None
     condicion_texto = ''
-    if situaciones:
-        cond = condicion_final_estudiante(situaciones)
-        condicion_texto = cond.get('detalle') or ''
-        mapa_x = {'promovido': 'promovido', 'repite': 'repitente',
-                  'repitente_condicional': 'aplazado'}
-        situacion_final = mapa_x.get(cond.get('condicion'))  # en_proceso → sin X
+    if curso is not None:
+        _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                             estudiante_ids=[estudiante.id])
+        _paquete = _situacion_canonica_primaria(
+            db, current_user, estudiante, ano, _precarga)
+        situacion_final = RAC.MARCA_BOLETIN_PRIMARIA.get(
+            _paquete['situacion']['condicion'])
+        condicion_texto = RAC.texto_situacion(_paquete['situacion'])
+        _detalle = RAC.detalle_situacion(_paquete['situacion'],
+                                         _paquete['diagnosticos'])
+        if _detalle:
+            condicion_texto = '%s — %s' % (condicion_texto, _detalle)
 
     return generar_boletin_primaria(
         estudiante=estudiante,
@@ -13852,8 +14099,10 @@ async def boletin_primaria_estudiante_json(
     Carril separado del JSON de secundaria: devuelve por área las 3
     competencias con P1-P4/RP1-RP4, su CF, la CF del área y la situación.
     """
+    # `situacion_area` sigue aquí a propósito: alimenta el `estado` y la
+    # `nota_final` que se muestran POR ÁREA, que es dato de presentación y no
+    # la decisión global. Esa la toma A2 más abajo.
     from calculo_primaria import (cf_area as calc_cf_area, situacion_area,
-                                  condicion_final_estudiante,
                                   MINIMO_APROBATORIO_PRIMARIA)
 
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
@@ -13941,7 +14190,28 @@ async def boletin_primaria_estudiante_json(
             'nota_final': sit['nota_final'],
         })
 
-    condicion = condicion_final_estudiante(situaciones) if situaciones else None
+    # ── R4-A3 · La condición sale del motor canónico ──
+    #
+    # La FORMA de la respuesta no cambia: el frontend lee
+    # {'condicion', 'detalle', 'areas_reprobadas', 'areas_pendientes'} y
+    # reconoce los valores 'promovido' | 'repitente_condicional' | 'repite' |
+    # 'en_proceso'. Lo que cambia es QUIÉN decide, no cómo se llama.
+    condicion = None
+    if situaciones and curso is not None:
+        _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                             estudiante_ids=[estudiante.id])
+        _paquete = _situacion_canonica_primaria(
+            db, current_user, estudiante, ano, _precarga)
+        _sit = _paquete['situacion']
+        _detalle = RAC.detalle_situacion(_sit, _paquete['diagnosticos'])
+        condicion = {
+            'condicion': RAC.CONDICION_LEGACY_PRIMARIA.get(_sit['condicion'],
+                                                           'en_proceso'),
+            'detalle': (RAC.texto_situacion(_sit)
+                        + (' — %s' % _detalle if _detalle else '')),
+            'areas_reprobadas': _sit['no_aprobadas'],
+            'areas_pendientes': _sit['pendientes'],
+        }
     asistencia = _construir_asistencias_boletin(db, id, current_user, ano)
     # v2.14.1 BUGFIX: se sumaba .get('presentes') sobre un dict cuyas claves
     # reales son 'asistencia'/'ausencia' — la asistencia de la vista previa
@@ -14136,37 +14406,24 @@ async def generar_boletin_minerd_v2(
             'error': f'{estudiante.nombre_completo} no tiene calificaciones completas (las 4 competencias) en ninguna asignatura. Verificá que los profesores hayan cargado todas las competencias.'
         }, status_code=400)
     
-    # Situación final (calculada a partir de notas)
-    aprobadas = 0
-    reprobadas = 0
-    for asig_id, data in califs_por_asig.items():
-        ev = data.get('evaluacion_extra')
-        nota_final = None
-        if ev:
-            nota_final = (getattr(ev, 'nota_final', None) or
-                          getattr(ev, 'especial_final', None) or
-                          getattr(ev, 'extraordinaria_final', None) or
-                          getattr(ev, 'completiva_final', None))
-        if nota_final is None:
-            nota_final = data.get('cf')
-        if nota_final is not None:
-            if nota_final >= 70:
-                aprobadas += 1
-            else:
-                reprobadas += 1
+    # ── R4-A3 · La situación sale del motor canónico ──
+    #
+    # Aquí había una regla propia: una cadena `nota_final or especial_final or
+    # extraordinaria_final or completiva_final` y un `reprobadas > 2`. La
+    # cadena se comía un 0 legítimo —`0 or 75` da 75— y el contador no
+    # distinguía un área que agotó la cascada de otra que ni la empezó.
+    #
+    # Ya no se decide aquí. Lo que sigue es lectura y presentación.
+    _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                         estudiante_ids=[estudiante.id])
+    _paquete = _situacion_canonica_secundaria(
+        db, current_user, estudiante, ano, _precarga)
+    situacion = RAC.situacion_boletin_secundaria(
+        _paquete['situacion'], _paquete['diagnosticos'])
     
-    promovido = reprobadas == 0 and aprobadas > 0
-    repitente = reprobadas > 2  # MINERD: más de 2 reprobadas → repitente
-    
-    situacion = {
-        'promovido': promovido,
-        'repitente': repitente,
-        'condicion': request.query_params.get('condicion', 
-            'APROBADO/A — Promovido' if promovido else
-            ('REPITENTE — Debe repetir el grado' if repitente else 
-             'PENDIENTE — Evaluaciones extra en curso'))
-    }
-    
+    # `condicion` ya no se lee del query string: una situación académica
+    # oficial no puede depender de lo que alguien escriba en la URL. Ningún
+    # cliente lo mandaba (se comprobó en el frontend antes de retirarlo).
     observaciones = request.query_params.get('observaciones', '')
     
     # v2.13.18: docente encargado del grado = profesor titular del curso
@@ -14273,22 +14530,35 @@ async def generar_boletines_curso_minerd_v2(
     except Exception as e:
         logger.warning(f"No se pudo obtener docente titular del curso {curso_id}: {e}")
     
+    # ── R4-A3 · Todo lo que es igual para el curso, una sola vez ──
+    _ids = [e.id for e in estudiantes]
+    _precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                         estudiante_ids=_ids)
+    _comps = _datos_academicos_estudiantes(
+        db, current_user, _ids, ano, CalificacionSecundaria)
+    _extras = _datos_academicos_estudiantes(
+        db, current_user, _ids, ano, EvaluacionExtraSecundaria)
+    _asist_idx = _asistencias_estudiantes(db, current_user, _ids, ano)
+
     for est in estudiantes:
         try:
             califs = _construir_datos_boletin_secundaria(db, est, curso, current_user, ano)
             asist = _construir_asistencias_boletin(db, est.id, current_user, ano)
             if not califs:
                 continue  # skip si no tiene notas cargadas
-            # Situación
-            aprobadas = sum(1 for d in califs.values() 
-                           if (d.get('cf') or 0) >= 70 or 
-                              (d.get('evaluacion_extra') and (getattr(d['evaluacion_extra'], 'nota_final', None) or 0) >= 70))
-            reprobadas = len(califs) - aprobadas
-            situacion = {
-                'promovido': reprobadas == 0,
-                'repitente': reprobadas > 2,
-                'condicion': 'APROBADO/A — Promovido' if reprobadas == 0 else 'PENDIENTE/REPITENTE',
-            }
+            # ── R4-A3 · El MISMO helper que el boletín individual ──
+            #
+            # Antes esto era una comprensión aparte —`(cf or 0) >= 70`— con su
+            # propio texto por defecto. Dos estudiantes idénticos podían salir
+            # con condiciones distintas según por dónde se pidiera el PDF.
+            _paquete = _situacion_canonica_secundaria(
+                db, current_user, est, ano, _precarga,
+                competencias_por_asig=_comps.get(est.id, {}),
+                extras_por_asig={k: v[0] for k, v
+                                 in (_extras.get(est.id) or {}).items() if v},
+                asistencias=_asist_idx.get(est.id, []))
+            situacion = RAC.situacion_boletin_secundaria(
+                _paquete['situacion'], _paquete['diagnosticos'])
             buf = generar_boletin_secundaria_minerd(
                 estudiante=est, curso=curso,
                 calificaciones_por_asig=califs,
@@ -15210,133 +15480,365 @@ async def get_reporte_notas_curso(curso_id, periodo, db: Session = Depends(get_d
 
 # ============== PROMOCIÓN REAL ==============
 
-@app.get("/api/promocion/estudiantes")
-async def get_estudiantes_promocion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Obtener lista de estudiantes con su estado de promoción real.
-    
-    v2.13.8: lee AMBOS modelos. Para CalificacionSecundaria calcula CF como
-    AVG(PC1..PC4) considerando evaluacion_extra si existe.
+
+# ═══════════════ R4-A4 · PREVISUALIZACION CANONICA DE PROMOCION ═══════════════
+#
+# Las dos pantallas de Direccion que ANTICIPAN la promocion tenian cada una su
+# propia regla, y ninguna era la del motor:
+#
+#   GET /api/promocion/estudiantes   recalculaba CF, cortaba en 70 y repartia
+#                                    en Promovido / "Promovido condicional" /
+#                                    Reprobado segun contara 0, 1-2 o 3+ fallos
+#   GET /api/cierre-ano/promocion    recalculaba CF otra vez y decidia
+#                                    promovido / reprobado con "cualquier fallo
+#                                    reprueba", ademas de inventar la asistencia
+#                                    como presentes / filas existentes
+#
+# «Promovido condicional» no existe en la Ordenanza ni en el motor. Lo que
+# existe es el APLAZADO: el estudiante que aun tiene derecho a un proceso de
+# recuperacion. Llamarlo "promovido con condiciones" adelanta una promocion que
+# todavia no ocurrio; llamarlo "reprobado" le quita un derecho.
+#
+# A4 no decide nada: pregunta a A2 a traves de los mismos helpers que usan los
+# boletines, y se limita a presentar la respuesta.
+
+DESTINO_TITULACION_PENDIENTE = 'PROCESO_DE_TITULACION_EGRESO_PENDIENTE'
+DESTINO_SIN_GRADO_SIGUIENTE = 'NO_EXISTE_GRADO_SIGUIENTE_EN_EL_COLEGIO'
+DESTINO_AMBIGUO = 'VARIOS_GRADOS_CANDIDATOS_PARA_EL_DESTINO'
+DESTINO_PROCESO_ABIERTO = 'PROCESO_ACADEMICO_ABIERTO_SIN_DESTINO'
+DIAG_ESTUDIANTE_SIN_CURSO = 'ESTUDIANTE_SIN_CURSO_ASIGNADO'
+
+# Condicion canonica -> valor estable para la UI. NO hay un quinto estado, y
+# ninguno de estos textos vuelve a ser fuente de verdad.
+CONDICION_UI = {
+    RAC.PA.PROMOVIDO: 'promovido',
+    RAC.PA.APLAZADO: 'aplazado',
+    RAC.PA.REPROBADO: 'reprobado',
+    RAC.PA.EN_PROCESO: 'en_proceso',
+}
+
+# Que accion propone la pantalla ANTES de que Direccion toque nada. Un
+# aplazado no esta listo para promover ni para repetir: esta a mitad de su
+# proceso, y la pantalla no puede preseleccionar por el.
+ACCION_SUGERIDA = {
+    RAC.PA.PROMOVIDO: 'promueve',
+    RAC.PA.REPROBADO: 'repite',
+    RAC.PA.APLAZADO: None,
+    RAC.PA.EN_PROCESO: None,
+}
+
+
+def _indice_grados_canonico(db, current_user):
+    """Los grados del colegio indexados por (nivel, numero), fail-closed.
+
+    `Grado.orden` NO sirve para esto: es un contador global que se reparte
+    entre los planes contratados, asi que en un colegio mixto Primaria empieza
+    en 7 y en uno solo-primaria empieza en 1 (R4-A3.1). El numero canonico sale
+    del nombre, validado contra `orden` cuando este es interpretable.
+
+    Si dos grados resuelven al mismo (nivel, numero) —en produccion hay grados
+    duplicados— se marcan como AMBIGUOS y no se elige ninguno.
     """
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True).order_by(Estudiante.curso_id, Estudiante.no_lista).all()
-    est_ids = [e.id for e in estudiantes]
-    
-    # Pre-cargar CalificacionSecundaria de todos los estudiantes
-    ano_activo_prom = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    sec_por_est_asig: dict = {}
-    extras_por_est_asig: dict = {}
-    if ano_activo_prom and est_ids:
-        califs_sec_prom = tenant_filter(
-            db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-        ).filter(
-            CalificacionSecundaria.estudiante_id.in_(est_ids),
-            CalificacionSecundaria.ano_escolar_id == ano_activo_prom.id,
-        ).all()
-        from collections import defaultdict as _dd
-        sec_por_est_asig = _dd(list)
-        for c in califs_sec_prom:
-            sec_por_est_asig[(c.estudiante_id, c.asignatura_id)].append(c)
-        
-        # Pre-cargar evaluaciones extras
-        extras = tenant_filter(
-            db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria, current_user
-        ).filter(
-            EvaluacionExtraSecundaria.estudiante_id.in_(est_ids),
-            EvaluacionExtraSecundaria.ano_escolar_id == ano_activo_prom.id,
-        ).all()
-        for e in extras:
-            extras_por_est_asig[(e.estudiante_id, e.asignatura_id)] = e
-    
-    resultado = []
-    for est in estudiantes:
-        cfs = []
-        asignaturas_reprobadas = []
-        asig_ids_modelo_nuevo = set()
-        
-        # 1. Modelo NUEVO: CalificacionSecundaria
-        for (eid, aid), comps in list(sec_por_est_asig.items()):
-            if eid != est.id:
-                continue
-            # CF = AVG(PC1..PC4)
-            pcs = []
-            for p in range(1, 5):
-                vals = []
-                for c in comps:
-                    v = c.valor_periodo(p) if hasattr(c, 'valor_periodo') else None
-                    if v is not None:
-                        vals.append(v)
-                if vals:
-                    pcs.append(sum(vals) / len(vals))
-            if not pcs:
-                continue
-            cf = int(round(sum(pcs) / len(pcs)))
-            
-            # Evaluación extra (puede haber subido la nota tras cascada completiva/extra)
-            ev = extras_por_est_asig.get((est.id, aid))
-            nota_final = ev.nota_final if (ev and ev.nota_final is not None) else cf
-            
-            cfs.append(nota_final)
-            if nota_final < 70:
-                asig_obj = db.get(Asignatura, aid)
-                asignaturas_reprobadas.append(asig_obj.nombre if asig_obj else 'Asignatura')
-            asig_ids_modelo_nuevo.add(aid)
-        
-        # 2. Modelo LEGACY
-        calificaciones = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(estudiante_id=est.id).all()
-        for calif in calificaciones:
-            if calif.asignatura_id in asig_ids_modelo_nuevo:
-                continue
-            if calif.cf is not None:
-                cfs.append(calif.cf)
-                if calif.cf < 70:
-                    asignaturas_reprobadas.append(calif.asignatura.nombre if calif.asignatura else 'Asignatura')
-        
-        promedio_general = round(sum(cfs) / len(cfs), 1) if cfs else None
-        todas_aprobadas = all(cf >= 70 for cf in cfs) if cfs else False
-        
-        # Determinar condición
-        if not cfs:
-            condicion = 'Sin calificaciones'
-        elif todas_aprobadas:
-            condicion = 'Promovido'
-        elif len(asignaturas_reprobadas) <= 2:
-            condicion = 'Promovido condicional'
-        else:
-            condicion = 'Reprobado'
-        
-        # Determinar nuevo grado
-        grado_actual = est.curso.grado if est.curso else None
-        if condicion in ['Promovido', 'Promovido condicional'] and grado_actual:
-            siguiente_grado = tenant_filter(db.query(Grado), Grado, current_user).filter(Grado.orden == grado_actual.orden + 1).first()
-            nuevo_grado = siguiente_grado.nombre if siguiente_grado else 'Egresado'
-        else:
-            nuevo_grado = grado_actual.nombre if grado_actual else None
-        
-        resultado.append({
-            'id': est.id,
-            'nombre': est.nombre_completo,
-            'matricula': est.matricula,
-            'curso': est.curso.nombre_completo if est.curso else None,
-            'grado_actual': grado_actual.nombre if grado_actual else None,
-            'promedio_general': promedio_general,
-            'literal': Calificacion().get_literal(promedio_general) if promedio_general else None,
-            'asignaturas_reprobadas': asignaturas_reprobadas,
-            'condicion': condicion,
-            'nuevo_grado': nuevo_grado
-        })
-    
-    # Resumen
-    resumen = {
-        'total': len(resultado),
-        'promovidos': sum(1 for r in resultado if r['condicion'] == 'Promovido'),
-        'promovidos_condicional': sum(1 for r in resultado if r['condicion'] == 'Promovido condicional'),
-        'reprobados': sum(1 for r in resultado if r['condicion'] == 'Reprobado'),
-        'sin_calificaciones': sum(1 for r in resultado if r['condicion'] == 'Sin calificaciones')
-    }
-    
+    indice, ambiguos = {}, set()
+    for g in tenant_filter(db.query(Grado), Grado, current_user).all():
+        nivel = RAC.nivel_de_grado(g)
+        numero, _diag = RAC.numero_de_grado(g)
+        if nivel is None or numero is None:
+            continue
+        clave = (nivel, numero)
+        if clave in indice:
+            ambiguos.add(clave)
+        indice[clave] = g
+    return indice, ambiguos
+
+
+def _destino_previsto(indice_grados, ambiguos, nivel, grado_numero, condicion,
+                      grado_actual):
+    """A donde IRIA el estudiante. Informativo: A4 no mueve a nadie.
+
+    · APLAZADO y EN_PROCESO no tienen destino. No es que no se sepa: es que
+      todavia no hay decision de promocion, y ofrecer un grado siguiente
+      invitaria a ejecutarla.
+    · REPROBADO repite el que ya cursa.
+    · 6.o de Secundaria PROMOVIDO no es "Graduado" ni "Egresado". La titulacion
+      depende de las Pruebas Nacionales, que EducaOne no conoce; A2 ya emite su
+      advertencia y aqui solo se dice que el proceso esta pendiente.
+    """
+    if condicion in (RAC.PA.APLAZADO, RAC.PA.EN_PROCESO):
+        return None, DESTINO_PROCESO_ABIERTO
+    if condicion == RAC.PA.REPROBADO:
+        return (getattr(grado_actual, 'nombre', None), None)
+    if condicion != RAC.PA.PROMOVIDO:
+        return None, DESTINO_PROCESO_ABIERTO
+
+    if nivel is None or grado_numero is None:
+        return None, DESTINO_SIN_GRADO_SIGUIENTE
+
+    if nivel == RAC.RA.NIVEL_SECUNDARIA and grado_numero >= 6:
+        return None, DESTINO_TITULACION_PENDIENTE
+
+    if nivel == RAC.RA.NIVEL_PRIMARIA and grado_numero >= 6:
+        destino = (RAC.RA.NIVEL_SECUNDARIA, 1)
+    else:
+        destino = (nivel, grado_numero + 1)
+
+    if destino in ambiguos:
+        return None, DESTINO_AMBIGUO
+    grado = indice_grados.get(destino)
+    if grado is None:
+        return None, DESTINO_SIN_GRADO_SIGUIENTE
+    return grado.nombre, None
+
+
+def _promedio_informativo(resultados):
+    """Promedio de las notas finales CANONICAS, solo para mostrar.
+
+    No decide nada: la condicion la da A2. Si ninguna area tiene nota final
+    numerica se devuelve None, nunca 0 — un 0 es una nota, y fingirlo pintaria
+    de rojo a un estudiante que simplemente no tiene notas cargadas.
+    """
+    notas = [r['nota_final'] for r in resultados
+             if isinstance(r.get('nota_final'), (int, float))
+             and not isinstance(r.get('nota_final'), bool)]
+    if not notas:
+        return None
+    return round(sum(notas) / len(notas), 1)
+
+
+def _fila_preview(estudiante, paquete, indice_grados, ambiguos, grado_actual):
+    """Una fila de previsualizacion. Presentacion pura sobre la salida de A2."""
+    situacion = paquete['situacion']
+    condicion = situacion['condicion']
+    nuevo_grado, diag_destino = _destino_previsto(
+        indice_grados, ambiguos, paquete['nivel'], paquete['grado_numero'],
+        condicion, grado_actual)
+    diagnosticos = list(paquete['diagnosticos'])
+    if diag_destino and diag_destino != DESTINO_PROCESO_ABIERTO:
+        diagnosticos.append(diag_destino)
+
     return {
-        'estudiantes': resultado,
-        'resumen': resumen
+        'id': estudiante.id,
+        'nombre_completo': estudiante.nombre_completo,
+        'matricula': estudiante.matricula,
+        'curso': estudiante.curso.nombre_completo if estudiante.curso else None,
+        'curso_id': estudiante.curso_id,
+        'grado_actual': getattr(grado_actual, 'nombre', None),
+        'nivel': paquete['nivel'],
+        'grado_numero': paquete['grado_numero'],
+
+        # LA VERDAD ACADEMICA. Los dos GET transportan exactamente esto.
+        'condicion_canonica': condicion,
+        'condicion': CONDICION_UI.get(condicion, 'en_proceso'),
+        'es_definitiva': situacion['es_definitiva'],
+        'motivo': situacion['motivo'],
+        'bloqueos': list(situacion['bloqueos']),
+        'advertencias': list(situacion['advertencias']),
+        'inconsistencias': list(situacion['inconsistencias']),
+        'diagnosticos': diagnosticos,
+
+        # Conteos de A2. Aqui no se vuelve a contar nada.
+        'total_asignaturas': situacion['total_oficiales'],
+        'asignaturas_aprobadas': situacion['aprobadas'],
+        'asignaturas_pendientes': situacion['pendientes'],
+        'asignaturas_no_aprobadas': situacion['no_aprobadas'],
+        # Alias de DISPLAY conservado por compatibilidad con la tabla actual.
+        # No es una decision: es el mismo numero que `asignaturas_no_aprobadas`.
+        'asignaturas_reprobadas': situacion['no_aprobadas'],
+        'codigos_no_aprobados': list(situacion['codigos_no_aprobados']),
+        'codigos_pendientes': list(situacion['codigos_pendientes']),
+
+        'promedio_general': _promedio_informativo(paquete['resultados']),
+        'porcentaje_ausencias_no_justificadas': paquete['contexto'].get(
+            'porcentaje_ausencias_no_justificadas'),
+
+        'nuevo_grado': nuevo_grado,
+        'destino_diagnostico': diag_destino,
+        'accion_sugerida': ACCION_SUGERIDA.get(condicion),
+        'listo_para_decidir': condicion in (RAC.PA.PROMOVIDO, RAC.PA.REPROBADO),
+        'requiere_recuperacion_especial': situacion.get(
+            'requiere_recuperacion_especial', False),
+        'requiere_evaluacion_especial': situacion.get(
+            'requiere_evaluacion_especial', False),
+        'fuente_curriculo': paquete['fuente_curriculo'],
     }
+
+
+def _preview_promocion_canonica(db, current_user, ano):
+    """La previsualizacion de TODO el colegio, resuelta con A1/A2.
+
+    Agrupa por curso y precarga por bloque: una precarga curricular y cuatro
+    consultas de datos academicos por CURSO, no por estudiante. Sin esto, un
+    colegio de 300 alumnos haria miles de viajes a la base.
+
+    Es LECTURA PURA. No escribe, no mueve a nadie, no toca
+    `Estudiante.condicion` —que es un campo administrativo y no la verdad
+    academica— y no ejecuta ninguna promocion.
+    """
+    estudiantes = tenant_filter(
+        db.query(Estudiante), Estudiante, current_user
+    ).filter_by(activo=True).order_by(
+        Estudiante.curso_id, Estudiante.no_lista, Estudiante.apellido).all()
+    if not estudiantes:
+        return []
+
+    indice_grados, ambiguos = _indice_grados_canonico(db, current_user)
+
+    por_curso = {}
+    for est in estudiantes:
+        por_curso.setdefault(est.curso_id, []).append(est)
+
+    filas = []
+    for curso_id, alumnos in por_curso.items():
+        curso = alumnos[0].curso if curso_id is not None else None
+        if curso is None or ano is None:
+            # Sin curso no hay grado, y sin grado no hay norma aplicable. El
+            # estudiante NO se omite: aparece en proceso y con el motivo.
+            for est in alumnos:
+                paquete = RAC.construir_situacion_estudiante(
+                    None, None, [], None, {},
+                    diagnosticos=[DIAG_ESTUDIANTE_SIN_CURSO])
+                filas.append(_fila_preview(est, paquete, indice_grados,
+                                           ambiguos, None))
+            continue
+
+        ids = [e.id for e in alumnos]
+        precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                            estudiante_ids=ids)
+        asistencias = _asistencias_estudiantes(db, current_user, ids, ano)
+
+        if precarga['nivel'] == RAC.RA.NIVEL_SECUNDARIA:
+            comps = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, CalificacionSecundaria)
+            extras = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, EvaluacionExtraSecundaria)
+            for est in alumnos:
+                paquete = _situacion_canonica_secundaria(
+                    db, current_user, est, ano, precarga,
+                    competencias_por_asig=comps.get(est.id, {}),
+                    extras_por_asig={k: v[0] for k, v
+                                     in (extras.get(est.id) or {}).items() if v},
+                    asistencias=asistencias.get(est.id, []))
+                filas.append(_fila_preview(est, paquete, indice_grados,
+                                           ambiguos, precarga['grado']))
+        else:
+            comps = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, CalificacionPrimaria)
+            recs = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, RecuperacionPrimaria)
+            for est in alumnos:
+                paquete = _situacion_canonica_primaria(
+                    db, current_user, est, ano, precarga,
+                    competencias_por_asig=comps.get(est.id, {}),
+                    recuperaciones_por_asig={k: v[0] for k, v
+                                             in (recs.get(est.id) or {}).items() if v},
+                    asistencias=asistencias.get(est.id, []))
+                filas.append(_fila_preview(est, paquete, indice_grados,
+                                           ambiguos, precarga['grado']))
+
+    filas.sort(key=lambda f: ((f['curso'] or ''), f['nombre_completo'] or ''))
+    return filas
+
+
+def _resolver_ano_preview(db, current_user, ano_id=None,
+                          preferir_cerrado=False):
+    """Qué año ACADÉMICO alimenta la previsualización.
+
+    AÑO ACTIVO NO ES AÑO QUE SE ESTÁ PROMOVIENDO
+        Este resolver existe por un defecto real. El flujo de Cierre de Año
+        es: cerrar 2025-2026 (`cerrado=True`, `activo=False`), crear
+        2026-2027 (que queda `activo=True` y VACÍO) y recién entonces mirar
+        la previsualización. Preferir el año activo la hacía mirar el año
+        nuevo, donde no hay ni una calificación: un estudiante PROMOVIDO
+        pasaba a EN_PROCESO por CURRICULO_OFICIAL_INCOMPLETO. Crear el año
+        siguiente cambiaba la situación académica del año que se cerraba.
+
+        Los estudiantes se promueven según las notas, recuperaciones,
+        asistencia y currículo del año que TERMINA. El año nuevo es un
+        destino administrativo, no una fuente académica.
+
+    TRES CAMINOS, EN ESTE ORDEN
+        1. `ano_id` explícito manda siempre. Se resuelve DENTRO del tenant:
+           un id de otro colegio no puede revelar ni su nombre, ni sus
+           fechas, ni su existencia, así que devuelve el mismo 404 que un id
+           inexistente.
+        2. `preferir_cerrado=True` —la pantalla de Cierre— toma el cerrado
+           más reciente. Si todavía no se cerró ninguno usa el activo, para
+           que la pantalla siga sirviendo ANTES del cierre.
+        3. Por defecto —la promoción general— toma el activo, y si no hay,
+           el cerrado más reciente.
+
+    El caso 2 es además la garantía de backend para el refresco de página:
+    aunque el navegador pierda el estado, la preview de Cierre sigue
+    encontrando el año correcto sin que nadie se lo diga.
+    """
+    if ano_id is not None:
+        return get_tenant_or_404(db, AnoEscolar, ano_id, current_user,
+                                 name='anoescolar')
+
+    def _activo():
+        return tenant_filter(
+            db.query(AnoEscolar), AnoEscolar, current_user
+        ).filter_by(activo=True).first()
+
+    def _cerrado_reciente():
+        return tenant_filter(
+            db.query(AnoEscolar), AnoEscolar, current_user
+        ).filter_by(cerrado=True).order_by(AnoEscolar.id.desc()).first()
+
+    if preferir_cerrado:
+        return _cerrado_reciente() or _activo()
+
+    ano = _activo()
+    if ano is None:
+        ano = _cerrado_reciente()
+    if ano is None:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar,
+                            current_user).order_by(AnoEscolar.id.desc()).first()
+    return ano
+
+
+def _ano_para_preview(db, current_user):
+    """Compatibilidad: el comportamiento por defecto del resolver."""
+    return _resolver_ano_preview(db, current_user)
+
+
+@app.get("/api/promocion/estudiantes")
+async def get_estudiantes_promocion(request: Request, ano_id: int = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Previsualizacion de promocion. R4-A4: la decide A2, no este endpoint.
+
+    Aqui vivia una regla propia —recalcular CF, cortar en 70 y repartir en
+    Promovido / "Promovido condicional" / Reprobado segun contara 0, 1-2 o 3+
+    fallos—. «Promovido condicional» no existe en la Ordenanza ni en el motor:
+    lo que existe es el APLAZADO, el estudiante que aun tiene derecho a un
+    proceso de recuperacion.
+
+    R4-A4.1: acepta `?ano_id=` para fijar el año académico de origen. Sin
+    parámetro conserva su semántica de siempre —el año ACTIVO—, que es la
+    correcta para una consulta general de promoción durante el curso.
+
+    No ejecuta nada. No escribe nada.
+    """
+    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id)
+    filas = _preview_promocion_canonica(db, current_user, ano)
+
+    resumen = {
+        'total': len(filas),
+        'promovidos': sum(1 for f in filas if f['condicion'] == 'promovido'),
+        'aplazados': sum(1 for f in filas if f['condicion'] == 'aplazado'),
+        'reprobados': sum(1 for f in filas if f['condicion'] == 'reprobado'),
+        'en_proceso': sum(1 for f in filas if f['condicion'] == 'en_proceso'),
+    }
+    resumen['pendientes_de_proceso'] = resumen['aplazados'] + resumen['en_proceso']
+
+    return {
+        'estudiantes': [dict(f, nombre=f['nombre_completo']) for f in filas],
+        'resumen': resumen,
+        # Que año se calculo, sin ambiguedad: lo necesita la auditoria y lo
+        # necesita la pantalla para no tener que adivinarlo.
+        'ano_escolar_id': ano.id if ano else None,
+        'ano_escolar': ano.nombre if ano else None,
+    }
+
 
 @app.post("/api/promocion/ejecutar")
 async def ejecutar_promocion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
@@ -15542,93 +16044,40 @@ async def get_resumen_cierre_ano(db: Session = Depends(get_db), current_user: Us
     return {'cursos': resumen_cursos}
 
 @app.get("/api/cierre-ano/promocion")
-async def get_datos_promocion(db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Obtener lista de estudiantes con su condición de promoción"""
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True).all()
-    grados = {g.id: g for g in tenant_filter(db.query(Grado), Grado, current_user).all()}
-    
-    resultado = []
-    for est in estudiantes:
-        calificaciones = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(estudiante_id=est.id).all()
-        asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(estudiante_id=est.id).all()
-        
-        # v2.13.8: CFs de AMBOS modelos
-        cfs_lista = []
-        asig_ids_nuevo = set()
-        
-        ano_activo_cp = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-        if ano_activo_cp:
-            califs_sec_est = tenant_filter(
-                db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-            ).filter_by(estudiante_id=est.id, ano_escolar_id=ano_activo_cp.id).all()
-            from collections import defaultdict as _dd
-            por_asig = _dd(list)
-            for c in califs_sec_est:
-                por_asig[c.asignatura_id].append(c)
-            for aid, comps in por_asig.items():
-                pcs = []
-                for p in range(1, 5):
-                    vals = [comp.valor_periodo(p) for comp in comps if hasattr(comp, 'valor_periodo') and comp.valor_periodo(p) is not None]
-                    if vals:
-                        pcs.append(sum(vals) / len(vals))
-                if pcs:
-                    cfs_lista.append(sum(pcs) / len(pcs))
-                    asig_ids_nuevo.add(aid)
-        
-        # Legacy (solo asignaturas no en modelo nuevo)
-        for c in calificaciones:
-            if c.asignatura_id in asig_ids_nuevo:
-                continue
-            if c.cf is not None:
-                cfs_lista.append(c.cf)
-        
-        # Calcular promedio general
-        promedio_general = sum(cfs_lista) / len(cfs_lista) if cfs_lista else 0
-        
-        # Contar asignaturas aprobadas/reprobadas
-        asignaturas_aprobadas = sum(1 for cf in cfs_lista if cf >= 70)
-        asignaturas_reprobadas = sum(1 for cf in cfs_lista if cf < 70)
-        total_asignaturas = len(cfs_lista)
-        
-        # Calcular asistencia
-        total_asistencias = len(asistencias)
-        presentes = sum(1 for a in asistencias if a.estado == 'presente')
-        porcentaje_asistencia = (presentes / total_asistencias * 100) if total_asistencias > 0 else 0
-        
-        # Determinar condición
-        todas_aprobadas = asignaturas_reprobadas == 0 and total_asignaturas > 0
-        condicion = 'promovido' if todas_aprobadas else 'reprobado'
-        
-        # Determinar nuevo grado
-        nuevo_grado = None
-        if est.curso and est.curso.grado:
-            grado_actual = est.curso.grado
-            if condicion == 'promovido':
-                # Buscar siguiente grado
-                siguiente = tenant_filter(db.query(Grado), Grado, current_user).filter(Grado.orden > grado_actual.orden).order_by(Grado.orden).first()
-                nuevo_grado = siguiente.nombre if siguiente else 'Graduado'
-            else:
-                nuevo_grado = grado_actual.nombre  # Repite
-        
-        resultado.append({
-            'id': est.id,
-            'nombre_completo': est.nombre_completo,
-            'matricula': est.matricula,
-            'curso': est.curso.nombre_completo if est.curso else None,
-            'curso_id': est.curso_id,
-            'promedio_general': round(promedio_general, 2),
-            'asignaturas_aprobadas': asignaturas_aprobadas,
-            'asignaturas_reprobadas': asignaturas_reprobadas,
-            'total_asignaturas': total_asignaturas,
-            'asistencia_porcentaje': round(porcentaje_asistencia, 1),
-            'condicion': condicion,
-            'nuevo_grado': nuevo_grado
-        })
-    
-    # Ordenar por curso y nombre
-    resultado.sort(key=lambda x: (x['curso'] or '', x['nombre_completo']))
-    
-    return {'estudiantes': resultado}
+async def get_datos_promocion(ano_id: int = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Previsualizacion del Cierre de Ano. R4-A4: misma verdad que el otro GET.
+
+    Aqui habia una SEGUNDA regla, distinta de la de /api/promocion/estudiantes:
+    recalculaba la CF por su cuenta, decidia "cualquier fallo reprueba" e
+    inventaba la asistencia como presentes / filas existentes. Dos pantallas de
+    la misma Direccion podian contradecirse sobre el mismo estudiante.
+
+    Las dos preguntan ahora a `_preview_promocion_canonica`. El envoltorio JSON
+    se conserva por compatibilidad; la verdad academica es identica.
+
+    R4-A4.1 · EL AÑO ORIGEN
+        Sin `?ano_id=` toma el año CERRADO más reciente, no el activo. El
+        flujo de Cierre cierra un año y crea el siguiente, que queda activo y
+        vacío; mirar ahí convertía a un PROMOVIDO en EN_PROCESO por
+        CURRICULO_OFICIAL_INCOMPLETO. Si todavía no se cerró ninguno, usa el
+        activo: la pantalla sirve igual ANTES del cierre.
+
+    Es PREVISUALIZACION: el POST de cierre no se toca aqui.
+    """
+    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id,
+                                preferir_cerrado=True)
+    filas = _preview_promocion_canonica(db, current_user, ano)
+    hay_pendientes = any(not f['listo_para_decidir'] for f in filas)
+    return {
+        'estudiantes': filas,
+        # La pantalla no puede ofrecer "Ejecutar promocion" cuando todavia hay
+        # procesos academicos abiertos. El guard definitivo del POST es de
+        # Cierre de Ano; este es el de la interfaz.
+        'hay_procesos_pendientes': hay_pendientes,
+        'ano_escolar_id': ano.id if ano else None,
+        'ano_escolar': ano.nombre if ano else None,
+    }
+
 
 @app.post("/api/cierre-ano/promover")
 async def ejecutar_promocion_cierre_ano(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
@@ -17761,7 +18210,6 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
     Carril primaria puro: RecuperacionPrimaria + calculo_primaria.
     """
     from registro_primaria import area_canonica
-    from calculo_primaria import situacion_area, condicion_final_estudiante
 
     recuperaciones, condiciones = {}, {}
     if not estudiantes_db:
@@ -17787,20 +18235,34 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
 
     ETIQUETA = {'promovido': 'Promovido(a)', 'repite': 'Repitente',
                 'repitente_condicional': 'Repitente condicional', 'en_proceso': 'En proceso'}
-    for idx in idx_por_id.values():
-        situaciones = []
-        for nombre_asig, area_data in (calificaciones_por_area or {}).items():
-            comps = area_data.get(idx) or {}
-            finales = [(comps.get(c) or {}).get('final_competencia') for c in (1, 2, 3)]
-            # Linaje estricto: sin las 3 competencias, el área no vota
-            if not all(f is not None for f in finales):
+    # ── R4-A3 · El acta usa el mismo motor que el boletín ──
+    #
+    # Antes rearmaba la CF desde `final_competencia` y llamaba a
+    # `condicion_final_estudiante`. Eran dos rutas distintas hacia la misma
+    # pregunta, y la del acta tampoco sabía el grado.
+    _curso_acta = getattr(estudiantes_db[0], 'curso', None)
+    if _curso_acta is not None and ano_act is not None:
+        _ids = list(idx_por_id.keys())
+        _precarga = _precarga_curso_canonica(db, current_user, _curso_acta,
+                                             ano_act, estudiante_ids=_ids)
+        _comps = _datos_academicos_estudiantes(
+            db, current_user, _ids, ano_act, CalificacionPrimaria)
+        _recs = _datos_academicos_estudiantes(
+            db, current_user, _ids, ano_act, RecuperacionPrimaria)
+        _asist = _asistencias_estudiantes(db, current_user, _ids, ano_act)
+        for est in estudiantes_db:
+            idx = idx_por_id.get(est.id)
+            if idx is None:
                 continue
-            cf = round(sum(float(f) for f in finales) / 3)
-            rec = (recuperaciones.get(idx) or {}).get(area_canonica(nombre_asig) or '') or {}
-            situaciones.append(situacion_area(cf, rec.get('final'), rec.get('especial')))
-        if situaciones:
-            cond = condicion_final_estudiante(situaciones)
-            condiciones[idx] = ETIQUETA.get(cond.get('condicion'), cond.get('condicion', ''))
+            _paquete = _situacion_canonica_primaria(
+                db, current_user, est, ano_act, _precarga,
+                competencias_por_asig=_comps.get(est.id, {}),
+                recuperaciones_por_asig={k: v[0] for k, v
+                                         in (_recs.get(est.id) or {}).items() if v},
+                asistencias=_asist.get(est.id, []))
+            condiciones[idx] = ETIQUETA.get(
+                RAC.CONDICION_LEGACY_PRIMARIA.get(
+                    _paquete['situacion']['condicion']), '')
     return recuperaciones, condiciones
 
 

@@ -100,7 +100,28 @@ def get_situacion_asignatura(cf):
 
 
 def get_situacion_final(calificaciones_data):
-    """Determina si el estudiante es Promovido o Repitente"""
+    """LEGACY — NO USAR. Sin llamadores activos desde R4-A3.
+
+    Este módulo es el boletín v1, que dibujaba todo desde cero en Letter.
+    Lo reemplazó `boletin_minerd_secundaria` (overlay sobre la plantilla
+    oficial), y `app.py` solo importa ese: `generar_boletin_minerd` no se
+    llama desde ningún sitio. Se comprobó en todo el repositorio —backend,
+    frontend y tools— antes de escribir esto.
+
+    Se conserva el archivo como referencia de la maquetación v1, pero esta
+    función NO puede volver a ser fuente de verdad. Tiene dos defectos que
+    R4 existe para cerrar:
+
+      · `d.get('cf') and d['cf'] < 70` — una CF de 0 es falsy, así que un
+        estudiante con 0 en un área contaba como APROBADO en ella;
+      · `reprobadas <= 2 -> 'Promovido/a con condiciones'` — «promovido con
+        condiciones» no existe en la Ordenanza 22-2017. Lo que existe es el
+        aplazamiento con derecho a Evaluación Especial, que es otra cosa: no
+        promueve todavía.
+
+    La respuesta canónica la dan `resultado_academico` y
+    `promocion_academica`, a través de `resultado_academico_consumidores`.
+    """
     reprobadas = sum(1 for d in calificaciones_data if d.get('cf') and d['cf'] < 70)
     if reprobadas == 0:
         return 'Promovido/a'

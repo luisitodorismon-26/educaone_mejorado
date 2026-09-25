@@ -426,18 +426,31 @@ class Asignatura(Base):
     # en producción "Lenguas" agrupa Lengua Española, Inglés y Francés — tres
     # bloques oficiales distintos— y es texto libre editable desde la UI.
     area = Column(String(50))
-    # R2.1C — BLOQUE CURRICULAR OFICIAL DEL REGISTRO DE SECUNDARIA.
+    # R2.1C / R4-A3.3 — IDENTIDAD CURRICULAR OFICIAL MINERD DE LA ASIGNATURA.
     #
-    # No es "el área general de la asignatura": es el bloque de CE + Indicadores
-    # de Logro que le corresponde en el Registro Escolar MINERD. Uno de
-    # LE | LEI | LEF | MAT | CS | CN | EA | EF | FIHR, validados contra el
-    # catálogo oficial (catalogo_indicadores.codigos_area_validos()).
+    # No es "el área general de la asignatura": es el bloque curricular oficial
+    # que representa. Uno de LE | LEI | LEF | MAT | CS | CN | EA | EF | FIHR,
+    # validados contra `catalogo_indicadores.codigos_area_validos()`.
+    #
+    # VALE PARA LOS DOS NIVELES (R4-A3.3)
+    #     Hasta A3.2 esto se documentaba como identidad del Registro de
+    #     SECUNDARIA. Se auditó área por área y los ocho bloques del Nivel
+    #     Primario tienen el MISMO código y el MISMO nombre oficial que sus
+    #     equivalentes de Secundaria, así que un solo campo identifica a los dos
+    #     niveles y no hizo falta una segunda columna.
+    #
+    # IDENTIDAD NO ES PARTICIPACIÓN
+    #     Que una asignatura sea LEI no implica que cuente para la promoción de
+    #     cualquier grado. Un colegio privado puede enseñar Inglés en 1.º de
+    #     Primaria: la identidad LEI es correcta, y aun así LEI no está en el
+    #     currículo oficial de 1.º, así que esa materia no participa en su
+    #     promoción. Quién participa lo deciden `catalogo_primaria` y
+    #     `catalogo_indicadores` por grado, no este campo.
     #
     # NULL es un estado VÁLIDO y frecuente, no un error de datos: significa que
-    # la asignatura no corresponde a ninguno de los 9 bloques del Registro.
-    # Música es el caso real en producción. Una asignatura con NULL conserva
-    # profesor, horario, calificaciones, recuperaciones y boletín con total
-    # normalidad; simplemente queda fuera de las páginas de CE/IL del Registro.
+    # la asignatura no representa ningún bloque oficial. Música es el caso real
+    # en producción. Una asignatura con NULL conserva profesor, horario,
+    # calificaciones, recuperaciones y boletín con total normalidad.
     #
     # Se resuelve SIEMPRE por este campo. Nunca por `nombre`, `codigo` ni `area`.
     area_curricular_codigo = Column(String(8), nullable=True)
