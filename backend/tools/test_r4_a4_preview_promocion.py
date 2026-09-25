@@ -785,6 +785,259 @@ def _():
         igual(d.strip(), '', ruta)
 
 
+
+
+# ═══════════ A4Y · EL AÑO ACADEMICO ORIGEN ═══════════
+#
+# AÑO ACTIVO NO ES AÑO QUE SE ESTA PROMOVIENDO.
+#
+# El flujo real de Cierre cierra 2025-2026 y crea 2026-2027, que queda activo
+# y VACIO. Preferir el ano activo hacia que la preview mirara ahi: un
+# estudiante PROMOVIDO pasaba a EN_PROCESO por CURRICULO_OFICIAL_INCOMPLETO.
+# Crear el ano siguiente cambiaba la situacion academica del ano que se estaba
+# cerrando.
+print(f"\n{B}A4Y · EL AÑO ORIGEN, FIJADO{X}")
+
+# Un colegio aparte, para no perturbar el resto de la suite.
+_DB2 = SessionLocal()
+_COL2 = M.Colegio(nombre='A4Y', codigo='A4YTEST', activo=True)
+_DB2.add(_COL2)
+_DB2.flush()
+
+# Ano A: el que se promueve. Cerrado, con TODAS las notas.
+_ANO_A = M.AnoEscolar(colegio_id=_COL2.id, nombre='2025-2026', activo=False,
+                      cerrado=True)
+_ANO_A.set_dias_trabajados(DIAS)
+# Ano B: el destino. Activo y sin una sola calificacion.
+_ANO_B = M.AnoEscolar(colegio_id=_COL2.id, nombre='2026-2027', activo=True,
+                      cerrado=False)
+_GRD2 = M.Grado(colegio_id=_COL2.id, nombre='3ro Secundaria',
+                nivel='secundaria', orden=3, activo=True)
+_DB2.add_all([_ANO_A, _ANO_B, _GRD2])
+_DB2.flush()
+_CURSO2 = M.Curso(colegio_id=_COL2.id, nombre='A', grado_id=_GRD2.id,
+                  ano_escolar_id=_ANO_A.id, activo=True)
+_PROF2 = M.Usuario(colegio_id=_COL2.id, nombre='P', username='a4yprof',
+                   password_hash='x', role='profesor', activo=True)
+_DB2.add_all([_CURSO2, _PROF2])
+_DB2.flush()
+_EST2 = M.Estudiante(colegio_id=_COL2.id, matricula='A4Y-1', nombre='E',
+                     apellido='S', curso_id=_CURSO2.id, activo=True)
+_DB2.add(_EST2)
+_DB2.flush()
+for _cod in AREAS_SEC:
+    _a = M.Asignatura(colegio_id=_COL2.id, nombre=_cod, codigo=_cod[:10],
+                      area='X', area_curricular_codigo=_cod, activo=True)
+    _DB2.add(_a)
+    _DB2.flush()
+    _DB2.add(M.AsignacionProfesor(
+        colegio_id=_COL2.id, profesor_id=_PROF2.id, curso_id=_CURSO2.id,
+        asignatura_id=_a.id, ano_escolar_id=_ANO_A.id, activo=True))
+    for _n in range(1, 5):
+        _DB2.add(M.CalificacionSecundaria(
+            colegio_id=_COL2.id, estudiante_id=_EST2.id, asignatura_id=_a.id,
+            ano_escolar_id=_ANO_A.id, competencia_numero=_n,
+            p1=90, p2=90, p3=90, p4=90))
+_DB2.commit()
+
+
+class _Direccion2:
+    colegio_id = _COL2.id
+    role = 'direccion'
+    id = 3
+
+
+_USER2 = _Direccion2()
+
+
+def cierre2(ano_id=None):
+    return asyncio.run(APP.get_datos_promocion(
+        ano_id=ano_id, db=_DB2, current_user=_USER2))
+
+
+def promocion2(ano_id=None):
+    return asyncio.run(APP.get_estudiantes_promocion(
+        request=None, ano_id=ano_id, db=_DB2, current_user=_USER2))
+
+
+@test("A4Y-1 tras crear el ano nuevo, el Cierre sigue mirando el ano CERRADO")
+def _():
+    datos = cierre2()
+    igual(datos['ano_escolar_id'], _ANO_A.id,
+          'el ano nuevo esta vacio: mirar ahi convierte un PROMOVIDO en '
+          'EN_PROCESO por curriculo incompleto')
+    igual(datos['ano_escolar'], '2025-2026')
+    f = datos['estudiantes'][0]
+    igual(f['condicion_canonica'], PA.PROMOVIDO)
+    igual(f['bloqueos'], [])
+
+
+@test("A4Y-2 con `ano_id` explicito, los dos GET dan lo mismo")
+def _():
+    a = cierre2(ano_id=_ANO_A.id)
+    b = promocion2(ano_id=_ANO_A.id)
+    igual(a['ano_escolar_id'], _ANO_A.id)
+    igual(b['ano_escolar_id'], _ANO_A.id)
+    igual({f['id']: f['condicion_canonica'] for f in b['estudiantes']},
+          {f['id']: f['condicion_canonica'] for f in a['estudiantes']},
+          'el mismo ano tiene que dar la misma verdad academica')
+    # Y con el ano vacio, los dos coinciden tambien: en que no se puede.
+    a2 = cierre2(ano_id=_ANO_B.id)
+    b2 = promocion2(ano_id=_ANO_B.id)
+    igual({f['id']: f['condicion_canonica'] for f in b2['estudiantes']},
+          {f['id']: f['condicion_canonica'] for f in a2['estudiantes']})
+    igual(a2['estudiantes'][0]['condicion_canonica'], PA.EN_PROCESO)
+
+
+@test("A4Y-3 la promocion general SIN parametro conserva el ano ACTIVO")
+def _():
+    datos = promocion2()
+    igual(datos['ano_escolar_id'], _ANO_B.id,
+          'este endpoint es de consulta durante el curso: su ano es el activo')
+
+
+@test("A4Y-4 el Cierre SIN parametro toma el cerrado mas reciente")
+def _():
+    igual(cierre2()['ano_escolar_id'], _ANO_A.id)
+
+
+@test("A4Y-5 antes de cerrar nada, el Cierre usa el activo y NO viene vacio")
+def _():
+    # Un colegio que todavia no cerro ningun ano.
+    col = M.Colegio(nombre='Nuevo', codigo='NUEVO1', activo=True)
+    _DB2.add(col)
+    _DB2.flush()
+    ano = M.AnoEscolar(colegio_id=col.id, nombre='2025-2026', activo=True,
+                       cerrado=False)
+    ano.set_dias_trabajados(DIAS)
+    grd = M.Grado(colegio_id=col.id, nombre='2do Primaria', nivel='primaria',
+                  orden=8, activo=True)
+    _DB2.add_all([ano, grd])
+    _DB2.flush()
+    c = M.Curso(colegio_id=col.id, nombre='A', grado_id=grd.id,
+                ano_escolar_id=ano.id, activo=True)
+    prof = M.Usuario(colegio_id=col.id, nombre='P', username='nuevoprof',
+                     password_hash='x', role='profesor', activo=True)
+    _DB2.add_all([c, prof])
+    _DB2.flush()
+    est = M.Estudiante(colegio_id=col.id, matricula='N-1', nombre='E',
+                       apellido='S', curso_id=c.id, activo=True)
+    _DB2.add(est)
+    _DB2.flush()
+    for cod in AD.curriculo_oficial_esperado(RA.NIVEL_PRIMARIA, 2)[0]:
+        a = M.Asignatura(colegio_id=col.id, nombre=cod, codigo=cod[:10],
+                         area='X', area_curricular_codigo=cod, activo=True)
+        _DB2.add(a)
+        _DB2.flush()
+        _DB2.add(M.AsignacionProfesor(
+            colegio_id=col.id, profesor_id=prof.id, curso_id=c.id,
+            asignatura_id=a.id, ano_escolar_id=ano.id, activo=True))
+        for n in (1, 2, 3):
+            _DB2.add(M.CalificacionPrimaria(
+                colegio_id=col.id, estudiante_id=est.id, asignatura_id=a.id,
+                ano_escolar_id=ano.id, competencia_numero=n,
+                competencia_nombre='C%d' % n, p1=90, p2=90, p3=90, p4=90))
+    _DB2.commit()
+
+    class Usr:
+        colegio_id = col.id
+        role = 'direccion'
+        id = 4
+
+    datos = asyncio.run(APP.get_datos_promocion(db=_DB2, current_user=Usr()))
+    igual(datos['ano_escolar_id'], ano.id,
+          'sin ningun ano cerrado, el Cierre usa el activo')
+    assert datos['estudiantes'], 'no puede venir vacio solo por no haber cerrado'
+    igual(datos['estudiantes'][0]['condicion_canonica'], PA.PROMOVIDO)
+
+
+@test("A4Y-6 un `ano_id` de otro colegio no revela nada")
+def _():
+    from fastapi import HTTPException
+    # `_ANO_A` es del colegio A4Y; se pide desde el colegio de la suite.
+    for endpoint in (APP.get_datos_promocion,):
+        try:
+            asyncio.run(endpoint(ano_id=_ANO_A.id, db=_DB, current_user=_USER))
+            raise AssertionError('un ano de otro colegio no puede resolverse')
+        except HTTPException as e:
+            igual(e.status_code, 404,
+                  'mismo 404 que un id inexistente: sin filtracion')
+    try:
+        asyncio.run(APP.get_estudiantes_promocion(
+            request=None, ano_id=_ANO_A.id, db=_DB, current_user=_USER))
+        raise AssertionError('un ano de otro colegio no puede resolverse')
+    except HTTPException as e:
+        igual(e.status_code, 404)
+    # Un id que no existe en ningun sitio da exactamente lo mismo.
+    try:
+        asyncio.run(APP.get_datos_promocion(
+            ano_id=999999, db=_DB, current_user=_USER))
+        raise AssertionError('deberia ser 404')
+    except HTTPException as e:
+        igual(e.status_code, 404)
+
+
+@test("A4Y-7 la pantalla pide el ano ORIGEN, nunca el destino")
+def _():
+    fe = _fuente_fe()
+    assert 'anoOrigenId' in fe, 'falta el estado del ano origen'
+    # La carga de la preview manda `ano_id`, y el valor sale del origen.
+    assert 'params: { ano_id: origen }' in fe, fe[:0]
+    assert 'const origen = origenId ?? anoOrigenId' in fe
+    # Y el destino NUNCA se usa para LEER NOTAS. Se mira la llamada de la
+    # preview, no una subcadena suelta: `nuevo_ano_id: nuevoAnoId` es el
+    # destino del POST de promocion y es correcto que exista.
+    assert 'cargarDatosPromocion(nuevoAnoId)' not in fe
+    assert 'cargarDatosPromocion(anoId)' not in fe
+    _carga = fe[fe.index('const cargarDatosPromocion'):
+                fe.index('const cargarDatosPromocion') + 900]
+    assert 'nuevoAnoId' not in _carga,         'la carga de la preview no puede tocar el ano destino'
+    assert "api.get('/cierre-ano/promocion'" in _carga
+    # El origen se captura ANTES de crear el ano siguiente.
+    pos_captura = fe.index('const origenId = anoOrigenId')
+    pos_crear = fe.index("await api.post('/ano-escolar', nuevoAno)")
+    assert pos_captura < pos_crear, \
+        'el origen hay que anotarlo antes de que el ano nuevo pase a activo'
+    assert 'await cargarDatosPromocion(origenId)' in fe
+
+
+@test("A4Y-8 tras un refresco, sin estado en el navegador, el Cierre acierta")
+def _():
+    # No se manda `ano_id`: es exactamente lo que ocurre cuando el usuario
+    # recarga la pagina y React perdio su estado. La garantia es del backend.
+    datos = cierre2(ano_id=None)
+    igual(datos['ano_escolar_id'], _ANO_A.id)
+    igual(datos['estudiantes'][0]['condicion_canonica'], PA.PROMOVIDO)
+    # Y la respuesta dice que ano se uso, para que la pantalla lo recupere.
+    assert 'ano_escolar_id' in datos and 'ano_escolar' in datos
+    fe = _fuente_fe()
+    assert 'if (res.data?.ano_escolar_id) setAnoOrigenId(res.data.ano_escolar_id);' in fe
+
+
+@test("A4Y-9 los cursos del ano origen son los que se leen")
+def _():
+    # El estudiante sigue en su curso del ano A; el ano B no tiene cursos.
+    datos = cierre2()
+    f = datos['estudiantes'][0]
+    igual(f['curso_id'], _CURSO2.id)
+    igual(f['grado_actual'], '3ro Secundaria')
+    igual(f['total_asignaturas'], len(AREAS_SEC))
+
+
+@test("A4Y-10 el resolver es explicito sobre sus tres caminos")
+def _():
+    import inspect
+    firma = inspect.signature(APP._resolver_ano_preview).parameters
+    igual(sorted(firma), ['ano_id', 'current_user', 'db', 'preferir_cerrado'])
+    cuerpo = inspect.getsource(APP._resolver_ano_preview)
+    assert 'get_tenant_or_404' in cuerpo, 'el ano_id del cliente es tenant-safe'
+    # Y el endpoint de Cierre pide el cerrado.
+    assert 'preferir_cerrado=True' in inspect.getsource(APP.get_datos_promocion)
+    assert 'preferir_cerrado' not in inspect.getsource(
+        APP.get_estudiantes_promocion), \
+        'la promocion general conserva su semantica de ano activo'
+
+
 print("\n" + "=" * 70)
 if _fail:
     print(f"{R}{B}R4-A4: {len(_fail)} fallo(s) de {_total}{X}")

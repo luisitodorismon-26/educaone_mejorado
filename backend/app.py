@@ -15739,18 +15739,71 @@ def _preview_promocion_canonica(db, current_user, ano):
     return filas
 
 
-def _ano_para_preview(db, current_user):
-    """El año activo, o el mas reciente si ya se cerro."""
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(
-        activo=True).first()
+def _resolver_ano_preview(db, current_user, ano_id=None,
+                          preferir_cerrado=False):
+    """Qué año ACADÉMICO alimenta la previsualización.
+
+    AÑO ACTIVO NO ES AÑO QUE SE ESTÁ PROMOVIENDO
+        Este resolver existe por un defecto real. El flujo de Cierre de Año
+        es: cerrar 2025-2026 (`cerrado=True`, `activo=False`), crear
+        2026-2027 (que queda `activo=True` y VACÍO) y recién entonces mirar
+        la previsualización. Preferir el año activo la hacía mirar el año
+        nuevo, donde no hay ni una calificación: un estudiante PROMOVIDO
+        pasaba a EN_PROCESO por CURRICULO_OFICIAL_INCOMPLETO. Crear el año
+        siguiente cambiaba la situación académica del año que se cerraba.
+
+        Los estudiantes se promueven según las notas, recuperaciones,
+        asistencia y currículo del año que TERMINA. El año nuevo es un
+        destino administrativo, no una fuente académica.
+
+    TRES CAMINOS, EN ESTE ORDEN
+        1. `ano_id` explícito manda siempre. Se resuelve DENTRO del tenant:
+           un id de otro colegio no puede revelar ni su nombre, ni sus
+           fechas, ni su existencia, así que devuelve el mismo 404 que un id
+           inexistente.
+        2. `preferir_cerrado=True` —la pantalla de Cierre— toma el cerrado
+           más reciente. Si todavía no se cerró ninguno usa el activo, para
+           que la pantalla siga sirviendo ANTES del cierre.
+        3. Por defecto —la promoción general— toma el activo, y si no hay,
+           el cerrado más reciente.
+
+    El caso 2 es además la garantía de backend para el refresco de página:
+    aunque el navegador pierda el estado, la preview de Cierre sigue
+    encontrando el año correcto sin que nadie se lo diga.
+    """
+    if ano_id is not None:
+        return get_tenant_or_404(db, AnoEscolar, ano_id, current_user,
+                                 name='anoescolar')
+
+    def _activo():
+        return tenant_filter(
+            db.query(AnoEscolar), AnoEscolar, current_user
+        ).filter_by(activo=True).first()
+
+    def _cerrado_reciente():
+        return tenant_filter(
+            db.query(AnoEscolar), AnoEscolar, current_user
+        ).filter_by(cerrado=True).order_by(AnoEscolar.id.desc()).first()
+
+    if preferir_cerrado:
+        return _cerrado_reciente() or _activo()
+
+    ano = _activo()
+    if ano is None:
+        ano = _cerrado_reciente()
     if ano is None:
         ano = tenant_filter(db.query(AnoEscolar), AnoEscolar,
                             current_user).order_by(AnoEscolar.id.desc()).first()
     return ano
 
 
+def _ano_para_preview(db, current_user):
+    """Compatibilidad: el comportamiento por defecto del resolver."""
+    return _resolver_ano_preview(db, current_user)
+
+
 @app.get("/api/promocion/estudiantes")
-async def get_estudiantes_promocion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def get_estudiantes_promocion(request: Request, ano_id: int = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Previsualizacion de promocion. R4-A4: la decide A2, no este endpoint.
 
     Aqui vivia una regla propia —recalcular CF, cortar en 70 y repartir en
@@ -15759,9 +15812,13 @@ async def get_estudiantes_promocion(request: Request, db: Session = Depends(get_
     lo que existe es el APLAZADO, el estudiante que aun tiene derecho a un
     proceso de recuperacion.
 
+    R4-A4.1: acepta `?ano_id=` para fijar el año académico de origen. Sin
+    parámetro conserva su semántica de siempre —el año ACTIVO—, que es la
+    correcta para una consulta general de promoción durante el curso.
+
     No ejecuta nada. No escribe nada.
     """
-    ano = _ano_para_preview(db, current_user)
+    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id)
     filas = _preview_promocion_canonica(db, current_user, ano)
 
     resumen = {
@@ -15776,6 +15833,9 @@ async def get_estudiantes_promocion(request: Request, db: Session = Depends(get_
     return {
         'estudiantes': [dict(f, nombre=f['nombre_completo']) for f in filas],
         'resumen': resumen,
+        # Que año se calculo, sin ambiguedad: lo necesita la auditoria y lo
+        # necesita la pantalla para no tener que adivinarlo.
+        'ano_escolar_id': ano.id if ano else None,
         'ano_escolar': ano.nombre if ano else None,
     }
 
@@ -15984,7 +16044,7 @@ async def get_resumen_cierre_ano(db: Session = Depends(get_db), current_user: Us
     return {'cursos': resumen_cursos}
 
 @app.get("/api/cierre-ano/promocion")
-async def get_datos_promocion(db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def get_datos_promocion(ano_id: int = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Previsualizacion del Cierre de Ano. R4-A4: misma verdad que el otro GET.
 
     Aqui habia una SEGUNDA regla, distinta de la de /api/promocion/estudiantes:
@@ -15995,9 +16055,17 @@ async def get_datos_promocion(db: Session = Depends(get_db), current_user: Usuar
     Las dos preguntan ahora a `_preview_promocion_canonica`. El envoltorio JSON
     se conserva por compatibilidad; la verdad academica es identica.
 
+    R4-A4.1 · EL AÑO ORIGEN
+        Sin `?ano_id=` toma el año CERRADO más reciente, no el activo. El
+        flujo de Cierre cierra un año y crea el siguiente, que queda activo y
+        vacío; mirar ahí convertía a un PROMOVIDO en EN_PROCESO por
+        CURRICULO_OFICIAL_INCOMPLETO. Si todavía no se cerró ninguno, usa el
+        activo: la pantalla sirve igual ANTES del cierre.
+
     Es PREVISUALIZACION: el POST de cierre no se toca aqui.
     """
-    ano = _ano_para_preview(db, current_user)
+    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id,
+                                preferir_cerrado=True)
     filas = _preview_promocion_canonica(db, current_user, ano)
     hay_pendientes = any(not f['listo_para_decidir'] for f in filas)
     return {
@@ -16006,6 +16074,7 @@ async def get_datos_promocion(db: Session = Depends(get_db), current_user: Usuar
         # procesos academicos abiertos. El guard definitivo del POST es de
         # Cierre de Ano; este es el de la interfaz.
         'hay_procesos_pendientes': hay_pendientes,
+        'ano_escolar_id': ano.id if ano else None,
         'ano_escolar': ano.nombre if ano else None,
     }
 

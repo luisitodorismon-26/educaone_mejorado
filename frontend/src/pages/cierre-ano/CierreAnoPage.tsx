@@ -86,7 +86,12 @@ export const CierreAnoPage = () => {
     fecha_inicio: '',
     fecha_fin: ''
   });
+  // DESTINO administrativo. NO alimenta la preview: el ano nuevo nace vacio.
   const [nuevoAnoId, setNuevoAnoId] = useState<number | null>(null);
+  // ORIGEN academico: el ano cuyas notas deciden la promocion. Se captura
+  // ANTES de crear el ano siguiente, porque en cuanto ese existe pasa a ser
+  // el activo y `anoEscolar` deja de apuntar al que se esta cerrando.
+  const [anoOrigenId, setAnoOrigenId] = useState<number | null>(null);
   // v2.13.26: acción por estudiante: 'promueve' (default) | 'repite' | 'retira'
   const [acciones, setAcciones] = useState<Record<number, 'promueve' | 'repite' | 'retira'>>({});
 
@@ -113,12 +118,20 @@ export const CierreAnoPage = () => {
     }
   };
 
-  const cargarDatosPromocion = async () => {
+  const cargarDatosPromocion = async (origenId?: number | null) => {
     setLoadingPromocion(true);
     try {
-      const res = await api.get('/cierre-ano/promocion');
+      // El ano ORIGEN, nunca el destino. Si no se conoce —por ejemplo tras
+      // recargar la pagina— no se manda nada y el backend resuelve por su
+      // cuenta el cerrado mas reciente, que es la garantia de ultimo recurso.
+      const origen = origenId ?? anoOrigenId;
+      const res = await api.get('/cierre-ano/promocion',
+        origen ? { params: { ano_id: origen } } : undefined);
       const lista: EstudiantePromocion[] = res.data.estudiantes || [];
       setEstudiantesPromocion(lista);
+      // El backend dice que ano calculo; asi la pantalla no tiene que
+      // deducirlo y sobrevive a un refresco.
+      if (res.data?.ano_escolar_id) setAnoOrigenId(res.data.ano_escolar_id);
       // La accion por defecto YA NO es "promueve" para todos. Un reprobado
       // aparece preseleccionado para repetir, y un aplazado o un en proceso no
       // aparecen preseleccionados en absoluto.
@@ -138,6 +151,8 @@ export const CierreAnoPage = () => {
   const handleCerrarAno = async () => {
     setProcesando(true);
     try {
+      // Se anota el ORIGEN antes de que exista el ano siguiente.
+      if (anoEscolar?.id) setAnoOrigenId(anoEscolar.id);
       await api.post(`/ano-escolar/${anoEscolar?.id}/cerrar`);
       setMessage({ type: 'success', text: 'Año escolar cerrado. Ahora creá el nuevo año escolar.' });
       setShowConfirmCierre(false);
@@ -192,6 +207,11 @@ export const CierreAnoPage = () => {
     }
     setProcesando(true);
     try {
+      // 0. Capturar el ORIGEN antes de nada: crear el ano nuevo lo activa
+      //    y desactiva este, asi que despues ya no se puede saber cual era.
+      const origenId = anoOrigenId ?? anoEscolar?.id ?? null;
+      if (origenId) setAnoOrigenId(origenId);
+
       // 1. Crear el año nuevo
       const res = await api.post('/ano-escolar', nuevoAno);
       const anoId = res.data?.id;
@@ -211,7 +231,9 @@ export const CierreAnoPage = () => {
       setMessage({ type: 'success', text: `Nuevo año escolar creado y activado.${avisoClonado} Ahora promové los estudiantes.` });
       setPaso(4);
       loadData();
-      await cargarDatosPromocion();
+      // Con el ORIGEN explicito. Pasar `anoId` —el destino— dejaria la
+      // preview mirando un ano sin una sola calificacion.
+      await cargarDatosPromocion(origenId);
     } catch (e: any) {
       setMessage({ type: 'error', text: e.response?.data?.error || 'Error al crear año escolar' });
     } finally {
@@ -521,7 +543,7 @@ export const CierreAnoPage = () => {
             </>
           ) : (
             <div className="p-8 text-center">
-              <Button onClick={cargarDatosPromocion} loading={loadingPromocion}>
+              <Button onClick={() => cargarDatosPromocion()} loading={loadingPromocion}>
                 Cargar Datos de Promoción
               </Button>
             </div>
