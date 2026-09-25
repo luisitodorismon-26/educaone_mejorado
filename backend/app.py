@@ -2946,6 +2946,172 @@ def _bloqueo_cierre_ano(codigo=ERROR_CIERRE_BLOQUEADO, mensaje=None):
     }, status_code=409)
 
 
+# ═══════════════ CIERRE DE AÑO C2 · TRANSICIÓN Y COHORTE ═══════════════
+#
+# Dos defectos estructurales del writer antiguo, reproducidos en C0/C0.1:
+#
+#   1. ADIVINA EL AÑO ORIGEN. Lo deduce con «el último cerrado»
+#      (`filter_by(cerrado=True).order_by(id.desc()).first()`). Un colegio
+#      con dos años cerrados, o que reabre y vuelve a cerrar, cambia de
+#      origen sin que nadie lo decida. Nadie escribió nunca «promuevo el
+#      2025-2026»: el sistema lo supuso.
+#
+#   2. PROCESA A TODO EL TENANT. Recorre los estudiantes con `activo=True`
+#      del colegio, sin mirar a qué año pertenece su curso. Un alumno ya
+#      movido al año nuevo vuelve a moverse; uno matriculado directamente
+#      en el año nuevo se mueve sin haber cursado el anterior.
+#
+# Lo que sigue no mueve a nadie. Fija el CONTEXTO —qué año se cierra, hacia
+# qué año, y quiénes son los alumnos de ese año— y deja fuera, a propósito,
+# toda decisión académica: la situación del estudiante (A2), el grado
+# destino, el historial y las recuperaciones pertenecen a gates posteriores.
+# Mientras no estén migradas, el camino correcto es no mutar.
+#
+# Estos helpers son puros: consultan y validan. No hacen commit, ni flush,
+# ni corrigen estados. Si el año origen no está cerrado, NO se cierra: se
+# rechaza. Arreglar el estado por cuenta propia es exactamente cómo se
+# pierden datos.
+
+
+class TransicionCierreInvalida(Exception):
+    """El par (origen, destino) no describe una transición ejecutable.
+
+    Lleva un código estable para que la respuesta HTTP y los tests hablen
+    del mismo error, sin depender del texto del mensaje.
+    """
+
+    def __init__(self, codigo, mensaje, status=409):
+        super().__init__(mensaje)
+        self.codigo = codigo
+        self.mensaje = mensaje
+        self.status = status
+
+
+ERROR_TRANSICION_INCOMPLETA = 'CIERRE_TRANSICION_INCOMPLETA'
+ERROR_TRANSICION_ANOS_IGUALES = 'CIERRE_TRANSICION_ANOS_IGUALES'
+ERROR_ORIGEN_NO_CERRADO = 'CIERRE_ORIGEN_NO_CERRADO'
+ERROR_ORIGEN_TODAVIA_ACTIVO = 'CIERRE_ORIGEN_TODAVIA_ACTIVO'
+ERROR_DESTINO_NO_ACTIVO = 'CIERRE_DESTINO_NO_ACTIVO'
+ERROR_DESTINO_CERRADO = 'CIERRE_DESTINO_CERRADO'
+
+
+def _respuesta_transicion_invalida(exc):
+    """La excepción de transición, en la forma que ya usa el resto de la API."""
+    return JSONResponse({'error': exc.codigo, 'message': exc.mensaje},
+                        status_code=exc.status)
+
+
+def _resolver_transicion_cierre(db, current_user, ano_origen_id, ano_destino_id):
+    """Los DOS años de la transición, explícitos y validados. -> (origen, destino)
+
+    Quien llame dice exactamente qué año cierra y hacia dónde. No hay
+    deducción: ni «el último cerrado», ni «el activo», ni el ID más alto.
+
+    Los dos años se resuelven con `get_tenant_or_404`, así que un ID de otro
+    colegio responde 404 igual que uno inexistente: el rechazo no revela si
+    el recurso existe en otro tenant.
+
+    Levanta `TransicionCierreInvalida` —fail-closed— si el par no describe
+    una transición ejecutable. NUNCA corrige el estado de un año.
+    """
+    if ano_origen_id is None or ano_destino_id is None:
+        raise TransicionCierreInvalida(
+            ERROR_TRANSICION_INCOMPLETA,
+            'Hay que indicar el año que se cierra y el año al que se '
+            'promueve. Esta operación no los adivina.',
+            status=400)
+
+    # Primero resolver —tenant-safe— y solo después comparar. Al revés, dos
+    # IDs iguales de otro colegio se distinguirían de dos IDs distintos de
+    # otro colegio, y eso ya es información sobre un tenant ajeno.
+    origen = get_tenant_or_404(db, AnoEscolar, ano_origen_id, current_user,
+                               name='anoescolar')
+    destino = get_tenant_or_404(db, AnoEscolar, ano_destino_id, current_user,
+                                name='anoescolar')
+
+    if origen.id == destino.id:
+        raise TransicionCierreInvalida(
+            ERROR_TRANSICION_ANOS_IGUALES,
+            'El año de origen y el de destino son el mismo (%s).' % origen.nombre)
+
+    # El origen tiene que estar CERRADO: promover desde un año abierto
+    # significa mover alumnos cuyas notas todavía pueden cambiar.
+    if not getattr(origen, 'cerrado', False):
+        raise TransicionCierreInvalida(
+            ERROR_ORIGEN_NO_CERRADO,
+            'El año %s todavía no está cerrado. Ciérrelo antes de promover.'
+            % origen.nombre)
+
+    # Y no puede seguir siendo el año en curso. Media aplicación resuelve
+    # «el año actual» con `filter_by(activo=True)`; promover desde el año
+    # activo dejaría las recuperaciones apuntando al año que se vacía.
+    if getattr(origen, 'activo', False):
+        raise TransicionCierreInvalida(
+            ERROR_ORIGEN_TODAVIA_ACTIVO,
+            'El año %s sigue marcado como activo. No se puede promover '
+            'desde el año en curso.' % origen.nombre)
+
+    if not getattr(destino, 'activo', False):
+        raise TransicionCierreInvalida(
+            ERROR_DESTINO_NO_ACTIVO,
+            'El año %s no es el año en curso. Actívelo antes de promover '
+            'hacia él.' % destino.nombre)
+
+    if getattr(destino, 'cerrado', False):
+        raise TransicionCierreInvalida(
+            ERROR_DESTINO_CERRADO,
+            'El año %s está cerrado: no se puede promover hacia él.'
+            % destino.nombre)
+
+    return origen, destino
+
+
+def _cohorte_del_ano_origen(db, current_user, ano_origen):
+    """Los alumnos que de verdad cursaron el año origen. -> (candidatos, diag)
+
+    Un estudiante es candidato solo si las cuatro cosas se cumplen a la vez:
+    es del tenant, está activo, tiene curso, y ESE CURSO pertenece al año
+    origen. El JOIN con Curso hace el trabajo: quien ya fue movido al año
+    nuevo, quien se matriculó directamente en él y quien está en un tercer
+    año quedan fuera sin necesidad de ninguna marca.
+
+    De ahí sale la idempotencia secuencial: cuando un alumno pasa a un curso
+    del año destino deja de cumplir la condición, así que una segunda
+    ejecución de la misma transición ya no lo encuentra. (Dos ejecuciones
+    SIMULTÁNEAS son otro problema, y se resuelve en el gate de bloqueos.)
+
+    Los alumnos activos sin curso se devuelven aparte, como diagnóstico. No
+    pertenecen a ningún año, así que no se les puede inventar un destino;
+    ocultarlos sería peor, porque alguien tiene que mirarlos.
+
+    Consulta, no escribe. `joinedload` evita el N+1 de leer `curso` y
+    `grado` uno por uno.
+    """
+    candidatos = (
+        tenant_filter(db.query(Estudiante), Estudiante, current_user)
+        .join(Curso, Estudiante.curso_id == Curso.id)
+        .options(joinedload(Estudiante.curso).joinedload(Curso.grado))
+        .filter(Estudiante.activo.is_(True),
+                Curso.ano_escolar_id == ano_origen.id)
+        .order_by(Estudiante.id)
+        .all()
+    )
+
+    sin_curso = (
+        tenant_filter(db.query(Estudiante), Estudiante, current_user)
+        .filter(Estudiante.activo.is_(True), Estudiante.curso_id.is_(None))
+        .order_by(Estudiante.id)
+        .all()
+    )
+
+    return candidatos, {
+        'ano_origen_id': ano_origen.id,
+        'total_candidatos': len(candidatos),
+        'activos_sin_curso': [e.id for e in sin_curso],
+    }
+
+
+
 @app.post("/api/ano-escolar/{id}/cerrar")
 async def cerrar_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     # C1 · SAFETY LOCK. Primero de todo: ni se resuelve el año, ni se lee el
