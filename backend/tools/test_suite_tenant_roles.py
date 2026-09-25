@@ -1936,17 +1936,25 @@ with client:
         r = client.post('/api/promocion/ejecutar',
                         json={'estudiantes': [B['est']]},
                         headers=auth(DIR_A_TOKEN))
-        assert r.status_code == 200, r.text
+        assert r.status_code in (200, 409), r.text
         body = r.json()
 
-        # 1. No se promovió nada.
-        assert body['promocionados'] == 0, \
-            f"no debe promover estudiantes de otro colegio: {body}"
+        # Desde C1 este endpoint está bloqueado (409) y rechaza antes de mirar
+        # el cuerpo, así que el aislamiento se cumple con más razón. El test
+        # cubre los dos contratos a propósito: cuando se levante el lock, las
+        # aserciones de tenant vuelven a exigirse sobre la respuesta real.
+        if r.status_code == 409:
+            assert body['error'] == 'PROMOCION_LEGACY_BLOQUEADA', body
+            errores_txt = str(body)
+        else:
+            # 1. No se promovió nada.
+            assert body['promocionados'] == 0, \
+                f"no debe promover estudiantes de otro colegio: {body}"
+            errores_txt = ' '.join(body.get('errores', []))
 
-        # 2. No se filtra el nombre del menor ajeno en los errores.
-        errores_txt = ' '.join(body.get('errores', []))
+        # 2. No se filtra el nombre del menor ajeno en la respuesta.
         assert nombre_b not in errores_txt, \
-            f"el nombre del estudiante de otro colegio se filtró en errores: {errores_txt!r}"
+            f"el nombre del estudiante de otro colegio se filtró: {errores_txt!r}"
 
         # 3. El estudiante de B sigue intacto: activo y en su curso original.
         ests_b2 = client.get('/api/estudiantes', headers=auth(DIR_B_TOKEN)).json()

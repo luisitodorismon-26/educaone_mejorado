@@ -585,8 +585,11 @@ def _cuerpo_en(sha, nombre):
     arbol = _ast.parse(fuente)
     for n in _ast.walk(arbol):
         if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and n.name == nombre:
-            fin = max(getattr(x, 'lineno', n.lineno) for x in _ast.walk(n))
-            return "\n".join(fuente.splitlines()[n.lineno - 1:fin])
+            # `end_lineno` y no `max(lineno)`: cuando la funcion termina en un
+            # literal multilinea, el nodo con mayor `lineno` es la ultima clave
+            # del dict, no la llave que lo cierra, y el fragmento salia
+            # truncado — comparable como texto, pero imposible de parsear.
+            return chr(10).join(fuente.splitlines()[n.lineno - 1:n.end_lineno])
     return None
 
 
@@ -604,19 +607,71 @@ def _cuerpo_actual(nombre):
     arbol = _ast.parse(fuente)
     for n in _ast.walk(arbol):
         if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and n.name == nombre:
-            fin = max(getattr(x, 'lineno', n.lineno) for x in _ast.walk(n))
-            return chr(10).join(fuente.splitlines()[n.lineno - 1:fin])
+            return chr(10).join(fuente.splitlines()[n.lineno - 1:n.end_lineno])
     return None
 
 
-@test("A4-22 los POST de promocion y cierre estan intactos")
+def _cola_legacy(cuerpo):
+    """El cuerpo sin la firma ni el docstring: solo la logica ejecutable.
+
+    La comparacion byte a byte del cuerpo ENTERO dejo de servir cuando C1
+    antepuso el safety lock. Pero lo que este invariante protege no es el
+    docstring: es que nadie reescriba en silencio la logica legacy mientras
+    dice estar bloqueandola. Esa logica es la cola, y la cola sigue exigiendose
+    IDENTICA.
+    """
+    import ast as _ast
+    lineas = cuerpo.splitlines()
+    arbol = _ast.parse(cuerpo)
+    fn = arbol.body[0]
+    cuerpos = list(fn.body)
+    if (cuerpos and isinstance(cuerpos[0], _ast.Expr)
+            and isinstance(cuerpos[0].value, _ast.Constant)
+            and isinstance(cuerpos[0].value.value, str)):
+        cuerpos = cuerpos[1:]           # fuera el docstring
+    assert cuerpos, 'funcion sin cuerpo ejecutable'
+    return chr(10).join(lineas[cuerpos[0].lineno - 1:])
+
+
+def _primera_sentencia(cuerpo):
+    import ast as _ast
+    fn = _ast.parse(cuerpo).body[0]
+    cuerpos = [n for n in fn.body
+               if not (isinstance(n, _ast.Expr)
+                       and isinstance(n.value, _ast.Constant)
+                       and isinstance(n.value.value, str))]
+    return cuerpos[0]
+
+
+@test("A4-22 la logica legacy de los POST sigue sin reescribirse")
 def _():
     for nombre in ('ejecutar_promocion', 'ejecutar_promocion_cierre_ano',
                    'promover_estudiantes'):
         antes = _cuerpo_en(_SHA_A3, nombre)
         ahora = _cuerpo_actual(nombre)
         assert antes and ahora, nombre
-        igual(ahora, antes, nombre)
+        cola = _cola_legacy(antes)
+        assert cola in ahora, (
+            '%s: la logica legacy cambio, no solo se le antepuso un guard'
+            % nombre)
+
+
+@test("A4-22b lo unico que se les antepuso es el safety lock de C1")
+def _():
+    import ast as _ast
+    for nombre in ('ejecutar_promocion', 'ejecutar_promocion_cierre_ano',
+                   'promover_estudiantes', 'cerrar_ano_escolar'):
+        n = _primera_sentencia(_cuerpo_actual(nombre))
+        # La PRIMERA sentencia ejecutable debe ser el guard. Si alguien
+        # colocase una consulta, un `await request.json()` o un log por
+        # delante, el rechazo dejaria de ser fail-closed limpio.
+        assert isinstance(n, _ast.If), (
+            '%s: su primera sentencia ya no es el guard (%s)'
+            % (nombre, type(n).__name__))
+        assert isinstance(n.test, _ast.Name) and n.test.id == 'CIERRE_ANO_BLOQUEADO', (
+            '%s: la primera sentencia no comprueba CIERRE_ANO_BLOQUEADO' % nombre)
+        assert isinstance(n.body[0], _ast.Return), (
+            '%s: el guard no retorna de inmediato' % nombre)
 
 
 @test("A4-23 construir la preview NO escribe nada")

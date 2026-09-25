@@ -60,6 +60,11 @@ interface EstudiantePromocion {
   listo_para_decidir: boolean;
 }
 
+// C1 · El backend rechaza con 409 los POST de cierre y promocion mientras se
+// reconstruye el flujo academico. Esta bandera NO es la proteccion: el backend
+// lo es. Aqui solo evita que Direccion llegue a un boton que va a fallar.
+const CIERRE_BLOQUEADO = true;
+
 const CONDICION_BADGE: Record<CondicionCanonica,
   { variant: 'success' | 'warning' | 'danger' | 'default'; texto: string }> = {
   promovido: { variant: 'success', texto: 'Promovido' },
@@ -266,6 +271,16 @@ export const CierreAnoPage = () => {
         <p className="text-gray-500">Proceso de cierre y promoción de estudiantes</p>
       </div>
 
+      {CIERRE_BLOQUEADO && (
+        <Alert variant="warning">
+          <AlertTriangle size={18} className="inline mr-2" />
+          <strong>Cierre de Año temporalmente deshabilitado.</strong> Se está
+          completando el flujo académico seguro. Puede revisar la situación de
+          cada estudiante y las previsualizaciones con normalidad; lo que no se
+          puede ejecutar todavía es el cierre ni la promoción.
+        </Alert>
+      )}
+
       {message && (
         <Alert variant={message.type} onClose={() => setMessage(null)}>{message.text}</Alert>
       )}
@@ -395,7 +410,7 @@ export const CierreAnoPage = () => {
                 onClick={() => setShowConfirmCierre(true)} 
                 variant="danger"
                 icon={<Lock size={18} />}
-                disabled={!anoEscolar || anoEscolar.cerrado}
+                disabled={CIERRE_BLOQUEADO || !anoEscolar || anoEscolar.cerrado}
               >
                 Proceder al Cierre
               </Button>
@@ -562,7 +577,8 @@ export const CierreAnoPage = () => {
               <Button variant="secondary" onClick={() => setPaso(3)}>← Volver</Button>
               <Button
                 onClick={() => setShowConfirmPromocion(true)}
-                disabled={estudiantesPromocion.length === 0
+                disabled={CIERRE_BLOQUEADO
+                  || estudiantesPromocion.length === 0
                   || estudiantesPromocion.some(e => !e.listo_para_decidir)}
                 icon={<GraduationCap size={18} />}
               >

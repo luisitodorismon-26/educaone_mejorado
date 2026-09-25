@@ -2891,8 +2891,71 @@ async def update_ano_escolar(id, request: Request, db: Session = Depends(get_db)
         'campos_modificados': sorted(despues),
     }
 
+
+# ═══════════════ CIERRE DE AÑO C1 · SAFETY LOCK ═══════════════
+#
+# La auditoría C0/C0.1 reprodujo, en base local aislada, que los writers
+# académicos antiguos producen movimientos incorrectos:
+#
+#   · promueven a alumnos que NO pertenecen al año que se está cerrando,
+#     incluidos los matriculados directamente en el año nuevo;
+#   · resuelven el grado destino con `Grado.orden` GLOBAL, así que en un
+#     colegio mixto un 6.º de Secundaria aterriza en 1.º de Primaria y un
+#     6.º de Primaria queda marcado «Egresado» y desactivado;
+#   · no consultan A2: un APLAZADO se promueve por defecto y pierde de
+#     hecho su derecho a la Recuperación Especial;
+#   · no son idempotentes: una segunda ejecución mueve a todos otra vez;
+#   · `/api/promocion/ejecutar` busca el curso destino sin filtrar por año,
+#     y deja al alumno en un curso del año VIEJO.
+#
+# Ninguno de esos defectos se corrige aquí. C1 solo impide ejecutarlos
+# mientras se reconstruye el flujo, y lo hace ANTES de leer el cuerpo de la
+# petición y antes de cualquier consulta de mutación: el rechazo no puede
+# dejar la base a medias porque no llega a tocarla.
+#
+# Las LECTURAS no se tocan. Las previsualizaciones de R4 siguen intactas,
+# que es justamente lo que Dirección necesita para revisar el año.
+
+CIERRE_ANO_BLOQUEADO = True
+
+ERROR_CIERRE_BLOQUEADO = 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO'
+ERROR_PROMOCION_LEGACY_BLOQUEADA = 'PROMOCION_LEGACY_BLOQUEADA'
+ERROR_ANO_CERRADO_NO_ACTIVABLE = 'ANO_ESCOLAR_CERRADO_NO_ACTIVABLE'
+
+_MENSAJE_CIERRE = (
+    'El Cierre de Año está temporalmente bloqueado mientras se completa el '
+    'flujo académico seguro. Las previsualizaciones siguen disponibles.'
+)
+_MENSAJE_LEGACY = (
+    'Esta vía de promoción quedó fuera de servicio: movía estudiantes sin '
+    'comprobar su situación académica ni el año escolar de destino. Use el '
+    'Cierre de Año cuando esté habilitado.'
+)
+
+
+def _bloqueo_cierre_ano(codigo=ERROR_CIERRE_BLOQUEADO, mensaje=None):
+    """La respuesta fail-closed. 409: el estado del sistema lo impide.
+
+    Se devuelve SIN tocar la base. No hay commit, ni flush, ni una sola
+    escritura pendiente en la sesión.
+    """
+    return JSONResponse({
+        'error': codigo,
+        'message': mensaje or _MENSAJE_CIERRE,
+        'bloqueado': True,
+    }, status_code=409)
+
+
 @app.post("/api/ano-escolar/{id}/cerrar")
 async def cerrar_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    # C1 · SAFETY LOCK. Primero de todo: ni se resuelve el año, ni se lee el
+    # cuerpo. Cerrar escribe `cerrado`, `activo` y una fila de
+    # HistorialAcademico por alumno ACTIVO del tenant —incluidos los que ya
+    # están en un curso del año siguiente—, con una condición que sale de
+    # `Estudiante.condicion` y no de A2.
+    if CIERRE_ANO_BLOQUEADO:
+        return _bloqueo_cierre_ano()
+
     ano = get_tenant_or_404(db, AnoEscolar, id, current_user, name='anoescolar')
     if getattr(ano, 'cerrado', False):
         return {'message': 'El año escolar ya estaba cerrado', 'ano_id': ano.id}
@@ -2935,7 +2998,21 @@ async def cerrar_ano_escolar(id, request: Request, db: Session = Depends(get_db)
 
 @app.post("/api/ano-escolar/{id}/reabrir")
 async def reabrir_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Reabrir un año escolar cerrado"""
+    """Reabrir un año escolar cerrado.
+
+    TODO (Cierre de Año, fase posterior) · RIESGO CONOCIDO, NO CORREGIDO AQUÍ.
+        C0.1 confirmó que reabrir NO comprueba si ya hubo movimientos
+        parciales. Si parte del alumnado fue promovido al año siguiente,
+        reabrir el anterior deja al colegio con estudiantes en cursos de B
+        mientras el año activo es A: las recuperaciones se escribirían
+        contra A para alumnos cuyo curso pertenece a B, y la
+        previsualización de A los incluiría con el grado de B.
+
+        La política segura necesita conocer el estado de transición
+        (cuántos alumnos siguen en el año origen), y ese estado se diseña
+        junto al nuevo writer. C1 deja esta función intacta a propósito:
+        un side-fix aquí sería adivinar la regla.
+    """
     ano = get_tenant_or_404(db, AnoEscolar, id, current_user, name='anoescolar')
     
     # Desactivar otros años activos del mismo colegio
@@ -2954,9 +3031,33 @@ async def reabrir_ano_escolar(id, request: Request, db: Session = Depends(get_db
 
 @app.post("/api/ano-escolar/{id}/activar")
 async def activar_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Activar un año escolar existente (sin cerrarlo)"""
+    """Activar un año escolar existente (sin cerrarlo).
+
+    C1 · Un año CERRADO no puede quedar activo. Esta función nunca tocó
+    `cerrado`, así que activar un año cerrado dejaba `cerrado=True` y
+    `activo=True` a la vez — y media aplicación resuelve «el año en curso»
+    con `filter_by(activo=True)`: las recuperaciones, la creación del año
+    siguiente y la previsualización general habrían apuntado a un año
+    cerrado.
+
+    No se reabre nada automáticamente ni se infiere la intención: si hace
+    falta volver a trabajar sobre ese año, Dirección tiene el flujo
+    explícito de reapertura.
+    """
     ano = get_tenant_or_404(db, AnoEscolar, id, current_user, name='anoescolar')
-    
+
+    # ANTES de desactivar los demás años: un rechazo no puede dejar al
+    # colegio sin ningún año activo.
+    if getattr(ano, 'cerrado', False):
+        return JSONResponse({
+            'error': ERROR_ANO_CERRADO_NO_ACTIVABLE,
+            'message': (
+                'El año escolar %s está cerrado y no puede activarse. '
+                'Reábralo primero si necesita volver a trabajar sobre él.'
+                % ano.nombre
+            ),
+        }, status_code=409)
+
     # Desactivar otros años activos del mismo colegio
     tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).update({AnoEscolar.activo: False})
     
@@ -3008,6 +3109,18 @@ async def editar_mensaje(id, request: Request, db: Session = Depends(get_db), cu
 
 @app.post("/api/ano-escolar/promover")
 async def promover_estudiantes(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """C1 · SAFETY LOCK: bloqueado.
+
+    En la reproducción local NO movió a ningún estudiante: calcula el grado
+    siguiente y descarta el resultado, y su `commit()` no guarda nada. Aun
+    así respondía «Estudiantes promovidos», que es peor que no existir:
+    Dirección podía creer que la promoción se hizo. Se bloquea con el mismo
+    código legacy hasta decidir si se retira.
+    """
+    if CIERRE_ANO_BLOQUEADO:
+        return _bloqueo_cierre_ano(ERROR_PROMOCION_LEGACY_BLOQUEADA,
+                                   _MENSAJE_LEGACY)
+
     grados = tenant_filter(db.query(Grado), Grado, current_user).order_by(Grado.orden).all()
     grado_siguiente = {g.id: grados[i+1].id if i+1 < len(grados) else None for i, g in enumerate(grados)}
     
@@ -15842,7 +15955,19 @@ async def get_estudiantes_promocion(request: Request, ano_id: int = None, db: Se
 
 @app.post("/api/promocion/ejecutar")
 async def ejecutar_promocion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Ejecutar la promoción de estudiantes al siguiente grado"""
+    """Ejecutar la promoción de estudiantes al siguiente grado.
+
+    C1 · SAFETY LOCK: bloqueado, y con código propio porque su problema es
+    distinto. Recibe IDs del cliente, no conoce el año origen ni el destino,
+    resuelve el grado con `orden + 1` y busca el curso destino por
+    (grado, tanda, activo) SIN filtrar `ano_escolar_id`: en la reproducción
+    local dejó al estudiante en un curso del año VIEJO. Era un bypass
+    completo del Cierre de Año.
+    """
+    if CIERRE_ANO_BLOQUEADO:
+        return _bloqueo_cierre_ano(ERROR_PROMOCION_LEGACY_BLOQUEADA,
+                                   _MENSAJE_LEGACY)
+
     data = await request.json()
     
     estudiantes_promover = data.get('estudiantes', [])  # Lista de IDs
@@ -16095,7 +16220,13 @@ async def ejecutar_promocion_cierre_ano(request: Request, db: Session = Depends(
       - overrides (dict): {estudiante_id: 'repite'|'retira'}
 
     Requiere que exista un año CERRADO (el actual) antes de promover.
+
+    C1 · SAFETY LOCK: bloqueado. Ver `_bloqueo_cierre_ano`.
     """
+    # Antes de `await request.json()`: el rechazo no depende del cuerpo.
+    if CIERRE_ANO_BLOQUEADO:
+        return _bloqueo_cierre_ano()
+
     try:
         data = await request.json()
     except Exception:
