@@ -369,13 +369,35 @@ try:
     col5, viejo5, nuevo5, grados5, ests5 = montar(db, 'Mut', 'MUT1')
     usr5 = usuario_real(db, col5)
 
+    # CORE-1: el writer ya no acepta `nuevo_ano_id` ni deduce el origen. Hay
+    # que mandarle la transicion explicita, que es justamente lo que se quiere
+    # comprobar: sin la bandera el camino canonico corre y escribe.
     with Vigilante(db) as v:
         r = asyncio.run(APP.ejecutar_promocion_cierre_ano(
-            request=Req({'nuevo_ano_id': nuevo5.id}), db=db, current_user=usr5))
+            request=Req({'ano_origen_id': viejo5.id,
+                         'ano_destino_id': nuevo5.id}),
+            db=db, current_user=usr5))
     bloqueado = hasattr(r, 'status_code') and r.status_code == 409
+    # Los alumnos de esta fixture no tienen ninguna nota, asi que A2 los deja
+    # EN_PROCESO y el writer —correctamente— no mueve a nadie. Lo que prueba
+    # que el camino corrio es que devuelve el informe canonico, no el 409.
+    corrio = (not bloqueado and isinstance(r, dict)
+              and r.get('ano_origen_id') == viejo5.id
+              and r.get('ano_destino_id') == nuevo5.id
+              and r.get('en_proceso', 0) > 0)
     check('C1-M1 sin la bandera, cierre-ano/promover vuelve a ejecutar',
-          not bloqueado and v.total > 0,
-          'escrituras=%s' % repr(v))
+          corrio, 'respuesta=%s' % (
+              {k: r[k] for k in ('ano_origen_id', 'movidos', 'en_proceso')}
+              if isinstance(r, dict) else type(r).__name__))
+
+    # Y sin los dos años explicitos se rechaza con 400, no con el 409 del lock:
+    # el contrato nuevo es obligatorio incluso con la bandera apagada.
+    with Vigilante(db) as v2:
+        r2 = asyncio.run(APP.ejecutar_promocion_cierre_ano(
+            request=Req({'nuevo_ano_id': nuevo5.id}), db=db, current_user=usr5))
+    check('C1-M1b sin la transicion explicita: 400, y no escribe',
+          hasattr(r2, 'status_code') and r2.status_code == 400 and v2.total == 0,
+          'status=%s escrituras=%s' % (getattr(r2, 'status_code', None), repr(v2)))
 
     r = asyncio.run(APP.activar_ano_escolar(
         id=viejo5.id, request=Req({}), db=db, current_user=usr5))

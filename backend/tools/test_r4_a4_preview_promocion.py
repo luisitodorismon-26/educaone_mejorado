@@ -543,8 +543,16 @@ def _():
     assert 'e.accion_sugerida' in fe, 'la accion sale del motor'
 
 
-@test("A4-21 APLAZADO / EN_PROCESO deshabilitan el boton de ejecutar")
+@test("A4-21 APLAZADO / EN_PROCESO no se deciden, pero no paran al colegio")
 def _():
+    # CORE-1 cambio esta regla a proposito. A4 deshabilitaba el boton Ejecutar
+    # en cuanto UN solo estudiante tuviera proceso abierto, lo que condenaba a
+    # 300 alumnos a esperar por uno. Ahora el aplazado se queda en su año con
+    # su recuperacion pendiente y el resto avanza.
+    #
+    # Lo que NO cambio, y se sigue exigiendo: el selector de accion de un
+    # estudiante no decidible sigue bloqueado, la pantalla sigue avisando, y
+    # el boton solo se habilita si hay alguien a quien procesar.
     datos = preview_cierre()
     assert datos['hay_procesos_pendientes'] is True, \
         'la fixture tiene aplazados: el backend debe avisarlo'
@@ -552,9 +560,12 @@ def _():
     assert 'listo_para_decidir' in fe
     assert 'disabled={!est.listo_para_decidir}' in fe, \
         'el selector de accion debe bloquearse'
-    assert 'Hay estudiantes con proceso académico pendiente.' in fe
-    assert "estudiantesPromocion.some(e => !e.listo_para_decidir)" in fe, \
-        'el boton Ejecutar debe mirar si queda algo pendiente'
+    assert 'proceso académico abierto permanecerán en el año actual' in fe, \
+        'la pantalla debe decir que los pendientes se quedan, no callarlo'
+    assert "estudiantesPromocion.every(e => !e.listo_para_decidir)" in fe, \
+        'el boton solo se bloquea si NADIE es procesable'
+    assert "estudiantesPromocion.some(e => !e.listo_para_decidir)}" not in fe, \
+        'un solo aplazado NO puede volver a bloquear el lote entero'
 
 
 @test("A4-21b la pantalla representa los CUATRO estados")
@@ -611,6 +622,18 @@ def _cuerpo_actual(nombre):
     return None
 
 
+def codigo_efectivo(fuente):
+    """Sin comentarios ni cadenas: prohibir una regla no es prohibir nombrarla."""
+    import io as _io
+    import tokenize
+    trozos = []
+    for tok in tokenize.generate_tokens(_io.StringIO(fuente).readline):
+        if tok.type in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        trozos.append(tok.string)
+    return ' '.join(trozos)
+
+
 _SHA_C1_BASE = '064c9326fd66539cd6b0e835266a5ac442974bf7'
 
 # Los CUATRO writers que C1 bloquea. `cerrar_ano_escolar` no estaba en el
@@ -658,32 +681,110 @@ def _primera_sentencia(cuerpo):
     return _sentencias(cuerpo)[0]
 
 
-@test("A4-22 guard + cuerpo legacy EXACTO, sin una sola sentencia extra")
+# CORE-1 reescribio el writer de Cierre. Los otros tres siguen CONGELADOS
+# contra la base; este tiene un prologo canonico y, debajo, el mismo cuerpo
+# legacy de siempre —ya inalcanzable—. La regla no se afloja: el legacy se
+# sigue exigiendo IDENTICO sentencia a sentencia, y ademas hay que demostrar
+# que no se puede llegar a el.
+_WRITER_REESCRITO = 'ejecutar_promocion_cierre_ano'
+_WRITERS_CONGELADOS = tuple(w for w in _WRITERS_C1 if w != _WRITER_REESCRITO)
+
+
+def _exigir_cola_identica(nombre, cola, base):
+    assert len(cola) == len(base), (
+        '%s: quedan %d sentencias legacy y la base tiene %d'
+        % (nombre, len(cola), len(base)))
+    for pos, (actual, original) in enumerate(zip(cola, base)):
+        assert _huella(actual) == _huella(original), (
+            '%s: la sentencia legacy %d difiere de la base.%s'
+            '  base : %s%s  ahora: %s'
+            % (nombre, pos + 1, chr(10),
+               _huella(original)[:200], chr(10), _huella(actual)[:200]))
+
+
+@test("A4-22 los tres writers congelados: guard + legacy EXACTO")
 def _():
-    # La version anterior comprobaba `cola_legacy in cuerpo_actual`. Eso
-    # demuestra que la logica vieja sigue AHI, pero no que sea lo unico que
-    # hay: entre el guard y esa cola cabia codigo nuevo sin que la subcadena
-    # dejase de encontrarse. Aqui se compara sentencia a sentencia contra la
-    # base, asi que cualquier linea ejecutable de mas —o de menos, o movida—
-    # hace fallar el test.
-    for nombre in _WRITERS_C1:
+    # `cola_legacy in cuerpo_actual` demostraba que la logica vieja seguia
+    # AHI, pero no que fuera lo unico: entre el guard y esa cola cabia codigo
+    # nuevo sin que la subcadena dejase de encontrarse. Aqui se compara
+    # sentencia a sentencia, asi que cualquier linea ejecutable de mas —o de
+    # menos, o movida— hace fallar el test.
+    for nombre in _WRITERS_CONGELADOS:
         base = _sentencias(_cuerpo_en(_SHA_C1_BASE, nombre))
         ahora = _sentencias(_cuerpo_actual(nombre))
-
         assert _es_guard_c1(ahora[0]), (
             '%s: su primera sentencia ejecutable no es el guard de C1' % nombre)
+        _exigir_cola_identica(nombre, ahora[1:], base)
 
-        resto = ahora[1:]
-        assert len(resto) == len(base), (
-            '%s: tras el guard hay %d sentencias y la base tiene %d'
-            % (nombre, len(resto), len(base)))
 
-        for pos, (actual, original) in enumerate(zip(resto, base)):
-            assert _huella(actual) == _huella(original), (
-                '%s: la sentencia %d tras el guard difiere de la base.%s'
-                '  base : %s%s  ahora: %s'
-                % (nombre, pos + 1, chr(10),
-                   _huella(original)[:200], chr(10), _huella(actual)[:200]))
+@test("A4-22d el writer reescrito: guard + prologo CORE-1 + legacy intacto")
+def _():
+    import ast as _ast
+    base = _sentencias(_cuerpo_en(_SHA_C1_BASE, _WRITER_REESCRITO))
+    ahora = _sentencias(_cuerpo_actual(_WRITER_REESCRITO))
+
+    assert _es_guard_c1(ahora[0]), 'la primera sentencia no es el guard de C1'
+
+    # El prologo canonico termina en un `return` INCONDICIONAL al nivel
+    # superior de la funcion. Ese return es, a la vez, la salida del camino
+    # nuevo y la prueba de que lo de abajo es codigo muerto.
+    cortes = [k for k, n in enumerate(ahora) if isinstance(n, _ast.Return)]
+    assert cortes, 'el writer no tiene ningun return al nivel superior'
+    corte = cortes[0]
+    assert corte >= 1, 'el return no puede ser la primera sentencia'
+
+    # Y debajo del corte, el legacy EXACTAMENTE como en la base.
+    _exigir_cola_identica(_WRITER_REESCRITO, ahora[corte + 1:], base)
+
+    # El prologo es pequeno a proposito: leer el cuerpo, llamar al nucleo
+    # canonico y responder. Si creciera, la logica estaria volviendo al
+    # endpoint en vez de vivir en los helpers.
+    prologo = ahora[1:corte + 1]
+    assert len(prologo) <= 5, (
+        'el prologo canonico tiene %d sentencias: la logica debe vivir en '
+        'los helpers, no en el endpoint' % len(prologo))
+
+
+@test("A4-22e el cuerpo legacy del writer es INALCANZABLE")
+def _():
+    import ast as _ast
+    ahora = _sentencias(_cuerpo_actual(_WRITER_REESCRITO))
+    corte = [k for k, n in enumerate(ahora) if isinstance(n, _ast.Return)][0]
+
+    # Un `return` incondicional al nivel superior de la funcion hace muerto
+    # todo lo que le sigue: no hay bucle que lo envuelva ni rama que lo
+    # esquive, porque ES una sentencia hermana de las demas.
+    assert isinstance(ahora[corte], _ast.Return)
+    assert corte < len(ahora) - 1, (
+        'no queda codigo legacy debajo: si se borro, hay que quitar este test')
+
+    # Y nadie mas llama al legacy por otra via: el writer es la unica
+    # definicion, y las funciones que quedan debajo del return no son
+    # funciones — son sentencias sueltas de su cuerpo.
+    for n in ahora[corte + 1:]:
+        assert not isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)), \
+            'hay una funcion definida en el codigo muerto: seria alcanzable'
+
+
+@test("A4-22f el writer NO decide nada academico por su cuenta")
+def _():
+    import ast as _ast
+    import inspect
+    import textwrap
+    # Solo el prologo: lo de abajo es legacy muerto y ya esta fijado por
+    # A4-22d. Y sobre CODIGO, no sobre texto: el docstring del writer EXPLICA
+    # que se elimino `overrides` y que el destino ya no sale de `orden + 1`,
+    # y buscar esas cadenas en crudo acusaba justo al parrafo que lo prohibe.
+    fuente = textwrap.dedent(inspect.getsource(APP.ejecutar_promocion_cierre_ano))
+    ahora = _sentencias(fuente)
+    corte = [k for k, n in enumerate(ahora) if isinstance(n, _ast.Return)][0]
+    modulo = _ast.Module(body=ahora[:corte + 1], type_ignores=[])
+    prologo = codigo_efectivo(_ast.unparse(modulo))
+    for prohibido in ('overrides', '>= 70', '>= 65', 'promueve',
+                      'orden + 1', 'Egresado'):
+        assert prohibido not in prologo, (
+            'el camino nuevo contiene %r: la verdad academica es de A2'
+            % prohibido)
 
 
 @test("A4-22b lo unico que se les antepuso es el safety lock de C1")
@@ -835,18 +936,6 @@ print(f"\n{B}ESTATICOS: LAS REGLAS VIEJAS NO VUELVEN{X}")
 _MIGRADOS = ('get_estudiantes_promocion', 'get_datos_promocion',
              '_preview_promocion_canonica', '_fila_preview',
              '_destino_previsto')
-
-
-def codigo_efectivo(fuente):
-    """Sin comentarios ni cadenas: prohibir una regla no es prohibir nombrarla."""
-    import io as _io
-    import tokenize
-    trozos = []
-    for tok in tokenize.generate_tokens(_io.StringIO(fuente).readline):
-        if tok.type in (tokenize.COMMENT, tokenize.STRING):
-            continue
-        trozos.append(tok.string)
-    return ' '.join(trozos)
 
 
 @test("S1  ningun camino migrado decide con cortes numericos")

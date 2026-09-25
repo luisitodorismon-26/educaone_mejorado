@@ -316,7 +316,7 @@ eX = alumno(db, colX, cursosX[('A', 1)])
 
 origen, destino = APP._resolver_transicion_cierre(db, DIR, A.id, B.id)
 with Vigilante(db) as v:
-    candidatos, diag = APP._cohorte_del_ano_origen(db, DIR, origen)
+    candidatos, diag = APP._candidatos_pendientes_del_ano_origen(db, DIR, origen)
 ids = [e.id for e in candidatos]
 
 check('C2-9  alumno en curso de A -> incluido', e1.id in ids, 'ids=%s' % ids)
@@ -356,7 +356,7 @@ print("=" * 94)
 e1.curso_id = cursos[('B', 2)].id
 db.commit()
 
-candidatos2, diag2 = APP._cohorte_del_ano_origen(db, DIR, origen)
+candidatos2, diag2 = APP._candidatos_pendientes_del_ano_origen(db, DIR, origen)
 check('C2-15 tras pasar A->B, la segunda seleccion ya no lo incluye',
       e1.id not in [e.id for e in candidatos2] and diag2['total_candidatos'] == 0,
       'cohorte de A ahora=%d' % diag2['total_candidatos'])
@@ -382,7 +382,8 @@ print("=" * 94)
 
 _FUENTE_C2 = {
     nombre: inspect.getsource(getattr(APP, nombre))
-    for nombre in ('_resolver_transicion_cierre', '_cohorte_del_ano_origen')
+    for nombre in ('_resolver_transicion_cierre',
+                   '_candidatos_pendientes_del_ano_origen')
 }
 
 
@@ -403,12 +404,23 @@ def _comparaciones_curso(arbol):
     return fuera
 
 
-comparaciones = _comparaciones_curso(_arbol('_cohorte_del_ano_origen'))
-check('C2-17 la unica condicion sobre Curso es el AÑO, nunca grado+tanda',
-      comparaciones and all(attr == 'ano_escolar_id' for attr, _ in comparaciones),
-      '%s' % [a for a, _ in comparaciones])
+comparaciones = _comparaciones_curso(_arbol('_candidatos_pendientes_del_ano_origen'))
+_atributos = [a for a, _ in comparaciones]
+# CORE-1 §2 endurecio el filtro: sobre `Curso` se comprueba el AÑO y el
+# COLEGIO, y nada mas. El colegio hace falta porque `tenant_filter` solo mira
+# al estudiante, y una fila corrupta —alumno de A con curso de B— entraria
+# por la puerta del curso. Grado y tanda siguen prohibidos aqui: elegir por
+# ellos es resolver un destino, y C2 no resuelve destinos.
+check('C2-17 sobre Curso solo se filtra AÑO y COLEGIO, nunca grado+tanda',
+      comparaciones and set(_atributos) == {'ano_escolar_id', 'colegio_id'},
+      '%s' % _atributos)
 check('C2-17b y ese año es el ORIGEN, no otro',
-      all('ano_origen' in dump for _, dump in comparaciones),
+      all('ano_origen' in dump for attr, dump in comparaciones
+          if attr == 'ano_escolar_id'),
+      '')
+check('C2-17d el filtro de colegio ata el curso al MISMO tenant',
+      all(('Estudiante' in dump or 'ano_origen' in dump)
+          for attr, dump in comparaciones if attr == 'colegio_id'),
       '')
 
 # C2 se detiene antes de decidir grado destino: no hay resolucion de curso
@@ -442,13 +454,13 @@ def _contar_consultas(fn):
 db.expire_all()
 n3 = _contar_consultas(lambda: [
     (e.curso.grado.nombre if e.curso and e.curso.grado else None)
-    for e in APP._cohorte_del_ano_origen(db, DIR, origen)[0]])
+    for e in APP._candidatos_pendientes_del_ano_origen(db, DIR, origen)[0]])
 for _ in range(8):
     alumno(db, col, cursos[('A', 3)])
 db.expire_all()
 n9 = _contar_consultas(lambda: [
     (e.curso.grado.nombre if e.curso and e.curso.grado else None)
-    for e in APP._cohorte_del_ano_origen(db, DIR, origen)[0]])
+    for e in APP._candidatos_pendientes_del_ano_origen(db, DIR, origen)[0]])
 check('C2-14c leer curso y grado de la cohorte no produce N+1',
       n3 == n9, 'consultas con 1 alumno=%d, con 9=%d' % (n3, n9))
 

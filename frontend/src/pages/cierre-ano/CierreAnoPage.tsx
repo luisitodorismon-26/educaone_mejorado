@@ -14,12 +14,17 @@ interface AnoEscolar {
 }
 
 interface ResumenCurso {
-  id: number;
   nombre: string;
   estudiantes: number;
   promovidos: number;
   reprobados: number;
-  promedio: number;
+  // CORE-1: el resumen dejo de tener su propia regla (`todos los CF >= 70`)
+  // y ahora sale de A1/A2, igual que la previsualizacion. Por eso aparecen
+  // los cuatro estados: un APLAZADO no es un reprobado.
+  aplazados: number;
+  en_proceso: number;
+  // `null` cuando el curso no tiene ninguna nota final numerica. NO es 0.
+  promedio: number | null;
 }
 
 // R4-A4: la condicion la decide el motor canonico (A2) y llega ya resuelta.
@@ -176,20 +181,22 @@ export const CierreAnoPage = () => {
       // v2.13.24: promover pasando el año destino. Sin esto, los
       // estudiantes no tienen a dónde moverse y quedan en el mismo grado.
       // v2.13.26: enviar overrides solo de los que NO son 'promueve'
-      const overrides: Record<number, string> = {};
-      Object.entries(acciones).forEach(([id, acc]) => {
-        if (acc && acc !== 'promueve') overrides[Number(id)] = acc;
-      });
+      // CORE-1: la transicion se DECLARA. El backend ya no deduce el origen
+      // con "el ultimo cerrado" ni el destino con "el año activo", y no
+      // acepta `overrides`: quien promueve o repite lo decide A2, no la
+      // pantalla. Si falta cualquiera de los dos años, responde 400.
+      const origenId = anoOrigenId ?? anoEscolar?.id ?? null;
       const res = await api.post('/cierre-ano/promover', {
-        ...(nuevoAnoId ? { nuevo_ano_id: nuevoAnoId } : {}),
-        ...(Object.keys(overrides).length ? { overrides } : {}),
+        ano_origen_id: origenId,
+        ano_destino_id: nuevoAnoId,
       });
       const d = res.data || {};
       const partes = [];
+      if (d.movidos) partes.push(`${d.movidos} movidos`);
       if (d.promovidos) partes.push(`${d.promovidos} promovidos`);
-      if (d.repitentes) partes.push(`${d.repitentes} repitentes`);
-      if (d.retirados) partes.push(`${d.retirados} retirados`);
-      if (d.egresados) partes.push(`${d.egresados} egresados`);
+      if (d.reprobados) partes.push(`${d.reprobados} repitentes`);
+      if (d.aplazados) partes.push(`${d.aplazados} aplazados (siguen en el año anterior)`);
+      if (d.en_proceso) partes.push(`${d.en_proceso} en proceso`);
       const detalle = partes.length ? ` (${partes.join(', ')})` : '';
       if (d.aviso) {
         setMessage({ type: 'warning', text: d.aviso });
@@ -250,8 +257,10 @@ export const CierreAnoPage = () => {
     return resumenCursos.reduce((acc, c) => ({
       estudiantes: acc.estudiantes + c.estudiantes,
       promovidos: acc.promovidos + c.promovidos,
-      reprobados: acc.reprobados + c.reprobados
-    }), { estudiantes: 0, promovidos: 0, reprobados: 0 });
+      reprobados: acc.reprobados + c.reprobados,
+      aplazados: acc.aplazados + (c.aplazados || 0),
+      en_proceso: acc.en_proceso + (c.en_proceso || 0),
+    }), { estudiantes: 0, promovidos: 0, reprobados: 0, aplazados: 0, en_proceso: 0 });
   };
 
   if (loading) {
@@ -373,12 +382,14 @@ export const CierreAnoPage = () => {
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Estudiantes</th>
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Promovidos</th>
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Reprobados</th>
+                      <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Aplazados</th>
+                      <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">En proceso</th>
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Promedio</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y">
                     {resumenCursos.map(curso => (
-                      <tr key={curso.id} className="hover:bg-gray-50">
+                      <tr key={curso.nombre} className="hover:bg-gray-50">
                         <td className="px-4 py-3 font-medium">{curso.nombre}</td>
                         <td className="px-4 py-3 text-center">{curso.estudiantes}</td>
                         <td className="px-4 py-3 text-center">
@@ -388,9 +399,19 @@ export const CierreAnoPage = () => {
                           <span className="text-red-600 font-medium">{curso.reprobados}</span>
                         </td>
                         <td className="px-4 py-3 text-center">
-                          <Badge variant={curso.promedio >= 80 ? 'success' : curso.promedio >= 70 ? 'warning' : 'danger'}>
-                            {curso.promedio.toFixed(1)}
-                          </Badge>
+                          <span className="text-amber-600 font-medium">{curso.aplazados ?? 0}</span>
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          <span className="text-gray-500 font-medium">{curso.en_proceso ?? 0}</span>
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          {curso.promedio === null || curso.promedio === undefined ? (
+                            <span className="text-gray-400">—</span>
+                          ) : (
+                            <Badge variant={curso.promedio >= 80 ? 'success' : curso.promedio >= 70 ? 'warning' : 'danger'}>
+                              {curso.promedio.toFixed(1)}
+                            </Badge>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -569,8 +590,11 @@ export const CierreAnoPage = () => {
                 la promocion no se puede lanzar. La validacion definitiva del
                 POST es de Cierre de Ano; esta solo evita el clic. */}
             <p className="text-xs text-amber-700">
+              {/* CORE-1: un aplazado ya NO paraliza al colegio. Se queda en el
+                  año anterior con su recuperación pendiente, y el resto se
+                  promueve. Antes esto deshabilitaba el botón para todos. */}
               {estudiantesPromocion.some(e => !e.listo_para_decidir)
-                ? 'Hay estudiantes con proceso académico pendiente.'
+                ? `${estudiantesPromocion.filter(e => !e.listo_para_decidir).length} estudiante(s) con proceso académico abierto permanecerán en el año actual; el resto se procesará.`
                 : ''}
             </p>
             <div className="flex gap-3">
@@ -579,7 +603,7 @@ export const CierreAnoPage = () => {
                 onClick={() => setShowConfirmPromocion(true)}
                 disabled={CIERRE_BLOQUEADO
                   || estudiantesPromocion.length === 0
-                  || estudiantesPromocion.some(e => !e.listo_para_decidir)}
+                  || estudiantesPromocion.every(e => !e.listo_para_decidir)}
                 icon={<GraduationCap size={18} />}
               >
                 Ejecutar Promoción
