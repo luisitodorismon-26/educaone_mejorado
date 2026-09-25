@@ -611,56 +611,85 @@ def _cuerpo_actual(nombre):
     return None
 
 
-def _cola_legacy(cuerpo):
-    """El cuerpo sin la firma ni el docstring: solo la logica ejecutable.
+_SHA_C1_BASE = '064c9326fd66539cd6b0e835266a5ac442974bf7'
 
-    La comparacion byte a byte del cuerpo ENTERO dejo de servir cuando C1
-    antepuso el safety lock. Pero lo que este invariante protege no es el
-    docstring: es que nadie reescriba en silencio la logica legacy mientras
-    dice estar bloqueandola. Esa logica es la cola, y la cola sigue exigiendose
-    IDENTICA.
+# Los CUATRO writers que C1 bloquea. `cerrar_ano_escolar` no estaba en el
+# A4-22 historico porque R4 no lo tocaba; C1 si le antepone el lock, asi que
+# a partir de aqui tambien queda fijado contra la base.
+_WRITERS_C1 = ('cerrar_ano_escolar', 'ejecutar_promocion_cierre_ano',
+               'ejecutar_promocion', 'promover_estudiantes')
+
+
+def _sentencias(cuerpo):
+    """Las sentencias EJECUTABLES de la funcion, sin docstring.
+
+    Trabajar sobre nodos AST y no sobre texto descarta de una vez los
+    comentarios, la indentacion y los numeros de linea. Lo que queda es lo
+    unico que puede cambiar el comportamiento.
     """
     import ast as _ast
-    lineas = cuerpo.splitlines()
-    arbol = _ast.parse(cuerpo)
-    fn = arbol.body[0]
-    cuerpos = list(fn.body)
-    if (cuerpos and isinstance(cuerpos[0], _ast.Expr)
-            and isinstance(cuerpos[0].value, _ast.Constant)
-            and isinstance(cuerpos[0].value.value, str)):
-        cuerpos = cuerpos[1:]           # fuera el docstring
-    assert cuerpos, 'funcion sin cuerpo ejecutable'
-    return chr(10).join(lineas[cuerpos[0].lineno - 1:])
+    st = list(_ast.parse(cuerpo).body[0].body)
+    if (st and isinstance(st[0], _ast.Expr)
+            and isinstance(st[0].value, _ast.Constant)
+            and isinstance(st[0].value.value, str)):
+        st = st[1:]                     # fuera el docstring
+    assert st, 'funcion sin cuerpo ejecutable'
+    return st
+
+
+def _huella(nodo):
+    """La forma del nodo, sin posiciones. Dos sentencias con la misma huella
+    hacen exactamente lo mismo aunque esten en otra linea o columna."""
+    import ast as _ast
+    return _ast.dump(nodo, include_attributes=False)
+
+
+def _es_guard_c1(n):
+    import ast as _ast
+    return (isinstance(n, _ast.If)
+            and isinstance(n.test, _ast.Name)
+            and n.test.id == 'CIERRE_ANO_BLOQUEADO'
+            and len(n.body) == 1
+            and isinstance(n.body[0], _ast.Return)
+            and not n.orelse)
 
 
 def _primera_sentencia(cuerpo):
-    import ast as _ast
-    fn = _ast.parse(cuerpo).body[0]
-    cuerpos = [n for n in fn.body
-               if not (isinstance(n, _ast.Expr)
-                       and isinstance(n.value, _ast.Constant)
-                       and isinstance(n.value.value, str))]
-    return cuerpos[0]
+    return _sentencias(cuerpo)[0]
 
 
-@test("A4-22 la logica legacy de los POST sigue sin reescribirse")
+@test("A4-22 guard + cuerpo legacy EXACTO, sin una sola sentencia extra")
 def _():
-    for nombre in ('ejecutar_promocion', 'ejecutar_promocion_cierre_ano',
-                   'promover_estudiantes'):
-        antes = _cuerpo_en(_SHA_A3, nombre)
-        ahora = _cuerpo_actual(nombre)
-        assert antes and ahora, nombre
-        cola = _cola_legacy(antes)
-        assert cola in ahora, (
-            '%s: la logica legacy cambio, no solo se le antepuso un guard'
-            % nombre)
+    # La version anterior comprobaba `cola_legacy in cuerpo_actual`. Eso
+    # demuestra que la logica vieja sigue AHI, pero no que sea lo unico que
+    # hay: entre el guard y esa cola cabia codigo nuevo sin que la subcadena
+    # dejase de encontrarse. Aqui se compara sentencia a sentencia contra la
+    # base, asi que cualquier linea ejecutable de mas —o de menos, o movida—
+    # hace fallar el test.
+    for nombre in _WRITERS_C1:
+        base = _sentencias(_cuerpo_en(_SHA_C1_BASE, nombre))
+        ahora = _sentencias(_cuerpo_actual(nombre))
+
+        assert _es_guard_c1(ahora[0]), (
+            '%s: su primera sentencia ejecutable no es el guard de C1' % nombre)
+
+        resto = ahora[1:]
+        assert len(resto) == len(base), (
+            '%s: tras el guard hay %d sentencias y la base tiene %d'
+            % (nombre, len(resto), len(base)))
+
+        for pos, (actual, original) in enumerate(zip(resto, base)):
+            assert _huella(actual) == _huella(original), (
+                '%s: la sentencia %d tras el guard difiere de la base.%s'
+                '  base : %s%s  ahora: %s'
+                % (nombre, pos + 1, chr(10),
+                   _huella(original)[:200], chr(10), _huella(actual)[:200]))
 
 
 @test("A4-22b lo unico que se les antepuso es el safety lock de C1")
 def _():
     import ast as _ast
-    for nombre in ('ejecutar_promocion', 'ejecutar_promocion_cierre_ano',
-                   'promover_estudiantes', 'cerrar_ano_escolar'):
+    for nombre in _WRITERS_C1:
         n = _primera_sentencia(_cuerpo_actual(nombre))
         # La PRIMERA sentencia ejecutable debe ser el guard. Si alguien
         # colocase una consulta, un `await request.json()` o un log por
@@ -672,6 +701,25 @@ def _():
             '%s: la primera sentencia no comprueba CIERRE_ANO_BLOQUEADO' % nombre)
         assert isinstance(n.body[0], _ast.Return), (
             '%s: el guard no retorna de inmediato' % nombre)
+
+
+@test("A4-22c el invariante esta VIVO: detecta una sentencia intercalada")
+def _():
+    # Mutacion en memoria, sin tocar app.py: se inyecta una llamada entre el
+    # guard y la cola legacy y se comprueba que A4-22 la caza. Un invariante
+    # que nadie ha intentado romper no esta demostrado.
+    import ast as _ast
+    fuente = _cuerpo_actual('ejecutar_promocion')
+    lineas = fuente.splitlines()
+    corte = _sentencias(fuente)[1].lineno - 1
+    mutado = chr(10).join(lineas[:corte] + ['    codigo_no_autorizado()']
+                          + lineas[corte:])
+
+    base = _sentencias(_cuerpo_en(_SHA_C1_BASE, 'ejecutar_promocion'))
+    resto = _sentencias(mutado)[1:]
+    assert len(resto) != len(base) or any(
+        _huella(a) != _huella(b) for a, b in zip(resto, base)), \
+        'el invariante NO detecta una sentencia intercalada: no prueba nada'
 
 
 @test("A4-23 construir la preview NO escribe nada")

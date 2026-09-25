@@ -418,6 +418,121 @@ check('C1-C4 el frontend muestra el aviso informativo',
 
 print()
 print("=" * 86)
+print("BLOQUE 7 — RBAC: el lock no sustituye al control de acceso")
+print("=" * 86)
+
+# El riesgo que se descarta aqui: que C1 haya convertido el guard en un
+# atajo que responde 409 a cualquiera. Si el guard corriese ANTES de
+# RolesRequired, un profesor —o alguien sin token— recibiria el contrato de
+# C1 en vez del rechazo de autorizacion, y el dia que se levante el lock
+# entraria al writer. El guard vive DENTRO de la funcion, o sea despues de
+# las dependencias, y eso es lo que se comprueba.
+
+from fastapi.testclient import TestClient      # noqa: E402
+from auth import create_token                  # noqa: E402
+
+col6, viejo6, nuevo6, grados6, ests6 = montar(db, 'RBAC', 'RBA1')
+dir6 = usuario_real(db, col6)
+prof6 = M.Usuario(colegio_id=col6.id, username='prof-RBA1', password_hash='x',
+                  nombre='Prof', role='profesor', activo=True,
+                  must_change_password=False, token_version=0)
+db.add(prof6)
+db.commit()
+
+TOK_DIR = create_token(dir6)
+TOK_PROF = create_token(prof6)
+
+ENDPOINTS = [
+    ('POST /api/ano-escolar/{id}/cerrar', 'post',
+     '/api/ano-escolar/%d/cerrar' % viejo6.id, {},
+     'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO'),
+    ('POST /api/cierre-ano/promover', 'post',
+     '/api/cierre-ano/promover', {'nuevo_ano_id': nuevo6.id},
+     'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO'),
+    ('POST /api/promocion/ejecutar', 'post',
+     '/api/promocion/ejecutar', {'estudiantes': [e.id for e in ests6.values()]},
+     'PROMOCION_LEGACY_BLOQUEADA'),
+    ('POST /api/ano-escolar/promover', 'post',
+     '/api/ano-escolar/promover', {},
+     'PROMOCION_LEGACY_BLOQUEADA'),
+]
+
+with TestClient(APP.app) as cli:
+    for etiqueta, metodo, ruta, body, codigo_esperado in ENDPOINTS:
+        antes6 = foto(db, col6)
+
+        # ── DIRECCION: pasa RBAC y choca con el lock ──────────────
+        r = cli.post(ruta, json=body,
+                     headers={'Authorization': 'Bearer %s' % TOK_DIR})
+        ok = r.status_code == 409 and r.json().get('error') == codigo_esperado
+        check('C1-R1 %s · direccion -> 409 %s' % (etiqueta, codigo_esperado),
+              ok, 'status=%s error=%s' % (r.status_code, r.json().get('error')))
+
+        # ── PROFESOR: lo para RolesRequired, NO el lock ───────────
+        r = cli.post(ruta, json=body,
+                     headers={'Authorization': 'Bearer %s' % TOK_PROF})
+        cuerpo_prof = r.text
+        check('C1-R2 %s · profesor -> 403 por autorizacion' % etiqueta,
+              r.status_code == 403,
+              'status=%s' % r.status_code)
+        check('C1-R3 %s · profesor NO recibe el contrato de C1' % etiqueta,
+              codigo_esperado not in cuerpo_prof
+              and 'bloqueado' not in cuerpo_prof,
+              repr(cuerpo_prof[:70]))
+
+        # ── SIN TOKEN: rechazo de autenticacion de siempre ────────
+        r = cli.post(ruta, json=body)
+        cuerpo_anon = r.text
+        check('C1-R4 %s · sin token -> 401/403, no 409' % etiqueta,
+              r.status_code in (401, 403) and r.status_code != 409,
+              'status=%s' % r.status_code)
+        check('C1-R5 %s · sin token NO recibe el contrato de C1' % etiqueta,
+              codigo_esperado not in cuerpo_anon
+              and 'bloqueado' not in cuerpo_anon,
+              repr(cuerpo_anon[:70]))
+
+        # Ninguna de las tres llamadas pudo escribir.
+        db.expire_all()
+        check('C1-R6 %s · ningun rol movio nada' % etiqueta,
+              foto(db, col6) == antes6, '')
+
+print()
+print("=" * 86)
+print("BLOQUE 8 — el 409 no revela nada sobre el recurso pedido")
+print("=" * 86)
+
+# Con el lock puesto, `cerrar` rechaza antes de resolver el año. Por tanto la
+# respuesta a un ID propio, a uno de OTRO colegio y a uno inexistente tiene
+# que ser identica: si difiriese, el 409 se convertiria en un oraculo de
+# existencia cross-tenant. No se apaga el lock para comprobarlo.
+col7, viejo7, nuevo7, grados7, ests7 = montar(db, 'Ajeno', 'AJE1')
+antes7 = foto(db, col7)
+
+with TestClient(APP.app) as cli:
+    respuestas = {}
+    for etiqueta_id, ident in (('propio', viejo6.id),
+                               ('de otro colegio', viejo7.id),
+                               ('inexistente', 987654)):
+        r = cli.post('/api/ano-escolar/%d/cerrar' % ident, json={},
+                     headers={'Authorization': 'Bearer %s' % TOK_DIR})
+        respuestas[etiqueta_id] = (r.status_code, r.text)
+
+distintas = set(respuestas.values())
+check('C1-T1 el 409 es indistinguible sea cual sea el ID',
+      len(distintas) == 1,
+      ' | '.join('%s=%s' % (k, v[0]) for k, v in respuestas.items()))
+
+for campo in ('nombre', '2025-2026', '2026-2027', 'AJE1', 'estudiante',
+              'curso', 'anoescolar'):
+    check('C1-T2 la respuesta no filtra %r' % campo,
+          all(campo not in texto for _, texto in respuestas.values()),
+          '')
+
+db.expire_all()
+check('C1-T3 el colegio ajeno quedo intacto', foto(db, col7) == antes7, '')
+
+print()
+print("=" * 86)
 print("RESULTADO: %d PASARON / %d FALLARON" % (len(PASARON), len(FALLARON)))
 print("=" * 86)
 for f in FALLARON:
