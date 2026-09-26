@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
-import { AlertTriangle, Save, CheckCircle, RefreshCw, Backpack } from 'lucide-react';
+import { AlertTriangle, Save, CheckCircle, RefreshCw, Backpack, Calendar } from 'lucide-react';
 import { Button, Alert, Spinner } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
 import { TabRecuperacionCualitativa } from './TabRecuperacionCualitativa';
@@ -38,6 +38,15 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
   const [pendientes, setPendientes] = useState<Recuperacion[]>([]);
   const [resueltas, setResueltas] = useState<Recuperacion[]>([]);
   const [minimo, setMinimo] = useState(65);
+  // CORE-2: sobre QUE año se esta calificando. Un aplazado del año anterior
+  // conserva su recuperacion aunque el año nuevo ya este en curso, y el
+  // maestro tiene que saber en cual esta escribiendo. Mezclar dos años sin
+  // etiquetarlos seria peor que no mostrarlos.
+  const [anoEscolar, setAnoEscolar] = useState<{ id: number; nombre: string; cerrado: boolean } | null>(null);
+  // Cuando hay pendientes en mas de un año, el backend responde 409 y manda
+  // la lista. El maestro ELIGE; no escribe IDs.
+  const [anosAmbiguos, setAnosAmbiguos] = useState<{ id: number; nombre: string; pendientes: number }[]>([]);
+  const [anoElegido, setAnoElegido] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [savingKey, setSavingKey] = useState<string | null>(null);
@@ -48,18 +57,32 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
   const cargar = async () => {
     setLoading(true);
     try {
-      const res = await api.get('/recuperaciones-primaria/pendientes');
+      const res = await api.get('/recuperaciones-primaria/pendientes',
+        anoElegido ? { params: { ano_id: anoElegido } } : undefined);
       setPendientes(res.data.pendientes || []);
       setResueltas(res.data.resueltas || []);
       setMinimo(res.data.minimo || 65);
+      setAnosAmbiguos([]);
+      setAnoEscolar(res.data.ano_escolar_id
+        ? { id: res.data.ano_escolar_id, nombre: res.data.ano_escolar, cerrado: !!res.data.ano_cerrado }
+        : null);
     } catch (e: any) {
-      setMensaje({ tipo: 'error', texto: e.response?.data?.error || 'Error al cargar las recuperaciones' });
+      if (e.response?.status === 409 && e.response?.data?.error === 'RECUPERACION_ANO_AMBIGUO') {
+        // No es un fallo: hay procesos abiertos en dos años y solo una
+        // persona puede decir en cual esta calificando.
+        setAnosAmbiguos(e.response.data.anos || []);
+        setPendientes([]);
+        setResueltas([]);
+        setAnoEscolar(null);
+      } else {
+        setMensaje({ tipo: 'error', texto: e.response?.data?.error || 'Error al cargar las recuperaciones' });
+      }
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => { cargar(); }, []);
+  useEffect(() => { cargar(); }, [anoElegido]);
 
   const guardar = async (r: Recuperacion) => {
     const k = keyDe(r);
@@ -76,6 +99,8 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
         asignatura_id: r.asignatura_id,
         tipo: r.fase_pendiente,
         puntos: parseFloat(valor),
+        // El año viaja explicito: el backend ya no lo deduce del año activo.
+        ...(anoEscolar ? { ano_id: anoEscolar.id } : {}),
       });
       setMensaje({
         tipo: 'success',
@@ -222,6 +247,34 @@ export const RecuperacionesPrimariaPage: React.FC = () => {
         </div>
         <Button variant="secondary" onClick={cargar} icon={<RefreshCw size={16} />}>Refrescar</Button>
       </div>
+
+      {anoEscolar && (
+        <div className="flex items-center gap-2 text-sm">
+          <span className="inline-flex items-center gap-1.5 bg-gray-100 text-gray-800 font-semibold px-3 py-1.5 rounded-lg">
+            <Calendar size={14} /> Año escolar: {anoEscolar.nombre}
+          </span>
+          {anoEscolar.cerrado && (
+            <span className="inline-flex items-center gap-1.5 bg-amber-100 text-amber-800 font-semibold px-3 py-1.5 rounded-lg">
+              <AlertTriangle size={14} /> Proceso pendiente de año anterior
+            </span>
+          )}
+        </div>
+      )}
+
+      {anosAmbiguos.length > 0 && (
+        <Alert variant="warning">
+          <p className="font-semibold mb-2">
+            Hay recuperaciones pendientes en más de un año escolar. ¿Sobre cuál está calificando?
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {anosAmbiguos.map(a => (
+              <Button key={a.id} variant="secondary" onClick={() => setAnoElegido(a.id)}>
+                {a.nombre} ({a.pendientes} pendiente{a.pendientes === 1 ? '' : 's'})
+              </Button>
+            ))}
+          </div>
+        </Alert>
+      )}
 
       {mensaje && <Alert variant={mensaje.tipo} onClose={() => setMensaje(null)}>{mensaje.texto}</Alert>}
 

@@ -81,6 +81,12 @@ export const EvaluacionesExtraPage = () => {
   const [filtroAsignatura, setFiltroAsignatura] = useState<string>(''); // idem
 
   // Borradores de notas (uno por fila pendiente)
+  // CORE-2: sobre QUE año se esta calificando. Un aplazado del año anterior
+  // conserva su evaluacion Especial aunque el año nuevo ya este en curso.
+  const [anoEscolar, setAnoEscolar] = useState<{ id: number; nombre: string; cerrado: boolean } | null>(null);
+  const [anosAmbiguos, setAnosAmbiguos] = useState<{ id: number; nombre: string; pendientes: number }[]>([]);
+  const [anoElegido, setAnoElegido] = useState<number | null>(null);
+
   const [drafts, setDrafts] = useState<DraftMap>({});
   const [savingKey, setSavingKey] = useState<string | null>(null);
 
@@ -89,18 +95,31 @@ export const EvaluacionesExtraPage = () => {
   useEffect(() => {
     cargar();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtroFase]);
+  }, [filtroFase, anoElegido]);
 
   const cargar = async () => {
     setLoading(true);
     try {
       const params: Record<string, string> = {};
       if (filtroFase !== 'todos') params.tipo = filtroFase;
+      if (anoElegido) params.ano_id = String(anoElegido);
       const res = await api.get('/calificaciones-secundaria/pendientes-evaluacion-extra', { params });
       setPendientes(res.data.pendientes || []);
       setDrafts({});
+      setAnosAmbiguos([]);
+      setAnoEscolar(res.data.ano_escolar_id
+        ? { id: res.data.ano_escolar_id, nombre: res.data.ano_escolar, cerrado: !!res.data.ano_cerrado }
+        : null);
     } catch (err: any) {
-      setMensaje({ tipo: 'error', texto: err.response?.data?.error || 'Error cargando pendientes' });
+      if (err.response?.status === 409 && err.response?.data?.error === 'RECUPERACION_ANO_AMBIGUO') {
+        // No es un fallo: hay procesos abiertos en dos años y solo una
+        // persona puede decir en cual esta calificando.
+        setAnosAmbiguos(err.response.data.anos || []);
+        setPendientes([]);
+        setAnoEscolar(null);
+      } else {
+        setMensaje({ tipo: 'error', texto: err.response?.data?.error || 'Error cargando pendientes' });
+      }
     } finally {
       setLoading(false);
     }
@@ -131,6 +150,8 @@ export const EvaluacionesExtraPage = () => {
         asignatura_id: p.asignatura_id,
         tipo: p.fase_pendiente,
         nota,
+        // El año viaja explicito: el backend ya no lo deduce del año activo.
+        ...(anoEscolar ? { ano_id: anoEscolar.id } : {}),
       });
       setMensaje({
         tipo: 'success',
@@ -214,6 +235,37 @@ export const EvaluacionesExtraPage = () => {
           Refrescar
         </Button>
       </div>
+
+      {/* CORE-2: sobre que año se esta calificando. Sin esto, un maestro que
+          carga la Especial de un aplazado del año pasado no sabe en cual de
+          los dos años esta escribiendo. */}
+      {anoEscolar && (
+        <div className="flex items-center gap-2 text-sm">
+          <span className="inline-flex items-center gap-1.5 bg-gray-100 text-gray-800 font-semibold px-3 py-1.5 rounded-lg">
+            Año escolar: {anoEscolar.nombre}
+          </span>
+          {anoEscolar.cerrado && (
+            <span className="inline-flex items-center gap-1.5 bg-amber-100 text-amber-800 font-semibold px-3 py-1.5 rounded-lg">
+              <AlertTriangle size={14} /> Proceso pendiente de año anterior
+            </span>
+          )}
+        </div>
+      )}
+
+      {anosAmbiguos.length > 0 && (
+        <Alert variant="warning">
+          <p className="font-semibold mb-2">
+            Hay evaluaciones pendientes en más de un año escolar. ¿Sobre cuál está calificando?
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {anosAmbiguos.map(a => (
+              <Button key={a.id} variant="secondary" onClick={() => setAnoElegido(a.id)}>
+                {a.nombre} ({a.pendientes} pendiente{a.pendientes === 1 ? '' : 's'})
+              </Button>
+            ))}
+          </div>
+        </Alert>
+      )}
 
       {mensaje && (
         <Alert variant={mensaje.tipo === 'info' ? 'info' : mensaje.tipo} onClose={() => setMensaje(null)}>

@@ -686,8 +686,10 @@ def _primera_sentencia(cuerpo):
 # legacy de siempre —ya inalcanzable—. La regla no se afloja: el legacy se
 # sigue exigiendo IDENTICO sentencia a sentencia, y ademas hay que demostrar
 # que no se puede llegar a el.
-_WRITER_REESCRITO = 'ejecutar_promocion_cierre_ano'
-_WRITERS_CONGELADOS = tuple(w for w in _WRITERS_C1 if w != _WRITER_REESCRITO)
+_WRITERS_REESCRITOS = ('ejecutar_promocion_cierre_ano', 'cerrar_ano_escolar')
+_WRITER_REESCRITO = _WRITERS_REESCRITOS[0]
+_WRITERS_CONGELADOS = tuple(w for w in _WRITERS_C1
+                            if w not in _WRITERS_REESCRITOS)
 
 
 def _exigir_cola_identica(nombre, cola, base):
@@ -717,53 +719,56 @@ def _():
         _exigir_cola_identica(nombre, ahora[1:], base)
 
 
-@test("A4-22d el writer reescrito: guard + prologo CORE-1 + legacy intacto")
+@test("A4-22d los writers reescritos: guard + prologo + legacy intacto")
 def _():
     import ast as _ast
-    base = _sentencias(_cuerpo_en(_SHA_C1_BASE, _WRITER_REESCRITO))
-    ahora = _sentencias(_cuerpo_actual(_WRITER_REESCRITO))
+    for nombre in _WRITERS_REESCRITOS:
+        base = _sentencias(_cuerpo_en(_SHA_C1_BASE, nombre))
+        ahora = _sentencias(_cuerpo_actual(nombre))
 
-    assert _es_guard_c1(ahora[0]), 'la primera sentencia no es el guard de C1'
+        assert _es_guard_c1(ahora[0]), (
+            '%s: la primera sentencia no es el guard de C1' % nombre)
 
-    # El prologo canonico termina en un `return` INCONDICIONAL al nivel
-    # superior de la funcion. Ese return es, a la vez, la salida del camino
-    # nuevo y la prueba de que lo de abajo es codigo muerto.
-    cortes = [k for k, n in enumerate(ahora) if isinstance(n, _ast.Return)]
-    assert cortes, 'el writer no tiene ningun return al nivel superior'
-    corte = cortes[0]
-    assert corte >= 1, 'el return no puede ser la primera sentencia'
+        # El prologo canonico termina en un `return` INCONDICIONAL al nivel
+        # superior de la funcion. Ese return es, a la vez, la salida del
+        # camino nuevo y la prueba de que lo de abajo es codigo muerto.
+        cortes = [k for k, n in enumerate(ahora) if isinstance(n, _ast.Return)]
+        assert cortes, '%s: no tiene ningun return al nivel superior' % nombre
+        corte = cortes[0]
+        assert corte >= 1, '%s: el return no puede ser la primera' % nombre
 
-    # Y debajo del corte, el legacy EXACTAMENTE como en la base.
-    _exigir_cola_identica(_WRITER_REESCRITO, ahora[corte + 1:], base)
+        # Y debajo del corte, el legacy EXACTAMENTE como en la base.
+        _exigir_cola_identica(nombre, ahora[corte + 1:], base)
 
-    # El prologo es pequeno a proposito: leer el cuerpo, llamar al nucleo
-    # canonico y responder. Si creciera, la logica estaria volviendo al
-    # endpoint en vez de vivir en los helpers.
-    prologo = ahora[1:corte + 1]
-    assert len(prologo) <= 5, (
-        'el prologo canonico tiene %d sentencias: la logica debe vivir en '
-        'los helpers, no en el endpoint' % len(prologo))
+        # El prologo es pequeno a proposito: leer el cuerpo, llamar al nucleo
+        # canonico y responder. Si creciera, la logica estaria volviendo al
+        # endpoint en vez de vivir en los helpers.
+        prologo = ahora[1:corte + 1]
+        assert len(prologo) <= 5, (
+            '%s: el prologo tiene %d sentencias; la logica debe vivir en los '
+            'helpers, no en el endpoint' % (nombre, len(prologo)))
 
 
-@test("A4-22e el cuerpo legacy del writer es INALCANZABLE")
+@test("A4-22e el legacy de los writers reescritos es INALCANZABLE")
 def _():
     import ast as _ast
-    ahora = _sentencias(_cuerpo_actual(_WRITER_REESCRITO))
-    corte = [k for k, n in enumerate(ahora) if isinstance(n, _ast.Return)][0]
+    for nombre in _WRITERS_REESCRITOS:
+        ahora = _sentencias(_cuerpo_actual(nombre))
+        corte = [k for k, n in enumerate(ahora)
+                 if isinstance(n, _ast.Return)][0]
 
-    # Un `return` incondicional al nivel superior de la funcion hace muerto
-    # todo lo que le sigue: no hay bucle que lo envuelva ni rama que lo
-    # esquive, porque ES una sentencia hermana de las demas.
-    assert isinstance(ahora[corte], _ast.Return)
-    assert corte < len(ahora) - 1, (
-        'no queda codigo legacy debajo: si se borro, hay que quitar este test')
+        # Un `return` incondicional al nivel superior de la funcion hace
+        # muerto todo lo que le sigue: no hay bucle que lo envuelva ni rama
+        # que lo esquive, porque ES una sentencia hermana de las demas.
+        assert isinstance(ahora[corte], _ast.Return)
+        assert corte < len(ahora) - 1, (
+            '%s: no queda legacy debajo; si se borro, quitar este test'
+            % nombre)
 
-    # Y nadie mas llama al legacy por otra via: el writer es la unica
-    # definicion, y las funciones que quedan debajo del return no son
-    # funciones — son sentencias sueltas de su cuerpo.
-    for n in ahora[corte + 1:]:
-        assert not isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)), \
-            'hay una funcion definida en el codigo muerto: seria alcanzable'
+        for n in ahora[corte + 1:]:
+            assert not isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)), (
+                '%s: hay una funcion en el codigo muerto, seria alcanzable'
+                % nombre)
 
 
 @test("A4-22f el writer NO decide nada academico por su cuenta")
@@ -802,6 +807,58 @@ def _():
             '%s: la primera sentencia no comprueba CIERRE_ANO_BLOQUEADO' % nombre)
         assert isinstance(n.body[0], _ast.Return), (
             '%s: el guard no retorna de inmediato' % nombre)
+
+
+def _esquema_modelos(fuente):
+    """{tabla: {columna: tipo}} leido por AST, sin importar el modulo."""
+    import ast as _ast
+    tablas = {}
+    for n in _ast.walk(_ast.parse(fuente)):
+        if not isinstance(n, _ast.ClassDef):
+            continue
+        nombre, columnas = None, {}
+        for item in n.body:
+            if not isinstance(item, _ast.Assign) or not item.targets:
+                continue
+            destino = item.targets[0]
+            if not isinstance(destino, _ast.Name):
+                continue
+            if destino.id == '__tablename__' and isinstance(item.value, _ast.Constant):
+                nombre = item.value.value
+            elif (isinstance(item.value, _ast.Call)
+                  and isinstance(item.value.func, _ast.Name)
+                  and item.value.func.id == 'Column'):
+                columnas[destino.id] = (
+                    _ast.dump(item.value.args[0], include_attributes=False)
+                    if item.value.args else '')
+        if nombre:
+            tablas[nombre] = columnas
+    return tablas
+
+
+@test("S3b  models.py solo puede CRECER: nada borrado, nada cambiado")
+def _():
+    # CORE-2 anade una tabla a models.py —la persistencia de las decisiones
+    # humanas que A2 necesita—, asi que la igualdad byte a byte dejo de
+    # valer. Lo que hay que proteger no es que el archivo no cambie: es que
+    # el cambio sea ADITIVO. Ninguna tabla desaparece, ninguna columna
+    # desaparece, ningun tipo cambia. Eso compara el ESQUEMA y no el texto,
+    # asi que es mas estricto que el diff en lo unico que importa.
+    import subprocess
+    import io as _io
+    base = _esquema_modelos(subprocess.run(
+        ['git', 'show', '%s:backend/models.py' % _SHA_A3],
+        capture_output=True, cwd=_REPO).stdout.decode('utf-8'))
+    ahora = _esquema_modelos(_io.open(
+        os.path.join(os.path.dirname(_AQUI), 'models.py'),
+        encoding='utf-8').read())
+
+    for tabla, columnas in base.items():
+        assert tabla in ahora, 'desaparecio la tabla %r' % tabla
+        for col, tipo in columnas.items():
+            assert col in ahora[tabla], \
+                'desaparecio la columna %s.%s' % (tabla, col)
+            igual(ahora[tabla][col], tipo, '%s.%s cambio de tipo' % (tabla, col))
 
 
 @test("A4-22c el invariante esta VIVO: detecta una sentencia intercalada")
@@ -970,8 +1027,7 @@ def _():
                       ('d784da67dc279d018abb45b8dc25d482752d18a5',
                        'backend/promocion_academica.py'),
                       (_SHA_A3, 'backend/resultado_academico_consumidores.py'),
-                      (_SHA_A3, 'backend/catalogo_primaria.py'),
-                      (_SHA_A3, 'backend/models.py')):
+                      (_SHA_A3, 'backend/catalogo_primaria.py')):
         d = subprocess.run(['git', 'diff', '--stat', sha, '--', ruta],
                            capture_output=True, cwd=_REPO).stdout.decode('utf-8')
         igual(d.strip(), '', ruta)
@@ -1073,12 +1129,24 @@ def _():
     igual({f['id']: f['condicion_canonica'] for f in b['estudiantes']},
           {f['id']: f['condicion_canonica'] for f in a['estudiantes']},
           'el mismo ano tiene que dar la misma verdad academica')
-    # Y con el ano vacio, los dos coinciden tambien: en que no se puede.
+    # Y con el ano VACIO los dos coinciden tambien: en que ahi no hay nadie.
+    #
+    # CORE-2 cambio esto a proposito. Antes la preview de un ano arrancaba
+    # por TODOS los estudiantes activos del colegio, asi que preguntar por el
+    # ano nuevo devolvia el colegio entero marcado EN_PROCESO —evaluado
+    # contra un ano en el que ninguno esta matriculado—. Esa es la misma
+    # mezcla que C0.1 reprodujo al reves: notas de un ano con el grado del
+    # otro. La cohorte de un ano son los que pertenecen a ese ano; si no hay
+    # ninguno, la respuesta honesta es que no hay ninguno.
     a2 = cierre2(ano_id=_ANO_B.id)
     b2 = promocion2(ano_id=_ANO_B.id)
     igual({f['id']: f['condicion_canonica'] for f in b2['estudiantes']},
           {f['id']: f['condicion_canonica'] for f in a2['estudiantes']})
-    igual(a2['estudiantes'][0]['condicion_canonica'], PA.EN_PROCESO)
+    igual(a2['estudiantes'], [],
+          'el ano destino todavia vacio no tiene cohorte propia')
+    # Y el estudiante de A NO se colo en la vista de B.
+    assert all(f['id'] != _EST2.id for f in a2['estudiantes']), \
+        'un alumno de A no puede aparecer en la cohorte de B'
 
 
 @test("A4Y-3 la promocion general SIN parametro conserva el ano ACTIVO")

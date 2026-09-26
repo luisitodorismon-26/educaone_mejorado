@@ -70,6 +70,41 @@ interface EstudiantePromocion {
 // lo es. Aqui solo evita que Direccion llegue a un boton que va a fallar.
 const CIERRE_BLOQUEADO = true;
 
+// CORE-2 · La fase del asistente se DERIVA del backend, no del estado de
+// React. Antes «en qué paso voy», «cuál es el año origen» y «cuál el
+// destino» vivían solo en memoria: un refresco los perdía y Dirección volvía
+// al paso 1 sobre un año ya cerrado —o veía el año NUEVO como el que había
+// que cerrar—.
+interface EstadoCierre {
+  bloqueado_por_safety_lock: boolean;
+  ano_origen: { id: number; nombre: string; cerrado: boolean; activo: boolean } | null;
+  ano_destino: { id: number; nombre: string; cerrado: boolean; activo: boolean } | null;
+  ano_activo_id: number | null;
+  cohorte: {
+    estudiantes?: number; promovidos?: number; reprobados?: number;
+    aplazados?: number; en_proceso?: number; procesados?: number; pendientes?: number;
+  };
+  errores_estructurales: { estudiante_id: number | null; nombre_completo: string | null; motivo: string }[];
+  historiales_duplicados: number[];
+  transicion_ejecutada: boolean;
+  motivos_transicion: string[];
+  puede_cerrar: boolean;
+  puede_promover: boolean;
+  transicion_completa: boolean;
+}
+
+// Dirección aporta el DATO humano; A2 produce la condición. Aquí no se
+// escribe «promovido» ni «reprobado» en ningún caso.
+interface DecisionPendiente {
+  estudiante_id: number;
+  nombre_completo: string;
+  curso: string | null;
+  grado: string | null;
+  motivo: string | null;
+  campos_requeridos: string[];
+  registrado: Record<string, unknown> | null;
+}
+
 const CONDICION_BADGE: Record<CondicionCanonica,
   { variant: 'success' | 'warning' | 'danger' | 'default'; texto: string }> = {
   promovido: { variant: 'success', texto: 'Promovido' },
@@ -102,6 +137,9 @@ export const CierreAnoPage = () => {
   // ANTES de crear el ano siguiente, porque en cuanto ese existe pasa a ser
   // el activo y `anoEscolar` deja de apuntar al que se esta cerrando.
   const [anoOrigenId, setAnoOrigenId] = useState<number | null>(null);
+  const [estado, setEstado] = useState<EstadoCierre | null>(null);
+  const [decisiones, setDecisiones] = useState<DecisionPendiente[]>([]);
+  const [guardandoDecision, setGuardandoDecision] = useState<number | null>(null);
   // v2.13.26: acción por estudiante: 'promueve' (default) | 'repite' | 'retira'
   const [acciones, setAcciones] = useState<Record<number, 'promueve' | 'repite' | 'retira'>>({});
 
@@ -117,10 +155,32 @@ export const CierreAnoPage = () => {
       // Cargar resumen real de cursos
       const resumenRes = await api.get('/cierre-ano/resumen').catch(() => ({ data: { cursos: [] } }));
       setResumenCursos(resumenRes.data.cursos || []);
-      
-      if (anoRes.data?.cerrado) {
+
+      // CORE-2 · La fase sale de la base, no de la memoria del navegador.
+      const est = await api.get('/cierre-ano/estado')
+        .then(r => r.data as EstadoCierre)
+        .catch(() => null);
+      setEstado(est);
+      if (est) {
+        if (est.ano_origen) setAnoOrigenId(est.ano_origen.id);
+        if (est.ano_destino) setNuevoAnoId(est.ano_destino.id);
+        // Un refresco vuelve exactamente a donde estaba el proceso:
+        //   origen abierto            -> revisión y cierre
+        //   cerrado y sin destino     -> crear el año siguiente
+        //   cerrado con destino       -> promover
+        //   nada pendiente            -> terminado
+        if (est.transicion_completa && est.ano_origen?.cerrado) setPaso(5);
+        else if (est.puede_promover || (est.ano_origen?.cerrado && est.ano_destino)) setPaso(4);
+        else if (est.ano_origen?.cerrado) setPaso(3);
+        else setPaso(1);
+      } else if (anoRes.data?.cerrado) {
         setPaso(3);
       }
+
+      const dec = await api.get('/cierre-ano/decisiones')
+        .then(r => r.data.pendientes || [])
+        .catch(() => []);
+      setDecisiones(dec);
     } catch (e) {
       console.error(e);
     } finally {
@@ -253,6 +313,34 @@ export const CierreAnoPage = () => {
     }
   };
 
+  // Dirección aporta el dato; el backend devuelve la condición RECALCULADA
+  // por A2. Si la decisión resuelve el bloqueo, el estado cambia al instante.
+  const registrarDecision = async (d: DecisionPendiente, campo: string, valor: unknown) => {
+    setGuardandoDecision(d.estudiante_id);
+    try {
+      const res = await api.post('/cierre-ano/decisiones', {
+        estudiante_id: d.estudiante_id,
+        ano_id: estado?.ano_origen?.id ?? anoOrigenId,
+        [campo]: valor,
+      });
+      setMessage({
+        type: 'success',
+        text: `${d.nombre_completo}: ${res.data.condicion ?? 'situación actualizada'}.`,
+      });
+      await loadData();
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.response?.data?.message || e.response?.data?.error || 'No se pudo registrar la decisión' });
+    } finally {
+      setGuardandoDecision(null);
+    }
+  };
+
+  const etiquetaCampo: Record<string, string> = {
+    alfabetizacion_inicial: 'Registrar estado de alfabetización',
+    decision_asistencia: 'Registrar decisión de revisión de asistencia',
+    repeticion_excepcional_segundo_ya_utilizada: 'Registrar decisión colegiada excepcional',
+  };
+
   const getResumenTotales = () => {
     return resumenCursos.reduce((acc, c) => ({
       estudiantes: acc.estudiantes + c.estudiantes,
@@ -288,6 +376,76 @@ export const CierreAnoPage = () => {
           cada estudiante y las previsualizaciones con normalidad; lo que no se
           puede ejecutar todavía es el cierre ni la promoción.
         </Alert>
+      )}
+
+      {estado?.historiales_duplicados?.length ? (
+        <Alert variant="error">
+          <strong>Hay estudiantes con más de un historial académico de este año.</strong> El
+          Cierre no puede continuar sobre una cuenta que no cuadra. Estudiantes:{' '}
+          {estado.historiales_duplicados.join(', ')}.
+        </Alert>
+      ) : null}
+
+      {estado?.errores_estructurales?.length ? (
+        <Alert variant="error">
+          <strong>Falta estructura en el año destino.</strong> No se moverá a nadie hasta
+          resolverlo: la promoción se ejecuta entera o no se ejecuta.
+          <ul className="list-disc ml-5 mt-2 text-sm">
+            {estado.errores_estructurales.slice(0, 8).map((e, i) => (
+              <li key={i}>{e.nombre_completo ?? 'Historial'}: {e.motivo}</li>
+            ))}
+          </ul>
+        </Alert>
+      ) : null}
+
+      {decisiones.length > 0 && (
+        <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
+          <div className="p-4 border-b">
+            <h3 className="font-bold text-gray-800">Decisiones pendientes de Dirección</h3>
+            <p className="text-xs text-gray-500 mt-1">
+              Estos estudiantes no están en proceso por falta de notas, sino porque falta un
+              dato que solo una persona puede aportar. Al registrarlo, su situación la vuelve
+              a calcular el motor académico — aquí no se decide «promovido» ni «reprobado».
+            </p>
+          </div>
+          <div className="divide-y">
+            {decisiones.map(d => (
+              <div key={d.estudiante_id} className="p-4 flex flex-wrap items-center gap-3">
+                <div className="min-w-[14rem]">
+                  <p className="font-medium text-gray-900">{d.nombre_completo}</p>
+                  <p className="text-xs text-gray-500">{d.curso || d.grado || ''} · {d.motivo || ''}</p>
+                </div>
+                {d.campos_requeridos.includes('alfabetizacion_inicial') && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">{etiquetaCampo.alfabetizacion_inicial}:</span>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'alfabetizacion_inicial', true)}>Lograda</Button>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'alfabetizacion_inicial', false)}>No lograda</Button>
+                  </div>
+                )}
+                {d.campos_requeridos.includes('decision_asistencia') && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">{etiquetaCampo.decision_asistencia}:</span>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'decision_asistencia', 'PERMITIR_APROBACION')}>Permitir aprobación</Button>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'decision_asistencia', 'REPETIR_GRADO')}>Repetir grado</Button>
+                  </div>
+                )}
+                {d.campos_requeridos.includes('repeticion_excepcional_segundo_ya_utilizada') && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">{etiquetaCampo.repeticion_excepcional_segundo_ya_utilizada}:</span>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'repeticion_excepcional_segundo_ya_utilizada', false)}>No se ha usado</Button>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'repeticion_excepcional_segundo_ya_utilizada', true)}>Ya se usó</Button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
       )}
 
       {message && (
