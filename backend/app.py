@@ -3076,20 +3076,33 @@ ERROR_HISTORIAL_DUPLICADO = 'HISTORIAL_ACADEMICO_DUPLICADO'
 def _historiales_definitivos_del_ano(db, current_user, ano):
     """Quién ya quedó CERRADO académicamente en ese año.
 
-    -> ({estudiante_id: HistorialAcademico}, [estudiante_id duplicados])
+    -> ({estudiante_id: HistorialAcademico}, [ambiguos], [legacy_duplicados])
 
-    Definitivo significa que el historial trae una condición canónica de A2
-    —PROMOVIDO o REPROBADO—. Un historial con otra cosa dentro no cuenta:
-    puede ser una fila del writer legacy, que guardaba `Estudiante.condicion`
-    («activo», «Inscrito»…) creyendo que era un resultado académico.
+    `HistorialAcademico` lleva años recibiendo dos cosas distintas en la
+    misma columna, y confundirlas tiene consecuencias opuestas:
 
-    Los DUPLICADOS no se resuelven aquí ni se borran. Si un estudiante tiene
-    dos historiales del mismo año, elegir uno en silencio sería decidir cuál
-    de las dos verdades vale, y ninguna de las dos está verificada. Se
-    devuelven aparte para que el proceso se detenga y alguien los mire.
+      · CANÓNICO — `condicion` es exactamente PROMOVIDO o REPROBADO, que son
+        los valores que produce A2. Lo escribió el Cierre nuevo. Eso SÍ
+        demuestra que el estudiante ya fue procesado.
+
+      · LEGACY — cualquier otra cosa: «activo», «Inscrito», «Promovido»
+        (con minúsculas distintas), «Egresado», None… El writer antiguo
+        copiaba `Estudiante.condicion`, que es un campo de matrícula, y lo
+        guardaba como si fuera un resultado académico. NO demuestra nada.
+
+    CORE-2.1 · Antes esta función devolvía los duplicados SIN mirar la
+    condición, así que dos filas legacy del mismo estudiante —que no
+    afirman ningún resultado— bloqueaban el cierre, la promoción y la
+    reapertura de un colegio donde el proceso nuevo jamás había corrido.
+    La ambigüedad que importa es la CANÓNICA: dos resultados académicos
+    distintos para el mismo estudiante y año, o el mismo dos veces. Eso sí
+    hay que pararlo, porque elegir uno sería decidir cuál de las dos
+    verdades vale sin haber verificado ninguna.
+
+    Aquí no se borra ni se repara nada. Se clasifica y se informa.
     """
     if ano is None:
-        return {}, []
+        return {}, [], []
     filas = (
         tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
                       current_user)
@@ -3097,16 +3110,26 @@ def _historiales_definitivos_del_ano(db, current_user, ano):
         .order_by(HistorialAcademico.id)
         .all()
     )
-    por_estudiante, duplicados = {}, []
+
+    canonicos, legacy = {}, {}
     for h in filas:
-        if h.estudiante_id in por_estudiante:
-            if h.estudiante_id not in duplicados:
-                duplicados.append(h.estudiante_id)
-            continue
-        por_estudiante[h.estudiante_id] = h
-    definitivos = {k: v for k, v in por_estudiante.items()
-                   if v.condicion in CONDICIONES_DEFINITIVAS}
-    return definitivos, duplicados
+        destino = (canonicos if h.condicion in CONDICIONES_DEFINITIVAS
+                   else legacy)
+        destino.setdefault(h.estudiante_id, []).append(h)
+
+    # Un solo canónico: ese es el estado académico, aunque el estudiante
+    # arrastre además filas legacy. Las legacy no sustituyen al canónico, no
+    # crean un segundo estado y no generan ambigüedad.
+    definitivos = {k: v[0] for k, v in canonicos.items() if len(v) == 1}
+
+    # Dos o más canónicos: AMBIGÜEDAD REAL. Fail-closed.
+    ambiguos = sorted(k for k, v in canonicos.items() if len(v) > 1)
+
+    # Duplicados solo legacy: diagnóstico, nunca bloqueo.
+    legacy_duplicados = sorted(k for k, v in legacy.items()
+                               if len(v) > 1 and k not in canonicos)
+
+    return definitivos, ambiguos, legacy_duplicados
 
 
 def _candidatos_pendientes_del_ano_origen(db, current_user, ano_origen):
@@ -3172,8 +3195,8 @@ def _candidatos_pendientes_del_ano_origen(db, current_user, ano_origen):
     # Y sigue distinguiéndose del APLAZADO, que también permanece en el año
     # origen: aquel no tiene historial definitivo, justamente porque su
     # proceso no terminó.
-    definitivos, duplicados = _historiales_definitivos_del_ano(
-        db, current_user, ano_origen)
+    definitivos, ambiguos, legacy_duplicados = \
+        _historiales_definitivos_del_ano(db, current_user, ano_origen)
     candidatos = [e for e in candidatos if e.id not in definitivos]
 
     return candidatos, {
@@ -3181,7 +3204,11 @@ def _candidatos_pendientes_del_ano_origen(db, current_user, ano_origen):
         'total_candidatos': len(candidatos),
         'activos_sin_curso': [e.id for e in sin_curso],
         'ya_finalizados': sorted(definitivos),
-        'historiales_duplicados': duplicados,
+        # Ambigüedad CANÓNICA: dos resultados académicos para el mismo
+        # estudiante y año. Bloquea.
+        'historiales_ambiguos': ambiguos,
+        # Duplicados solo legacy: se informan, no bloquean nada.
+        'historiales_legacy_duplicados': legacy_duplicados,
     }
 
 
@@ -3362,8 +3389,8 @@ def _vista_cohorte_ano(db, current_user, ano):
     marca como no fiable, para que nadie cierre un año sobre una cuenta que
     no cuadra.
     """
-    definitivos, duplicados = _historiales_definitivos_del_ano(
-        db, current_user, ano)
+    definitivos, ambiguos_historial, legacy_duplicados = \
+        _historiales_definitivos_del_ano(db, current_user, ano)
 
     pendientes, diagnostico = _candidatos_pendientes_del_ano_origen(
         db, current_user, ano) if ano is not None else ([], {})
@@ -3449,8 +3476,12 @@ def _vista_cohorte_ano(db, current_user, ano):
             'pendientes': sum(1 for f in filas if not f.get('procesado')),
         },
         'activos_sin_curso': diagnostico.get('activos_sin_curso', []),
-        'historiales_duplicados': duplicados,
-        'fiable': not duplicados,
+        # `fiable` mide UNA cosa: si la situación académica del año se puede
+        # leer sin adivinar. Dos filas legacy no la hacen ilegible —no
+        # afirman ningún resultado—; dos canónicas sí.
+        'historiales_ambiguos': ambiguos_historial,
+        'historiales_legacy_duplicados': legacy_duplicados,
+        'fiable': not ambiguos_historial,
     }
 
 
@@ -3682,13 +3713,16 @@ def _plan_cierre(db, current_user, ano_origen, ano_destino):
         for f in filas
         if f['bloqueo'] and f['bloqueo'] not in BLOQUEOS_NO_ESTRUCTURALES
     ]
-    if diagnostico.get('historiales_duplicados'):
+    if diagnostico.get('historiales_ambiguos'):
+        # Solo la ambigüedad CANÓNICA es un error estructural. Un estudiante
+        # con dos resultados académicos distintos para el mismo año no se
+        # puede mover sin decidir cuál vale, y eso no lo decide el código.
         errores.append({
             'estudiante_id': None,
             'nombre_completo': None,
             'grado_origen': None,
             'motivo': '%s: %s' % (DIAG_HISTORIAL_DUPLICADO,
-                                  diagnostico['historiales_duplicados']),
+                                  diagnostico['historiales_ambiguos']),
         })
 
     resumen = {
@@ -3710,6 +3744,8 @@ def _plan_cierre(db, current_user, ano_origen, ano_destino):
         'bloqueados': sum(1 for f in filas if f['bloqueo']),
         'activos_sin_curso': diagnostico['activos_sin_curso'],
         'ya_finalizados': diagnostico.get('ya_finalizados', []),
+        'historiales_legacy_duplicados': diagnostico.get(
+            'historiales_legacy_duplicados', []),
         'errores_estructurales': len(errores),
     }
     return {'filas': filas, 'resumen': resumen, 'errores': errores}
@@ -3922,9 +3958,9 @@ def _cerrar_ano_canonico(db, current_user, ano_id, request=None,
     if not vista['fiable']:
         raise TransicionCierreInvalida(
             ERROR_CIERRE_COHORTE_NO_FIABLE,
-            'Hay estudiantes con más de un historial académico de este año '
-            '(%s). No se cierra sobre una cuenta que no cuadra.'
-            % vista['historiales_duplicados'])
+            'Hay estudiantes con más de un RESULTADO ACADÉMICO registrado '
+            'para este año (%s). No se cierra sobre una cuenta que no cuadra.'
+            % vista['historiales_ambiguos'])
 
     if solo_diagnostico:
         return ano, vista
@@ -3960,13 +3996,16 @@ def _transicion_ejecutada(db, current_user, ano):
     operación de reversión propia y auditada, no un efecto lateral.
     """
     motivos = []
-    definitivos, duplicados = _historiales_definitivos_del_ano(
+    definitivos, ambiguos, _legacy = _historiales_definitivos_del_ano(
         db, current_user, ano)
     if definitivos:
         motivos.append('%d estudiante(s) ya tienen resultado definitivo '
                        'registrado en este año' % len(definitivos))
-    if duplicados:
-        motivos.append('hay historiales duplicados sin resolver')
+    if ambiguos:
+        # Dos resultados académicos para el mismo estudiante. Reabrir sobre
+        # eso empeoraría una situación que ya hay que resolver a mano.
+        motivos.append('hay estudiantes con dos resultados académicos '
+                       'distintos en este año')
 
     # Alumnos que estaban en este año y hoy están en un curso posterior.
     posteriores = (
@@ -4001,29 +4040,51 @@ def _estado_cierre_ano(db, current_user, ano_origen_id=None,
             .order_by(AnoEscolar.id.desc()).all())
     activo = next((a for a in anos if a.activo), None)
 
-    origen = None
+    # CORE-2.1 · UNA TRANSICIÓN EXISTE SOLO SI HAY EVIDENCIA DE ELLA.
+    #
+    # Antes, cuando ningún año cerrado tenía gente pendiente, esto caía en
+    # «el último cerrado» por id. Eso inventaba una transición terminada:
+    # con A ya procesado y B funcionando como el año normal, la pantalla
+    # seguía etiquetando A como origen para siempre. Un año cerrado no es
+    # una transición pendiente; solo lo es si queda alguien por procesar.
+    #
+    # La evidencia objetiva es una sola: un año CERRADO con candidatos
+    # académicos todavía en él. Eso cubre al aplazado que sigue en su año,
+    # al lote a medio procesar y al año recién cerrado del que aún no se
+    # movió nadie.
+    candidatos_origen = []
+    for a in anos:
+        if not a.cerrado:
+            continue
+        pendientes, _diag = _candidatos_pendientes_del_ano_origen(
+            db, current_user, a)
+        if pendientes:
+            candidatos_origen.append(a)
+
+    origen, ambiguedad_origen = None, []
     if ano_origen_id is not None:
         origen = get_tenant_or_404(db, AnoEscolar, ano_origen_id,
                                    current_user, name='anoescolar')
-    else:
-        # El año que se está promoviendo es el CERRADO más reciente que
-        # todavía tenga gente sin procesar; si no hay ninguno, el activo.
-        for a in anos:
-            if not a.cerrado:
-                continue
-            pendientes, _diag = _candidatos_pendientes_del_ano_origen(
-                db, current_user, a)
-            if pendientes:
-                origen = a
-                break
-        if origen is None:
-            origen = next((a for a in anos if a.cerrado), None) or activo
+    elif len(candidatos_origen) == 1:
+        origen = candidatos_origen[0]
+    elif len(candidatos_origen) > 1:
+        # Dos años cerrados con transición pendiente. No se elige el de mayor
+        # id: se devuelven los dos para que Dirección diga cuál está
+        # cerrando. Adivinarlo movería a un colegio entero por el año
+        # equivocado.
+        ambiguedad_origen = [{'id': a.id, 'nombre': a.nombre}
+                             for a in candidatos_origen]
+    # Y si no hay ninguno, `origen` se queda en None: no hay transición
+    # pendiente, y decirlo es la respuesta correcta.
 
     destino = None
     if ano_destino_id is not None:
         destino = get_tenant_or_404(db, AnoEscolar, ano_destino_id,
                                     current_user, name='anoescolar')
     elif activo is not None and origen is not None and activo.id != origen.id:
+        # El destino es el año en curso, y solo cuando existe y no es el
+        # propio origen. Si A acaba de cerrarse y B todavía no se creó,
+        # `destino` queda en None y la fase es «crear el año siguiente».
         destino = activo
 
     vista = _vista_cohorte_ano(db, current_user, origen) if origen else None
@@ -4055,8 +4116,15 @@ def _estado_cierre_ano(db, current_user, ano_origen_id=None,
         and totales.get('pendientes') and not errores
         and (vista or {}).get('fiable'))
 
+    # Hay transición en progreso cuando existe un origen con gente pendiente.
+    # No cuando simplemente existe un año cerrado.
+    transicion_en_progreso = bool(
+        origen is not None and origen.cerrado and totales.get('pendientes'))
+
     return {
         'bloqueado_por_safety_lock': bool(CIERRE_ANO_BLOQUEADO),
+        'transicion_en_progreso': transicion_en_progreso,
+        'origen_ambiguo': ambiguedad_origen,
         'ano_origen': ({'id': origen.id, 'nombre': origen.nombre,
                         'cerrado': bool(origen.cerrado),
                         'activo': bool(origen.activo)} if origen else None),
@@ -4066,11 +4134,16 @@ def _estado_cierre_ano(db, current_user, ano_origen_id=None,
         'ano_activo_id': getattr(activo, 'id', None),
         'cohorte': totales,
         'errores_estructurales': errores,
-        'historiales_duplicados': (vista or {}).get('historiales_duplicados', []),
+        'historiales_ambiguos': (vista or {}).get('historiales_ambiguos', []),
+        'historiales_legacy_duplicados': (vista or {}).get(
+            'historiales_legacy_duplicados', []),
         'transicion_ejecutada': transicion_ejecutada,
         'motivos_transicion': motivos,
         'puede_cerrar': puede_cerrar,
         'puede_promover': puede_promover,
+        # Terminada = hubo un origen y ya no le queda nadie. Si no hay
+        # origen en absoluto, no hay transición ni terminada ni pendiente:
+        # el colegio simplemente está trabajando sobre su año activo.
         'transicion_completa': bool(
             origen is not None and origen.cerrado
             and not totales.get('pendientes')),
@@ -17710,7 +17783,8 @@ async def get_resumen_cierre_ano(ano_id: int = None,
         'ano_cerrado': vista['ano_cerrado'],
         'procesados': vista['totales']['procesados'],
         'pendientes': vista['totales']['pendientes'],
-        'historiales_duplicados': vista['historiales_duplicados'],
+        'historiales_ambiguos': vista['historiales_ambiguos'],
+        'historiales_legacy_duplicados': vista['historiales_legacy_duplicados'],
         'fiable': vista['fiable'],
         'hay_procesos_pendientes': bool(totales['aplazados']
                                         or totales['en_proceso']),

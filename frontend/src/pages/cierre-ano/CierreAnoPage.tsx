@@ -85,7 +85,14 @@ interface EstadoCierre {
     aplazados?: number; en_proceso?: number; procesados?: number; pendientes?: number;
   };
   errores_estructurales: { estudiante_id: number | null; nombre_completo: string | null; motivo: string }[];
-  historiales_duplicados: number[];
+  // CORE-2.1 · Dos listas distintas. La AMBIGUEDAD son dos resultados
+  // academicos para el mismo estudiante y año: eso bloquea. Los duplicados
+  // LEGACY son filas del writer antiguo, que no afirman ningun resultado:
+  // se informan y ya.
+  historiales_ambiguos: number[];
+  historiales_legacy_duplicados: number[];
+  transicion_en_progreso: boolean;
+  origen_ambiguo: { id: number; nombre: string }[];
   transicion_ejecutada: boolean;
   motivos_transicion: string[];
   puede_cerrar: boolean;
@@ -378,11 +385,25 @@ export const CierreAnoPage = () => {
         </Alert>
       )}
 
-      {estado?.historiales_duplicados?.length ? (
+      {estado?.historiales_ambiguos?.length ? (
         <Alert variant="error">
-          <strong>Hay estudiantes con más de un historial académico de este año.</strong> El
+          <strong>Hay estudiantes con dos resultados académicos distintos para este año.</strong> El
           Cierre no puede continuar sobre una cuenta que no cuadra. Estudiantes:{' '}
-          {estado.historiales_duplicados.join(', ')}.
+          {estado.historiales_ambiguos.join(', ')}.
+        </Alert>
+      ) : null}
+
+      {estado?.origen_ambiguo?.length ? (
+        <Alert variant="warning">
+          <strong>Hay más de un año escolar con promoción pendiente.</strong> Indique cuál
+          está cerrando; el sistema no lo elige por su cuenta.
+          <div className="flex flex-wrap gap-2 mt-2">
+            {estado.origen_ambiguo.map(a => (
+              <span key={a.id} className="bg-white border rounded px-2 py-1 text-sm">
+                {a.nombre}
+              </span>
+            ))}
+          </div>
         </Alert>
       ) : null}
 

@@ -591,18 +591,34 @@ check('CORE2-44 reabrir ANTES de mover sigue permitido',
       and db.get(M.AnoEscolar, A2_.id).cerrado is False, '')
 
 _estado = asyncio.run(APP.get_estado_cierre_ano(db=db, current_user=DIR))
+# CORE-2.1 cambio este contrato a proposito. En este punto de la suite la
+# transicion A->B ya termino: todos los definitivos se movieron y 6.o de
+# Secundaria quedo finalizado, asi que A no tiene a nadie pendiente. Antes
+# el estado seguia etiquetando a A como origen para siempre, porque caia en
+# «el ultimo cerrado» por id. Una transicion existe solo si hay evidencia de
+# ella, y aqui ya no la hay.
 check('CORE2-45 el estado se deriva de la base, no del navegador',
-      isinstance(_estado, dict) and _estado['ano_origen'] is not None,
-      'origen=%s destino=%s' % (
+      isinstance(_estado, dict) and 'ano_origen' in _estado
+      and _estado['ano_activo_id'] == B.id,
+      'origen=%s destino=%s activo=%s' % (
           (_estado['ano_origen'] or {}).get('nombre'),
-          (_estado['ano_destino'] or {}).get('nombre')))
-check('CORE2-46 dice si la transicion ya se ejecuto',
-      _estado['transicion_ejecutada'] is True, str(_estado['motivos_transicion'])[:70])
+          (_estado['ano_destino'] or {}).get('nombre'),
+          _estado['ano_activo_id']))
+check('CORE2-46 terminada la transicion, NO queda ninguna en progreso',
+      _estado['transicion_en_progreso'] is False
+      and _estado['ano_origen'] is None,
+      'en_progreso=%s origen=%s' % (_estado['transicion_en_progreso'],
+                                    _estado['ano_origen']))
+check('CORE2-46b pero A sigue teniendo su transicion EJECUTADA registrada',
+      APP._transicion_ejecutada(db, DIR, db.get(M.AnoEscolar, A.id))[0] is True,
+      '')
 check('CORE2-47 y NO propone cerrar un año ya cerrado',
       _estado['puede_cerrar'] is False, '')
-check('CORE2-48 nunca presenta B como el año a cerrar mientras A sigue abierto',
-      (_estado['ano_origen'] or {}).get('id') == A.id,
+check('CORE2-48 nunca presenta B como el año a cerrar',
+      (_estado['ano_origen'] or {}).get('id') != B.id,
       (_estado['ano_origen'] or {}).get('nombre'))
+check('CORE2-48b ni vuelve a ofrecer una promocion ya hecha',
+      _estado['puede_promover'] is False, '')
 check('CORE2-49 informa el safety lock',
       _estado['bloqueado_por_safety_lock'] is True, '')
 
@@ -619,13 +635,19 @@ db.add(_dup)
 db.commit()
 
 _vista_dup = APP._vista_cohorte_ano(db, DIR, A)
-check('CORE2-50 la cohorte declara la duplicidad',
-      E_PROM.id in _vista_dup['historiales_duplicados']
+# CORE-2.1: son DOS filas CANONICAS (PROMOVIDO + REPROBADO), o sea una
+# ambiguedad academica real. La clave paso a llamarse `historiales_ambiguos`
+# para distinguirla de los duplicados meramente legacy, que no bloquean.
+check('CORE2-50 la cohorte declara la ambiguedad canonica',
+      E_PROM.id in _vista_dup['historiales_ambiguos']
       and _vista_dup['fiable'] is False,
-      str(_vista_dup['historiales_duplicados']))
+      str(_vista_dup['historiales_ambiguos']))
+_filas_dup = [f for f in _vista_dup['filas']
+              if f.get('estudiante_id') == E_PROM.id]
 check('CORE2-51 y NO elige una de las dos en silencio',
-      len([f for f in _vista_dup['filas']
-           if f.get('estudiante_id') == E_PROM.id]) == 1, '')
+      len(_filas_dup) <= 1
+      and not any(f.get('origen_del_dato') == 'historial' for f in _filas_dup),
+      'filas=%d' % len(_filas_dup))
 
 try:
     APP._cierre_canonico(db, DIR, A.id, B.id, request=Req({}))
