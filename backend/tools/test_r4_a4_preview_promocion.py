@@ -1244,14 +1244,24 @@ def _():
     # La carga de la preview manda `ano_id`, y el valor sale del origen.
     assert 'params: { ano_id: origen }' in fe, fe[:0]
     assert 'const origen = origenId ?? anoOrigenId' in fe
+    # CORE-2.2 · Y ya nunca se pide sin año: la llamada opcional
+    # `origen ? {...} : undefined` desaparecio, porque el backend dejo de
+    # tener una resolucion de ultimo recurso a la que caer.
+    assert 'origen ? { params: { ano_id: origen } } : undefined' not in fe, \
+        'la preview de Cierre no puede pedirse sin año'
     # Y el destino NUNCA se usa para LEER NOTAS. Se mira la llamada de la
     # preview, no una subcadena suelta: `nuevo_ano_id: nuevoAnoId` es el
     # destino del POST de promocion y es correcto que exista.
     assert 'cargarDatosPromocion(nuevoAnoId)' not in fe
     assert 'cargarDatosPromocion(anoId)' not in fe
-    _carga = fe[fe.index('const cargarDatosPromocion'):
-                fe.index('const cargarDatosPromocion') + 900]
-    assert 'nuevoAnoId' not in _carga,         'la carga de la preview no puede tocar el ano destino'
+    # La ventana era de 900 caracteres fijos, y eso la ataba al LARGO del
+    # codigo: al crecer la funcion, la llamada que se queria comprobar salia
+    # de la ventana y el test fallaba sin que nada se hubiera roto. Se toma
+    # el cuerpo REAL, de la apertura a su cierre, que ademas cubre la funcion
+    # entera en vez de sus primeros 900 caracteres.
+    _ini = fe.index('const cargarDatosPromocion')
+    _carga = fe[_ini:fe.index(chr(10) + '  };', _ini)]
+    assert 'nuevoAnoId' not in _carga, 'la carga de la preview no puede tocar el ano destino'
     assert "api.get('/cierre-ano/promocion'" in _carga
     # El origen se captura ANTES de crear el ano siguiente.
     pos_captura = fe.index('const origenId = anoOrigenId')
@@ -1291,11 +1301,32 @@ def _():
     igual(sorted(firma), ['ano_id', 'current_user', 'db', 'preferir_cerrado'])
     cuerpo = inspect.getsource(APP._resolver_ano_preview)
     assert 'get_tenant_or_404' in cuerpo, 'el ano_id del cliente es tenant-safe'
-    # Y el endpoint de Cierre pide el cerrado.
-    assert 'preferir_cerrado=True' in inspect.getsource(APP.get_datos_promocion)
+    # CORE-2.2 · El endpoint de Cierre ya no pide «el cerrado mas reciente».
+    # Esa garantia valia cuando un año cerrado significaba siempre una
+    # promocion pendiente; dejo de valer cuando se distinguio el año cerrado
+    # que YA termino. Ahora usa `_ano_visible_de_cierre`, la misma resolucion
+    # de `/cierre-ano/estado`, para que las tres pantallas hablen del mismo
+    # año.
+    _fuente_cierre = inspect.getsource(APP.get_datos_promocion)
+    assert '_ano_visible_de_cierre' in _fuente_cierre, \
+        'la preview de Cierre debe usar la resolucion compartida'
+    assert 'preferir_cerrado' not in codigo_efectivo(_fuente_cierre), \
+        'y ya no puede caer en el cerrado mas reciente'
+
+    # Lo que NO cambia, y es lo importante: el resolutor de R4 sigue intacto
+    # y la promocion general conserva su semantica de año activo.
     assert 'preferir_cerrado' not in inspect.getsource(
         APP.get_estudiantes_promocion), \
         'la promocion general conserva su semantica de ano activo'
+
+    # El helper de Cierre es un camino INDEPENDIENTE: se apoya en el estado,
+    # no en el resolutor de R4. Si algun dia volviera a llamarlo, las dos
+    # semanticas quedarian otra vez enredadas.
+    _fuente_helper = inspect.getsource(APP._ano_visible_de_cierre)
+    assert '_estado_cierre_ano' in _fuente_helper, \
+        'el año visible de Cierre sale del estado'
+    assert '_resolver_ano_preview' not in codigo_efectivo(_fuente_helper), \
+        'el helper de Cierre no puede depender del resolutor de R4'
 
 
 print("\n" + "=" * 70)

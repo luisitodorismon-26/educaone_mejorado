@@ -4152,6 +4152,61 @@ def _estado_cierre_ano(db, current_user, ano_origen_id=None,
     }
 
 
+ERROR_CIERRE_ORIGEN_AMBIGUO = 'CIERRE_ORIGEN_AMBIGUO'
+
+
+def _ano_visible_de_cierre(db, current_user, ano_id=None):
+    """El ÚNICO año del que hablan todas las pantallas de Cierre.
+
+    -> (ano | None, error JSONResponse | None)
+
+    Había dos resoluciones distintas conviviendo. `/cierre-ano/estado`
+    decidía «hay transición si un año cerrado conserva gente pendiente», y
+    el resumen y la previsualización usaban `preferir_cerrado=True`, que
+    toma el cerrado más reciente pase lo que pase. Mientras la transición
+    estaba en curso coincidían; en cuanto terminaba, no: el asistente se
+    colocaba sobre el año nuevo y la tabla de debajo seguía mostrando la
+    cohorte del año anterior. Dirección leía los números del año pasado bajo
+    un encabezado sobre el actual.
+
+    La regla, ahora una sola:
+
+        `ano_id` explícito                  → ese, resuelto tenant-safe.
+        hay transición en progreso          → el año ORIGEN.
+        no hay transición                   → el año ACTIVO.
+        el origen es ambiguo                → no se elige ninguno.
+
+    `_resolver_ano_preview` NO se toca: alimenta contratos de R4 —entre
+    ellos `/api/promocion/estudiantes`— que están congelados y cuyo criterio
+    es otro. Este helper es de Cierre y solo de Cierre.
+    """
+    if ano_id is not None:
+        return get_tenant_or_404(db, AnoEscolar, ano_id, current_user,
+                                 name='anoescolar'), None
+
+    estado = _estado_cierre_ano(db, current_user)
+
+    if estado['origen_ambiguo']:
+        # Dos años cerrados con promoción pendiente. Mostrar el resumen de
+        # uno sería decir que ese es «el año que se está cerrando», y no
+        # consta. Se pide que lo indiquen.
+        return None, JSONResponse({
+            'error': ERROR_CIERRE_ORIGEN_AMBIGUO,
+            'message': ('Hay más de un año escolar con promoción pendiente. '
+                        'Indique sobre cuál está trabajando.'),
+            'anos': estado['origen_ambiguo'],
+        }, status_code=409)
+
+    destino_id = (estado['ano_origen'] or {}).get('id') \
+        if estado['transicion_en_progreso'] else estado['ano_activo_id']
+    if destino_id is None:
+        # Ni transición ni año activo: no hay nada que mostrar, y decirlo es
+        # mejor que inventar un año.
+        return None, None
+    return get_tenant_or_404(db, AnoEscolar, destino_id, current_user,
+                             name='anoescolar'), None
+
+
 # ═══════ CORE-2 · LAS DECISIONES QUE SOLO UNA PERSONA PUEDE TOMAR ═══════
 
 ERROR_DECISION_VALOR_INVALIDO = 'DECISION_ACADEMICA_VALOR_INVALIDO'
@@ -17726,8 +17781,10 @@ async def get_resumen_cierre_ano(ano_id: int = None,
 
     LECTURA PURA: no escribe, no mueve a nadie, no cierra nada.
     """
-    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id,
-                                preferir_cerrado=True)
+    # CORE-2.2 · El MISMO año del que habla `/cierre-ano/estado`.
+    ano, _err = _ano_visible_de_cierre(db, current_user, ano_id=ano_id)
+    if _err is not None:
+        return _err
     if ano is None:
         return {'cursos': [], 'ano_escolar_id': None, 'ano_escolar': None,
                 'totales': {'estudiantes': 0, 'promovidos': 0, 'reprobados': 0,
@@ -17979,16 +18036,23 @@ async def get_datos_promocion(ano_id: int = None, db: Session = Depends(get_db),
     se conserva por compatibilidad; la verdad academica es identica.
 
     R4-A4.1 · EL AÑO ORIGEN
-        Sin `?ano_id=` toma el año CERRADO más reciente, no el activo. El
-        flujo de Cierre cierra un año y crea el siguiente, que queda activo y
-        vacío; mirar ahí convertía a un PROMOVIDO en EN_PROCESO por
-        CURRICULO_OFICIAL_INCOMPLETO. Si todavía no se cerró ninguno, usa el
-        activo: la pantalla sirve igual ANTES del cierre.
+        Sin `?ano_id=` NO se mira el año activo. El flujo de Cierre cierra un
+        año y crea el siguiente, que queda activo y vacío; mirar ahí
+        convertía a un PROMOVIDO en EN_PROCESO por
+        CURRICULO_OFICIAL_INCOMPLETO.
+
+    CORE-2.2 · La garantía de último recurso era «el cerrado más reciente», y
+        eso dejó de ser cierto: un año cerrado cuya promoción ya terminó no
+        es el año del que habla esta pantalla. Ahora se usa la misma
+        resolución que `/cierre-ano/estado` —origen si hay transición, activo
+        si no, nada si el origen es ambiguo—, así que las tres pantallas
+        hablan siempre del mismo año.
 
     Es PREVISUALIZACION: el POST de cierre no se toca aqui.
     """
-    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id,
-                                preferir_cerrado=True)
+    ano, _err = _ano_visible_de_cierre(db, current_user, ano_id=ano_id)
+    if _err is not None:
+        return _err
     filas = _preview_promocion_canonica(db, current_user, ano)
     hay_pendientes = any(not f['listo_para_decidir'] for f in filas)
     return {

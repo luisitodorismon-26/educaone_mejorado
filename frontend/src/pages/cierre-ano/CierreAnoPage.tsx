@@ -159,18 +159,42 @@ export const CierreAnoPage = () => {
       const anoRes = await api.get('/ano-escolar');
       setAnoEscolar(anoRes.data);
       
-      // Cargar resumen real de cursos
-      const resumenRes = await api.get('/cierre-ano/resumen').catch(() => ({ data: { cursos: [] } }));
-      setResumenCursos(resumenRes.data.cursos || []);
-
-      // CORE-2 · La fase sale de la base, no de la memoria del navegador.
+      // CORE-2.2 · El ESTADO va PRIMERO. Antes el resumen se pedía sin
+      // `ano_id` y se resolvía por su cuenta con «el cerrado más reciente»,
+      // así que al terminar una transición el asistente se colocaba sobre el
+      // año nuevo y la tabla de debajo seguía mostrando el año anterior.
+      // Ahora se pregunta qué año toca y se pide el resumen de ESE año.
       const est = await api.get('/cierre-ano/estado')
         .then(r => r.data as EstadoCierre)
         .catch(() => null);
       setEstado(est);
+
+      // Asignación EXPLÍCITA, incluido el null: si la transición terminó, el
+      // origen y el destino dejan de existir y no pueden sobrevivir en
+      // memoria al recargar los datos.
+      setAnoOrigenId(est?.ano_origen?.id ?? null);
+      setNuevoAnoId(est?.ano_destino?.id ?? null);
+
+      // Un solo año visible para toda la pantalla:
+      //   hay transición  -> el año ORIGEN
+      //   no la hay       -> el año ACTIVO
+      //   origen ambiguo  -> ninguno; se pregunta antes de mostrar nada
+      const hayAmbiguedad = (est?.origen_ambiguo?.length ?? 0) > 0;
+      const visibleAnoId = hayAmbiguedad
+        ? null
+        : (est?.ano_origen?.id ?? est?.ano_activo_id ?? anoRes.data?.id ?? null);
+
+      if (visibleAnoId != null) {
+        const resumenRes = await api.get('/cierre-ano/resumen',
+          { params: { ano_id: visibleAnoId } })
+          .catch(() => ({ data: { cursos: [] } }));
+        setResumenCursos(resumenRes.data.cursos || []);
+      } else {
+        // Sin año determinado no se muestra el resumen de ninguno.
+        setResumenCursos([]);
+      }
+
       if (est) {
-        if (est.ano_origen) setAnoOrigenId(est.ano_origen.id);
-        if (est.ano_destino) setNuevoAnoId(est.ano_destino.id);
         // Un refresco vuelve exactamente a donde estaba el proceso:
         //   origen abierto            -> revisión y cierre
         //   cerrado y sin destino     -> crear el año siguiente
@@ -198,12 +222,25 @@ export const CierreAnoPage = () => {
   const cargarDatosPromocion = async (origenId?: number | null) => {
     setLoadingPromocion(true);
     try {
-      // El ano ORIGEN, nunca el destino. Si no se conoce —por ejemplo tras
-      // recargar la pagina— no se manda nada y el backend resuelve por su
-      // cuenta el cerrado mas reciente, que es la garantia de ultimo recurso.
-      const origen = origenId ?? anoOrigenId;
+      // El ano ORIGEN, nunca el destino.
+      //
+      // CORE-2.2 · Ya no hay «garantía de último recurso»: el backend dejó de
+      // caer en el cerrado más reciente, porque un año cuya promoción ya
+      // terminó no es el año del que habla esta pantalla. Si no se conoce el
+      // origen, no se pide nada: preguntar sin año devolvería la cohorte de
+      // otro año o un 409 de ambigüedad, y las dos cosas confunden más que
+      // un aviso claro.
+      const origen = origenId ?? anoOrigenId ?? estado?.ano_origen?.id ?? null;
+      if (origen == null) {
+        setEstudiantesPromocion([]);
+        setMessage({
+          type: 'warning',
+          text: 'No se pudo determinar el año escolar que se está promoviendo. Recargue la pantalla.',
+        });
+        return;
+      }
       const res = await api.get('/cierre-ano/promocion',
-        origen ? { params: { ano_id: origen } } : undefined);
+        { params: { ano_id: origen } });
       const lista: EstudiantePromocion[] = res.data.estudiantes || [];
       setEstudiantesPromocion(lista);
       // El backend dice que ano calculo; asi la pantalla no tiene que
@@ -322,6 +359,26 @@ export const CierreAnoPage = () => {
 
   // Dirección aporta el dato; el backend devuelve la condición RECALCULADA
   // por A2. Si la decisión resuelve el bloqueo, el estado cambia al instante.
+  // Dirección desambigua qué año está cerrando. La elección se reenvía como
+  // `ano_origen_id` explícito, y a partir de ahí estado, resumen y
+  // previsualización hablan de ese mismo año.
+  const elegirAnoOrigen = async (id: number) => {
+    setLoading(true);
+    try {
+      const est = await api.get('/cierre-ano/estado', { params: { ano_origen_id: id } })
+        .then(r => r.data as EstadoCierre)
+        .catch(() => null);
+      setEstado(est);
+      setAnoOrigenId(est?.ano_origen?.id ?? id);
+      setNuevoAnoId(est?.ano_destino?.id ?? null);
+      const resumenRes = await api.get('/cierre-ano/resumen', { params: { ano_id: id } })
+        .catch(() => ({ data: { cursos: [] } }));
+      setResumenCursos(resumenRes.data.cursos || []);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const registrarDecision = async (d: DecisionPendiente, campo: string, valor: unknown) => {
     setGuardandoDecision(d.estudiante_id);
     try {
@@ -398,10 +455,16 @@ export const CierreAnoPage = () => {
           <strong>Hay más de un año escolar con promoción pendiente.</strong> Indique cuál
           está cerrando; el sistema no lo elige por su cuenta.
           <div className="flex flex-wrap gap-2 mt-2">
+            {/* CORE-2.2 · Antes esto solo enumeraba los años, así que pedía
+                una decisión que no se podía tomar. Ahora se elige, y esa
+                elección viaja como `ano_origen_id` explícito al estado, al
+                resumen y a la previsualización. No se guarda en la base:
+                es desambiguación de navegación, no un hecho académico. */}
             {estado.origen_ambiguo.map(a => (
-              <span key={a.id} className="bg-white border rounded px-2 py-1 text-sm">
+              <Button key={a.id} variant="secondary"
+                onClick={() => elegirAnoOrigen(a.id)}>
                 {a.nombre}
-              </span>
+              </Button>
             ))}
           </div>
         </Alert>
