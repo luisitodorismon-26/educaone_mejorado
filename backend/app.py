@@ -12978,6 +12978,26 @@ def _guard_titular_primaria(db, curso, current_user):
     return None
 
 
+def _solo_profesor_pasa_lista(current_user):
+    """La regla de rol de la asistencia, aislada para poder adelantarla.
+
+    ENTREGA-1 · Vivía dentro de `_guard_asistencia`, que necesita curso y
+    asignatura para trabajar. El lote de asistencia, en cambio, resolvía
+    antes el caso «lista vacía» y contestaba 200 sin haber mirado el rol:
+    una secretaria recibía un «Sin cambios» afirmativo sobre un endpoint al
+    que no debería poder llamar. No escribía nada —no había nada que
+    escribir— pero la respuesta decía que la llamada era legítima.
+
+    Sacándola aquí, el permiso se puede comprobar lo primero y la política
+    sigue existiendo UNA sola vez.
+    """
+    if current_user.role != 'profesor':
+        return JSONResponse({
+            'error': 'Solo los profesores pueden registrar o modificar asistencia.'
+        }, status_code=403)
+    return None
+
+
 def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
                       asignatura_id=None):
     """
@@ -13008,10 +13028,9 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
     # de tests usan token de profesor; el backend, en cambio, dejaba entrar a
     # cualquier rol autenticado. Se alinea con la UI. Los GET de asistencia NO
     # se tocan: quién CONSULTA sigue exactamente igual.
-    if current_user.role != 'profesor':
-        return None, JSONResponse({
-            'error': 'Solo los profesores pueden registrar o modificar asistencia.'
-        }, status_code=403)
+    _err_rol = _solo_profesor_pasa_lista(current_user)
+    if _err_rol:
+        return None, _err_rol
 
     # R3.4.1 §1 — COHERENCIA ESTUDIANTE <-> CURSO. `curso_id` llega del cliente
     # y no puede ser la autoridad cuando hay un estudiante: sin esta comprobacion
@@ -13543,6 +13562,12 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     El lote se valida completo antes de escribir para evitar guardados parciales
     silenciosos y referencias cross-tenant.
     """
+    # ENTREGA-1 · El permiso, lo primero. Más abajo hay una salida temprana
+    # para el lote vacío que devolvía 200 sin haber mirado el rol.
+    _err_rol = _solo_profesor_pasa_lista(current_user)
+    if _err_rol:
+        return _err_rol
+
     data = await request.json()
     fecha_str = data.get('fecha', today_rd().isoformat())
     asignatura_id = data.get('asignatura_id')  # Puede ser None
@@ -14146,14 +14171,25 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
     if _guard:
         return _guard
 
-    # Asistencia (sin cambios — el modelo Asistencia no fue afectado)
-    asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(estudiante_id=id).all()
-    presentes = sum(1 for a in asistencias if a.estado == 'presente')
-    total_dias = len(asistencias)
-    
     # ─── 1. CalificacionSecundaria (modelo nuevo MINERD) ───
     asignaturas_por_id: dict = {}  # asig_id → dict del boletín
     ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+
+    # ── ENTREGA-1 · La asistencia del boletín sale del cálculo canónico ──
+    #
+    # Aquí había un cuarto cálculo propio, y erraba en cuatro cosas a la vez:
+    #
+    #   · no filtraba por año, así que un estudiante con historia en el colegio
+    #     arrastraba al boletín las marcas de años anteriores;
+    #   · contaba `presente` como única asistencia, de modo que una `tardanza`
+    #     —que el contrato define como asistencia— bajaba el porcentaje;
+    #   · usaba `len(asistencias)`, es decir FILAS. En Secundaria la asistencia
+    #     es por materia: seis asignaturas convertían un día en seis «días»;
+    #   · y con cero registros devolvía 0 %, que se lee como «no vino nunca»
+    #     cuando lo cierto es que nadie pasó lista.
+    #
+    # Ahora es el mismo desglose que ven el PDF y Primaria.
+    asistencia_anual = _asistencia_anual_boletin(db, id, current_user, ano_activo)
     
     if ano_activo:
         califs_sec = tenant_filter(
@@ -14271,11 +14307,15 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
             'grado': estudiante.curso.grado.nombre if estudiante.curso and estudiante.curso.grado else None
         },
         'asignaturas': asignaturas,
+        # `asistencia` conserva su forma histórica para no romper a quien ya la
+        # consume; lo que cambia es que los números son los correctos y que
+        # `porcentaje` puede venir en None cuando no hay de dónde sacarlo.
         'asistencia': {
-            'presentes': presentes,
-            'total': total_dias,
-            'porcentaje': round(presentes / total_dias * 100, 1) if total_dias > 0 else 0
+            'presentes': asistencia_anual['asistencias'],
+            'total': asistencia_anual['dias_computados'],
+            'porcentaje': asistencia_anual['pct_asistencia'],
         },
+        'asistencia_anual': asistencia_anual,
         'promedio_general': round(promedio_general, 2)
     }
 
@@ -14353,6 +14393,8 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
             asignaturas_data=asignaturas_data,
             config=config,
             ano_nombre=ano.nombre if ano else '',
+            asistencia_anual=_asistencia_anual_boletin(
+                db, estudiante.id, current_user, ano),
         )
     except Exception as e:
         logger.error(f"Error generando boletin de padres para estudiante {id}: {e}", exc_info=True)
@@ -14424,6 +14466,10 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
             buf = generar_boletin_padres(
                 estudiante=estudiante, curso=curso, asignaturas_data=asignaturas_data,
                 config=config, ano_nombre=ano.nombre if ano else '',
+                # El MISMO helper que el individual: la página del lote no
+                # puede decir algo distinto del PDF suelto.
+                asistencia_anual=_asistencia_anual_boletin(
+                    db, estudiante.id, current_user, ano),
             )
             reader = PdfReader(buf)
             for page in reader.pages:
@@ -14792,6 +14838,157 @@ def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano
     return resultado
 
 
+# ── ENTREGA-1 · LA UNIDAD DE ASISTENCIA ES EL DÍA ──────────────────────
+#
+# El modelo lo dice sin ambigüedad. En PRIMARIA `asignatura_id` es NULL y un
+# índice único parcial garantiza UNA fila por (estudiante, fecha): una fila es
+# un día. En SECUNDARIA la asistencia es POR MATERIA, así que el mismo día
+# produce tantas filas como asignaturas tenga el estudiante ese día.
+#
+# Contar filas, entonces, cuenta días en Primaria y clases en Secundaria. Un
+# boletín que sumara filas diría que un alumno de Secundaria con seis materias
+# tuvo seis veces más días de clase que uno de Primaria, y el porcentaje de
+# ambos hablaría de cosas distintas bajo la misma etiqueta.
+#
+# La unidad del boletín es el DÍA, en los dos niveles. Cuando un día trae
+# varias marcas gana la de mayor prioridad, que es la que el sistema ya usaba:
+# presente > tardanza > excusa > ausente. El criterio no es arbitrario —
+# describe al estudiante, no a la materia: si vino, vino, aunque faltara a una
+# clase suelta.
+_PRIORIDAD_DIA_ASISTENCIA = {'presente': 4, 'tardanza': 3, 'excusa': 2,
+                             'ausente': 1}
+
+# Contrato congelado: `tardanza` es asistencia (el estudiante vino) y `excusa`
+# es ausencia JUSTIFICADA. Las dos distinciones se conservan enteras en el
+# desglose anual; aquí solo se agrupan para los totales.
+_DIA_PRESENCIAL = ('presente', 'tardanza')
+_DIA_AUSENCIA = ('ausente', 'excusa')
+
+
+def _dias_asistencia_del_ano(db, estudiante_id, current_user, ano):
+    """`{fecha: estado}` del estudiante dentro del año escolar dado.
+
+    Tenant-safe y acotado al año: sin el recorte, las marcas de años
+    anteriores entraban al boletín por el camino del «período más cercano».
+    """
+    filas = tenant_filter(
+        db.query(Asistencia), Asistencia, current_user
+    ).filter_by(estudiante_id=estudiante_id).all()
+    return _dias_asistencia_de_filas(filas, ano)
+
+
+def _dias_asistencia_de_filas(filas, ano):
+    """La misma deduplicación, sobre filas ya cargadas (camino por lotes)."""
+    _ini = getattr(ano, 'fecha_inicio', None)
+    _fin = getattr(ano, 'fecha_fin', None)
+    por_dia = {}
+    for a in filas or ():
+        fecha = getattr(a, 'fecha', None)
+        if not fecha:
+            continue
+        if _ini and _fin and not (_ini <= fecha <= _fin):
+            continue
+        estado = getattr(a, 'estado', None)
+        previo = por_dia.get(fecha)
+        if previo is None or (_PRIORIDAD_DIA_ASISTENCIA.get(estado, 0)
+                              > _PRIORIDAD_DIA_ASISTENCIA.get(previo, 0)):
+            por_dia[fecha] = estado
+    return por_dia
+
+
+def _resumen_anual_asistencia(dias, ano):
+    """Desglose ANUAL de asistencia a partir de los días ya deduplicados.
+
+    EL DENOMINADOR
+    --------------
+    EducaOne ya tenía declarada su política, y en dos sitios: A3
+    (`porcentaje_ausencias`, congelado) y el resumen por períodos de
+    /academico. En los dos, el denominador oficial es
+    `AnoEscolar.dias_trabajados` —los días hábiles que la dirección declara
+    mes a mes— y no «los días en que alguien pasó lista». La razón está
+    escrita en A3: a un curso al que se le pasó lista tres días, una sola
+    falta le daría 33 % de ausencia.
+
+    El boletín usaba su propio denominador. Aquí se alinea con el canónico.
+    Cuando `dias_trabajados` no está declarado se conserva el respaldo que el
+    resumen por períodos ya usaba —los días con registro—, pero DECLARADO en
+    la respuesta (`base_porcentaje`), para que la pantalla pueda advertirlo en
+    vez de presentarlo como un dato firme.
+
+    LA AUSENCIA ES EL NUMERADOR; LA ASISTENCIA ES SU COMPLEMENTO
+    ------------------------------------------------------------
+    Este es el punto fino, y conviene decirlo entero porque la aritmética
+    ingenua da un resultado absurdo.
+
+    Lo que A3 calcula sobre `dias_trabajados` son las AUSENCIAS: cuánto del
+    año lectivo se perdió el estudiante. Los días en que nadie pasó lista
+    cuentan, correctamente, como «no consta que faltara».
+
+    Si se aplicara el mismo denominador a las ASISTENCIAS, esos días se
+    volverían en contra del estudiante: con 195 días hábiles declarados y
+    trece días de lista pasada, un alumno con asistencia casi perfecta
+    aparecería con un 4,6 % de asistencia. El número sería cierto —asistió a
+    9 de 195— pero diría algo que nadie preguntó, y en un boletín se leería
+    como un desastre.
+
+    Por eso la ausencia se mide contra el denominador canónico y la
+    asistencia es su complemento. Las dos columnas de la plantilla están una
+    al lado de la otra y suman 100: así es como se leen.
+
+    Y si la declaración no puede sostener los datos —menos días hábiles que
+    días con registro— es la declaración la que está mal. No se adivina cuál
+    de los dos corregir: se cae al respaldo y se dice en `base_porcentaje`.
+
+    SIN REGISTROS NO ES CERO
+    ------------------------
+    Un estudiante sin ninguna marca no tiene 0 % de asistencia: no tiene
+    dato. Los porcentajes salen en None y `sin_registros` queda en True.
+    """
+    presentes = sum(1 for e in dias.values() if e == 'presente')
+    tardanzas = sum(1 for e in dias.values() if e == 'tardanza')
+    ausencias = sum(1 for e in dias.values() if e == 'ausente')
+    excusas = sum(1 for e in dias.values() if e == 'excusa')
+
+    asistidos = presentes + tardanzas
+    ausentados = ausencias + excusas
+    computados = asistidos + ausentados
+
+    trabajados = RAC.sumar_dias_trabajados(ano)
+    if not computados:
+        base, etiqueta = None, None
+    elif trabajados and trabajados >= computados:
+        base, etiqueta = trabajados, 'dias_trabajados'
+    else:
+        base, etiqueta = computados, 'dias_con_registro'
+
+    if base:
+        pct_ausencia = round(ausentados / base * 100, 1)
+        pct_asistencia = round(100.0 - pct_ausencia, 1)
+    else:
+        pct_ausencia = pct_asistencia = None
+
+    return {
+        'sin_registros': computados == 0,
+        'presentes': presentes,
+        'tardanzas': tardanzas,
+        'asistencias': asistidos,
+        'ausencias': ausencias,
+        'excusas': excusas,
+        'ausencias_totales': ausentados,
+        'dias_computados': computados,
+        'dias_trabajados': trabajados,
+        'base_porcentaje': etiqueta,
+        'pct_asistencia': pct_asistencia,
+        'pct_ausencia': pct_ausencia,
+    }
+
+
+def _asistencia_anual_boletin(db, estudiante_id, current_user, ano):
+    """El desglose anual que consumen boletines web y PDF."""
+    return _resumen_anual_asistencia(
+        _dias_asistencia_del_ano(db, estudiante_id, current_user, ano), ano)
+
+
 def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
     """Helper que arma el dict asistencias_por_periodo desde la BD.
     
@@ -14805,10 +15002,6 @@ def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
          al período más cercano (no perderla)
       3. Si no hay año escolar válido, usar el año calendario actual dividido en 4
     """
-    asistencias = tenant_filter(
-        db.query(Asistencia), Asistencia, current_user
-    ).filter_by(estudiante_id=estudiante_id).all()
-
     # v2.14.1 BUGFIX (3 en 1):
     #  a) Solo asistencias DENTRO del año escolar. Antes entraban registros de
     #     años anteriores y el fallback "período más cercano" los metía en P1-P4.
@@ -14818,19 +15011,12 @@ def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
     #  c) tardanza cuenta como ASISTENCIA (el estudiante vino) y excusa como
     #     AUSENCIA (justificada). Antes ambas se descartaban ('ausente_justificado'
     #     ni siquiera es un estado válido del sistema).
-    _ini = getattr(ano, 'fecha_inicio', None)
-    _fin = getattr(ano, 'fecha_fin', None)
-    if _ini and _fin:
-        asistencias = [a for a in asistencias if a.fecha and _ini <= a.fecha <= _fin]
-
-    _prioridad = {'presente': 4, 'tardanza': 3, 'excusa': 2, 'ausente': 1}
-    _por_dia = {}
-    for a in asistencias:
-        if not a.fecha:
-            continue
-        prev = _por_dia.get(a.fecha)
-        if prev is None or _prioridad.get(a.estado, 0) > _prioridad.get(prev, 0):
-            _por_dia[a.fecha] = a.estado
+    #
+    # ENTREGA-1 · Esas tres reglas viven ahora en `_dias_asistencia_del_ano`,
+    # tal cual, porque el desglose ANUAL tiene que salir de la MISMA
+    # deduplicación que el desglose por período. Cuando eran dos copias, nada
+    # impedía que se separaran y que el boletín se contradijera consigo mismo.
+    _por_dia = _dias_asistencia_del_ano(db, estudiante_id, current_user, ano)
     
     # Construir rangos de períodos con fallback
     rangos = []
@@ -15000,19 +15186,24 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
 
     areas = _construir_areas_primaria(db, estudiante.id, current_user, ano)
     asistencias = _construir_asistencias_boletin(db, estudiante.id, current_user, ano)
+    asistencia_anual = _asistencia_anual_boletin(db, estudiante.id, current_user, ano)
 
     # v2.14.1 BUGFIX: la asistencia NUNCA se imprimía en el boletín — el helper
     # devuelve {'p1': {'asistencia', 'ausencia'}} y el PDF espera
     # {1: {'presentes', 'ausentes'}}. Se adapta aquí sin tocar el contrato del
     # helper (secundaria y el registro lo consumen con las claves originales).
+    #
+    # ENTREGA-1 · La condición era `is not None`, y el helper devuelve SIEMPRE
+    # los cuatro períodos con enteros —nunca None—, así que un curso al que
+    # nadie pasó lista imprimía «0» y «0» en las ocho casillas. Un cero es una
+    # afirmación: dice que el estudiante no faltó ningún día y tampoco vino
+    # ninguno. Ahora un período sin ningún registro se deja en blanco.
     asistencias_pdf = {}
     for p in range(1, 5):
         d = (asistencias or {}).get(f'p{p}') or {}
-        if d.get('asistencia') is not None or d.get('ausencia') is not None:
-            asistencias_pdf[p] = {
-                'presentes': d.get('asistencia') or 0,
-                'ausentes': d.get('ausencia') or 0,
-            }
+        _a, _au = d.get('asistencia') or 0, d.get('ausencia') or 0
+        if _a or _au:
+            asistencias_pdf[p] = {'presentes': _a, 'ausentes': _au}
 
     # v2.14.1 BUGFIX (reportado): el "docente del grado" salía con el PRIMER
     # profesor asignado al curso (orden arbitrario — podía ser el de inglés).
@@ -15075,6 +15266,7 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
         situacion_final=situacion_final,
         condicion_final=condicion_texto,
         asistencias_por_periodo=asistencias_pdf,
+        asistencia_anual=asistencia_anual,
     )
 
 
@@ -16050,9 +16242,13 @@ async def boletin_primaria_estudiante_json(
     # v2.14.1 BUGFIX: se sumaba .get('presentes') sobre un dict cuyas claves
     # reales son 'asistencia'/'ausencia' — la asistencia de la vista previa
     # salía SIEMPRE 0 / 0%.
-    total_pres = sum((a or {}).get('asistencia', 0) or 0 for a in (asistencia or {}).values())
-    total_aus = sum((a or {}).get('ausencia', 0) or 0 for a in (asistencia or {}).values())
-    total_dias = total_pres + total_aus
+    #
+    # ENTREGA-1 · Y el total anual ya no se recompone sumando los cuatro
+    # períodos: sale del mismo desglose que usa el PDF, que además distingue
+    # presentes de tardanzas y ausencias de excusas.
+    asistencia_anual = _asistencia_anual_boletin(db, id, current_user, ano)
+    total_pres = asistencia_anual['asistencias']
+    total_dias = asistencia_anual['dias_computados']
 
     cfs = [a['cf_area'] for a in areas if a['cf_area'] is not None]
 
@@ -16071,8 +16267,9 @@ async def boletin_primaria_estudiante_json(
         'asistencia': {
             'presentes': total_pres,
             'total': total_dias,
-            'porcentaje': round(total_pres / total_dias * 100) if total_dias else 0,
+            'porcentaje': asistencia_anual['pct_asistencia'],
         },
+        'asistencia_anual': asistencia_anual,
         'condicion_final': condicion,
     }
 
@@ -16231,6 +16428,7 @@ async def generar_boletin_minerd_v2(
     try:
         califs_por_asig = _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano)
         asistencias = _construir_asistencias_boletin(db, estudiante.id, current_user, ano)
+        asistencia_anual = _asistencia_anual_boletin(db, estudiante.id, current_user, ano)
     except Exception as e:
         logger.error(f"Error construyendo datos del boletín para estudiante {id}: {e}", exc_info=True)
         return JSONResponse({'error': f'Error preparando datos del boletín: {str(e)[:120]}'}, status_code=500)
@@ -16284,6 +16482,7 @@ async def generar_boletin_minerd_v2(
             curso=curso,
             calificaciones_por_asig=califs_por_asig,
             asistencias_por_periodo=asistencias,
+            asistencia_anual=asistencia_anual,
             config=config,
             ano_escolar=ano,
             observaciones=observaciones,
@@ -16377,7 +16576,11 @@ async def generar_boletines_curso_minerd_v2(
     for est in estudiantes:
         try:
             califs = _construir_datos_boletin_secundaria(db, est, curso, current_user, ano)
+            # ENTREGA-1 · El lote llama a los MISMOS dos helpers que el
+            # individual. Mientras sea así, la página de un estudiante dentro
+            # del PDF del curso no puede decir algo distinto de su PDF suelto.
             asist = _construir_asistencias_boletin(db, est.id, current_user, ano)
+            asist_anual = _asistencia_anual_boletin(db, est.id, current_user, ano)
             if not califs:
                 continue  # skip si no tiene notas cargadas
             # ── R4-A3 · El MISMO helper que el boletín individual ──
@@ -16397,6 +16600,7 @@ async def generar_boletines_curso_minerd_v2(
                 estudiante=est, curso=curso,
                 calificaciones_por_asig=califs,
                 asistencias_por_periodo=asist,
+                asistencia_anual=asist_anual,
                 config=config, ano_escolar=ano,
                 situacion_final=situacion,
                 docente_nombre=docente_nombre,
@@ -20053,8 +20257,25 @@ async def validar_registro(curso_id: int, request: Request, db: Session = Depend
 
 
 @app.get("/api/registros/preview/{curso_id}")
+# ── ENTREGA-1 · Secretaría abre el Registro Escolar ──────────────────
+#
+# El menú y el acceso rápido del panel llevaban a Secretaría al Registro
+# Escolar desde siempre, pero el backend no la reconocía: al montar, la
+# página pide este endpoint y recibía 403, así que quedaba vacía con un
+# error. Una entrada de menú que siempre falla es peor que una ausente.
+#
+# Se le da ESTE endpoint y ningún otro. Es un GET, no escribe nada, y es
+# la única llamada que la página hace al cargar.
+#
+# Los cuatro endpoints de PDF del módulo NO se tocan, y conviene decir por
+# qué: el frontend nunca le ofreció esos botones —`canPreview` y
+# `canGenerate` no incluyen a secretaría— y la suite de tenant/roles
+# afirma desde v2.19.3-A que no entra al BORRADOR, que es el documento de
+# trabajo de quien llena el registro. Ampliar ahí sería inventar una
+# política nueva, no alinear la que hay. `guardar_dias_trabajados`, que sí
+# escribe, sigue siendo de dirección.
 async def preview_registro_v2(curso_id: int, request: Request, db: Session = Depends(get_db),
-                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
+                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """
     Preview completo del JSON que irá al PDF.
     Usado para debugging y auditoría antes de generar el documento.
@@ -20062,6 +20283,15 @@ async def preview_registro_v2(curso_id: int, request: Request, db: Session = Dep
     Permisos: cualquier docente del colegio (la seguridad multitenant
     impide ver cursos de otros colegios).
     """
+    # ENTREGA-1 · El curso se resuelve por tenant ANTES de nada.
+    #
+    # Estos endpoints pasaban `curso_id` crudo al validador, que respondía
+    # «El curso no pertenece a este colegio» para uno ajeno y «El curso con
+    # id=N no existe» para uno inventado. Ninguna de las dos filtra datos,
+    # pero juntas permiten averiguar QUÉ ids existen en otros colegios.
+    # `get_tenant_or_404` da 404 en los dos casos, que es el contrato del
+    # resto del sistema.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_secundaria, _normalizar_nivel, _extraer_grado_numero
     
     curso = db.query(Curso).filter_by(id=curso_id, colegio_id=current_user.colegio_id).first()
@@ -20324,6 +20554,8 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
     Vista previa del PDF de primaria con marca de agua BORRADOR.
     Genera SIEMPRE, ignorando errores y warnings.
     """
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_primaria, _extraer_grado_numero
     from registro_primaria import generar_registro_primaria_desde_sistema
     from registro_borrador import aplicar_marca_borrador
@@ -20463,6 +20695,8 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
     Genera el PDF del Registro Escolar MINERD para un curso de PRIMARIA.
     Estructura por competencias (C1, C2, C3).
     """
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_primaria
     from registro_primaria import generar_registro_primaria_desde_sistema
 
@@ -20619,6 +20853,8 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     endpoints de carga de notas — esto refleja la práctica real del MINERD
     donde el registro es un documento compartido del curso.
     """
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema
 
@@ -20785,6 +21021,8 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     3. Usa profesor titular del curso (no coordinador del colegio)
     4. Usa días trabajados configurados
     """
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema, get_asignaturas_por_grado
 

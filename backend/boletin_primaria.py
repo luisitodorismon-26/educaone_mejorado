@@ -353,7 +353,8 @@ def _dibujar_portada(c: canvas.Canvas, estudiante, curso, config, ano_escolar,
             c.drawString(OBSERVACIONES_X, _y_linea(y_obs), linea)
 
 
-def _dibujar_tabla(c: canvas.Canvas, areas_data, grado_nombre, asistencias_por_periodo=None):
+def _dibujar_tabla(c: canvas.Canvas, areas_data, grado_nombre,
+                   asistencias_por_periodo=None, asistencia_anual=None):
     """Página 2: notas de cada área en sus casillas oficiales.
 
     areas_data: dict {nombre_area: {
@@ -430,33 +431,52 @@ def _dibujar_tabla(c: canvas.Canvas, areas_data, grado_nombre, asistencias_por_p
         if rec_e is not None and rec_especial_x is not None:
             c.drawCentredString(rec_especial_x, y_row, _fmt(rec_e))
 
-    # Resumen de asistencia por período
-    if asistencias_por_periodo:
-        c.setFont("Helvetica", 8)
-        for per, datos in asistencias_por_periodo.items():
-            if per not in ASISTENCIA_Y:
-                continue
-            y_a = _y(ASISTENCIA_Y[per])
-            presentes = (datos or {}).get('presentes')
-            ausentes = (datos or {}).get('ausentes')
-            if presentes is not None:
-                c.drawCentredString(ASISTENCIA_X['asistencia'], y_a, str(presentes))
-            if ausentes is not None:
-                c.drawCentredString(ASISTENCIA_X['ausencia'], y_a, str(ausentes))
-            # % anual de asistencia / ausencia
-            if presentes is not None and ausentes is not None:
-                total = presentes + ausentes
-                if total > 0:
-                    c.drawCentredString(ASISTENCIA_X['pct_asistencia'], y_a,
-                                        f"{round(presentes / total * 100)}%")
-                    c.drawCentredString(ASISTENCIA_X['pct_ausencia'], y_a,
-                                        f"{round(ausentes / total * 100)}%")
+    # ── Resumen de asistencia ──────────────────────────────────────────
+    #
+    # ENTREGA-1 · La plantilla oficial tiene DOS geometrías distintas en esta
+    # tabla, y el código trataba a las cuatro columnas por igual:
+    #
+    #   · «Asistencia» y «Ausencia» están divididas fila por fila: son
+    #     conteos POR PERÍODO, y así se siguen llenando;
+    #   · «% de Anual → Asistencia | Ausencia» son UNA celda fusionada que
+    #     abarca P1 a P4. No hay cuatro casillas ahí, hay una.
+    #
+    # Antes se escribía en esa celda única el porcentaje de CADA período, uno
+    # debajo de otro: cuatro números apilados dentro de un recuadro que pide
+    # uno solo, y además ninguno de los cuatro era el anual que el rótulo
+    # anuncia. Ahora se escribe el anual, una vez, centrado en la celda.
+    c.setFont("Helvetica", 8)
+    for per, datos in (asistencias_por_periodo or {}).items():
+        if per not in ASISTENCIA_Y:
+            continue
+        y_a = _y(ASISTENCIA_Y[per])
+        presentes = (datos or {}).get('presentes')
+        ausentes = (datos or {}).get('ausentes')
+        if presentes is not None:
+            c.drawCentredString(ASISTENCIA_X['asistencia'], y_a, str(presentes))
+        if ausentes is not None:
+            c.drawCentredString(ASISTENCIA_X['ausencia'], y_a, str(ausentes))
+
+    # El porcentaje ANUAL, una sola vez, centrado en la celda fusionada. Si no
+    # hay registros no se escribe nada: un boletín en blanco dice «no se pasó
+    # lista», y un 0 % dice «no vino nunca». No son lo mismo.
+    if asistencia_anual and not asistencia_anual.get('sin_registros'):
+        pct_a = asistencia_anual.get('pct_asistencia')
+        pct_au = asistencia_anual.get('pct_ausencia')
+        y_medio = _y((ASISTENCIA_Y[1] + ASISTENCIA_Y[4]) / 2.0)
+        if pct_a is not None:
+            c.drawCentredString(ASISTENCIA_X['pct_asistencia'], y_medio,
+                                f"{round(pct_a)}%")
+        if pct_au is not None:
+            c.drawCentredString(ASISTENCIA_X['pct_ausencia'], y_medio,
+                                f"{round(pct_au)}%")
 
 
 def generar_boletin_primaria(estudiante, curso, grado_nombre, areas_data, config,
                              ano_escolar, docente_nombre='', situacion_final=None,
                              condicion_final='', observaciones='',
-                             asistencias_por_periodo=None) -> io.BytesIO:
+                             asistencias_por_periodo=None,
+                             asistencia_anual=None) -> io.BytesIO:
     """Genera el Informe de Aprendizaje (primaria) como io.BytesIO.
 
     Compone un overlay con los datos sobre la plantilla oficial del MINERD.
@@ -468,7 +488,8 @@ def generar_boletin_primaria(estudiante, curso, grado_nombre, areas_data, config
                      situacion_final, condicion_final, observaciones)
     c.showPage()
 
-    _dibujar_tabla(c, areas_data, grado_nombre, asistencias_por_periodo)
+    _dibujar_tabla(c, areas_data, grado_nombre, asistencias_por_periodo,
+                   asistencia_anual)
     c.showPage()
     c.save()
     overlay_buf.seek(0)

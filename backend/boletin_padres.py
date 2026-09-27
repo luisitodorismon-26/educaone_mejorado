@@ -98,7 +98,7 @@ def _dibujar_logo(c, config, x, y, max_w, max_h):
 
 
 def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
-                            ano_nombre: str) -> io.BytesIO:
+                            ano_nombre: str, asistencia_anual=None) -> io.BytesIO:
     """Genera el boletín de padres detallado en PDF (apaisado).
 
     asignaturas_data: lista de dicts, cada uno:
@@ -255,6 +255,39 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
         pc_str = ' · '.join(_fmt(p) for p in pcs)
         c.drawCentredString(cx + col_pc / 2, row_y + 5, pc_str)
         c.setFont('Helvetica', 7)
+
+    # ─── Asistencia anual ───
+    #
+    # ENTREGA-1 · Este reporte no la mostraba en absoluto, y es el documento
+    # que lee el padre. A diferencia de los dos boletines oficiales, aquí la
+    # maqueta es nuestra y hay sitio de sobra sobre las firmas, así que cabe
+    # el desglose entero en una línea: las cuatro cuentas y los dos
+    # porcentajes, todo del mismo cálculo que los PDF oficiales.
+    if asistencia_anual is not None:
+        row_y -= 22
+        c.setFillColor(colors.HexColor('#eef8f1'))
+        c.rect(margin, row_y - 6, W - 2 * margin, 20, fill=1, stroke=0)
+        c.setFillColor(colors.black)
+        c.setFont('Helvetica-Bold', 7)
+        c.drawString(margin + 6, row_y + 3, 'ASISTENCIA ANUAL')
+        c.setFont('Helvetica', 7)
+        if asistencia_anual.get('sin_registros'):
+            # Un 0 % aquí le diría al padre que su hijo no fue nunca.
+            c.drawString(margin + 94, row_y + 3,
+                         'Sin registros de asistencia para este año escolar.')
+        else:
+            _pa = asistencia_anual.get('pct_asistencia')
+            _pau = asistencia_anual.get('pct_ausencia')
+            _txt = ('Asistencias: %d   ·   Tardanzas: %d   ·   '
+                    'Ausencias: %d   ·   Excusas: %d'
+                    % (asistencia_anual.get('asistencias', 0),
+                       asistencia_anual.get('tardanzas', 0),
+                       asistencia_anual.get('ausencias', 0),
+                       asistencia_anual.get('excusas', 0)))
+            if _pa is not None and _pau is not None:
+                _txt += ('   ·   Asistencia: %.1f%%   ·   Ausencia: %.1f%%'
+                         % (_pa, _pau))
+            c.drawString(margin + 94, row_y + 3, _txt)
 
     # ─── Nota aclaratoria ───
     row_y -= 24

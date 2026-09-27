@@ -81,8 +81,26 @@ interface BoletinPrimaria {
   estudiante: { id: number; nombre: string; matricula: string; curso: string; no_lista: number | null };
   areas: AreaPrimaria[];
   promedio_general: number;
-  asistencia: { presentes: number; total: number; porcentaje: number };
+  asistencia: { presentes: number; total: number; porcentaje: number | null };
+  asistencia_anual?: AsistenciaAnual | null;
   condicion_final: { condicion: string; detalle: string } | null;
+}
+
+// ENTREGA-1 · El desglose anual de asistencia, idéntico en los dos niveles
+// porque sale del mismo helper del backend. `porcentaje` puede ser null: un
+// estudiante sin ninguna marca no tiene 0 % de asistencia, no tiene dato.
+interface AsistenciaAnual {
+  sin_registros: boolean;
+  presentes: number;
+  tardanzas: number;
+  asistencias: number;
+  ausencias: number;
+  excusas: number;
+  dias_computados: number;
+  dias_trabajados: number | null;
+  base_porcentaje: 'dias_trabajados' | 'dias_con_registro' | null;
+  pct_asistencia: number | null;
+  pct_ausencia: number | null;
 }
 
 interface Boletin {
@@ -97,9 +115,57 @@ interface Boletin {
   asistencia: {
     presentes: number;
     total: number;
-    porcentaje: number;
+    porcentaje: number | null;
   };
+  asistencia_anual?: AsistenciaAnual | null;
   promedio_general: number;
+}
+
+// La tarjeta de asistencia. Compacta, y sobre todo honesta: cuando no hay
+// una sola marca registrada NO dice «0 %» ni «0 ausencias» —eso afirmaría que
+// el estudiante no vino nunca— sino que no hay registros.
+function TarjetaAsistencia({ anual, porcentajeLegacy }: {
+  anual?: AsistenciaAnual | null;
+  porcentajeLegacy?: number | null;
+}) {
+  const vacio = !anual || anual.sin_registros;
+  return (
+    <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-200">
+      <p className="text-xs text-emerald-700 uppercase text-center">Asistencia anual</p>
+      {vacio ? (
+        <p className="text-sm text-gray-500 text-center mt-1">Sin registros de asistencia</p>
+      ) : (
+        <>
+          <p className="text-xl font-bold text-emerald-600 text-center">
+            {anual!.pct_asistencia !== null
+              ? `${anual!.pct_asistencia.toFixed(1)}%`
+              : (porcentajeLegacy != null ? `${porcentajeLegacy.toFixed(1)}%` : '—')}
+          </p>
+          <div className="mt-2 grid grid-cols-2 gap-x-3 text-xs text-gray-700">
+            <span>Asistencias: <strong>{anual!.asistencias}</strong></span>
+            <span>Tardanzas: <strong>{anual!.tardanzas}</strong></span>
+            <span>Ausencias: <strong>{anual!.ausencias}</strong></span>
+            <span>Excusas: <strong>{anual!.excusas}</strong></span>
+          </div>
+          {anual!.pct_ausencia !== null && (
+            <p className="text-xs text-gray-600 text-center mt-1">
+              Ausencia anual: <strong>{anual!.pct_ausencia.toFixed(1)}%</strong>
+            </p>
+          )}
+          {/* Cuando la dirección no declaró los días hábiles del año, el
+              porcentaje se calcula sobre los días con lista pasada. Es el
+              respaldo que el sistema ya usaba, pero se avisa en vez de
+              presentarlo como un dato firme. */}
+          {anual!.base_porcentaje === 'dias_con_registro' && (
+            <p className="text-[11px] text-amber-700 text-center mt-1">
+              Calculado sobre {anual!.dias_computados} días con lista pasada
+              (no hay días hábiles declarados para el año).
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 interface Colegio {
@@ -461,10 +527,8 @@ export const BoletinesPage = () => {
                 <p className="text-xs uppercase text-blue-600">Promedio General</p>
                 <p className="text-xl font-bold text-blue-700">{boletinPrim.promedio_general || '—'}</p>
               </div>
-              <div className="bg-green-50 rounded-lg p-3 text-center border border-green-200">
-                <p className="text-xs uppercase text-green-700">Asistencia</p>
-                <p className="text-xl font-bold text-green-600">{boletinPrim.asistencia.porcentaje}%</p>
-              </div>
+              <TarjetaAsistencia anual={boletinPrim.asistencia_anual}
+                                 porcentajeLegacy={boletinPrim.asistencia.porcentaje} />
               {(() => {
                 const cond = boletinPrim.condicion_final;
                 const c = cond?.condicion || '';
@@ -520,11 +584,18 @@ export const BoletinesPage = () => {
             <Button 
               onClick={() => {
                 const est = estudiantes.find(e => e.id === estudianteId);
+                // ENTREGA-1 · `|| 0` convertía «no hay datos» en «0 %», y esto
+                // se le manda al padre por WhatsApp. Ahora, sin registros, se
+                // dice que no los hay.
+                const pa = boletin.asistencia_anual?.pct_asistencia ?? null;
+                const lineaAsistencia = pa !== null
+                  ? `✅ Asistencia: ${pa.toFixed(1)}%25%0A`
+                  : `✅ Asistencia: sin registros%0A`;
                 const mensaje = `📋 *BOLETÍN DE CALIFICACIONES*%0A%0A` +
                   `👤 Estudiante: ${boletin.estudiante.nombre}%0A` +
                   `📚 Curso: ${boletin.estudiante.curso}%0A` +
                   `📊 Promedio General: ${boletin.promedio_general?.toFixed(1) || 'N/A'}%0A` +
-                  `✅ Asistencia: ${boletin.asistencia?.porcentaje?.toFixed(1) || 0}%25%0A%0A` +
+                  lineaAsistencia + `%0A` +
                   `Para ver el boletín completo, favor acercarse al colegio.`;
                 window.open(`https://wa.me/?text=${mensaje}`, '_blank');
               }} 
@@ -648,15 +719,17 @@ export const BoletinesPage = () => {
             )}
 
             {/* Resumen */}
-            <div className="mt-4 grid grid-cols-3 gap-3">
+            {/* ENTREGA-1 · Tres columnas fijas dejaban la tarjeta de
+                asistencia en unos 110 px en el móvil, y ahora lleva cuatro
+                cuentas además del porcentaje. Se apila, igual que ya hacía
+                el resumen de Primaria. */}
+            <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="bg-blue-50 rounded-lg p-3 text-center border border-blue-200">
                 <p className="text-xs text-blue-600 uppercase">Promedio General</p>
                 <p className={`text-xl font-bold ${getNotaClass(boletin.promedio_general)}`}>{boletin.promedio_general.toFixed(1)}</p>
               </div>
-              <div className="bg-emerald-50 rounded-lg p-3 text-center border border-emerald-200">
-                <p className="text-xs text-emerald-600 uppercase">Asistencia</p>
-                <p className="text-xl font-bold text-emerald-600">{boletin.asistencia.porcentaje.toFixed(0)}%</p>
-              </div>
+              <TarjetaAsistencia anual={boletin.asistencia_anual}
+                                 porcentajeLegacy={boletin.asistencia.porcentaje} />
               {(() => {
                 // v2.13.38: la situación general respeta la cascada de evaluaciones extra
                 const conNotas = (boletin.asignaturas || []).filter(a => a.cf !== null);
