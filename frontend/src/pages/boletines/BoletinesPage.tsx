@@ -168,6 +168,13 @@ function TarjetaAsistencia({ anual, porcentajeLegacy }: {
   );
 }
 
+interface AnoEscolar {
+  id: number;
+  nombre: string;
+  activo: boolean;
+  cerrado: boolean;
+}
+
 interface Colegio {
   nombre: string;
   logo: string | null;
@@ -179,6 +186,10 @@ interface Colegio {
 
 export const BoletinesPage = () => {
   const { user } = useAuth();
+  // ENTREGA-1.1 · El año del boletín. Por defecto el activo; se puede
+  // elegir uno cerrado para reemitir documentación de un año pasado.
+  const [anos, setAnos] = useState<AnoEscolar[]>([]);
+  const [anoId, setAnoId] = useState<number | null>(null);
   const [cursos, setCursos] = useState<Curso[]>([]);
   const [estudiantes, setEstudiantes] = useState<Estudiante[]>([]);
   const [cursoId, setCursoId] = useState<number | null>(null);
@@ -189,7 +200,13 @@ export const BoletinesPage = () => {
   // Descarga un PDF validando que el servidor no haya devuelto un error JSON
   const descargarPDF = async (url: string, filename: string, msgError: string) => {
     try {
-      const response = await api.get(url, { responseType: 'blob' });
+      // ENTREGA-1.1 · El año se añade AQUÍ, no en cada botón. Son seis
+      // descargas distintas y bastaba con olvidar una para que ese PDF
+      // saliera del año activo mientras la pantalla hablaba de otro.
+      const urlConAno = anoId
+        ? `${url}${url.includes('?') ? '&' : '?'}ano_id=${anoId}`
+        : url;
+      const response = await api.get(urlConAno, { responseType: 'blob' });
       if (response.data.type === 'application/json' || response.data.size < 300) {
         const texto = await response.data.text();
         try {
@@ -229,12 +246,47 @@ export const BoletinesPage = () => {
 
   useEffect(() => {
     if (cursoId) cargarEstudiantes();
-  }, [cursoId]);
+  }, [cursoId, anoId]);
+
+  // Al cambiar de año se recargan los cursos de ESE año y se limpia todo lo
+  // que colgaba del anterior. Si no, el curso de B seguiría seleccionado
+  // dentro de A y el boletín saldría de una cohorte que no existe en A.
+  const elegirAno = async (nuevo: number | null) => {
+    setAnoId(nuevo);
+    setCursoId(null);
+    setEstudianteId(null);
+    setEstudiantes([]);
+    setBoletin(null);
+    setBoletinPrim(null);
+    setError(null);
+    if (esProfesor) return;
+    try {
+      const res = await api.get('/cursos',
+        nuevo ? { params: { ano_id: nuevo } } : undefined);
+      setCursos(res.data || []);
+    } catch {
+      setCursos([]);
+    }
+  };
 
   const cargarDatosIniciales = async () => {
     try {
+      // El año va PRIMERO: los cursos que se listan son los de ese año, y
+      // mezclar los de A con los de B es justo lo que hay que evitar.
+      const anosRes = await api.get('/anos-escolares')
+        .catch(() => ({ data: [] as AnoEscolar[] }));
+      const listaAnos: AnoEscolar[] = anosRes.data || [];
+      setAnos(listaAnos);
+      // Default: el activo. Si no hay ninguno activo —un centro entre A
+      // cerrado y B sin crear— vale el más reciente, para que la pantalla
+      // siga sirviendo.
+      const anoInicial = (listaAnos.find(a => a.activo) || listaAnos[0])?.id ?? null;
+      setAnoId(anoInicial);
+
       const [cursosRes, colegioRes] = await Promise.all([
-        esProfesor ? api.get('/dashboard/profesor') : api.get('/cursos'),
+        esProfesor ? api.get('/dashboard/profesor')
+                   : api.get('/cursos', anoInicial
+                       ? { params: { ano_id: anoInicial } } : undefined),
         api.get('/configuracion/colegio')
       ]);
 
@@ -259,7 +311,12 @@ export const BoletinesPage = () => {
 
   const cargarEstudiantes = async () => {
     try {
-      const res = await api.get(`/estudiantes?curso_id=${cursoId}`);
+      // Con el año, el backend devuelve la COHORTE de ese curso en ese año:
+      // incluye a los promovidos, que ya no están físicamente en él.
+      const res = await api.get('/estudiantes', {
+        params: anoId ? { curso_id: cursoId, ano_id: anoId }
+                      : { curso_id: cursoId },
+      });
       setEstudiantes(res.data);
       setEstudianteId(null);
       setBoletin(null);
@@ -277,14 +334,16 @@ export const BoletinesPage = () => {
     try {
       // v2.13.49: cada nivel tiene su propio boletín (primaria ≠ secundaria)
       if (esPrimaria) {
-        const res = await api.get(`/boletines-primaria/estudiante/${estudianteId}`);
+        const res = await api.get(`/boletines-primaria/estudiante/${estudianteId}`,
+          anoId ? { params: { ano_id: anoId } } : undefined);
         if (res.data?.error) {
           setError(res.data.error);
         } else {
           setBoletinPrim({ ...res.data, areas: Array.isArray(res.data?.areas) ? res.data.areas : [] });
         }
       } else {
-        const res = await api.get(`/boletines/estudiante/${estudianteId}`);
+        const res = await api.get(`/boletines/estudiante/${estudianteId}`,
+          anoId ? { params: { ano_id: anoId } } : undefined);
         if (res.data?.error) {
           setError(res.data.error);
         } else {
@@ -329,10 +388,34 @@ export const BoletinesPage = () => {
         <p className="text-gray-500 mt-1">Generar reportes de calificaciones para padres</p>
       </div>
 
+      {anoId != null && anos.length > 0 && !anos.find(a => a.id === anoId)?.activo && (
+        <Alert variant="warning">
+          Está emitiendo documentación del año escolar{' '}
+          <strong>{anos.find(a => a.id === anoId)?.nombre}</strong>, que no es el
+          año en curso. Las notas, la asistencia y el curso corresponden a ese año.
+        </Alert>
+      )}
+
       {error && <Alert variant="error" onClose={() => setError(null)}>{error}</Alert>}
 
       <div className="bg-white rounded-xl shadow-sm border p-4">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+          {/* ENTREGA-1.1 · El año va PRIMERO porque manda sobre todo lo
+              demás: los cursos que se listan, la cohorte de cada curso y el
+              contenido del boletín. El profesor no lo ve: su pantalla se
+              alimenta de sus cursos asignados, no del catálogo del año. */}
+          {!esProfesor && (
+            <Select
+              label="Año escolar"
+              value={anoId?.toString() || ''}
+              onChange={(e) => elegirAno(e.target.value ? parseInt(e.target.value) : null)}
+              options={anos.map(a => ({
+                value: a.id,
+                label: a.nombre + (a.activo ? ' (en curso)' : a.cerrado ? ' (cerrado)' : ''),
+              }))}
+              placeholder="Seleccione año"
+            />
+          )}
           <Select
             label="Curso"
             value={cursoId?.toString() || ''}

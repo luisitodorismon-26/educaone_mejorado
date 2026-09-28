@@ -5372,12 +5372,32 @@ async def get_cursos(request: Request, db: Session = Depends(get_db), current_us
     # resultado es por-usuario, así que no participa del cache compartido.
     _niv = nivel_efectivo(current_user, request)
     _es_profesor = current_user.role == 'profesor'
-    ck = f'cursos:{current_user.colegio_id}:{_niv or "todos"}'
+
+    # ENTREGA-1.1 · `ano_id` opcional, para poder listar los cursos de un año
+    # CERRADO y emitir sus boletines. Sin el parametro, la lista es la de
+    # siempre: todos los cursos activos del colegio.
+    #
+    # Va en la CLAVE del cache. Si no, la primera respuesta —la de un año—
+    # se serviria para cualquier otro.
+    _ano_q = request.query_params.get('ano_id')
+    _ano_id = None
+    if _ano_q not in (None, '', 'todos'):
+        try:
+            _ano_id = int(_ano_q)
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'ano_id invalido'}, status_code=400)
+
+    ck = f'cursos:{current_user.colegio_id}:{_niv or "todos"}:{_ano_id or "todos"}'
     if not _es_profesor:
         cached = cache_get(ck)
         if cached: return cached
-    
-    cursos = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).join(Grado).outerjoin(Tanda).options(
+
+    _q = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True)
+    if _ano_id is not None:
+        # `tenant_filter` ya acota al colegio, asi que un `ano_id` ajeno no
+        # devuelve nada en vez de filtrar cursos de otro centro.
+        _q = _q.filter(Curso.ano_escolar_id == _ano_id)
+    cursos = _q.join(Grado).outerjoin(Tanda).options(
         selectinload(Curso.estudiantes), selectinload(Curso.grado), selectinload(Curso.tanda)
     ).order_by(Grado.orden, Tanda.nombre, Curso.nombre).all()
     if _niv is not None:
@@ -5406,6 +5426,7 @@ async def get_cursos(request: Request, db: Session = Depends(get_db), current_us
         'ciclo': c.grado.ciclo if c.grado else None,
         'tanda_id': c.tanda_id,
         'tanda': c.tanda.nombre if c.tanda else None,
+        'ano_escolar_id': c.ano_escolar_id,
         'capacidad': c.capacidad,
         'aula': c.aula,
         'estudiantes_count': sum(1 for e in c.estudiantes if e.activo)
@@ -6707,7 +6728,36 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
     # tienen el toggle en UI; un profesor verá retirados solo si los pide explícito.
     
     if request.query_params.get('curso_id'):
-        query = query.filter_by(curso_id=int(request.query_params.get('curso_id')))
+        _cid = int(request.query_params.get('curso_id'))
+        # ENTREGA-1.1 · Con `ano_id`, la COHORTE de ese curso en ese año.
+        #
+        # Despues de promover, el curso de A sigue existiendo pero sus
+        # estudiantes ya tienen `curso_id` de B. Filtrar por `curso_id`
+        # devolveria solo a los que NO se movieron, y la pantalla de boletines
+        # no podria ni ofrecer al promovido cuyo boletin de A se quiere
+        # reemitir. La cohorte historica se reconstruye con el MISMO helper
+        # que usan los lotes de boletines, asi que la lista de la pantalla y
+        # el PDF del curso hablan siempre de la misma gente.
+        _ano_q = request.query_params.get('ano_id')
+        _curso_obj = None
+        if _ano_q not in (None, '', 'todos'):
+            _ano_b, _err_b = _ano_de_boletin(db, current_user, _ano_q)
+            if _err_b:
+                return _err_b
+            _curso_obj = (tenant_filter(db.query(Curso), Curso, current_user)
+                          .filter(Curso.id == _cid).first())
+            if _curso_obj is None:
+                return JSONResponse({'error': 'Curso no encontrado'},
+                                    status_code=404)
+        if _curso_obj is not None:
+            _cohorte, _err_c = _cohorte_del_curso_en_ano(
+                db, current_user, _curso_obj, _ano_b)
+            if _err_c:
+                return _err_c
+            query = query.filter(
+                Estudiante.id.in_([e.id for e in _cohorte] or [0]))
+        else:
+            query = query.filter_by(curso_id=_cid)
     
     # Filtrar por cursos del profesor si no es direccion/coordinador
     if current_user.role == 'profesor':
@@ -14156,7 +14206,7 @@ async def get_historial_comunicaciones(estudiante_id, db: Session = Depends(get_
 # ============== BOLETINES ==============
 
 @app.get("/api/boletines/estudiante/{id}")
-async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_boletin_estudiante(id, request: Request, ano_id: int | None = None, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Obtener boletín de un estudiante con estructura completa de calificaciones.
     
     v2.13.7: lee AMBOS modelos (Calificacion legacy + CalificacionSecundaria
@@ -14173,7 +14223,15 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
 
     # ─── 1. CalificacionSecundaria (modelo nuevo MINERD) ───
     asignaturas_por_id: dict = {}  # asig_id → dict del boletín
-    ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    # ENTREGA-1.1 · Con `ano_id` se emite el boletín de ESE año; sin él, el
+    # activo, como siempre. La variable conserva su nombre histórico.
+    ano_activo, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    _curso_ano, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano_activo, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
 
     # ── ENTREGA-1 · La asistencia del boletín sale del cálculo canónico ──
     #
@@ -14303,8 +14361,10 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
             'id': estudiante.id,
             'nombre': estudiante.nombre_completo,
             'matricula': estudiante.matricula,
-            'curso': estudiante.curso.nombre_completo if estudiante.curso else None,
-            'grado': estudiante.curso.grado.nombre if estudiante.curso and estudiante.curso.grado else None
+            # El curso y el grado del AÑO DEL BOLETÍN, no el curso actual:
+            # un promovido ya está en B y su boletín de A debe decir A.
+            'curso': _curso_ano.nombre_completo if _curso_ano else None,
+            'grado': _grado_ano.nombre if _grado_ano else None
         },
         'asignaturas': asignaturas,
         # `asistencia` conserva su forma histórica para no romper a quien ya la
@@ -14321,7 +14381,7 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
 
 
 @app.get("/api/boletines/estudiante/{id}/pdf")
-async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
+async def generar_boletin_pdf(id, request: Request, ano_id: int | None = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """Boletin para PADRES - reporte detallado de calificaciones (v2.13.36).
 
     Documento formal con el detalle completo por competencia y periodo.
@@ -14339,10 +14399,15 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
         return _guard
 
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
-    curso = estudiante.curso
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
     if not curso:
         return JSONResponse({'error': 'El estudiante no tiene curso asignado.'}, status_code=400)
 
@@ -14407,7 +14472,7 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
 
 
 @app.get("/api/boletines/curso/{curso_id}/pdf")
-async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
+async def generar_boletines_curso_pdf(curso_id, ano_id: int | None = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
     """Boletines para PADRES de todo un curso en un solo PDF (v2.13.36).
 
     Genera el boletin de padres detallado (por competencia y periodo) de
@@ -14418,13 +14483,19 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
 
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
 
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.apellido, Estudiante.nombre).all()
+    # ENTREGA-1.1 · La cohorte del curso EN ESE AÑO. Filtrar por
+    # `Estudiante.curso_id` devolvería, en un año ya promovido, solo a los
+    # que NO se movieron.
+    estudiantes, _err_coh = _cohorte_del_curso_en_ano(
+        db, current_user, curso, ano)
+    if _err_coh:
+        return _err_coh
 
     if not estudiantes:
         return JSONResponse({'error': 'El curso no tiene estudiantes activos.'}, status_code=400)
@@ -14838,6 +14909,187 @@ def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano
     return resultado
 
 
+# ══ ENTREGA-1.1 · EL BOLETÍN DE UN AÑO SE EMITE CON LOS DATOS DE ESE AÑO ══
+#
+# Terminada una transición A -> B, un estudiante promovido tiene `curso_id`
+# de B. Su boletín de A, sin embargo, tiene que mostrar el curso, el grado,
+# las notas y la asistencia de A. Hasta aquí los ocho caminos de boletín
+# resolvían el año con `activo=True`, así que después de promover ya no había
+# forma de volver a emitir el documento del año cerrado.
+#
+# Estos tres helpers son todo lo que hace falta, y ninguno inventa verdad
+# académica: el año, el contexto de UN estudiante en ese año, y la cohorte de
+# UN curso en ese año.
+
+
+def _ano_de_boletin(db, current_user, ano_id=None):
+    """(año, error) para un boletín.
+
+    Con `ano_id` explícito manda ese año, resuelto por tenant: uno de otro
+    colegio da 404, igual que uno inexistente.
+
+    Sin él se conserva EXACTAMENTE el comportamiento anterior —el activo, y
+    si no hay, el más reciente— y el caso «no hay ningún año» se devuelve
+    como `(None, None)` para que cada endpoint siga tratándolo como siempre.
+    Este helper no cambia ninguna respuesta existente; solo añade la opción.
+    """
+    q = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+    if ano_id is not None:
+        ano = q.filter(AnoEscolar.id == int(ano_id)).first()
+        if ano is None:
+            return None, JSONResponse({'error': 'Año escolar no encontrado'},
+                                      status_code=404)
+        return ano, None
+    ano = q.filter_by(activo=True).first()
+    if not ano:
+        ano = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+               .order_by(AnoEscolar.id.desc()).first())
+    return ano, None
+
+
+def _historial_canonico_de(db, current_user, estudiante_id, ano):
+    """(historial | None, ambiguo) de UN estudiante en UN año.
+
+    El mismo criterio canónico que usa el Cierre: `condicion` es exactamente
+    PROMOVIDO o REPROBADO. Lo demás —«activo», «Inscrito», «Egresado», None—
+    lo escribió el writer antiguo copiando un campo de matrícula, y no
+    afirma ningún resultado académico.
+
+    Dos filas canónicas son dos verdades distintas sobre el mismo estudiante
+    y el mismo año. No se elige una: se avisa.
+    """
+    filas = (
+        tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
+                      current_user)
+        .filter(HistorialAcademico.estudiante_id == estudiante_id,
+                HistorialAcademico.ano_escolar_id == ano.id,
+                HistorialAcademico.condicion.in_(CONDICIONES_DEFINITIVAS))
+        .order_by(HistorialAcademico.id).all())
+    if len(filas) == 1:
+        return filas[0], False
+    return None, len(filas) > 1
+
+
+def _contexto_academico_del_ano(db, current_user, estudiante, ano,
+                                estricto=True):
+    """(curso, grado, error) del estudiante EN ese año escolar.
+
+    Dos casos, y el orden importa:
+
+      · si su curso actual pertenece al año pedido, ese es el contexto. Cubre
+        el año en curso y también al estudiante que sigue físicamente en A
+        —un APLAZADO, o un 6.º de Secundaria que terminó y no se mueve—, que
+        no necesita historial para imprimir su boletín de A;
+
+      · si ya fue movido a B, el curso y el grado de A salen de su historial
+        CANÓNICO de A, que los guarda precisamente para esto.
+
+    Sin historial canónico y sin pertenecer al año, no hay de dónde sacar el
+    contexto. No se recurre al curso actual —sería emitir el boletín de A con
+    el grado de B, que es la mezcla que todo esto existe para evitar— ni a
+    una fila legacy, que no afirma ningún resultado.
+
+    `estricto` distingue quién preguntó. Cuando el año llegó EXPLÍCITO, la
+    pregunta es «el boletín de ESE año» y no hay respuesta honesta sin
+    contexto: se falla cerrado. Cuando no llegó ninguno —una llamada antigua,
+    sin el parámetro— la pregunta es la de siempre, «el boletín», y se
+    conserva el comportamiento anterior: el curso actual del estudiante. No
+    es mejor, pero es el que esa llamada ya tenía, y ENTREGA-1.1 no rompe
+    clientes existentes para arreglar un caso que ahora tiene su parámetro.
+    """
+    curso = getattr(estudiante, 'curso', None)
+
+    def _grado_de(c):
+        return (db.get(Grado, c.grado_id) if c is not None and c.grado_id
+                else None)
+
+    if ano is None:
+        return curso, _grado_de(curso), None
+    if curso is not None and curso.ano_escolar_id == ano.id:
+        return curso, _grado_de(curso), None
+
+    historial, ambiguo = _historial_canonico_de(db, current_user,
+                                                estudiante.id, ano)
+    if ambiguo:
+        return None, None, JSONResponse({
+            'error': 'HISTORIAL_AMBIGUO',
+            'message': ('Hay más de un resultado académico registrado para '
+                        'este estudiante en ese año escolar. Corrija el '
+                        'historial antes de emitir el documento.'),
+        }, status_code=409)
+    if historial is None:
+        if not estricto:
+            return curso, _grado_de(curso), None
+        return None, None, JSONResponse({
+            'error': 'SIN_CONTEXTO_ACADEMICO',
+            'message': ('No existe contexto académico del estudiante para ese '
+                        'año escolar.'),
+        }, status_code=404)
+
+    curso_h = (tenant_filter(db.query(Curso), Curso, current_user)
+               .filter(Curso.id == historial.curso_id).first())
+    grado_h = (tenant_filter(db.query(Grado), Grado, current_user)
+               .filter(Grado.id == historial.grado_id).first())
+    return curso_h, grado_h, None
+
+
+def _cohorte_del_curso_en_ano(db, current_user, curso, ano):
+    """(estudiantes, error) que cursaron ESE curso en ESE año.
+
+    Después de promover, el curso de A sigue existiendo pero sus estudiantes
+    ya tienen `curso_id` de B. Buscar por `Estudiante.curso_id == curso_A.id`
+    devolvería justo a los que NO fueron promovidos: el lote histórico
+    perdería a la mayoría del curso.
+
+    La cohorte es la unión de dos conjuntos:
+
+      A. los que siguen físicamente en el curso —aplazados, en proceso, un
+         6.º de Secundaria que terminó y no se movió—;
+      B. los que tienen historial CANÓNICO de ese año apuntando a ese curso.
+
+    Una fila por estudiante. Las legacy no dan pertenencia: si alguien solo
+    aparece con una, no entra, porque esa fila no dice que cursara ahí.
+    """
+    actuales = (tenant_filter(db.query(Estudiante), Estudiante, current_user)
+                .filter_by(curso_id=curso.id, activo=True)
+                .order_by(Estudiante.no_lista, Estudiante.apellido).all())
+    if ano is None or curso.ano_escolar_id != ano.id:
+        return actuales, None
+
+    filas = (
+        tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
+                      current_user)
+        .filter(HistorialAcademico.ano_escolar_id == ano.id,
+                HistorialAcademico.condicion.in_(CONDICIONES_DEFINITIVAS))
+        .order_by(HistorialAcademico.id).all())
+    por_estudiante = {}
+    for h in filas:
+        por_estudiante.setdefault(h.estudiante_id, []).append(h)
+
+    # Solo importa la ambigüedad que toca a ESTE curso. Que otro curso del
+    # mismo año tenga un historial duplicado no dice nada sobre este lote.
+    ambiguos = sorted(eid for eid, v in por_estudiante.items()
+                      if len(v) > 1 and any(h.curso_id == curso.id for h in v))
+    if ambiguos:
+        return None, JSONResponse({
+            'error': 'HISTORIAL_AMBIGUO',
+            'message': ('Hay estudiantes con más de un resultado académico '
+                        'registrado en ese año escolar. Corrija el historial '
+                        'antes de emitir los documentos del curso.'),
+            'estudiantes': ambiguos,
+        }, status_code=409)
+
+    ya = {e.id for e in actuales}
+    faltan = [eid for eid, v in por_estudiante.items()
+              if len(v) == 1 and v[0].curso_id == curso.id and eid not in ya]
+    if faltan:
+        extra = (tenant_filter(db.query(Estudiante), Estudiante, current_user)
+                 .filter(Estudiante.id.in_(faltan))
+                 .order_by(Estudiante.no_lista, Estudiante.apellido).all())
+        actuales = actuales + list(extra)
+    return actuales, None
+
+
 # ── ENTREGA-1 · LA UNIDAD DE ASISTENCIA ES EL DÍA ──────────────────────
 #
 # El modelo lo dice sin ambigüedad. En PRIMARIA `asignatura_id` es NULL y un
@@ -15165,16 +15417,24 @@ def _construir_areas_primaria(db, estudiante_id, current_user, ano):
     return resultado
 
 
-def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curso=None):
+def _generar_pdf_primaria(db, estudiante, current_user, ano, config,
+                          _cache_curso=None, curso=None):
     """Genera el buffer del Informe de Aprendizaje de un estudiante de primaria.
 
     v2.17 PERF: `_cache_curso` es un dict opcional que el generador POR CURSO
     pasa para memoizar los datos que son IGUALES para todos los estudiantes del
     mismo curso (grado y maestro titular). Sin él, el comportamiento es idéntico
     al de siempre — un boletín individual no cambia en nada.
+
+    ENTREGA-1.1 · `curso` llega ya resuelto PARA EL AÑO del boletín. Aquí se
+    tomaba `estudiante.curso`, que es el curso ACTUAL: en un boletín histórico
+    de A, un estudiante ya promovido habría salido con el grado de B, y el
+    grado decide hasta qué plantilla oficial se usa. Sin `curso` el
+    comportamiento es el de siempre.
     """
     from boletin_primaria import generar_boletin_primaria
-    curso = estudiante.curso
+    if curso is None:
+        curso = estudiante.curso
     _ck = ('grado', curso.id) if curso else None
     if _cache_curso is not None and _ck in _cache_curso:
         grado = _cache_curso[_ck]
@@ -16117,6 +16377,7 @@ async def retirar_recuperacion_cualitativa(
 @app.get("/api/boletines-primaria/estudiante/{id}")
 async def boletin_primaria_estudiante_json(
     id: int,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user)
 ):
@@ -16138,15 +16399,20 @@ async def boletin_primaria_estudiante_json(
     if _guard:
         return _guard
 
-    curso = estudiante.curso
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
     if not curso:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
     if _es_curso_secundaria(db, curso.id):
         return JSONResponse({'error': 'Este estudiante es de secundaria.'}, status_code=400)
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
 
@@ -16277,6 +16543,7 @@ async def boletin_primaria_estudiante_json(
 @app.get("/api/boletines-primaria/estudiante/{id}/pdf")
 async def boletin_primaria_estudiante_pdf(
     id: int,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
 ):
@@ -16288,7 +16555,18 @@ async def boletin_primaria_estudiante_pdf(
     if _guard:
         return _guard
 
-    curso = estudiante.curso
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
     if not curso:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
     if _es_curso_secundaria(db, curso.id):
@@ -16296,16 +16574,11 @@ async def boletin_primaria_estudiante_pdf(
             {'error': 'Este boletín es solo para primaria. Para secundaria usá el Boletín MINERD.'},
             status_code=400)
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
-    if not ano:
-        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
-
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
 
     try:
-        buf = _generar_pdf_primaria(db, estudiante, current_user, ano, config)
+        buf = _generar_pdf_primaria(db, estudiante, current_user, ano, config,
+                                    curso=curso)
     except FileNotFoundError:
         return JSONResponse({'error': 'No se encontró la plantilla oficial de ese grado.'}, status_code=500)
 
@@ -16317,6 +16590,7 @@ async def boletin_primaria_estudiante_pdf(
 @app.get("/api/boletines-primaria/curso/{curso_id}/pdf")
 async def boletin_primaria_curso_pdf(
     curso_id: int,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
 ):
@@ -16333,16 +16607,19 @@ async def boletin_primaria_curso_pdf(
     if _es_curso_secundaria(db, curso.id):
         return JSONResponse({'error': 'Este boletín es solo para primaria.'}, status_code=400)
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
 
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.no_lista, Estudiante.apellido).all()
+    estudiantes, _err_coh = _cohorte_del_curso_en_ano(
+        db, current_user, curso, ano)
+    if _err_coh:
+        return _err_coh
 
     if not estudiantes:
         return JSONResponse({'error': 'El curso no tiene estudiantes activos'}, status_code=404)
@@ -16352,7 +16629,11 @@ async def boletin_primaria_curso_pdf(
     _cache_curso = {}  # v2.17 PERF: memoiza grado y titular del curso
     for est in estudiantes:
         try:
-            buf = _generar_pdf_primaria(db, est, current_user, ano, config, _cache_curso)
+            # El curso del LOTE es el curso histórico pedido, el mismo para
+            # todos: reconstruimos la cohorte de ESE curso, no la de donde
+            # esté cada estudiante ahora.
+            buf = _generar_pdf_primaria(db, est, current_user, ano, config,
+                                        _cache_curso, curso=curso)
             for page in PdfReader(buf).pages:
                 writer.add_page(page)
             generados += 1
@@ -16375,6 +16656,7 @@ async def boletin_primaria_curso_pdf(
 async def generar_boletin_minerd_v2(
     id: int,
     request: Request,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
 ):
@@ -16398,20 +16680,33 @@ async def generar_boletin_minerd_v2(
     if _guard:
         return _guard
 
-    curso = estudiante.curso
-    if not curso:
+    if not estudiante.curso_id:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
+    
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    # El curso y el grado del AÑO PEDIDO. `curso` alimenta la portada, el
+    # ciclo de la plantilla y la construcción de calificaciones, así que
+    # tomarlo del año actual emitiría el boletín de A con el grado de B.
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
+    if not curso:
+        return JSONResponse({'error': 'El estudiante no tiene curso asignado'}, status_code=400)
+    # ENTREGA-1.1 · El nivel se comprueba sobre el curso DEL AÑO PEDIDO. Se
+    # comprobaba sobre el curso actual, y un alumno que pasó de 6.º de
+    # Primaria a 1.º de Secundaria habría colado su año de primaria por este
+    # endpoint, que es de secundaria.
     if not _es_curso_secundaria(db, curso.id):
         return JSONResponse(
             {'error': 'Este boletín es solo para estudiantes de secundaria. Para primaria/legacy usá el botón "Descargar PDF" en /boletines.'},
             status_code=400
         )
-    
-    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        # v2.13.19: año cerrado tras promover → usar el más reciente
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado. Configurá uno en Configuración → Año Escolar.'}, status_code=404)
     
@@ -16512,6 +16807,7 @@ async def generar_boletin_minerd_v2(
 async def generar_boletines_curso_minerd_v2(
     curso_id: int,
     request: Request,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))
 ):
@@ -16525,19 +16821,24 @@ async def generar_boletines_curso_minerd_v2(
             status_code=400
         )
     
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.apellido, Estudiante.nombre).all()
-    if not estudiantes:
-        return JSONResponse({'error': 'No hay estudiantes en este curso'}, status_code=404)
-    
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        # v2.13.19: año cerrado tras promover → usar el más reciente
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    #
+    # El año va ANTES que la cohorte, porque la cohorte depende de él: quién
+    # cursó este curso se responde para un año concreto.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+
+    estudiantes, _err_coh = _cohorte_del_curso_en_ano(
+        db, current_user, curso, ano)
+    if _err_coh:
+        return _err_coh
+    if not estudiantes:
+        return JSONResponse({'error': 'No hay estudiantes en este curso'}, status_code=404)
     
     # Combinar PDFs por estudiante en uno solo
     # v2.13.9: try/except por estudiante para que UN error no rompa todo el curso
@@ -20690,11 +20991,22 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
 @app.get("/api/registros/primaria/{curso_id}")
 async def generar_registro_primaria_v2(curso_id: int, request: Request,
                                         db: Session = Depends(get_db),
-                                        current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
+                                        current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """
     Genera el PDF del Registro Escolar MINERD para un curso de PRIMARIA.
     Estructura por competencias (C1, C2, C3).
     """
+    # ENTREGA-1.1 · Secretaría emite el REGISTRO OFICIAL.
+    #
+    # Emitir el documento oficial del curso es trabajo administrativo, no
+    # académico: no escribe nada —este endpoint solo lee y compone un PDF— y
+    # es justo lo que una secretaría hace. ENTREGA-1 le dio la pantalla; sin
+    # esto podía verla y no podía entregar nada.
+    #
+    # El BORRADOR sigue fuera: `preview_pdf_primaria` y `preview_pdf_secundaria`
+    # conservan sus roles. Es el documento de trabajo de quien LLENA el
+    # registro, con su marca de agua y su «no apto para entrega oficial», y la
+    # suite de tenant/roles lo exige desde v2.19.3-A.
     # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
     get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_primaria
@@ -21011,7 +21323,7 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
 @app.get("/api/registros/secundaria/{curso_id}")
 async def generar_registro_secundaria_v2(curso_id: int, request: Request, 
                                           db: Session = Depends(get_db),
-                                          current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
+                                          current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """
     Genera el PDF del Registro Escolar MINERD para un curso de SECUNDARIA.
     

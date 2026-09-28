@@ -245,7 +245,14 @@ export const RegistroEscolarPage = () => {
   // v2.17: el PROFESOR ve e imprime el registro de SUS cursos (el backend
   // valida la asignación). En la práctica dominicana es quien lo llena.
   const canPreview = ['direccion', 'coordinador', 'superadmin', 'profesor'].includes(user?.role || '');
-  const canGenerate = ['direccion', 'coordinador', 'superadmin', 'profesor'].includes(user?.role || '');
+  // ENTREGA-1.1 · Secretaría emite el REGISTRO OFICIAL, no el borrador.
+  //
+  // El borrador lleva marca de agua y existe para que quien LLENA el registro
+  // revise su avance; el oficial es el documento que se entrega al MINERD, y
+  // entregarlo es trabajo de secretaría. Por eso está en `canGenerate` y no en
+  // `canPreview`: no son dos niveles del mismo permiso, son dos documentos
+  // distintos con dos destinatarios distintos.
+  const canGenerate = ['direccion', 'coordinador', 'superadmin', 'profesor', 'secretaria'].includes(user?.role || '');
   const isBlocked = preview ? !preview.validacion.valid : false;
 
   return (
@@ -488,13 +495,14 @@ export const RegistroEscolarPage = () => {
 
               {!canPreview && !canGenerate && (
                 <div className="text-sm text-gray-500 italic">
-                  Tu rol no tiene permiso para generar el registro escolar. Puedes revisar
-                  el diagnóstico de arriba; la impresión la realiza dirección o coordinación.
+                  Su rol no tiene permiso para generar el registro escolar. Puede revisar
+                  el diagnóstico de arriba; la impresión la realiza dirección, coordinación
+                  o secretaría.
                 </div>
               )}
               
               <div className="text-xs text-gray-500 italic">
-                <strong>Vista Previa</strong>: PDF con marca de agua "BORRADOR", útil para revisar avance del año. NO usar para entrega oficial.<br/>
+                <strong>Vista Previa</strong>: PDF con marca de agua "BORRADOR", útil para revisar avance del año. NO usar para entrega oficial. Disponible para dirección, coordinación y el profesor del curso.<br/>
                 <strong>Registro Oficial</strong>: PDF limpio, listo para impresión y entrega al MINERD. Solo disponible cuando todos los datos estén completos.
               </div>
             </div>

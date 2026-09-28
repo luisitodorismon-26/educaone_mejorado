@@ -254,36 +254,41 @@ with client:
               'nivel' in r.json() and 'curso' in r.json(),
               str(sorted(r.json().keys()))[:70])
 
-    # Y NO se le amplía más allá. Los cuatro PDF del módulo siguen fuera:
-    # el frontend nunca le ofreció esos botones (`canPreview`/`canGenerate`
-    # no la incluyen) y la suite de tenant/roles afirma desde v2.19.3-A que
-    # secretaría no entra al BORRADOR. Abrirlos sería inventar una política,
-    # no alinear la existente.
-    PDF_FUERA = [
-        ('E1S-12 registro oficial de primaria',
-         '/api/registros/primaria/%d' % A['cursos']['pri']),
-        ('E1S-13 borrador de primaria',
-         '/api/registros/primaria/%d/preview-pdf' % A['cursos']['pri']),
-        ('E1S-14 registro oficial de secundaria',
-         '/api/registros/secundaria/%d' % A['cursos']['sec']),
-        ('E1S-15 borrador de secundaria',
-         '/api/registros/secundaria/%d/preview-pdf' % A['cursos']['sec']),
-    ]
-    for nombre, ruta in PDF_FUERA:
+    # ENTREGA-1.1 · El documento OFICIAL sí lo emite. Es lo que se entrega al
+    # MINERD y entregarlo es trabajo de secretaría; el endpoint solo lee y
+    # compone un PDF.
+    for nombre, ruta in (
+            ('E1S-12 registro oficial de primaria',
+             '/api/registros/primaria/%d' % A['cursos']['pri']),
+            ('E1S-14 registro oficial de secundaria',
+             '/api/registros/secundaria/%d' % A['cursos']['sec'])):
+        r = client.get(ruta, headers=auth(SEC_A))
+        check(nombre + ' lo puede emitir', r.status_code != 403,
+              '-> %d' % r.status_code)
+
+    # El BORRADOR no. Es el documento de trabajo de quien LLENA el registro,
+    # con su marca de agua y su «no apto para entrega oficial», y la suite de
+    # tenant/roles lo exige desde v2.19.3-A. No son dos niveles del mismo
+    # permiso: son dos documentos con dos destinatarios.
+    for nombre, ruta in (
+            ('E1S-13 borrador de primaria',
+             '/api/registros/primaria/%d/preview-pdf' % A['cursos']['pri']),
+            ('E1S-15 borrador de secundaria',
+             '/api/registros/secundaria/%d/preview-pdf' % A['cursos']['sec'])):
         r = client.get(ruta, headers=auth(SEC_A))
         check(nombre + ' sigue fuera de su alcance', r.status_code == 403,
               '-> %d' % r.status_code)
 
-    # Y el frontend tampoco se lo ofrece: si algún día alguien añadiera
-    # `secretaria` a estas listas sin abrir el backend, volvería el botón
-    # muerto que ENTREGA-1 vino a quitar.
+    # Y el frontend dice lo mismo que el backend, en los dos sentidos.
     _pag = open(os.path.join(os.path.dirname(_BACKEND), 'frontend', 'src',
                              'pages', 'registro-escolar',
                              'RegistroEscolarPage.tsx'), encoding='utf-8').read()
-    for _var in ('canPreview', 'canGenerate'):
-        _linea = [l for l in _pag.splitlines() if 'const %s' % _var in l][0]
-        check('E1S-15b %s no ofrece el PDF a secretaría' % _var,
-              "'secretaria'" not in _linea, _linea.strip()[:78])
+    _linea_p = [l for l in _pag.splitlines() if 'const canPreview' in l][0]
+    _linea_g = [l for l in _pag.splitlines() if 'const canGenerate' in l][0]
+    check('E1S-15b canPreview NO ofrece el borrador a secretaría',
+          "'secretaria'" not in _linea_p, _linea_p.strip()[:76])
+    check('E1S-15c canGenerate SÍ le ofrece el oficial',
+          "'secretaria'" in _linea_g, _linea_g.strip()[:76])
 
     # Y sin regresión para quienes ya entraban.
     for et, tok in (('dirección', DIR_A), ('coordinación', COORD_A),

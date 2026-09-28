@@ -539,7 +539,7 @@ export const DashboardPage = () => {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <Link to="/estudiantes" className="flex items-center gap-3 p-4 bg-white rounded-xl border border-gray-200 hover:border-blue-300 hover:bg-blue-50 transition-all group">
             <div className="w-10 h-10 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center flex-shrink-0"><GraduationCap size={22} /></div>
-            <div className="min-w-0"><p className="font-semibold text-gray-800 text-sm">Estudiantes</p><p className="text-xs text-gray-500">Matriculación</p></div>
+            <div className="min-w-0"><p className="font-semibold text-gray-800 text-sm">Estudiantes</p><p className="text-xs text-gray-500">{user?.role === 'secretaria' ? 'Consulta y expedientes' : 'Matriculación'}</p></div>
           </Link>
           <Link to="/registro-escolar" className="flex items-center gap-3 p-4 bg-white rounded-xl border border-gray-200 hover:border-emerald-300 hover:bg-emerald-50 transition-all group">
             <div className="w-10 h-10 rounded-lg bg-emerald-100 text-emerald-600 flex items-center justify-center flex-shrink-0"><FileBarChart size={22} /></div>
