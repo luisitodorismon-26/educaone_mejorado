@@ -1796,6 +1796,68 @@ class HistorialAcademico(Base):
     condicion = Column(String(20))
     observaciones = Column(Text)
 
+
+# ============== DECISIONES HUMANAS DEL CIERRE (CORE-2) ==============
+#
+# Hay tres cosas que A2 necesita y que NINGÚN cálculo puede producir, porque
+# no son cálculos: son decisiones de personas.
+#
+#   · si un estudiante de 3.º logró la alfabetización inicial;
+#   · qué decide el equipo de gestión cuando las ausencias no justificadas
+#     pasan del 20 %;
+#   · si el consejo autoriza la repetición excepcional de 2.º, que la norma
+#     permite UNA sola vez.
+#
+# Hasta ahora no había dónde guardarlas, así que A2 las recibía en None y
+# dejaba al estudiante EN_PROCESO para siempre. Hoy ningún 3.º de Primaria
+# puede promoverse en EducaOne, y eso no es una cautela: es un proceso roto.
+#
+# Esta tabla las guarda con trazabilidad —quién y cuándo—, porque son actos
+# administrativos y alguien tiene que responder por ellos.
+#
+# Lo que esta tabla NO es: Dirección no escribe aquí «promovido» ni
+# «reprobado». Aporta el DATO; la condición la sigue produciendo A2. Los
+# valores son exactamente los del contrato de `promocion_academica`, no una
+# semántica paralela.
+#
+# Es una tabla NUEVA: `Base.metadata.create_all()` la crea sola, sin ALTER,
+# sin tocar ninguna fila existente.
+
+class DecisionAcademicaEstudiante(Base):
+    __tablename__ = 'decision_academica_estudiante'
+    __table_args__ = (
+        # Una decisión por estudiante y año. Es una tabla nueva, así que no
+        # puede haber duplicados heredados que esta restricción rompa.
+        UniqueConstraint('estudiante_id', 'ano_escolar_id',
+                         name='uq_decision_academica_estudiante_ano'),
+    )
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=True, index=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'), nullable=False)
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=False)
+
+    # True = lograda, False = no lograda, NULL = todavía nadie lo informó.
+    # Los tres estados son distintos y ninguno se infiere de los otros.
+    alfabetizacion_inicial = Column(Boolean, nullable=True)
+
+    # 'PERMITIR_APROBACION' | 'REPETIR_GRADO' | 'REPROBAR_ASIGNATURAS'
+    decision_asistencia = Column(String(30), nullable=True)
+
+    # 'repetir' es el único valor que A2 admite aquí.
+    decision_excepcional_segundo = Column(String(20), nullable=True)
+    # La excepción de 2.º se concede una sola vez en la vida escolar. A2 no
+    # tiene historial y no lo inventa: si no se le dice, no certifica.
+    repeticion_excepcional_segundo_ya_utilizada = Column(Boolean, nullable=True)
+
+    # Por qué se decidió. Un acta sin motivo no es un acta.
+    observacion = Column(Text)
+
+    registrado_por = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    fecha_registro = Column(DateTime, default=datetime.utcnow)
+    actualizado_por = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    fecha_actualizacion = Column(DateTime, onupdate=datetime.utcnow)
+
+
 # ============== DÍAS NO LABORABLES ==============
 
 class DiaNoLaborable(Base):

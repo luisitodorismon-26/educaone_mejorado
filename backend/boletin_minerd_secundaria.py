@@ -679,7 +679,8 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
                                    curso,
                                    calificaciones_por_asig: dict,
                                    asistencias_por_periodo: dict,
-                                   situacion_final: dict | None = None) -> None:
+                                   situacion_final: dict | None = None,
+                                   asistencia_anual: dict | None = None) -> None:
     """Página 2: tabla pixel-exacta de calificaciones.
     
     Elige el set de coordenadas Y correcto según el ciclo del curso:
@@ -842,23 +843,65 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             else:
                 c.drawCentredString(RIGHT_X['R'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
     
-    # Resumen de asistencia
+    # ── Resumen de asistencia ──────────────────────────────────────────
+    #
+    # ENTREGA-1 · Igual que en el Informe de Primaria, la plantilla MINERD
+    # divide «Asistencia» y «Ausencia» fila por fila —conteos por período—
+    # pero «% de Anual» es UNA celda fusionada de P1 a P4. Se escribía ahí el
+    # porcentaje de cada período, cuatro números en un recuadro que pide uno,
+    # y ninguno era el anual del rótulo.
     if asistencias_por_periodo:
         for p_key in ['p1', 'p2', 'p3', 'p4']:
             data = asistencias_por_periodo.get(p_key) or {}
             y_a = _y(asist_y_map[p_key])
             asis = data.get('asistencia')
             ausen = data.get('ausencia')
-            pct_a = data.get('pct_asistencia_anual')
-            pct_au = data.get('pct_ausencia_anual')
             if asis is not None:
                 c.drawCentredString(ASIST_X['asis'], y_a - 3, str(int(asis)))
             if ausen is not None:
                 c.drawCentredString(ASIST_X['ausen'], y_a - 3, str(int(ausen)))
-            if pct_a is not None:
-                c.drawCentredString(ASIST_X['pct_asis'], y_a - 3, f"{int(round(pct_a))}%")
-            if pct_au is not None:
-                c.drawCentredString(ASIST_X['pct_ausen'], y_a - 3, f"{int(round(pct_au))}%")
+
+    if asistencia_anual and not asistencia_anual.get('sin_registros'):
+        _pa = asistencia_anual.get('pct_asistencia')
+        _pau = asistencia_anual.get('pct_ausencia')
+        _y_medio = _y((asist_y_map['p1'] + asist_y_map['p4']) / 2.0)
+        if _pa is not None:
+            c.drawCentredString(ASIST_X['pct_asis'], _y_medio - 3,
+                                f"{int(round(_pa))}%")
+        if _pau is not None:
+            c.drawCentredString(ASIST_X['pct_ausen'], _y_medio - 3,
+                                f"{int(round(_pau))}%")
+
+    # ── Detalle anual, bajo la tabla ───────────────────────────────────
+    #
+    # La tabla oficial solo tiene cuatro columnas y agrupa: no puede decir
+    # cuántas de las asistencias fueron tardanzas ni cuántas de las ausencias
+    # estaban excusadas, que es justo lo que un padre pregunta. El espacio
+    # libre bajo la tabla sí lo permite, sin tocar ninguna casilla.
+    #
+    # El bloque se ancla al final de la tabla (`p4`), no a una Y absoluta,
+    # porque la plantilla de segundo ciclo está corrida hacia abajo respecto
+    # de la de primer ciclo.
+    _ay = asist_y_map['p4'] + 22
+    c.setFillColor(COLOR_DATOS)
+    if not asistencia_anual or asistencia_anual.get('sin_registros'):
+        c.setFont("Helvetica-Oblique", 6.5)
+        c.drawString(ASIST_X['asis'] - 66, _y(_ay), 'Sin registros de asistencia')
+    else:
+        c.setFont("Helvetica-Bold", 6.5)
+        c.drawString(ASIST_X['asis'] - 66, _y(_ay), 'ASISTENCIA ANUAL')
+        c.setFont("Helvetica", 6.5)
+        c.drawString(ASIST_X['asis'] - 66, _y(_ay + 8),
+                     'Asistencias: %d   Tardanzas: %d   Ausencias: %d   Excusas: %d'
+                     % (asistencia_anual.get('asistencias', 0),
+                        asistencia_anual.get('tardanzas', 0),
+                        asistencia_anual.get('ausencias', 0),
+                        asistencia_anual.get('excusas', 0)))
+        _pa = asistencia_anual.get('pct_asistencia')
+        _pau = asistencia_anual.get('pct_ausencia')
+        if _pa is not None and _pau is not None:
+            c.drawString(ASIST_X['asis'] - 66, _y(_ay + 16),
+                         'Asistencia: %.1f%%   Ausencia: %.1f%%' % (_pa, _pau))
     
     # Situación final del estudiante (Promovido/a o Repitente)
     if situacion_final:
@@ -894,6 +937,7 @@ def generar_boletin_secundaria_minerd(
     observaciones: str = '',
     situacion_final: dict | None = None,
     docente_nombre: str = '',
+    asistencia_anual: dict | None = None,
 ) -> io.BytesIO:
     """Genera el boletín MINERD pixel-exacto como io.BytesIO.
     
@@ -928,7 +972,8 @@ def generar_boletin_secundaria_minerd(
     
     # Página 2: tabla calificaciones
     _dibujar_tabla_calificaciones(c, estudiante, curso, calificaciones_por_asig,
-                                    asistencias_por_periodo or {}, situacion_final)
+                                    asistencias_por_periodo or {}, situacion_final,
+                                    asistencia_anual)
     c.showPage()
     c.save()
     overlay_buf.seek(0)

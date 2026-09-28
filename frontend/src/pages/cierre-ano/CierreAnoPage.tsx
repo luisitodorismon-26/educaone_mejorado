@@ -14,12 +14,17 @@ interface AnoEscolar {
 }
 
 interface ResumenCurso {
-  id: number;
   nombre: string;
   estudiantes: number;
   promovidos: number;
   reprobados: number;
-  promedio: number;
+  // CORE-1: el resumen dejo de tener su propia regla (`todos los CF >= 70`)
+  // y ahora sale de A1/A2, igual que la previsualizacion. Por eso aparecen
+  // los cuatro estados: un APLAZADO no es un reprobado.
+  aplazados: number;
+  en_proceso: number;
+  // `null` cuando el curso no tiene ninguna nota final numerica. NO es 0.
+  promedio: number | null;
 }
 
 // R4-A4: la condicion la decide el motor canonico (A2) y llega ya resuelta.
@@ -60,6 +65,61 @@ interface EstudiantePromocion {
   listo_para_decidir: boolean;
 }
 
+// RELEASE · El Cierre canónico está habilitado. Lo que antes era una
+// constante en `true` —C1 lo dejó así mientras se reconstruía el flujo— pasa
+// a DERIVARSE del backend: `/cierre-ano/estado` publica
+// `bloqueado_por_safety_lock`, que es la misma bandera que decide el 409.
+//
+// Atarlo ahí y no a un literal tiene una consecuencia práctica: si alguien
+// vuelve a cerrar el Cierre con el interruptor de emergencia, la pantalla se
+// entera sola. Con la constante habría que acordarse de tocar dos sitios, y
+// el que se olvida siempre es este.
+//
+// Esto NO es la protección: el backend lo es. Aquí solo se evita que
+// Dirección llegue a un botón que va a fallar.
+
+// CORE-2 · La fase del asistente se DERIVA del backend, no del estado de
+// React. Antes «en qué paso voy», «cuál es el año origen» y «cuál el
+// destino» vivían solo en memoria: un refresco los perdía y Dirección volvía
+// al paso 1 sobre un año ya cerrado —o veía el año NUEVO como el que había
+// que cerrar—.
+interface EstadoCierre {
+  bloqueado_por_safety_lock: boolean;
+  ano_origen: { id: number; nombre: string; cerrado: boolean; activo: boolean } | null;
+  ano_destino: { id: number; nombre: string; cerrado: boolean; activo: boolean } | null;
+  ano_activo_id: number | null;
+  cohorte: {
+    estudiantes?: number; promovidos?: number; reprobados?: number;
+    aplazados?: number; en_proceso?: number; procesados?: number; pendientes?: number;
+  };
+  errores_estructurales: { estudiante_id: number | null; nombre_completo: string | null; motivo: string }[];
+  // CORE-2.1 · Dos listas distintas. La AMBIGUEDAD son dos resultados
+  // academicos para el mismo estudiante y año: eso bloquea. Los duplicados
+  // LEGACY son filas del writer antiguo, que no afirman ningun resultado:
+  // se informan y ya.
+  historiales_ambiguos: number[];
+  historiales_legacy_duplicados: number[];
+  transicion_en_progreso: boolean;
+  origen_ambiguo: { id: number; nombre: string }[];
+  transicion_ejecutada: boolean;
+  motivos_transicion: string[];
+  puede_cerrar: boolean;
+  puede_promover: boolean;
+  transicion_completa: boolean;
+}
+
+// Dirección aporta el DATO humano; A2 produce la condición. Aquí no se
+// escribe «promovido» ni «reprobado» en ningún caso.
+interface DecisionPendiente {
+  estudiante_id: number;
+  nombre_completo: string;
+  curso: string | null;
+  grado: string | null;
+  motivo: string | null;
+  campos_requeridos: string[];
+  registrado: Record<string, unknown> | null;
+}
+
 const CONDICION_BADGE: Record<CondicionCanonica,
   { variant: 'success' | 'warning' | 'danger' | 'default'; texto: string }> = {
   promovido: { variant: 'success', texto: 'Promovido' },
@@ -92,6 +152,13 @@ export const CierreAnoPage = () => {
   // ANTES de crear el ano siguiente, porque en cuanto ese existe pasa a ser
   // el activo y `anoEscolar` deja de apuntar al que se esta cerrando.
   const [anoOrigenId, setAnoOrigenId] = useState<number | null>(null);
+  const [estado, setEstado] = useState<EstadoCierre | null>(null);
+  // La misma bandera que decide el 409 en el backend. Mientras no se conozca
+  // el estado se asume DESBLOQUEADO: el backend rechaza igual si no lo está,
+  // y presumir un bloqueo que no existe deja a Dirección sin poder cerrar.
+  const cierreBloqueado = estado?.bloqueado_por_safety_lock === true;
+  const [decisiones, setDecisiones] = useState<DecisionPendiente[]>([]);
+  const [guardandoDecision, setGuardandoDecision] = useState<number | null>(null);
   // v2.13.26: acción por estudiante: 'promueve' (default) | 'repite' | 'retira'
   const [acciones, setAcciones] = useState<Record<number, 'promueve' | 'repite' | 'retira'>>({});
 
@@ -104,13 +171,59 @@ export const CierreAnoPage = () => {
       const anoRes = await api.get('/ano-escolar');
       setAnoEscolar(anoRes.data);
       
-      // Cargar resumen real de cursos
-      const resumenRes = await api.get('/cierre-ano/resumen').catch(() => ({ data: { cursos: [] } }));
-      setResumenCursos(resumenRes.data.cursos || []);
-      
-      if (anoRes.data?.cerrado) {
+      // CORE-2.2 · El ESTADO va PRIMERO. Antes el resumen se pedía sin
+      // `ano_id` y se resolvía por su cuenta con «el cerrado más reciente»,
+      // así que al terminar una transición el asistente se colocaba sobre el
+      // año nuevo y la tabla de debajo seguía mostrando el año anterior.
+      // Ahora se pregunta qué año toca y se pide el resumen de ESE año.
+      const est = await api.get('/cierre-ano/estado')
+        .then(r => r.data as EstadoCierre)
+        .catch(() => null);
+      setEstado(est);
+
+      // Asignación EXPLÍCITA, incluido el null: si la transición terminó, el
+      // origen y el destino dejan de existir y no pueden sobrevivir en
+      // memoria al recargar los datos.
+      setAnoOrigenId(est?.ano_origen?.id ?? null);
+      setNuevoAnoId(est?.ano_destino?.id ?? null);
+
+      // Un solo año visible para toda la pantalla:
+      //   hay transición  -> el año ORIGEN
+      //   no la hay       -> el año ACTIVO
+      //   origen ambiguo  -> ninguno; se pregunta antes de mostrar nada
+      const hayAmbiguedad = (est?.origen_ambiguo?.length ?? 0) > 0;
+      const visibleAnoId = hayAmbiguedad
+        ? null
+        : (est?.ano_origen?.id ?? est?.ano_activo_id ?? anoRes.data?.id ?? null);
+
+      if (visibleAnoId != null) {
+        const resumenRes = await api.get('/cierre-ano/resumen',
+          { params: { ano_id: visibleAnoId } })
+          .catch(() => ({ data: { cursos: [] } }));
+        setResumenCursos(resumenRes.data.cursos || []);
+      } else {
+        // Sin año determinado no se muestra el resumen de ninguno.
+        setResumenCursos([]);
+      }
+
+      if (est) {
+        // Un refresco vuelve exactamente a donde estaba el proceso:
+        //   origen abierto            -> revisión y cierre
+        //   cerrado y sin destino     -> crear el año siguiente
+        //   cerrado con destino       -> promover
+        //   nada pendiente            -> terminado
+        if (est.transicion_completa && est.ano_origen?.cerrado) setPaso(5);
+        else if (est.puede_promover || (est.ano_origen?.cerrado && est.ano_destino)) setPaso(4);
+        else if (est.ano_origen?.cerrado) setPaso(3);
+        else setPaso(1);
+      } else if (anoRes.data?.cerrado) {
         setPaso(3);
       }
+
+      const dec = await api.get('/cierre-ano/decisiones')
+        .then(r => r.data.pendientes || [])
+        .catch(() => []);
+      setDecisiones(dec);
     } catch (e) {
       console.error(e);
     } finally {
@@ -121,12 +234,25 @@ export const CierreAnoPage = () => {
   const cargarDatosPromocion = async (origenId?: number | null) => {
     setLoadingPromocion(true);
     try {
-      // El ano ORIGEN, nunca el destino. Si no se conoce —por ejemplo tras
-      // recargar la pagina— no se manda nada y el backend resuelve por su
-      // cuenta el cerrado mas reciente, que es la garantia de ultimo recurso.
-      const origen = origenId ?? anoOrigenId;
+      // El ano ORIGEN, nunca el destino.
+      //
+      // CORE-2.2 · Ya no hay «garantía de último recurso»: el backend dejó de
+      // caer en el cerrado más reciente, porque un año cuya promoción ya
+      // terminó no es el año del que habla esta pantalla. Si no se conoce el
+      // origen, no se pide nada: preguntar sin año devolvería la cohorte de
+      // otro año o un 409 de ambigüedad, y las dos cosas confunden más que
+      // un aviso claro.
+      const origen = origenId ?? anoOrigenId ?? estado?.ano_origen?.id ?? null;
+      if (origen == null) {
+        setEstudiantesPromocion([]);
+        setMessage({
+          type: 'warning',
+          text: 'No se pudo determinar el año escolar que se está promoviendo. Recargue la pantalla.',
+        });
+        return;
+      }
       const res = await api.get('/cierre-ano/promocion',
-        origen ? { params: { ano_id: origen } } : undefined);
+        { params: { ano_id: origen } });
       const lista: EstudiantePromocion[] = res.data.estudiantes || [];
       setEstudiantesPromocion(lista);
       // El backend dice que ano calculo; asi la pantalla no tiene que
@@ -171,20 +297,22 @@ export const CierreAnoPage = () => {
       // v2.13.24: promover pasando el año destino. Sin esto, los
       // estudiantes no tienen a dónde moverse y quedan en el mismo grado.
       // v2.13.26: enviar overrides solo de los que NO son 'promueve'
-      const overrides: Record<number, string> = {};
-      Object.entries(acciones).forEach(([id, acc]) => {
-        if (acc && acc !== 'promueve') overrides[Number(id)] = acc;
-      });
+      // CORE-1: la transicion se DECLARA. El backend ya no deduce el origen
+      // con "el ultimo cerrado" ni el destino con "el año activo", y no
+      // acepta `overrides`: quien promueve o repite lo decide A2, no la
+      // pantalla. Si falta cualquiera de los dos años, responde 400.
+      const origenId = anoOrigenId ?? anoEscolar?.id ?? null;
       const res = await api.post('/cierre-ano/promover', {
-        ...(nuevoAnoId ? { nuevo_ano_id: nuevoAnoId } : {}),
-        ...(Object.keys(overrides).length ? { overrides } : {}),
+        ano_origen_id: origenId,
+        ano_destino_id: nuevoAnoId,
       });
       const d = res.data || {};
       const partes = [];
+      if (d.movidos) partes.push(`${d.movidos} movidos`);
       if (d.promovidos) partes.push(`${d.promovidos} promovidos`);
-      if (d.repitentes) partes.push(`${d.repitentes} repitentes`);
-      if (d.retirados) partes.push(`${d.retirados} retirados`);
-      if (d.egresados) partes.push(`${d.egresados} egresados`);
+      if (d.reprobados) partes.push(`${d.reprobados} repitentes`);
+      if (d.aplazados) partes.push(`${d.aplazados} aplazados (siguen en el año anterior)`);
+      if (d.en_proceso) partes.push(`${d.en_proceso} en proceso`);
       const detalle = partes.length ? ` (${partes.join(', ')})` : '';
       if (d.aviso) {
         setMessage({ type: 'warning', text: d.aviso });
@@ -241,12 +369,62 @@ export const CierreAnoPage = () => {
     }
   };
 
+  // Dirección aporta el dato; el backend devuelve la condición RECALCULADA
+  // por A2. Si la decisión resuelve el bloqueo, el estado cambia al instante.
+  // Dirección desambigua qué año está cerrando. La elección se reenvía como
+  // `ano_origen_id` explícito, y a partir de ahí estado, resumen y
+  // previsualización hablan de ese mismo año.
+  const elegirAnoOrigen = async (id: number) => {
+    setLoading(true);
+    try {
+      const est = await api.get('/cierre-ano/estado', { params: { ano_origen_id: id } })
+        .then(r => r.data as EstadoCierre)
+        .catch(() => null);
+      setEstado(est);
+      setAnoOrigenId(est?.ano_origen?.id ?? id);
+      setNuevoAnoId(est?.ano_destino?.id ?? null);
+      const resumenRes = await api.get('/cierre-ano/resumen', { params: { ano_id: id } })
+        .catch(() => ({ data: { cursos: [] } }));
+      setResumenCursos(resumenRes.data.cursos || []);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const registrarDecision = async (d: DecisionPendiente, campo: string, valor: unknown) => {
+    setGuardandoDecision(d.estudiante_id);
+    try {
+      const res = await api.post('/cierre-ano/decisiones', {
+        estudiante_id: d.estudiante_id,
+        ano_id: estado?.ano_origen?.id ?? anoOrigenId,
+        [campo]: valor,
+      });
+      setMessage({
+        type: 'success',
+        text: `${d.nombre_completo}: ${res.data.condicion ?? 'situación actualizada'}.`,
+      });
+      await loadData();
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.response?.data?.message || e.response?.data?.error || 'No se pudo registrar la decisión' });
+    } finally {
+      setGuardandoDecision(null);
+    }
+  };
+
+  const etiquetaCampo: Record<string, string> = {
+    alfabetizacion_inicial: 'Registrar estado de alfabetización',
+    decision_asistencia: 'Registrar decisión de revisión de asistencia',
+    repeticion_excepcional_segundo_ya_utilizada: 'Registrar decisión colegiada excepcional',
+  };
+
   const getResumenTotales = () => {
     return resumenCursos.reduce((acc, c) => ({
       estudiantes: acc.estudiantes + c.estudiantes,
       promovidos: acc.promovidos + c.promovidos,
-      reprobados: acc.reprobados + c.reprobados
-    }), { estudiantes: 0, promovidos: 0, reprobados: 0 });
+      reprobados: acc.reprobados + c.reprobados,
+      aplazados: acc.aplazados + (c.aplazados || 0),
+      en_proceso: acc.en_proceso + (c.en_proceso || 0),
+    }), { estudiantes: 0, promovidos: 0, reprobados: 0, aplazados: 0, en_proceso: 0 });
   };
 
   if (loading) {
@@ -265,6 +443,106 @@ export const CierreAnoPage = () => {
         </h1>
         <p className="text-gray-500">Proceso de cierre y promoción de estudiantes</p>
       </div>
+
+      {cierreBloqueado && (
+        <Alert variant="warning">
+          <AlertTriangle size={18} className="inline mr-2" />
+          <strong>Cierre de Año deshabilitado.</strong> Puede revisar la
+          situación de cada estudiante y las previsualizaciones con
+          normalidad; lo que no se puede ejecutar es el cierre ni la
+          promoción. Consulte con soporte técnico.
+        </Alert>
+      )}
+
+      {estado?.historiales_ambiguos?.length ? (
+        <Alert variant="error">
+          <strong>Hay estudiantes con dos resultados académicos distintos para este año.</strong> El
+          Cierre no puede continuar sobre una cuenta que no cuadra. Estudiantes:{' '}
+          {estado.historiales_ambiguos.join(', ')}.
+        </Alert>
+      ) : null}
+
+      {estado?.origen_ambiguo?.length ? (
+        <Alert variant="warning">
+          <strong>Hay más de un año escolar con promoción pendiente.</strong> Indique cuál
+          está cerrando; el sistema no lo elige por su cuenta.
+          <div className="flex flex-wrap gap-2 mt-2">
+            {/* CORE-2.2 · Antes esto solo enumeraba los años, así que pedía
+                una decisión que no se podía tomar. Ahora se elige, y esa
+                elección viaja como `ano_origen_id` explícito al estado, al
+                resumen y a la previsualización. No se guarda en la base:
+                es desambiguación de navegación, no un hecho académico. */}
+            {estado.origen_ambiguo.map(a => (
+              <Button key={a.id} variant="secondary"
+                onClick={() => elegirAnoOrigen(a.id)}>
+                {a.nombre}
+              </Button>
+            ))}
+          </div>
+        </Alert>
+      ) : null}
+
+      {estado?.errores_estructurales?.length ? (
+        <Alert variant="error">
+          <strong>Falta estructura en el año destino.</strong> No se moverá a nadie hasta
+          resolverlo: la promoción se ejecuta entera o no se ejecuta.
+          <ul className="list-disc ml-5 mt-2 text-sm">
+            {estado.errores_estructurales.slice(0, 8).map((e, i) => (
+              <li key={i}>{e.nombre_completo ?? 'Historial'}: {e.motivo}</li>
+            ))}
+          </ul>
+        </Alert>
+      ) : null}
+
+      {decisiones.length > 0 && (
+        <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
+          <div className="p-4 border-b">
+            <h3 className="font-bold text-gray-800">Decisiones pendientes de Dirección</h3>
+            <p className="text-xs text-gray-500 mt-1">
+              Estos estudiantes no están en proceso por falta de notas, sino porque falta un
+              dato que solo una persona puede aportar. Al registrarlo, su situación la vuelve
+              a calcular el motor académico — aquí no se decide «promovido» ni «reprobado».
+            </p>
+          </div>
+          <div className="divide-y">
+            {decisiones.map(d => (
+              <div key={d.estudiante_id} className="p-4 flex flex-wrap items-center gap-3">
+                <div className="min-w-[14rem]">
+                  <p className="font-medium text-gray-900">{d.nombre_completo}</p>
+                  <p className="text-xs text-gray-500">{d.curso || d.grado || ''} · {d.motivo || ''}</p>
+                </div>
+                {d.campos_requeridos.includes('alfabetizacion_inicial') && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">{etiquetaCampo.alfabetizacion_inicial}:</span>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'alfabetizacion_inicial', true)}>Lograda</Button>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'alfabetizacion_inicial', false)}>No lograda</Button>
+                  </div>
+                )}
+                {d.campos_requeridos.includes('decision_asistencia') && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">{etiquetaCampo.decision_asistencia}:</span>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'decision_asistencia', 'PERMITIR_APROBACION')}>Permitir aprobación</Button>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'decision_asistencia', 'REPETIR_GRADO')}>Repetir grado</Button>
+                  </div>
+                )}
+                {d.campos_requeridos.includes('repeticion_excepcional_segundo_ya_utilizada') && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-600">{etiquetaCampo.repeticion_excepcional_segundo_ya_utilizada}:</span>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'repeticion_excepcional_segundo_ya_utilizada', false)}>No se ha usado</Button>
+                    <Button variant="secondary" disabled={guardandoDecision === d.estudiante_id}
+                      onClick={() => registrarDecision(d, 'repeticion_excepcional_segundo_ya_utilizada', true)}>Ya se usó</Button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {message && (
         <Alert variant={message.type} onClose={() => setMessage(null)}>{message.text}</Alert>
@@ -358,12 +636,14 @@ export const CierreAnoPage = () => {
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Estudiantes</th>
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Promovidos</th>
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Reprobados</th>
+                      <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Aplazados</th>
+                      <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">En proceso</th>
                       <th className="px-4 py-3 text-center text-sm font-medium text-gray-600">Promedio</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y">
                     {resumenCursos.map(curso => (
-                      <tr key={curso.id} className="hover:bg-gray-50">
+                      <tr key={curso.nombre} className="hover:bg-gray-50">
                         <td className="px-4 py-3 font-medium">{curso.nombre}</td>
                         <td className="px-4 py-3 text-center">{curso.estudiantes}</td>
                         <td className="px-4 py-3 text-center">
@@ -373,9 +653,19 @@ export const CierreAnoPage = () => {
                           <span className="text-red-600 font-medium">{curso.reprobados}</span>
                         </td>
                         <td className="px-4 py-3 text-center">
-                          <Badge variant={curso.promedio >= 80 ? 'success' : curso.promedio >= 70 ? 'warning' : 'danger'}>
-                            {curso.promedio.toFixed(1)}
-                          </Badge>
+                          <span className="text-amber-600 font-medium">{curso.aplazados ?? 0}</span>
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          <span className="text-gray-500 font-medium">{curso.en_proceso ?? 0}</span>
+                        </td>
+                        <td className="px-4 py-3 text-center">
+                          {curso.promedio === null || curso.promedio === undefined ? (
+                            <span className="text-gray-400">—</span>
+                          ) : (
+                            <Badge variant={curso.promedio >= 80 ? 'success' : curso.promedio >= 70 ? 'warning' : 'danger'}>
+                              {curso.promedio.toFixed(1)}
+                            </Badge>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -395,7 +685,7 @@ export const CierreAnoPage = () => {
                 onClick={() => setShowConfirmCierre(true)} 
                 variant="danger"
                 icon={<Lock size={18} />}
-                disabled={!anoEscolar || anoEscolar.cerrado}
+                disabled={cierreBloqueado || !anoEscolar || anoEscolar.cerrado}
               >
                 Proceder al Cierre
               </Button>
@@ -554,16 +844,20 @@ export const CierreAnoPage = () => {
                 la promocion no se puede lanzar. La validacion definitiva del
                 POST es de Cierre de Ano; esta solo evita el clic. */}
             <p className="text-xs text-amber-700">
+              {/* CORE-1: un aplazado ya NO paraliza al colegio. Se queda en el
+                  año anterior con su recuperación pendiente, y el resto se
+                  promueve. Antes esto deshabilitaba el botón para todos. */}
               {estudiantesPromocion.some(e => !e.listo_para_decidir)
-                ? 'Hay estudiantes con proceso académico pendiente.'
+                ? `${estudiantesPromocion.filter(e => !e.listo_para_decidir).length} estudiante(s) con proceso académico abierto permanecerán en el año actual; el resto se procesará.`
                 : ''}
             </p>
             <div className="flex gap-3">
               <Button variant="secondary" onClick={() => setPaso(3)}>← Volver</Button>
               <Button
                 onClick={() => setShowConfirmPromocion(true)}
-                disabled={estudiantesPromocion.length === 0
-                  || estudiantesPromocion.some(e => !e.listo_para_decidir)}
+                disabled={cierreBloqueado
+                  || estudiantesPromocion.length === 0
+                  || estudiantesPromocion.every(e => !e.listo_para_decidir)}
                 icon={<GraduationCap size={18} />}
               >
                 Ejecutar Promoción

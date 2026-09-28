@@ -81,8 +81,26 @@ interface BoletinPrimaria {
   estudiante: { id: number; nombre: string; matricula: string; curso: string; no_lista: number | null };
   areas: AreaPrimaria[];
   promedio_general: number;
-  asistencia: { presentes: number; total: number; porcentaje: number };
+  asistencia: { presentes: number; total: number; porcentaje: number | null };
+  asistencia_anual?: AsistenciaAnual | null;
   condicion_final: { condicion: string; detalle: string } | null;
+}
+
+// ENTREGA-1 · El desglose anual de asistencia, idéntico en los dos niveles
+// porque sale del mismo helper del backend. `porcentaje` puede ser null: un
+// estudiante sin ninguna marca no tiene 0 % de asistencia, no tiene dato.
+interface AsistenciaAnual {
+  sin_registros: boolean;
+  presentes: number;
+  tardanzas: number;
+  asistencias: number;
+  ausencias: number;
+  excusas: number;
+  dias_computados: number;
+  dias_trabajados: number | null;
+  base_porcentaje: 'dias_trabajados' | 'dias_con_registro' | null;
+  pct_asistencia: number | null;
+  pct_ausencia: number | null;
 }
 
 interface Boletin {
@@ -97,9 +115,64 @@ interface Boletin {
   asistencia: {
     presentes: number;
     total: number;
-    porcentaje: number;
+    porcentaje: number | null;
   };
+  asistencia_anual?: AsistenciaAnual | null;
   promedio_general: number;
+}
+
+// La tarjeta de asistencia. Compacta, y sobre todo honesta: cuando no hay
+// una sola marca registrada NO dice «0 %» ni «0 ausencias» —eso afirmaría que
+// el estudiante no vino nunca— sino que no hay registros.
+function TarjetaAsistencia({ anual, porcentajeLegacy }: {
+  anual?: AsistenciaAnual | null;
+  porcentajeLegacy?: number | null;
+}) {
+  const vacio = !anual || anual.sin_registros;
+  return (
+    <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-200">
+      <p className="text-xs text-emerald-700 uppercase text-center">Asistencia anual</p>
+      {vacio ? (
+        <p className="text-sm text-gray-500 text-center mt-1">Sin registros de asistencia</p>
+      ) : (
+        <>
+          <p className="text-xl font-bold text-emerald-600 text-center">
+            {anual!.pct_asistencia !== null
+              ? `${anual!.pct_asistencia.toFixed(1)}%`
+              : (porcentajeLegacy != null ? `${porcentajeLegacy.toFixed(1)}%` : '—')}
+          </p>
+          <div className="mt-2 grid grid-cols-2 gap-x-3 text-xs text-gray-700">
+            <span>Asistencias: <strong>{anual!.asistencias}</strong></span>
+            <span>Tardanzas: <strong>{anual!.tardanzas}</strong></span>
+            <span>Ausencias: <strong>{anual!.ausencias}</strong></span>
+            <span>Excusas: <strong>{anual!.excusas}</strong></span>
+          </div>
+          {anual!.pct_ausencia !== null && (
+            <p className="text-xs text-gray-600 text-center mt-1">
+              Ausencia anual: <strong>{anual!.pct_ausencia.toFixed(1)}%</strong>
+            </p>
+          )}
+          {/* Cuando la dirección no declaró los días hábiles del año, el
+              porcentaje se calcula sobre los días con lista pasada. Es el
+              respaldo que el sistema ya usaba, pero se avisa en vez de
+              presentarlo como un dato firme. */}
+          {anual!.base_porcentaje === 'dias_con_registro' && (
+            <p className="text-[11px] text-amber-700 text-center mt-1">
+              Calculado sobre {anual!.dias_computados} días con lista pasada
+              (no hay días hábiles declarados para el año).
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+interface AnoEscolar {
+  id: number;
+  nombre: string;
+  activo: boolean;
+  cerrado: boolean;
 }
 
 interface Colegio {
@@ -113,6 +186,10 @@ interface Colegio {
 
 export const BoletinesPage = () => {
   const { user } = useAuth();
+  // ENTREGA-1.1 · El año del boletín. Por defecto el activo; se puede
+  // elegir uno cerrado para reemitir documentación de un año pasado.
+  const [anos, setAnos] = useState<AnoEscolar[]>([]);
+  const [anoId, setAnoId] = useState<number | null>(null);
   const [cursos, setCursos] = useState<Curso[]>([]);
   const [estudiantes, setEstudiantes] = useState<Estudiante[]>([]);
   const [cursoId, setCursoId] = useState<number | null>(null);
@@ -123,7 +200,13 @@ export const BoletinesPage = () => {
   // Descarga un PDF validando que el servidor no haya devuelto un error JSON
   const descargarPDF = async (url: string, filename: string, msgError: string) => {
     try {
-      const response = await api.get(url, { responseType: 'blob' });
+      // ENTREGA-1.1 · El año se añade AQUÍ, no en cada botón. Son seis
+      // descargas distintas y bastaba con olvidar una para que ese PDF
+      // saliera del año activo mientras la pantalla hablaba de otro.
+      const urlConAno = anoId
+        ? `${url}${url.includes('?') ? '&' : '?'}ano_id=${anoId}`
+        : url;
+      const response = await api.get(urlConAno, { responseType: 'blob' });
       if (response.data.type === 'application/json' || response.data.size < 300) {
         const texto = await response.data.text();
         try {
@@ -163,12 +246,47 @@ export const BoletinesPage = () => {
 
   useEffect(() => {
     if (cursoId) cargarEstudiantes();
-  }, [cursoId]);
+  }, [cursoId, anoId]);
+
+  // Al cambiar de año se recargan los cursos de ESE año y se limpia todo lo
+  // que colgaba del anterior. Si no, el curso de B seguiría seleccionado
+  // dentro de A y el boletín saldría de una cohorte que no existe en A.
+  const elegirAno = async (nuevo: number | null) => {
+    setAnoId(nuevo);
+    setCursoId(null);
+    setEstudianteId(null);
+    setEstudiantes([]);
+    setBoletin(null);
+    setBoletinPrim(null);
+    setError(null);
+    if (esProfesor) return;
+    try {
+      const res = await api.get('/cursos',
+        nuevo ? { params: { ano_id: nuevo } } : undefined);
+      setCursos(res.data || []);
+    } catch {
+      setCursos([]);
+    }
+  };
 
   const cargarDatosIniciales = async () => {
     try {
+      // El año va PRIMERO: los cursos que se listan son los de ese año, y
+      // mezclar los de A con los de B es justo lo que hay que evitar.
+      const anosRes = await api.get('/anos-escolares')
+        .catch(() => ({ data: [] as AnoEscolar[] }));
+      const listaAnos: AnoEscolar[] = anosRes.data || [];
+      setAnos(listaAnos);
+      // Default: el activo. Si no hay ninguno activo —un centro entre A
+      // cerrado y B sin crear— vale el más reciente, para que la pantalla
+      // siga sirviendo.
+      const anoInicial = (listaAnos.find(a => a.activo) || listaAnos[0])?.id ?? null;
+      setAnoId(anoInicial);
+
       const [cursosRes, colegioRes] = await Promise.all([
-        esProfesor ? api.get('/dashboard/profesor') : api.get('/cursos'),
+        esProfesor ? api.get('/dashboard/profesor')
+                   : api.get('/cursos', anoInicial
+                       ? { params: { ano_id: anoInicial } } : undefined),
         api.get('/configuracion/colegio')
       ]);
 
@@ -193,7 +311,12 @@ export const BoletinesPage = () => {
 
   const cargarEstudiantes = async () => {
     try {
-      const res = await api.get(`/estudiantes?curso_id=${cursoId}`);
+      // Con el año, el backend devuelve la COHORTE de ese curso en ese año:
+      // incluye a los promovidos, que ya no están físicamente en él.
+      const res = await api.get('/estudiantes', {
+        params: anoId ? { curso_id: cursoId, ano_id: anoId }
+                      : { curso_id: cursoId },
+      });
       setEstudiantes(res.data);
       setEstudianteId(null);
       setBoletin(null);
@@ -211,14 +334,16 @@ export const BoletinesPage = () => {
     try {
       // v2.13.49: cada nivel tiene su propio boletín (primaria ≠ secundaria)
       if (esPrimaria) {
-        const res = await api.get(`/boletines-primaria/estudiante/${estudianteId}`);
+        const res = await api.get(`/boletines-primaria/estudiante/${estudianteId}`,
+          anoId ? { params: { ano_id: anoId } } : undefined);
         if (res.data?.error) {
           setError(res.data.error);
         } else {
           setBoletinPrim({ ...res.data, areas: Array.isArray(res.data?.areas) ? res.data.areas : [] });
         }
       } else {
-        const res = await api.get(`/boletines/estudiante/${estudianteId}`);
+        const res = await api.get(`/boletines/estudiante/${estudianteId}`,
+          anoId ? { params: { ano_id: anoId } } : undefined);
         if (res.data?.error) {
           setError(res.data.error);
         } else {
@@ -263,10 +388,34 @@ export const BoletinesPage = () => {
         <p className="text-gray-500 mt-1">Generar reportes de calificaciones para padres</p>
       </div>
 
+      {anoId != null && anos.length > 0 && !anos.find(a => a.id === anoId)?.activo && (
+        <Alert variant="warning">
+          Está emitiendo documentación del año escolar{' '}
+          <strong>{anos.find(a => a.id === anoId)?.nombre}</strong>, que no es el
+          año en curso. Las notas, la asistencia y el curso corresponden a ese año.
+        </Alert>
+      )}
+
       {error && <Alert variant="error" onClose={() => setError(null)}>{error}</Alert>}
 
       <div className="bg-white rounded-xl shadow-sm border p-4">
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+          {/* ENTREGA-1.1 · El año va PRIMERO porque manda sobre todo lo
+              demás: los cursos que se listan, la cohorte de cada curso y el
+              contenido del boletín. El profesor no lo ve: su pantalla se
+              alimenta de sus cursos asignados, no del catálogo del año. */}
+          {!esProfesor && (
+            <Select
+              label="Año escolar"
+              value={anoId?.toString() || ''}
+              onChange={(e) => elegirAno(e.target.value ? parseInt(e.target.value) : null)}
+              options={anos.map(a => ({
+                value: a.id,
+                label: a.nombre + (a.activo ? ' (en curso)' : a.cerrado ? ' (cerrado)' : ''),
+              }))}
+              placeholder="Seleccione año"
+            />
+          )}
           <Select
             label="Curso"
             value={cursoId?.toString() || ''}
@@ -461,10 +610,8 @@ export const BoletinesPage = () => {
                 <p className="text-xs uppercase text-blue-600">Promedio General</p>
                 <p className="text-xl font-bold text-blue-700">{boletinPrim.promedio_general || '—'}</p>
               </div>
-              <div className="bg-green-50 rounded-lg p-3 text-center border border-green-200">
-                <p className="text-xs uppercase text-green-700">Asistencia</p>
-                <p className="text-xl font-bold text-green-600">{boletinPrim.asistencia.porcentaje}%</p>
-              </div>
+              <TarjetaAsistencia anual={boletinPrim.asistencia_anual}
+                                 porcentajeLegacy={boletinPrim.asistencia.porcentaje} />
               {(() => {
                 const cond = boletinPrim.condicion_final;
                 const c = cond?.condicion || '';
@@ -520,11 +667,18 @@ export const BoletinesPage = () => {
             <Button 
               onClick={() => {
                 const est = estudiantes.find(e => e.id === estudianteId);
+                // ENTREGA-1 · `|| 0` convertía «no hay datos» en «0 %», y esto
+                // se le manda al padre por WhatsApp. Ahora, sin registros, se
+                // dice que no los hay.
+                const pa = boletin.asistencia_anual?.pct_asistencia ?? null;
+                const lineaAsistencia = pa !== null
+                  ? `✅ Asistencia: ${pa.toFixed(1)}%25%0A`
+                  : `✅ Asistencia: sin registros%0A`;
                 const mensaje = `📋 *BOLETÍN DE CALIFICACIONES*%0A%0A` +
                   `👤 Estudiante: ${boletin.estudiante.nombre}%0A` +
                   `📚 Curso: ${boletin.estudiante.curso}%0A` +
                   `📊 Promedio General: ${boletin.promedio_general?.toFixed(1) || 'N/A'}%0A` +
-                  `✅ Asistencia: ${boletin.asistencia?.porcentaje?.toFixed(1) || 0}%25%0A%0A` +
+                  lineaAsistencia + `%0A` +
                   `Para ver el boletín completo, favor acercarse al colegio.`;
                 window.open(`https://wa.me/?text=${mensaje}`, '_blank');
               }} 
@@ -648,15 +802,17 @@ export const BoletinesPage = () => {
             )}
 
             {/* Resumen */}
-            <div className="mt-4 grid grid-cols-3 gap-3">
+            {/* ENTREGA-1 · Tres columnas fijas dejaban la tarjeta de
+                asistencia en unos 110 px en el móvil, y ahora lleva cuatro
+                cuentas además del porcentaje. Se apila, igual que ya hacía
+                el resumen de Primaria. */}
+            <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="bg-blue-50 rounded-lg p-3 text-center border border-blue-200">
                 <p className="text-xs text-blue-600 uppercase">Promedio General</p>
                 <p className={`text-xl font-bold ${getNotaClass(boletin.promedio_general)}`}>{boletin.promedio_general.toFixed(1)}</p>
               </div>
-              <div className="bg-emerald-50 rounded-lg p-3 text-center border border-emerald-200">
-                <p className="text-xs text-emerald-600 uppercase">Asistencia</p>
-                <p className="text-xl font-bold text-emerald-600">{boletin.asistencia.porcentaje.toFixed(0)}%</p>
-              </div>
+              <TarjetaAsistencia anual={boletin.asistencia_anual}
+                                 porcentajeLegacy={boletin.asistencia.porcentaje} />
               {(() => {
                 // v2.13.38: la situación general respeta la cascada de evaluaciones extra
                 const conNotas = (boletin.asignaturas || []).filter(a => a.cf !== null);

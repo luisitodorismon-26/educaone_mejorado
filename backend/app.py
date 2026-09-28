@@ -60,7 +60,8 @@ from models import (
     AreaCurricular, CalificacionPrimaria, RecuperacionPrimaria,
     RecuperacionPedagogicaPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
     AlertaAtendida, PushSubscription, CursoComponenteOptativo,
-    SesionNoImpartida, MOTIVOS_SESION_NO_IMPARTIDA, init_db
+    SesionNoImpartida, MOTIVOS_SESION_NO_IMPARTIDA,
+    DecisionAcademicaEstudiante, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -2891,8 +2892,1659 @@ async def update_ano_escolar(id, request: Request, db: Session = Depends(get_db)
         'campos_modificados': sorted(despues),
     }
 
+
+# ═══════════════ CIERRE DE AÑO C1 · SAFETY LOCK ═══════════════
+#
+# La auditoría C0/C0.1 reprodujo, en base local aislada, que los writers
+# académicos antiguos producen movimientos incorrectos:
+#
+#   · promueven a alumnos que NO pertenecen al año que se está cerrando,
+#     incluidos los matriculados directamente en el año nuevo;
+#   · resuelven el grado destino con `Grado.orden` GLOBAL, así que en un
+#     colegio mixto un 6.º de Secundaria aterriza en 1.º de Primaria y un
+#     6.º de Primaria queda marcado «Egresado» y desactivado;
+#   · no consultan A2: un APLAZADO se promueve por defecto y pierde de
+#     hecho su derecho a la Recuperación Especial;
+#   · no son idempotentes: una segunda ejecución mueve a todos otra vez;
+#   · `/api/promocion/ejecutar` busca el curso destino sin filtrar por año,
+#     y deja al alumno en un curso del año VIEJO.
+#
+# Ninguno de esos defectos se corrige aquí. C1 solo impide ejecutarlos
+# mientras se reconstruye el flujo, y lo hace ANTES de leer el cuerpo de la
+# petición y antes de cualquier consulta de mutación: el rechazo no puede
+# dejar la base a medias porque no llega a tocarla.
+#
+# Las LECTURAS no se tocan. Las previsualizaciones de R4 siguen intactas,
+# que es justamente lo que Dirección necesita para revisar el año.
+
+# ── RELEASE · DOS CANDADOS, PORQUE PROTEGEN COSAS DISTINTAS ──────────
+#
+# C1 puso UNA bandera delante de cuatro POST, y eso fue correcto mientras el
+# flujo se reconstruía: no había nada que habilitar. Ahora sí lo hay, y los
+# cuatro dejaron de ser lo mismo.
+#
+#   CANÓNICOS — `/api/ano-escolar/{id}/cerrar` y `/api/cierre-ano/promover`.
+#   Son el flujo nuevo, el que CORE-1 y CORE-2 construyeron: consultan A1+A2,
+#   distinguen PROMOVIDO de APLAZADO, resuelven el grado destino por (nivel,
+#   grado), bloquean con EN_PROCESO, escriben historial solo para resultados
+#   definitivos y son idempotentes. Se habilitan.
+#
+#   LEGACY — `/api/promocion/ejecutar` y `/api/ano-escolar/promover`. Mueven
+#   estudiantes sin mirar su situación académica ni el año de destino. No se
+#   arreglan y no vuelven: quedan fuera de servicio de forma permanente.
+#
+# Si compartieran bandera, habilitar el Cierre resucitaría los dos writers
+# que todo este trabajo existía para retirar. Por eso son dos.
+#
+# El candado canónico se conserva como interruptor de emergencia: ponerlo en
+# True vuelve a cerrar el Cierre entero sin tocar nada más.
+CIERRE_ANO_BLOQUEADO = False
+
+# El legacy NO es un interruptor. Está declarado para que el estado del
+# sistema pueda informarlo y para que quede escrito en el código qué política
+# rige, pero las guardas NO lo consultan: devuelven 409 sin condición. Si lo
+# consultaran, bastaría un `= False` despistado —o un parche de terceros—
+# para reactivar dos writers que corrompen expedientes. Hay una prueba que
+# lo pone en False y comprueba que los endpoints siguen rechazando.
+PROMOCION_LEGACY_BLOQUEADA = True
+
+ERROR_CIERRE_BLOQUEADO = 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO'
+ERROR_PROMOCION_LEGACY_BLOQUEADA = 'PROMOCION_LEGACY_BLOQUEADA'
+ERROR_ANO_CERRADO_NO_ACTIVABLE = 'ANO_ESCOLAR_CERRADO_NO_ACTIVABLE'
+
+_MENSAJE_CIERRE = (
+    'El Cierre de Año está temporalmente bloqueado mientras se completa el '
+    'flujo académico seguro. Las previsualizaciones siguen disponibles.'
+)
+_MENSAJE_LEGACY = (
+    'Esta vía de promoción quedó fuera de servicio: movía estudiantes sin '
+    'comprobar su situación académica ni el año escolar de destino. Use el '
+    'Cierre de Año cuando esté habilitado.'
+)
+
+
+def _bloqueo_cierre_ano(codigo=ERROR_CIERRE_BLOQUEADO, mensaje=None):
+    """La respuesta fail-closed. 409: el estado del sistema lo impide.
+
+    Se devuelve SIN tocar la base. No hay commit, ni flush, ni una sola
+    escritura pendiente en la sesión.
+    """
+    return JSONResponse({
+        'error': codigo,
+        'message': mensaje or _MENSAJE_CIERRE,
+        'bloqueado': True,
+    }, status_code=409)
+
+
+def _bloqueo_promocion_legacy():
+    """El rechazo permanente de los dos writers antiguos.
+
+    SIN condición, a propósito. Quien lea esto buscando el `if` que lo
+    activa no lo va a encontrar: no existe. `PROMOCION_LEGACY_BLOQUEADA`
+    declara la política; esta función la aplica pase lo que pase con la
+    constante, con el candado del Cierre o con cualquier configuración.
+
+    Se devuelve ANTES de leer el cuerpo de la petición y antes de cualquier
+    consulta: el rechazo no puede dejar la base a medias porque no llega a
+    tocarla.
+    """
+    return _bloqueo_cierre_ano(ERROR_PROMOCION_LEGACY_BLOQUEADA,
+                               _MENSAJE_LEGACY)
+
+
+# ═══════════════ CIERRE DE AÑO C2 · TRANSICIÓN Y COHORTE ═══════════════
+#
+# Dos defectos estructurales del writer antiguo, reproducidos en C0/C0.1:
+#
+#   1. ADIVINA EL AÑO ORIGEN. Lo deduce con «el último cerrado»
+#      (`filter_by(cerrado=True).order_by(id.desc()).first()`). Un colegio
+#      con dos años cerrados, o que reabre y vuelve a cerrar, cambia de
+#      origen sin que nadie lo decida. Nadie escribió nunca «promuevo el
+#      2025-2026»: el sistema lo supuso.
+#
+#   2. PROCESA A TODO EL TENANT. Recorre los estudiantes con `activo=True`
+#      del colegio, sin mirar a qué año pertenece su curso. Un alumno ya
+#      movido al año nuevo vuelve a moverse; uno matriculado directamente
+#      en el año nuevo se mueve sin haber cursado el anterior.
+#
+# Lo que sigue no mueve a nadie. Fija el CONTEXTO —qué año se cierra, hacia
+# qué año, y quiénes son los alumnos de ese año— y deja fuera, a propósito,
+# toda decisión académica: la situación del estudiante (A2), el grado
+# destino, el historial y las recuperaciones pertenecen a gates posteriores.
+# Mientras no estén migradas, el camino correcto es no mutar.
+#
+# Estos helpers son puros: consultan y validan. No hacen commit, ni flush,
+# ni corrigen estados. Si el año origen no está cerrado, NO se cierra: se
+# rechaza. Arreglar el estado por cuenta propia es exactamente cómo se
+# pierden datos.
+
+
+class TransicionCierreInvalida(Exception):
+    """El par (origen, destino) no describe una transición ejecutable.
+
+    Lleva un código estable para que la respuesta HTTP y los tests hablen
+    del mismo error, sin depender del texto del mensaje.
+    """
+
+    def __init__(self, codigo, mensaje, status=409):
+        super().__init__(mensaje)
+        self.codigo = codigo
+        self.mensaje = mensaje
+        self.status = status
+
+
+ERROR_TRANSICION_INCOMPLETA = 'CIERRE_TRANSICION_INCOMPLETA'
+ERROR_TRANSICION_ANOS_IGUALES = 'CIERRE_TRANSICION_ANOS_IGUALES'
+ERROR_ORIGEN_NO_CERRADO = 'CIERRE_ORIGEN_NO_CERRADO'
+ERROR_ORIGEN_TODAVIA_ACTIVO = 'CIERRE_ORIGEN_TODAVIA_ACTIVO'
+ERROR_DESTINO_NO_ACTIVO = 'CIERRE_DESTINO_NO_ACTIVO'
+ERROR_DESTINO_CERRADO = 'CIERRE_DESTINO_CERRADO'
+
+
+def _respuesta_transicion_invalida(exc):
+    """La excepción de transición, en la forma que ya usa el resto de la API."""
+    return JSONResponse({'error': exc.codigo, 'message': exc.mensaje},
+                        status_code=exc.status)
+
+
+def _resolver_transicion_cierre(db, current_user, ano_origen_id, ano_destino_id):
+    """Los DOS años de la transición, explícitos y validados. -> (origen, destino)
+
+    Quien llame dice exactamente qué año cierra y hacia dónde. No hay
+    deducción: ni «el último cerrado», ni «el activo», ni el ID más alto.
+
+    Los dos años se resuelven con `get_tenant_or_404`, así que un ID de otro
+    colegio responde 404 igual que uno inexistente: el rechazo no revela si
+    el recurso existe en otro tenant.
+
+    Levanta `TransicionCierreInvalida` —fail-closed— si el par no describe
+    una transición ejecutable. NUNCA corrige el estado de un año.
+    """
+    if ano_origen_id is None or ano_destino_id is None:
+        raise TransicionCierreInvalida(
+            ERROR_TRANSICION_INCOMPLETA,
+            'Hay que indicar el año que se cierra y el año al que se '
+            'promueve. Esta operación no los adivina.',
+            status=400)
+
+    # Primero resolver —tenant-safe— y solo después comparar. Al revés, dos
+    # IDs iguales de otro colegio se distinguirían de dos IDs distintos de
+    # otro colegio, y eso ya es información sobre un tenant ajeno.
+    origen = get_tenant_or_404(db, AnoEscolar, ano_origen_id, current_user,
+                               name='anoescolar')
+    destino = get_tenant_or_404(db, AnoEscolar, ano_destino_id, current_user,
+                                name='anoescolar')
+
+    if origen.id == destino.id:
+        raise TransicionCierreInvalida(
+            ERROR_TRANSICION_ANOS_IGUALES,
+            'El año de origen y el de destino son el mismo (%s).' % origen.nombre)
+
+    # El origen tiene que estar CERRADO: promover desde un año abierto
+    # significa mover alumnos cuyas notas todavía pueden cambiar.
+    if not getattr(origen, 'cerrado', False):
+        raise TransicionCierreInvalida(
+            ERROR_ORIGEN_NO_CERRADO,
+            'El año %s todavía no está cerrado. Ciérrelo antes de promover.'
+            % origen.nombre)
+
+    # Y no puede seguir siendo el año en curso. Media aplicación resuelve
+    # «el año actual» con `filter_by(activo=True)`; promover desde el año
+    # activo dejaría las recuperaciones apuntando al año que se vacía.
+    if getattr(origen, 'activo', False):
+        raise TransicionCierreInvalida(
+            ERROR_ORIGEN_TODAVIA_ACTIVO,
+            'El año %s sigue marcado como activo. No se puede promover '
+            'desde el año en curso.' % origen.nombre)
+
+    if not getattr(destino, 'activo', False):
+        raise TransicionCierreInvalida(
+            ERROR_DESTINO_NO_ACTIVO,
+            'El año %s no es el año en curso. Actívelo antes de promover '
+            'hacia él.' % destino.nombre)
+
+    if getattr(destino, 'cerrado', False):
+        raise TransicionCierreInvalida(
+            ERROR_DESTINO_CERRADO,
+            'El año %s está cerrado: no se puede promover hacia él.'
+            % destino.nombre)
+
+    return origen, destino
+
+
+CONDICIONES_DEFINITIVAS = (RAC.PA.PROMOVIDO, RAC.PA.REPROBADO)
+
+DIAG_HISTORIAL_DUPLICADO = 'HISTORIAL_ACADEMICO_DUPLICADO_PARA_ESTUDIANTE_Y_ANO'
+ERROR_HISTORIAL_DUPLICADO = 'HISTORIAL_ACADEMICO_DUPLICADO'
+
+
+def _historiales_definitivos_del_ano(db, current_user, ano):
+    """Quién ya quedó CERRADO académicamente en ese año.
+
+    -> ({estudiante_id: HistorialAcademico}, [ambiguos], [legacy_duplicados])
+
+    `HistorialAcademico` lleva años recibiendo dos cosas distintas en la
+    misma columna, y confundirlas tiene consecuencias opuestas:
+
+      · CANÓNICO — `condicion` es exactamente PROMOVIDO o REPROBADO, que son
+        los valores que produce A2. Lo escribió el Cierre nuevo. Eso SÍ
+        demuestra que el estudiante ya fue procesado.
+
+      · LEGACY — cualquier otra cosa: «activo», «Inscrito», «Promovido»
+        (con minúsculas distintas), «Egresado», None… El writer antiguo
+        copiaba `Estudiante.condicion`, que es un campo de matrícula, y lo
+        guardaba como si fuera un resultado académico. NO demuestra nada.
+
+    CORE-2.1 · Antes esta función devolvía los duplicados SIN mirar la
+    condición, así que dos filas legacy del mismo estudiante —que no
+    afirman ningún resultado— bloqueaban el cierre, la promoción y la
+    reapertura de un colegio donde el proceso nuevo jamás había corrido.
+    La ambigüedad que importa es la CANÓNICA: dos resultados académicos
+    distintos para el mismo estudiante y año, o el mismo dos veces. Eso sí
+    hay que pararlo, porque elegir uno sería decidir cuál de las dos
+    verdades vale sin haber verificado ninguna.
+
+    Aquí no se borra ni se repara nada. Se clasifica y se informa.
+    """
+    if ano is None:
+        return {}, [], []
+    filas = (
+        tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
+                      current_user)
+        .filter(HistorialAcademico.ano_escolar_id == ano.id)
+        .order_by(HistorialAcademico.id)
+        .all()
+    )
+
+    canonicos, legacy = {}, {}
+    for h in filas:
+        destino = (canonicos if h.condicion in CONDICIONES_DEFINITIVAS
+                   else legacy)
+        destino.setdefault(h.estudiante_id, []).append(h)
+
+    # Un solo canónico: ese es el estado académico, aunque el estudiante
+    # arrastre además filas legacy. Las legacy no sustituyen al canónico, no
+    # crean un segundo estado y no generan ambigüedad.
+    definitivos = {k: v[0] for k, v in canonicos.items() if len(v) == 1}
+
+    # Dos o más canónicos: AMBIGÜEDAD REAL. Fail-closed.
+    ambiguos = sorted(k for k, v in canonicos.items() if len(v) > 1)
+
+    # Duplicados solo legacy: diagnóstico, nunca bloqueo.
+    legacy_duplicados = sorted(k for k, v in legacy.items()
+                               if len(v) > 1 and k not in canonicos)
+
+    return definitivos, ambiguos, legacy_duplicados
+
+
+def _candidatos_pendientes_del_ano_origen(db, current_user, ano_origen):
+    """Quiénes siguen SIN procesar en el año origen. -> (candidatos, diag)
+
+    OJO CON EL NOMBRE: esto NO es la cohorte histórica del año. Es el
+    conjunto de estudiantes ACTIVOS cuyo curso ACTUAL todavía pertenece al
+    año origen, es decir, los que aún no se movieron. Quien ya fue promovido
+    desaparece de aquí, y eso es deliberado —de ahí sale la idempotencia—,
+    pero significa que esta función no sirve para preguntar «quiénes
+    cursaron 2025-2026»: para eso está el historial.
+
+    Un estudiante es candidato solo si las cinco cosas se cumplen a la vez:
+    es del tenant, está activo, tiene curso, ese curso es del MISMO colegio,
+    y pertenece al año origen. El JOIN con Curso hace el trabajo: quien ya
+    fue movido al año nuevo, quien se matriculó directamente en él y quien
+    está en un tercer año quedan fuera sin necesidad de ninguna marca.
+
+    La condición de colegio sobre el CURSO no es redundante. `tenant_filter`
+    solo mira `Estudiante.colegio_id`; una fila histórica corrupta
+    —estudiante del colegio A apuntando a un curso del colegio B— pasaría el
+    filtro del estudiante y entraría por la puerta del curso. Aquí no entra,
+    y el rechazo no dice nada sobre el colegio B.
+
+    De ahí sale la idempotencia secuencial: cuando un alumno pasa a un curso
+    del año destino deja de cumplir la condición, así que una segunda
+    ejecución de la misma transición ya no lo encuentra. (Dos ejecuciones
+    SIMULTÁNEAS son otro problema, y se resuelve en el gate de bloqueos.)
+
+    Los alumnos activos sin curso se devuelven aparte, como diagnóstico. No
+    pertenecen a ningún año, así que no se les puede inventar un destino;
+    ocultarlos sería peor, porque alguien tiene que mirarlos.
+
+    Consulta, no escribe. `joinedload` evita el N+1 de leer `curso` y
+    `grado` uno por uno.
+    """
+    candidatos = (
+        tenant_filter(db.query(Estudiante), Estudiante, current_user)
+        .join(Curso, Estudiante.curso_id == Curso.id)
+        .options(joinedload(Estudiante.curso).joinedload(Curso.grado))
+        .filter(Estudiante.activo.is_(True),
+                Curso.ano_escolar_id == ano_origen.id,
+                Curso.colegio_id == Estudiante.colegio_id,
+                Curso.colegio_id == ano_origen.colegio_id)
+        .order_by(Estudiante.id)
+        .all()
+    )
+
+    sin_curso = (
+        tenant_filter(db.query(Estudiante), Estudiante, current_user)
+        .filter(Estudiante.activo.is_(True), Estudiante.curso_id.is_(None))
+        .order_by(Estudiante.id)
+        .all()
+    )
+
+    # CORE-2 · Un 6.o de Secundaria PROMOVIDO se queda físicamente en su
+    # curso del año origen —no egresa, no se desactiva y no hay grado 7—, así
+    # que el filtro por curso volvía a encontrarlo en cada reintento y su
+    # finalización se procesaba una y otra vez. Ya no: quien tiene historial
+    # DEFINITIVO de este año está académicamente cerrado, siga donde siga
+    # sentado. La pertenencia física deja de ser la única señal.
+    #
+    # Y sigue distinguiéndose del APLAZADO, que también permanece en el año
+    # origen: aquel no tiene historial definitivo, justamente porque su
+    # proceso no terminó.
+    definitivos, ambiguos, legacy_duplicados = \
+        _historiales_definitivos_del_ano(db, current_user, ano_origen)
+    candidatos = [e for e in candidatos if e.id not in definitivos]
+
+    return candidatos, {
+        'ano_origen_id': ano_origen.id,
+        'total_candidatos': len(candidatos),
+        'activos_sin_curso': [e.id for e in sin_curso],
+        'ya_finalizados': sorted(definitivos),
+        # Ambigüedad CANÓNICA: dos resultados académicos para el mismo
+        # estudiante y año. Bloquea.
+        'historiales_ambiguos': ambiguos,
+        # Duplicados solo legacy: se informan, no bloquean nada.
+        'historiales_legacy_duplicados': legacy_duplicados,
+    }
+
+
+# ═══════════════ CIERRE DE AÑO CORE-1 · NÚCLEO CANÓNICO ═══════════════
+#
+# Aquí vive la promoción de verdad. Sigue detrás del candado de C1: nada de
+# esto es alcanzable por HTTP mientras `CIERRE_ANO_BLOQUEADO` sea True.
+#
+# Tres decisiones que conviene tener presentes al leer:
+#
+#   · LA VERDAD ACADÉMICA VIENE DE A1+A2, SIEMPRE. Aquí no hay ningún
+#     `if promedio >= 70`, ningún `overrides.get(id, 'promueve')` y ningún
+#     quinto estado. Se consulta el mismo motor que ya usan los boletines y
+#     la previsualización de Dirección; si alguna vez discrepan será porque
+#     alguien dejó de llamar aquí.
+#
+#   · SE PLANIFICA ENTERO ANTES DE ESCRIBIR NADA. Primero se arma el plan de
+#     todos los estudiantes, con su destino y sus bloqueos; después, y solo
+#     si el plan está armado, se aplica. Una transición no puede quedarse a
+#     medias porque el alumno 17 tuviera el curso destino duplicado.
+#
+#   · UN APLAZADO NO PARALIZA AL COLEGIO. Los estudiantes con proceso abierto
+#     se quedan donde están y se informan; los definitivos se mueven. Lo
+#     contrario condenaría a 300 alumnos a esperar por uno.
+
+
+ACCION_PROMUEVE = 'promueve'
+ACCION_REPITE = 'repite'
+ACCION_SIN_MOVIMIENTO = 'sin_movimiento'
+ACCION_FINALIZA_NIVEL = 'finaliza_nivel'
+
+# Condición ADMINISTRATIVA con la que el estudiante entra al año nuevo. Son
+# los valores que el resto de EducaOne ya usa (el selector de Estudiantes los
+# ofrece tal cual): no se inventa ninguno. Es un campo de matrícula, no la
+# verdad académica —esa sigue estando en A2 y en el historial—.
+CONDICION_ADMIN = {
+    RAC.PA.PROMOVIDO: 'promovido',
+    RAC.PA.REPROBADO: 'repitente',
+}
+
+ERROR_CIERRE_ESTRUCTURA_ROTA = 'CIERRE_ESTRUCTURA_DESTINO_INCOMPLETA'
+
+# Bloqueos que NO son errores estructurales: el estudiante simplemente no
+# está listo. No impiden mover a los demás.
+BLOQUEOS_NO_ESTRUCTURALES = ('PROCESO_ACADEMICO_ABIERTO',)
+
+DIAG_CURSO_DESTINO_INEXISTENTE = 'NO_HAY_CURSO_EN_EL_ANO_DESTINO_PARA_ESE_GRADO'
+DIAG_CURSO_DESTINO_AMBIGUO = 'VARIOS_CURSOS_DESTINO_INDISTINGUIBLES'
+DIAG_PROCESO_ABIERTO = 'PROCESO_ACADEMICO_ABIERTO'
+DIAG_FIN_DE_NIVEL_SIN_EGRESO = 'FIN_DE_SECUNDARIA_SIN_PROCESO_DE_EGRESO'
+
+
+def _situaciones_por_estudiante(db, current_user, estudiantes, ano):
+    """La situación canónica de una lista concreta de estudiantes.
+
+    Agrupa por curso y precarga por bloque: una precarga curricular y unas
+    pocas consultas por CURSO, no por estudiante. Es el mismo trabajo que
+    hacía la previsualización, extraído para que el writer y la pantalla
+    consuman exactamente el mismo cálculo —si se duplicara, volverían las
+    cuatro verdades que R4 vino a eliminar—.
+
+    LECTURA PURA. Devuelve {estudiante_id: paquete de A2}.
+    """
+    paquetes = {}
+    if not estudiantes:
+        return paquetes
+
+    por_curso = {}
+    for est in estudiantes:
+        por_curso.setdefault(est.curso_id, []).append(est)
+
+    for curso_id, alumnos in por_curso.items():
+        curso = alumnos[0].curso if curso_id is not None else None
+        if curso is None or ano is None:
+            # Sin curso no hay grado, y sin grado no hay norma aplicable. El
+            # estudiante NO se omite: sale EN_PROCESO y con el motivo.
+            for est in alumnos:
+                paquetes[est.id] = RAC.construir_situacion_estudiante(
+                    None, None, [], None, {},
+                    diagnosticos=[DIAG_ESTUDIANTE_SIN_CURSO])
+            continue
+
+        ids = [e.id for e in alumnos]
+        precarga = _precarga_curso_canonica(db, current_user, curso, ano,
+                                            estudiante_ids=ids)
+        asistencias = _asistencias_estudiantes(db, current_user, ids, ano)
+        decisiones = _decisiones_de_estudiantes(db, current_user, ids, ano)
+
+        if precarga['nivel'] == RAC.RA.NIVEL_SECUNDARIA:
+            comps = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, CalificacionSecundaria)
+            extras = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, EvaluacionExtraSecundaria)
+            for est in alumnos:
+                paquetes[est.id] = _situacion_canonica_secundaria(
+                    db, current_user, est, ano, precarga,
+                    competencias_por_asig=comps.get(est.id, {}),
+                    extras_por_asig={k: v[0] for k, v
+                                     in (extras.get(est.id) or {}).items() if v},
+                    asistencias=asistencias.get(est.id, []),
+                    decision=decisiones.get(est.id))
+        else:
+            comps = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, CalificacionPrimaria)
+            recs = _datos_academicos_estudiantes(
+                db, current_user, ids, ano, RecuperacionPrimaria)
+            for est in alumnos:
+                paquetes[est.id] = _situacion_canonica_primaria(
+                    db, current_user, est, ano, precarga,
+                    competencias_por_asig=comps.get(est.id, {}),
+                    recuperaciones_por_asig={k: v[0] for k, v
+                                             in (recs.get(est.id) or {}).items() if v},
+                    asistencias=asistencias.get(est.id, []),
+                    decision=decisiones.get(est.id))
+
+    return paquetes
+
+
+def _fila_desde_historial(historial, estudiante, grado=None, curso=None):
+    """La fila de un estudiante YA cerrado, reconstruida desde su historial.
+
+    Aquí NO se recalcula nada. Sus notas son del año origen, pero su curso
+    actual puede ser ya del año destino: volver a pasarlo por A2 mezclaría
+    las notas de un año con el grado y el currículo del otro, que es
+    exactamente el defecto que C0.1 §4 reprodujo. El historial guarda el año,
+    el grado y el curso de ORIGEN precisamente para no tener que adivinarlo.
+    """
+    # `HistorialAcademico` guarda `grado_id` y `curso_id` pero NO declara
+    # relaciones, así que `historial.grado` no existe y devolvía None en
+    # silencio: la fila salía sin grado justo en el caso que este camino
+    # existe para resolver. Se resuelven fuera, en bloque, y se pasan.
+    condicion = historial.condicion
+    return {
+        'id': estudiante.id if estudiante is not None else historial.estudiante_id,
+        'estudiante_id': historial.estudiante_id,
+        'nombre_completo': (getattr(estudiante, 'nombre_completo', None)
+                            or 'Estudiante %s' % historial.estudiante_id),
+        'matricula': getattr(estudiante, 'matricula', None),
+        'curso': getattr(curso, 'nombre_completo', None),
+        'curso_id': historial.curso_id,
+        'grado': getattr(grado, 'nombre', None),
+        'grado_id': historial.grado_id,
+        'condicion_canonica': condicion,
+        'condicion': CONDICION_UI.get(condicion, 'en_proceso'),
+        'promedio_general': historial.promedio_final,
+        'porcentaje_asistencia': historial.asistencia_porcentaje,
+        'procesado': True,
+        'origen_del_dato': 'historial',
+        'motivo': None,
+        'bloqueos': [],
+        'advertencias': [],
+        'diagnosticos': [],
+        'listo_para_decidir': True,
+        'accion_sugerida': None,
+    }
+
+
+def _vista_cohorte_ano(db, current_user, ano):
+    """LA cohorte del año, entera y sin duplicados. -> dict
+
+    Un año en transición tiene a su gente repartida en dos sitios, y la
+    pantalla de Dirección tiene que verlos a todos:
+
+      · PENDIENTES  — su curso sigue siendo del año origen. Su situación se
+        calcula en vivo con A1/A2, porque todavía puede cambiar: un APLAZADO
+        que apruebe su Especial pasa a PROMOVIDO esta misma tarde.
+
+      · PROCESADOS  — ya tienen historial definitivo de este año. Su
+        situación se LEE del historial. No se recalcula y no se vuelve a
+        decidir: eso ya ocurrió, y rehacerlo con su curso actual del año
+        siguiente daría un resultado distinto y falso.
+
+    Cada estudiante aparece UNA vez. Si alguien tuviera historial definitivo
+    y además siguiera en un curso del año origen —el 6.o de Secundaria es el
+    caso normal— manda el historial: está cerrado.
+
+    Si aparecen historiales duplicados, la vista no elige: lo declara y se
+    marca como no fiable, para que nadie cierre un año sobre una cuenta que
+    no cuadra.
+    """
+    definitivos, ambiguos_historial, legacy_duplicados = \
+        _historiales_definitivos_del_ano(db, current_user, ano)
+
+    pendientes, diagnostico = _candidatos_pendientes_del_ano_origen(
+        db, current_user, ano) if ano is not None else ([], {})
+
+    paquetes = _situaciones_por_estudiante(db, current_user, pendientes, ano)
+    indice_grados, ambiguos = _indice_grados_canonico(db, current_user)
+
+    filas = []
+    for est in pendientes:
+        paquete = paquetes.get(est.id)
+        if paquete is None:
+            continue
+        grado_actual = getattr(est.curso, 'grado', None) if est.curso else None
+        fila = _fila_preview(est, paquete, indice_grados, ambiguos, grado_actual)
+        fila['estudiante_id'] = est.id
+        fila['procesado'] = False
+        fila['origen_del_dato'] = 'calculo'
+        filas.append(fila)
+
+    if definitivos:
+        estudiantes = {
+            e.id: e for e in
+            tenant_filter(db.query(Estudiante), Estudiante, current_user)
+            .filter(Estudiante.id.in_(list(definitivos))).all()
+        }
+        # Los grados y cursos de ORIGEN, en dos consultas y no en 2N.
+        ids_grado = {h.grado_id for h in definitivos.values() if h.grado_id}
+        ids_curso = {h.curso_id for h in definitivos.values() if h.curso_id}
+        grados = {g.id: g for g in
+                  tenant_filter(db.query(Grado), Grado, current_user)
+                  .filter(Grado.id.in_(list(ids_grado))).all()} if ids_grado else {}
+        cursos = {c.id: c for c in
+                  tenant_filter(db.query(Curso), Curso, current_user)
+                  .filter(Curso.id.in_(list(ids_curso))).all()} if ids_curso else {}
+        for est_id, historial in definitivos.items():
+            filas.append(_fila_desde_historial(
+                historial, estudiantes.get(est_id),
+                grado=grados.get(historial.grado_id),
+                curso=cursos.get(historial.curso_id)))
+
+    # Los activos SIN curso no pertenecen a ningún año, así que el JOIN los
+    # deja fuera de los candidatos —correcto: no se les puede mover—. Pero no
+    # pueden desaparecer de la pantalla: un estudiante sin curso es un
+    # problema que alguien tiene que ver, y ocultarlo es peor que mostrarlo
+    # como pendiente de resolver.
+    ya_listados = {f.get('estudiante_id') for f in filas}
+    sin_curso = (
+        tenant_filter(db.query(Estudiante), Estudiante, current_user)
+        .filter(Estudiante.activo.is_(True), Estudiante.curso_id.is_(None))
+        .order_by(Estudiante.id).all())
+    for est in sin_curso:
+        if est.id in ya_listados:
+            continue
+        paquete = RAC.construir_situacion_estudiante(
+            None, None, [], None, {},
+            diagnosticos=[DIAG_ESTUDIANTE_SIN_CURSO])
+        fila = _fila_preview(est, paquete, indice_grados, ambiguos, None)
+        fila['estudiante_id'] = est.id
+        fila['procesado'] = False
+        fila['origen_del_dato'] = 'calculo'
+        filas.append(fila)
+
+    filas.sort(key=lambda f: ((f.get('curso') or ''),
+                              (f.get('nombre_completo') or '')))
+
+    conteo = {'promovido': 0, 'reprobado': 0, 'aplazado': 0, 'en_proceso': 0}
+    for f in filas:
+        conteo[f.get('condicion', 'en_proceso')] = \
+            conteo.get(f.get('condicion', 'en_proceso'), 0) + 1
+
+    return {
+        'ano_escolar_id': getattr(ano, 'id', None),
+        'ano_escolar': getattr(ano, 'nombre', None),
+        'ano_cerrado': bool(getattr(ano, 'cerrado', False)),
+        'filas': filas,
+        'totales': {
+            'estudiantes': len(filas),
+            'promovidos': conteo['promovido'],
+            'reprobados': conteo['reprobado'],
+            'aplazados': conteo['aplazado'],
+            'en_proceso': conteo['en_proceso'],
+            'procesados': sum(1 for f in filas if f.get('procesado')),
+            'pendientes': sum(1 for f in filas if not f.get('procesado')),
+        },
+        'activos_sin_curso': diagnostico.get('activos_sin_curso', []),
+        # `fiable` mide UNA cosa: si la situación académica del año se puede
+        # leer sin adivinar. Dos filas legacy no la hacen ilegible —no
+        # afirman ningún resultado—; dos canónicas sí.
+        'historiales_ambiguos': ambiguos_historial,
+        'historiales_legacy_duplicados': legacy_duplicados,
+        'fiable': not ambiguos_historial,
+    }
+
+
+def _grado_destino_canonico(indice_grados, ambiguos, nivel, grado_numero,
+                            condicion, grado_actual):
+    """El Grado al que va el estudiante. -> (Grado | None, diagnostico | None)
+
+    `Grado.orden + 1` NO sirve: es un contador global repartido entre los
+    planes contratados, así que en un colegio mixto 6.º de Secundaria (orden
+    6) tiene como "siguiente" a 1.º de Primaria (orden 7). El destino se
+    resuelve por (nivel, número académico), que es lo único que la Ordenanza
+    conoce.
+
+    · PROMOVIDO de 6.º de Primaria pasa a 1.º de Secundaria.
+    · PROMOVIDO de 6.º de Secundaria NO tiene grado siguiente y NO es un
+      egresado: termina el nivel, y la titulación depende de las Pruebas
+      Nacionales, que EducaOne no conoce.
+    · REPROBADO repite el grado que ya cursa.
+    · APLAZADO y EN_PROCESO no tienen destino: todavía no hay decisión.
+    """
+    if condicion in (RAC.PA.APLAZADO, RAC.PA.EN_PROCESO):
+        return None, DESTINO_PROCESO_ABIERTO
+    if condicion == RAC.PA.REPROBADO:
+        return grado_actual, (None if grado_actual is not None
+                              else DESTINO_SIN_GRADO_SIGUIENTE)
+    if condicion != RAC.PA.PROMOVIDO:
+        return None, DESTINO_PROCESO_ABIERTO
+
+    if nivel is None or grado_numero is None:
+        return None, DESTINO_SIN_GRADO_SIGUIENTE
+
+    if nivel == RAC.RA.NIVEL_SECUNDARIA and grado_numero >= 6:
+        return None, DESTINO_TITULACION_PENDIENTE
+
+    if nivel == RAC.RA.NIVEL_PRIMARIA and grado_numero >= 6:
+        clave = (RAC.RA.NIVEL_SECUNDARIA, 1)
+    else:
+        clave = (nivel, grado_numero + 1)
+
+    if clave in ambiguos:
+        return None, DESTINO_AMBIGUO
+    grado = indice_grados.get(clave)
+    if grado is None:
+        return None, DESTINO_SIN_GRADO_SIGUIENTE
+    return grado, None
+
+
+def _cursos_del_ano_destino(db, current_user, ano_destino):
+    """Índice {grado_id: [cursos]} del año destino. Una sola consulta."""
+    indice = {}
+    cursos = (
+        tenant_filter(db.query(Curso), Curso, current_user)
+        .filter(Curso.ano_escolar_id == ano_destino.id,
+                Curso.activo.is_(True),
+                Curso.colegio_id == ano_destino.colegio_id)
+        .order_by(Curso.id)
+        .all()
+    )
+    for c in cursos:
+        indice.setdefault(c.grado_id, []).append(c)
+    return indice
+
+
+def _curso_destino_canonico(cursos_destino, grado_destino, curso_origen):
+    """El curso concreto del año destino. -> (Curso | None, diagnostico | None)
+
+    Fail-closed en los dos extremos. Si no hay ningún curso del grado en el
+    año destino, no se inventa: Dirección tiene `clonar-cursos` para crear la
+    estructura, y crearla aquí a escondidas sería fabricar matrícula. Si hay
+    varios y no se pueden distinguir, tampoco se elige: un `.first()` mandaría
+    al alumno a la sección que devolviera antes la base de datos.
+
+    Para desempatar se usa lo que define una sección en EducaOne: la tanda
+    primero —un alumno de matutina no puede amanecer en vespertina— y después
+    el nombre de la sección, que es lo que hace que «3ro A» continúe en
+    «4to A».
+    """
+    candidatos = list(cursos_destino.get(getattr(grado_destino, 'id', None), ()))
+    if not candidatos:
+        return None, DIAG_CURSO_DESTINO_INEXISTENTE
+    if len(candidatos) == 1:
+        return candidatos[0], None
+
+    tanda_origen = getattr(curso_origen, 'tanda_id', None)
+    if tanda_origen is not None:
+        misma_tanda = [c for c in candidatos if c.tanda_id == tanda_origen]
+        if len(misma_tanda) == 1:
+            return misma_tanda[0], None
+        if misma_tanda:
+            candidatos = misma_tanda
+
+    nombre_origen = (getattr(curso_origen, 'nombre', '') or '').strip().lower()
+    if nombre_origen:
+        mismo_nombre = [c for c in candidatos
+                        if (c.nombre or '').strip().lower() == nombre_origen]
+        if len(mismo_nombre) == 1:
+            return mismo_nombre[0], None
+
+    return None, DIAG_CURSO_DESTINO_AMBIGUO
+
+
+def _asistencia_del_paquete(paquete):
+    """El % de ausencias que A2 ya calculó, para guardarlo en el historial."""
+    contexto = paquete.get('contexto') or {}
+    pct = contexto.get('porcentaje_ausencias_no_justificadas')
+    if isinstance(pct, (int, float)) and not isinstance(pct, bool):
+        return round(100.0 - float(pct), 1)
+    return None
+
+
+def _plan_cierre(db, current_user, ano_origen, ano_destino):
+    """El plan COMPLETO de la transición, sin escribir una sola fila.
+
+    Se calcula entero y se valida antes de tocar la base. Cada fila dice qué
+    va a pasar con ese estudiante y por qué; las que no pueden ejecutarse
+    quedan marcadas con su diagnóstico en vez de intentarse a medias.
+
+    Política de lote, elegida a propósito: se procesan los definitivos y se
+    informan los bloqueados uno por uno. Un APLAZADO no es un error —es un
+    estudiante a mitad de su proceso— y no puede impedir que el resto del
+    colegio avance. Un destino ambiguo o inexistente SÍ es un defecto
+    estructural, pero se contiene en ese estudiante: aborta su movimiento, no
+    el del colegio. Todo lo que sí se ejecuta va en UNA transacción, así que
+    o entra completo o no entra nada.
+    """
+    candidatos, diagnostico = _candidatos_pendientes_del_ano_origen(
+        db, current_user, ano_origen)
+    paquetes = _situaciones_por_estudiante(db, current_user, candidatos,
+                                           ano_origen)
+    indice_grados, ambiguos = _indice_grados_canonico(db, current_user)
+    cursos_destino = _cursos_del_ano_destino(db, current_user, ano_destino)
+
+    filas = []
+    for est in candidatos:
+        paquete = paquetes.get(est.id)
+        if paquete is None:
+            continue
+        situacion = paquete['situacion']
+        condicion = situacion['condicion']
+        curso_origen = est.curso
+        grado_origen = getattr(curso_origen, 'grado', None)
+
+        fila = {
+            'estudiante_id': est.id,
+            'nombre_completo': est.nombre_completo,
+            'ano_origen_id': ano_origen.id,
+            'curso_origen_id': getattr(curso_origen, 'id', None),
+            'curso_origen': getattr(curso_origen, 'nombre_completo', None),
+            'grado_origen_id': getattr(grado_origen, 'id', None),
+            'grado_origen': getattr(grado_origen, 'nombre', None),
+            'nivel': paquete['nivel'],
+            'grado_numero': paquete['grado_numero'],
+            'condicion_canonica': condicion,
+            'condicion_ui': CONDICION_UI.get(condicion, 'en_proceso'),
+            'motivo': situacion.get('motivo'),
+            'promedio': _promedio_informativo(paquete['resultados']),
+            'asistencia': _asistencia_del_paquete(paquete),
+            'diagnosticos': list(paquete['diagnosticos']),
+            'accion': ACCION_SIN_MOVIMIENTO,
+            'grado_destino_id': None,
+            'grado_destino': None,
+            'curso_destino_id': None,
+            'curso_destino': None,
+            'condicion_administrativa': None,
+            'escribe_historial': False,
+            'bloqueo': None,
+        }
+
+        # APLAZADO y EN_PROCESO se quedan donde están. No es un fallo: es que
+        # todavía no hay decisión, y moverlos la daría por hecha.
+        if condicion in (RAC.PA.APLAZADO, RAC.PA.EN_PROCESO):
+            fila['bloqueo'] = DIAG_PROCESO_ABIERTO
+            filas.append(fila)
+            continue
+
+        grado_destino, diag_grado = _grado_destino_canonico(
+            indice_grados, ambiguos, paquete['nivel'], paquete['grado_numero'],
+            condicion, grado_origen)
+
+        # 6.º de Secundaria PROMOVIDO: termina el nivel. NO se le pone
+        # `egresado`, NO se le desactiva y NO se le inventa un 7.º grado. Su
+        # resultado académico sí queda en el historial; el proceso de egreso
+        # y titulación no existe todavía en EducaOne y se declara como GAP.
+        if diag_grado == DESTINO_TITULACION_PENDIENTE:
+            fila['accion'] = ACCION_FINALIZA_NIVEL
+            fila['escribe_historial'] = True
+            fila['diagnosticos'].append(DIAG_FIN_DE_NIVEL_SIN_EGRESO)
+            filas.append(fila)
+            continue
+
+        if grado_destino is None:
+            fila['bloqueo'] = diag_grado or DESTINO_SIN_GRADO_SIGUIENTE
+            filas.append(fila)
+            continue
+
+        curso_destino, diag_curso = _curso_destino_canonico(
+            cursos_destino, grado_destino, curso_origen)
+        if curso_destino is None:
+            fila['grado_destino_id'] = grado_destino.id
+            fila['grado_destino'] = grado_destino.nombre
+            fila['bloqueo'] = diag_curso
+            filas.append(fila)
+            continue
+
+        fila['accion'] = (ACCION_PROMUEVE if condicion == RAC.PA.PROMOVIDO
+                          else ACCION_REPITE)
+        fila['grado_destino_id'] = grado_destino.id
+        fila['grado_destino'] = grado_destino.nombre
+        fila['curso_destino_id'] = curso_destino.id
+        fila['curso_destino'] = curso_destino.nombre_completo
+        fila['condicion_administrativa'] = CONDICION_ADMIN[condicion]
+        fila['escribe_historial'] = True
+        filas.append(fila)
+
+    # CORE-2 · Un estudiante DEFINITIVO sin destino válido no es «uno que se
+    # queda»: es una estructura rota. CORE-1 lo saltaba y movía al resto, lo
+    # que dejaba la transición a medias y dependiente del orden de la lista.
+    # Ahora aborta el lote entero, sin escribir nada: Dirección arregla el
+    # curso que falta —o el duplicado— y reintenta sobre un estado limpio.
+    # Es más seguro y mucho más fácil de recuperar que 299 movidos y uno no.
+    #
+    # El 6.o de Secundaria que finaliza nivel NO entra aquí: no tener grado
+    # siguiente es su resultado correcto, no un defecto de configuración.
+    errores = [
+        {'estudiante_id': f['estudiante_id'],
+         'nombre_completo': f['nombre_completo'],
+         'grado_origen': f['grado_origen'],
+         'motivo': f['bloqueo']}
+        for f in filas
+        if f['bloqueo'] and f['bloqueo'] not in BLOQUEOS_NO_ESTRUCTURALES
+    ]
+    if diagnostico.get('historiales_ambiguos'):
+        # Solo la ambigüedad CANÓNICA es un error estructural. Un estudiante
+        # con dos resultados académicos distintos para el mismo año no se
+        # puede mover sin decidir cuál vale, y eso no lo decide el código.
+        errores.append({
+            'estudiante_id': None,
+            'nombre_completo': None,
+            'grado_origen': None,
+            'motivo': '%s: %s' % (DIAG_HISTORIAL_DUPLICADO,
+                                  diagnostico['historiales_ambiguos']),
+        })
+
+    resumen = {
+        'ano_origen_id': ano_origen.id,
+        'ano_origen': ano_origen.nombre,
+        'ano_destino_id': ano_destino.id,
+        'ano_destino': ano_destino.nombre,
+        'total': len(filas),
+        'promovidos': sum(1 for f in filas
+                          if f['condicion_canonica'] == RAC.PA.PROMOVIDO),
+        'reprobados': sum(1 for f in filas
+                          if f['condicion_canonica'] == RAC.PA.REPROBADO),
+        'aplazados': sum(1 for f in filas
+                         if f['condicion_canonica'] == RAC.PA.APLAZADO),
+        'en_proceso': sum(1 for f in filas
+                          if f['condicion_canonica'] == RAC.PA.EN_PROCESO),
+        'moviles': sum(1 for f in filas
+                       if f['accion'] in (ACCION_PROMUEVE, ACCION_REPITE)),
+        'bloqueados': sum(1 for f in filas if f['bloqueo']),
+        'activos_sin_curso': diagnostico['activos_sin_curso'],
+        'ya_finalizados': diagnostico.get('ya_finalizados', []),
+        'historiales_legacy_duplicados': diagnostico.get(
+            'historiales_legacy_duplicados', []),
+        'errores_estructurales': len(errores),
+    }
+    return {'filas': filas, 'resumen': resumen, 'errores': errores}
+
+
+def _historial_de_cierre(db, current_user, estudiante_id, ano_origen_id):
+    """La fila de historial de ese estudiante en ese año, si ya existe.
+
+    `HistorialAcademico` no tiene constraint único por (estudiante, año), así
+    que la unicidad se sostiene aquí. Dentro de la transacción del writer, y
+    con el año origen bloqueado a nivel de fila, no hay dos ejecuciones
+    escribiendo a la vez; fuera de esa ruta el riesgo sigue existiendo y está
+    declarado como GAP.
+    """
+    return (
+        tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
+                      current_user)
+        .filter(HistorialAcademico.estudiante_id == estudiante_id,
+                HistorialAcademico.ano_escolar_id == ano_origen_id)
+        .order_by(HistorialAcademico.id)
+        .first()
+    )
+
+
+def _aplicar_plan_cierre(db, current_user, plan, request=None):
+    """Ejecuta el plan. UNA transacción: entra entero o no entra nada.
+
+    El historial guarda la situación CANÓNICA, no `Estudiante.condicion`. Y
+    solo se escribe para quien tiene un resultado definitivo: un APLAZADO
+    todavía puede aprobar su Especial, y congelarle ahora un «reprobado» le
+    quitaría un derecho que la Ordenanza le reconoce.
+    """
+    movidos, historiales = 0, 0
+    for fila in plan['filas']:
+        if not fila['escribe_historial']:
+            continue
+
+        est = get_tenant_or_404(db, Estudiante, fila['estudiante_id'],
+                                current_user, name='estudiante')
+
+        historial = _historial_de_cierre(db, current_user, est.id,
+                                         fila['ano_origen_id'])
+        if historial is None:
+            historial = HistorialAcademico(
+                colegio_id=est.colegio_id,
+                estudiante_id=est.id,
+                ano_escolar_id=fila['ano_origen_id'])
+            db.add(historial)
+            historiales += 1
+        historial.grado_id = fila['grado_origen_id']
+        historial.curso_id = fila['curso_origen_id']
+        historial.condicion = fila['condicion_canonica']
+        historial.promedio_final = fila['promedio']
+        historial.asistencia_porcentaje = fila['asistencia']
+
+        if fila['accion'] in (ACCION_PROMUEVE, ACCION_REPITE):
+            est.curso_id = fila['curso_destino_id']
+            est.condicion = fila['condicion_administrativa']
+            movidos += 1
+            log_auditoria(
+                db, 'CIERRE_PROMOCION', 'estudiantes', est.id,
+                {'ano': fila['ano_origen_id'], 'curso': fila['curso_origen_id'],
+                 'grado': fila['grado_origen']},
+                {'ano': plan['resumen']['ano_destino_id'],
+                 'curso': fila['curso_destino_id'],
+                 'grado': fila['grado_destino'],
+                 'condicion_canonica': fila['condicion_canonica']},
+                user=current_user, request=request)
+
+    db.commit()
+    return {'movidos': movidos, 'historiales_creados': historiales}
+
+
+def _cierre_canonico(db, current_user, ano_origen_id, ano_destino_id,
+                     request=None, solo_plan=False):
+    """El camino completo: transición -> bloqueo -> plan -> aplicación.
+
+    EL BLOQUEO VA ANTES DEL PLAN, y no es un detalle. La idempotencia por
+    pertenencia (C2) protege los reintentos SECUENCIALES: cuando un alumno
+    pasa a un curso del año destino deja de ser candidato. Pero dos
+    ejecuciones SIMULTÁNEAS pueden leer la misma lista antes de que ninguna
+    escriba, y entonces las dos lo mueven. `with_for_update()` sobre la fila
+    del año origen serializa las dos peticiones: la segunda espera, y cuando
+    entra vuelve a calcular la lista —no reutiliza la que leyó antes—, así
+    que encuentra cero candidatos y no hace nada.
+
+    En SQLite `FOR UPDATE` no se emite (no lo soporta), así que en los tests
+    locales lo que se comprueba es la RECALCULACIÓN tras el bloqueo, no el
+    bloqueo mismo. En producción corre PostgreSQL, que sí lo aplica.
+    """
+    ano_origen, ano_destino = _resolver_transicion_cierre(
+        db, current_user, ano_origen_id, ano_destino_id)
+
+    if not solo_plan:
+        # CORE-2 · Se bloquean LOS DOS años, no solo el origen. Validar que el
+        # destino está activo y abierto y luego aplicar el plan sobre el
+        # objeto que se leyó antes deja una carrera real: otra petición puede
+        # cerrarlo o desactivarlo en medio, y los alumnos aterrizarían en un
+        # año que ya no admite matrícula.
+        #
+        # El orden por ID es deliberado. Dos peticiones que bloqueen las
+        # mismas dos filas en orden distinto se esperan mutuamente para
+        # siempre; tomándolas siempre de menor a mayor, eso no puede pasar.
+        ids_en_orden = sorted({ano_origen.id, ano_destino.id})
+        bloqueados = {
+            a.id: a for a in
+            tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+            .filter(AnoEscolar.id.in_(ids_en_orden))
+            .order_by(AnoEscolar.id)
+            .populate_existing().with_for_update().all()
+        }
+        if len(bloqueados) != len(ids_en_orden):
+            raise TransicionCierreInvalida(
+                ERROR_TRANSICION_INCOMPLETA,
+                'Uno de los años de la transición dejó de estar disponible.',
+                status=409)
+
+        # Y se REVALIDA todo con los valores de ahora, no con los de antes
+        # del bloqueo. Tomar el candado y decidir con el estado viejo es el
+        # mismo error que no tomarlo.
+        ano_origen, ano_destino = _resolver_transicion_cierre(
+            db, current_user, ano_origen.id, ano_destino.id)
+
+    plan = _plan_cierre(db, current_user, ano_origen, ano_destino)
+    if solo_plan:
+        return plan, None
+
+    if plan['errores']:
+        # Nada escrito todavía: el plan es memoria pura. El rollback libera
+        # los bloqueos y deja la base exactamente como estaba.
+        db.rollback()
+        raise TransicionCierreInvalida(
+            ERROR_CIERRE_ESTRUCTURA_ROTA,
+            'La estructura del año destino está incompleta para %d '
+            'estudiante(s) con resultado definitivo. No se movió a nadie: '
+            'corrija los cursos y vuelva a intentarlo.' % len(plan['errores']),
+            status=409)
+
+    try:
+        resultado = _aplicar_plan_cierre(db, current_user, plan, request=request)
+    except Exception:
+        db.rollback()
+        raise
+    return plan, resultado
+
+
+# ═══════ CORE-2 · CIERRE ADMINISTRATIVO CANÓNICO ═══════
+#
+# Cerrar un año es un acto administrativo: deja de admitir notas y deja de
+# ser el año en curso. No mueve estudiantes, no crea el año siguiente y no
+# decide promociones. El writer legacy hacía las tres cosas —creaba una fila
+# de historial por cada alumno activo del colegio con `Estudiante.condicion`
+# dentro, que es un campo de matrícula y no un resultado académico— y por eso
+# está bloqueado.
+#
+# Qué SÍ comprueba: que no quede nadie EN_PROCESO. Un EN_PROCESO no es un
+# estudiante suspendido: es uno cuyo expediente no se puede leer todavía
+# —faltan notas, falta el currículo, falta la alfabetización de 3.º, falta
+# una decisión sobre su asistencia—. Cerrar el año encima de eso convierte
+# una laguna en un hecho consumado.
+#
+# Un APLAZADO, en cambio, NO impide cerrar. Su expediente se entiende
+# perfectamente: le falta un proceso de recuperación al que tiene derecho, y
+# ese derecho sobrevive al cierre. Exigir que todos los aplazados terminen
+# antes de cerrar dejaría al colegio sin poder abrir el año nuevo.
+
+ERROR_ANO_YA_CERRADO = 'ANO_ESCOLAR_YA_CERRADO'
+ERROR_ANO_NO_ES_EL_ACTIVO = 'ANO_ESCOLAR_NO_ES_EL_ACTIVO'
+ERROR_CIERRE_TIENE_EN_PROCESO = 'CIERRE_ANO_TIENE_EN_PROCESO'
+ERROR_CIERRE_COHORTE_NO_FIABLE = 'CIERRE_ANO_COHORTE_NO_FIABLE'
+ERROR_ANO_CON_CIERRE_EJECUTADO = 'ANO_ESCOLAR_CON_TRANSICION_EJECUTADA'
+
+
+def _cerrar_ano_canonico(db, current_user, ano_id, request=None,
+                         solo_diagnostico=False):
+    """Cierra el año, o explica por qué todavía no se puede. -> (ano, vista)
+
+    Levanta `TransicionCierreInvalida` con un código estable en cada
+    negativa. No escribe absolutamente nada cuando rechaza.
+    """
+    ano = get_tenant_or_404(db, AnoEscolar, ano_id, current_user,
+                            name='anoescolar')
+
+    if not solo_diagnostico:
+        # El candado antes de mirar: entre la comprobación y el UPDATE puede
+        # entrar otra petición cerrando el mismo año.
+        ano = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+               .filter(AnoEscolar.id == ano.id)
+               .populate_existing().with_for_update().first())
+        if ano is None:
+            raise TransicionCierreInvalida(
+                ERROR_TRANSICION_INCOMPLETA,
+                'El año escolar dejó de estar disponible.', status=409)
+
+    if getattr(ano, 'cerrado', False):
+        raise TransicionCierreInvalida(
+            ERROR_ANO_YA_CERRADO,
+            'El año %s ya está cerrado.' % ano.nombre)
+
+    if not getattr(ano, 'activo', False):
+        # Cerrar un año que no es el que está en curso significa casi siempre
+        # que se eligió el año equivocado en la pantalla.
+        raise TransicionCierreInvalida(
+            ERROR_ANO_NO_ES_EL_ACTIVO,
+            'El año %s no es el año en curso. Solo se cierra el año activo.'
+            % ano.nombre)
+
+    vista = _vista_cohorte_ano(db, current_user, ano)
+
+    if not vista['fiable']:
+        raise TransicionCierreInvalida(
+            ERROR_CIERRE_COHORTE_NO_FIABLE,
+            'Hay estudiantes con más de un RESULTADO ACADÉMICO registrado '
+            'para este año (%s). No se cierra sobre una cuenta que no cuadra.'
+            % vista['historiales_ambiguos'])
+
+    if solo_diagnostico:
+        return ano, vista
+
+    en_proceso = [f for f in vista['filas'] if f['condicion'] == 'en_proceso']
+    if en_proceso:
+        raise TransicionCierreInvalida(
+            ERROR_CIERRE_TIENE_EN_PROCESO,
+            '%d estudiante(s) tienen el proceso académico abierto y su '
+            'situación no puede determinarse todavía. Resuelva lo que falta '
+            'antes de cerrar el año.' % len(en_proceso))
+
+    # A partir de aquí sí se escribe, y es lo ÚNICO que se escribe: dos
+    # banderas del año. Ni una fila de historial, ni un estudiante movido.
+    ano.cerrado = True
+    ano.activo = False
+    log_auditoria(db, 'CERRAR_ANO_ESCOLAR', 'ano_escolar', ano.id,
+                  {'cerrado': False, 'activo': True},
+                  {'cerrado': True, 'activo': False,
+                   'cohorte': vista['totales']},
+                  user=current_user, request=request)
+    db.commit()
+    return ano, vista
+
+
+def _transicion_ejecutada(db, current_user, ano):
+    """¿Ya se movió o finalizó alguien en este año? -> (bool, motivos)
+
+    Reabrir un año sobre el que ya corrió la transición no es «volver
+    atrás»: deja al colegio con parte del alumnado en el año siguiente y el
+    anterior otra vez activo, que es el estado híbrido que C0.1 reprodujo.
+    Deshacerlo automáticamente sería despromover gente, y eso necesita una
+    operación de reversión propia y auditada, no un efecto lateral.
+    """
+    motivos = []
+    definitivos, ambiguos, _legacy = _historiales_definitivos_del_ano(
+        db, current_user, ano)
+    if definitivos:
+        motivos.append('%d estudiante(s) ya tienen resultado definitivo '
+                       'registrado en este año' % len(definitivos))
+    if ambiguos:
+        # Dos resultados académicos para el mismo estudiante. Reabrir sobre
+        # eso empeoraría una situación que ya hay que resolver a mano.
+        motivos.append('hay estudiantes con dos resultados académicos '
+                       'distintos en este año')
+
+    # Alumnos que estaban en este año y hoy están en un curso posterior.
+    posteriores = (
+        tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+        .filter(AnoEscolar.id != ano.id).all())
+    ids_posteriores = [a.id for a in posteriores]
+    if ids_posteriores and definitivos:
+        movidos = (
+            tenant_filter(db.query(Estudiante), Estudiante, current_user)
+            .join(Curso, Estudiante.curso_id == Curso.id)
+            .filter(Estudiante.id.in_(list(definitivos)),
+                    Curso.ano_escolar_id.in_(ids_posteriores))
+            .count())
+        if movidos:
+            motivos.append('%d estudiante(s) ya fueron movidos a otro año'
+                           % movidos)
+    return bool(motivos), motivos
+
+
+def _estado_cierre_ano(db, current_user, ano_origen_id=None,
+                       ano_destino_id=None):
+    """TODO lo que la pantalla necesita para reanudarse sola. -> dict
+
+    El asistente de Cierre guardaba su fase en el estado de React: en qué
+    paso va, qué año es el origen, cuál el destino. Un refresco lo perdía, y
+    Dirección volvía al paso 1 sobre un año ya cerrado —o peor, veía el año
+    NUEVO como «el año que hay que cerrar»—.
+
+    Aquí todo eso se deriva de la base. Es LECTURA PURA.
+    """
+    anos = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+            .order_by(AnoEscolar.id.desc()).all())
+    activo = next((a for a in anos if a.activo), None)
+
+    # CORE-2.1 · UNA TRANSICIÓN EXISTE SOLO SI HAY EVIDENCIA DE ELLA.
+    #
+    # Antes, cuando ningún año cerrado tenía gente pendiente, esto caía en
+    # «el último cerrado» por id. Eso inventaba una transición terminada:
+    # con A ya procesado y B funcionando como el año normal, la pantalla
+    # seguía etiquetando A como origen para siempre. Un año cerrado no es
+    # una transición pendiente; solo lo es si queda alguien por procesar.
+    #
+    # La evidencia objetiva es una sola: un año CERRADO con candidatos
+    # académicos todavía en él. Eso cubre al aplazado que sigue en su año,
+    # al lote a medio procesar y al año recién cerrado del que aún no se
+    # movió nadie.
+    candidatos_origen = []
+    for a in anos:
+        if not a.cerrado:
+            continue
+        pendientes, _diag = _candidatos_pendientes_del_ano_origen(
+            db, current_user, a)
+        if pendientes:
+            candidatos_origen.append(a)
+
+    origen, ambiguedad_origen = None, []
+    if ano_origen_id is not None:
+        origen = get_tenant_or_404(db, AnoEscolar, ano_origen_id,
+                                   current_user, name='anoescolar')
+    elif len(candidatos_origen) == 1:
+        origen = candidatos_origen[0]
+    elif len(candidatos_origen) > 1:
+        # Dos años cerrados con transición pendiente. No se elige el de mayor
+        # id: se devuelven los dos para que Dirección diga cuál está
+        # cerrando. Adivinarlo movería a un colegio entero por el año
+        # equivocado.
+        ambiguedad_origen = [{'id': a.id, 'nombre': a.nombre}
+                             for a in candidatos_origen]
+    # Y si no hay ninguno, `origen` se queda en None: no hay transición
+    # pendiente, y decirlo es la respuesta correcta.
+
+    destino = None
+    if ano_destino_id is not None:
+        destino = get_tenant_or_404(db, AnoEscolar, ano_destino_id,
+                                    current_user, name='anoescolar')
+    elif activo is not None and origen is not None and activo.id != origen.id:
+        # El destino es el año en curso, y solo cuando existe y no es el
+        # propio origen. Si A acaba de cerrarse y B todavía no se creó,
+        # `destino` queda en None y la fase es «crear el año siguiente».
+        destino = activo
+
+    vista = _vista_cohorte_ano(db, current_user, origen) if origen else None
+    totales = (vista or {}).get('totales', {})
+
+    errores = []
+    if destino is not None and origen is not None and vista:
+        try:
+            plan, _ = _cierre_canonico(db, current_user, origen.id, destino.id,
+                                       solo_plan=True)
+            errores = plan['errores']
+        except (TransicionCierreInvalida, HTTPException):
+            # La transición todavía no es válida —falta crear o activar el
+            # año destino—. No es un error estructural: es una fase anterior.
+            errores = []
+
+    transicion_ejecutada, motivos = (
+        _transicion_ejecutada(db, current_user, origen) if origen
+        else (False, []))
+
+    puede_cerrar = bool(
+        origen is not None and not origen.cerrado and origen.activo
+        and vista and vista['fiable'] and not totales.get('en_proceso'))
+
+    puede_promover = bool(
+        origen is not None and destino is not None
+        and origen.cerrado and not origen.activo
+        and destino.activo and not destino.cerrado
+        and totales.get('pendientes') and not errores
+        and (vista or {}).get('fiable'))
+
+    # Hay transición en progreso cuando existe un origen con gente pendiente.
+    # No cuando simplemente existe un año cerrado.
+    transicion_en_progreso = bool(
+        origen is not None and origen.cerrado and totales.get('pendientes'))
+
+    return {
+        'bloqueado_por_safety_lock': bool(CIERRE_ANO_BLOQUEADO),
+        'transicion_en_progreso': transicion_en_progreso,
+        'origen_ambiguo': ambiguedad_origen,
+        'ano_origen': ({'id': origen.id, 'nombre': origen.nombre,
+                        'cerrado': bool(origen.cerrado),
+                        'activo': bool(origen.activo)} if origen else None),
+        'ano_destino': ({'id': destino.id, 'nombre': destino.nombre,
+                         'cerrado': bool(destino.cerrado),
+                         'activo': bool(destino.activo)} if destino else None),
+        'ano_activo_id': getattr(activo, 'id', None),
+        'cohorte': totales,
+        'errores_estructurales': errores,
+        'historiales_ambiguos': (vista or {}).get('historiales_ambiguos', []),
+        'historiales_legacy_duplicados': (vista or {}).get(
+            'historiales_legacy_duplicados', []),
+        'transicion_ejecutada': transicion_ejecutada,
+        'motivos_transicion': motivos,
+        'puede_cerrar': puede_cerrar,
+        'puede_promover': puede_promover,
+        # Terminada = hubo un origen y ya no le queda nadie. Si no hay
+        # origen en absoluto, no hay transición ni terminada ni pendiente:
+        # el colegio simplemente está trabajando sobre su año activo.
+        'transicion_completa': bool(
+            origen is not None and origen.cerrado
+            and not totales.get('pendientes')),
+        'anos': [{'id': a.id, 'nombre': a.nombre, 'cerrado': bool(a.cerrado),
+                  'activo': bool(a.activo)} for a in anos],
+    }
+
+
+ERROR_CIERRE_ORIGEN_AMBIGUO = 'CIERRE_ORIGEN_AMBIGUO'
+
+
+def _ano_visible_de_cierre(db, current_user, ano_id=None):
+    """El ÚNICO año del que hablan todas las pantallas de Cierre.
+
+    -> (ano | None, error JSONResponse | None)
+
+    Había dos resoluciones distintas conviviendo. `/cierre-ano/estado`
+    decidía «hay transición si un año cerrado conserva gente pendiente», y
+    el resumen y la previsualización usaban `preferir_cerrado=True`, que
+    toma el cerrado más reciente pase lo que pase. Mientras la transición
+    estaba en curso coincidían; en cuanto terminaba, no: el asistente se
+    colocaba sobre el año nuevo y la tabla de debajo seguía mostrando la
+    cohorte del año anterior. Dirección leía los números del año pasado bajo
+    un encabezado sobre el actual.
+
+    La regla, ahora una sola:
+
+        `ano_id` explícito                  → ese, resuelto tenant-safe.
+        hay transición en progreso          → el año ORIGEN.
+        no hay transición                   → el año ACTIVO.
+        el origen es ambiguo                → no se elige ninguno.
+
+    `_resolver_ano_preview` NO se toca: alimenta contratos de R4 —entre
+    ellos `/api/promocion/estudiantes`— que están congelados y cuyo criterio
+    es otro. Este helper es de Cierre y solo de Cierre.
+    """
+    if ano_id is not None:
+        return get_tenant_or_404(db, AnoEscolar, ano_id, current_user,
+                                 name='anoescolar'), None
+
+    estado = _estado_cierre_ano(db, current_user)
+
+    if estado['origen_ambiguo']:
+        # Dos años cerrados con promoción pendiente. Mostrar el resumen de
+        # uno sería decir que ese es «el año que se está cerrando», y no
+        # consta. Se pide que lo indiquen.
+        return None, JSONResponse({
+            'error': ERROR_CIERRE_ORIGEN_AMBIGUO,
+            'message': ('Hay más de un año escolar con promoción pendiente. '
+                        'Indique sobre cuál está trabajando.'),
+            'anos': estado['origen_ambiguo'],
+        }, status_code=409)
+
+    destino_id = (estado['ano_origen'] or {}).get('id') \
+        if estado['transicion_en_progreso'] else estado['ano_activo_id']
+    if destino_id is None:
+        # Ni transición ni año activo: no hay nada que mostrar, y decirlo es
+        # mejor que inventar un año.
+        return None, None
+    return get_tenant_or_404(db, AnoEscolar, destino_id, current_user,
+                             name='anoescolar'), None
+
+
+# ═══════ CORE-2 · LAS DECISIONES QUE SOLO UNA PERSONA PUEDE TOMAR ═══════
+
+ERROR_DECISION_VALOR_INVALIDO = 'DECISION_ACADEMICA_VALOR_INVALIDO'
+ERROR_DECISION_FUERA_DE_LUGAR = 'DECISION_ACADEMICA_FUERA_DE_LUGAR'
+
+
+def _validar_decision(campo, valor, grado_numero, nivel):
+    """Los valores son EXACTAMENTE los del contrato de A2. -> mensaje | None
+
+    No se traduce ni se normaliza nada: si aquí se aceptara «SI» y A2
+    esperara True, habríamos creado una segunda semántica y el dato llegaría
+    a la norma convertido por nosotros.
+    """
+    if valor is None:
+        return None
+
+    if campo == 'alfabetizacion_inicial':
+        if not isinstance(valor, bool):
+            return 'La alfabetización inicial solo admite sí o no.'
+        # El NIVEL importa tanto como el número: 3.º de Secundaria también es
+        # «el número 3», y ahí la alfabetización inicial no existe.
+        if nivel != RAC.RA.NIVEL_PRIMARIA or \
+                grado_numero != RAC.PA.GRADO_ALFABETIZACION_INICIAL:
+            return ('La alfabetización inicial solo se registra en %d.º de '
+                    'Primaria.' % RAC.PA.GRADO_ALFABETIZACION_INICIAL)
+        return None
+
+    if campo == 'decision_asistencia':
+        if valor not in RAC.PA.DECISIONES_ASISTENCIA:
+            return ('Decisión de asistencia no reconocida. Valores válidos: %s'
+                    % ', '.join(RAC.PA.DECISIONES_ASISTENCIA))
+        return None
+
+    if campo == 'decision_excepcional_segundo':
+        if valor != RAC.PA.DECISION_EXCEPCIONAL_REPETIR:
+            return ('La decisión excepcional de 2.º solo admite el valor %r.'
+                    % RAC.PA.DECISION_EXCEPCIONAL_REPETIR)
+        if nivel != RAC.RA.NIVEL_PRIMARIA or \
+                grado_numero != RAC.PA.GRADO_EXCEPCION_COLEGIADA:
+            return ('La repetición excepcional existe solo en %d.º de '
+                    'Primaria.' % RAC.PA.GRADO_EXCEPCION_COLEGIADA)
+        return None
+
+    if campo == 'repeticion_excepcional_segundo_ya_utilizada':
+        if not isinstance(valor, bool):
+            return 'El antecedente de la excepción solo admite sí o no.'
+        return None
+
+    return 'Campo de decisión no reconocido: %s' % campo
+
+
+
+# ═══════ CORE-1 · EL AÑO DE UNA RECUPERACIÓN PENDIENTE ═══════
+#
+# El problema, reproducido en C0.1 §6: los cuatro endpoints de recuperación
+# resolvían el año con `filter_by(activo=True)`. En cuanto Dirección activaba
+# el año nuevo, un estudiante APLAZADO de 2025-2026 dejaba de poder terminar
+# su proceso: la Especial respondía «No hay CF calculado» porque buscaba la
+# ficha en 2026-2027, donde no existe.
+#
+# Eso convierte un derecho de la Ordenanza en un accidente de configuración.
+# El maestro no debería tener que reabrir el año viejo, cambiar el año activo
+# ni escribir IDs a mano para poner una nota que el reglamento le obliga a
+# poner.
+#
+# La regla nueva: el año de una recuperación es el año de SU FICHA, no el año
+# activo. Se deriva del proceso pendiente. `ano_id` explícito se admite
+# —la pantalla lo manda cuando hay más de un año con pendientes— pero se
+# valida siempre contra el tenant y contra la existencia real de pendientes.
+#
+# Lo que esto NO abre: un año cerrado sigue sin ser editable. Aquí solo pasa
+# la fase de recuperación legítimamente pendiente. P1-P4, competencias,
+# asistencia y cualquier otra nota del año cerrado siguen bloqueadas por
+# donde ya lo estaban.
+
+
+ERROR_RECUPERACION_ANO_AMBIGUO = 'RECUPERACION_ANO_AMBIGUO'
+ERROR_RECUPERACION_SIN_PENDIENTES = 'RECUPERACION_SIN_PROCESO_PENDIENTE'
+
+
+def _anos_con_proceso_pendiente(db, current_user, modelo, estudiante_id=None,
+                                asignatura_id=None):
+    """Los años que todavía tienen una fase de recuperación sin cargar.
+
+    Se resuelve en Python y no en SQL porque `fase_pendiente()` vive en el
+    modelo y encierra la cascada completa —en Secundaria son tres fases con
+    cortes distintos—. Duplicarla como filtro SQL sería crear una segunda
+    verdad para ahorrarse una consulta.
+
+    Devuelve {ano_escolar_id: nº de fichas pendientes}.
+    """
+    q = tenant_filter(db.query(modelo), modelo, current_user)
+    if estudiante_id is not None:
+        q = q.filter(modelo.estudiante_id == estudiante_id)
+    if asignatura_id is not None:
+        q = q.filter(modelo.asignatura_id == asignatura_id)
+
+    pendientes = {}
+    for ficha in q.all():
+        if ficha.fase_pendiente():
+            pendientes[ficha.ano_escolar_id] = pendientes.get(
+                ficha.ano_escolar_id, 0) + 1
+    return pendientes
+
+
+class _SaltarBackfill(Exception):
+    """Corta el backfill del GET cuando el año está cerrado.
+
+    Se usa una excepción propia, y no un `if` alrededor del bloque, porque el
+    backfill ya vive dentro de un `try/except Exception` que traga los
+    errores para no romper la lista. Un `except` genérico se tragaría también
+    esta señal, y el salto pasaría por un fallo silencioso.
+    """
+
+
+ERROR_RECUPERACION_ANO_CERRADO = 'RECUPERACION_ANO_CERRADO_SOLO_FASE_PENDIENTE'
+ERROR_RECUPERACION_CURSO_DE_OTRO_ANO = 'RECUPERACION_CURSO_NO_PERTENECE_AL_ANO'
+
+
+def _validar_escritura_en_ano_cerrado(ano, ficha, tipo_solicitado):
+    """Sobre un año CERRADO solo se escribe la fase pendiente. -> JSONResponse|None
+
+    Los endpoints de recuperación permiten corregir la última fase cargada
+    —un profesor se equivoca al teclear y vuelve a guardar—. Eso es razonable
+    mientras el año está abierto: es el año en curso y todo sigue en revisión.
+
+    Sobre un año CERRADO no lo es. El año cerrado no está abierto para
+    editar: está abierto SOLO para que termine un proceso de recuperación que
+    quedó pendiente y que la Ordenanza reconoce. Permitir ahí la corrección
+    convertiría esa rendija en una puerta: se podría reescribir una
+    recuperación final ya resuelta, cambiar el resultado del año y alterar un
+    historial ya emitido.
+
+    Regla: el `tipo` pedido tiene que ser EXACTAMENTE lo que
+    `fase_pendiente()` dice en este momento. Si no hay fase pendiente, no se
+    escribe nada.
+    """
+    if not getattr(ano, 'cerrado', False):
+        return None
+
+    fase = ficha.fase_pendiente() if ficha is not None else None
+    if fase is None:
+        return JSONResponse({
+            'error': ERROR_RECUPERACION_ANO_CERRADO,
+            'message': ('El año %s está cerrado y este proceso de '
+                        'recuperación ya terminó. No se puede modificar.'
+                        % getattr(ano, 'nombre', '')),
+            'fase_pendiente': None,
+        }, status_code=409)
+
+    if tipo_solicitado != fase:
+        return JSONResponse({
+            'error': ERROR_RECUPERACION_ANO_CERRADO,
+            'message': ('El año %s está cerrado: solo puede cargarse la fase '
+                        'pendiente (%s). No se permiten correcciones de fases '
+                        'ya resueltas.' % (getattr(ano, 'nombre', ''), fase)),
+            'fase_pendiente': fase,
+        }, status_code=409)
+    return None
+
+
+def _validar_curso_del_ano(db, current_user, estudiante, ano):
+    """El curso del estudiante tiene que ser DE ese año. -> JSONResponse|None
+
+    Un alumno ya movido al año siguiente no puede recibir notas del año
+    anterior por la vía de mandar `ano_id` a mano: su curso ya no pertenece a
+    ese año, y la asignación docente que autorizaría la escritura sería la
+    del curso NUEVO. Se comprueba aquí, con el mismo mensaje para «no
+    pertenece» y para «no existe», sin decir nada del otro año.
+    """
+    curso = estudiante.curso
+    if curso is None or curso.ano_escolar_id != getattr(ano, 'id', None) \
+            or curso.colegio_id != estudiante.colegio_id:
+        return JSONResponse({
+            'error': ERROR_RECUPERACION_CURSO_DE_OTRO_ANO,
+            'message': ('El curso actual del estudiante no pertenece al año '
+                        'escolar de esta recuperación. Si ya fue promovido, '
+                        'su proceso de ese año está cerrado.'),
+        }, status_code=409)
+    return None
+
+
+def _ano_de_recuperacion(db, current_user, modelo, ano_id=None,
+                         estudiante_id=None, asignatura_id=None):
+    """Sobre qué año escolar se está recuperando. -> (ano, error | None)
+
+    Orden de resolución:
+
+      1. `ano_id` explícito: se valida contra el tenant (404 si es ajeno) y
+         se usa. La pantalla lo manda cuando hay varios años con pendientes.
+      2. Si hay un único año con proceso pendiente, ese. Da igual cuál esté
+         activo: el proceso manda.
+      3. Si hay varios, se rechaza pidiendo `ano_id` y se dice cuáles son.
+         Elegir por nuestra cuenta metería la nota en el año equivocado.
+      4. Si no hay ninguno, se cae al año activo, que es el comportamiento
+         de siempre durante el curso normal.
+    """
+    if ano_id is not None:
+        return get_tenant_or_404(db, AnoEscolar, ano_id, current_user,
+                                 name='anoescolar'), None
+
+    pendientes = _anos_con_proceso_pendiente(
+        db, current_user, modelo, estudiante_id, asignatura_id)
+
+    if len(pendientes) == 1:
+        solo = next(iter(pendientes))
+        return get_tenant_or_404(db, AnoEscolar, solo, current_user,
+                                 name='anoescolar'), None
+
+    if not pendientes and estudiante_id is not None and asignatura_id is not None:
+        # No queda fase pendiente para ESTE par. Caer al ano activo aqui seria
+        # enganoso: el endpoint buscaria la ficha en el ano en curso, no la
+        # encontraria y respondaria «no hay CF calculado», cuando lo que pasa
+        # es que el proceso YA TERMINO en el ano donde vive la ficha. Se
+        # resuelve al ano de la ficha existente para que el rechazo diga la
+        # verdad: el ano esta cerrado y el proceso esta cerrado.
+        ficha = (tenant_filter(db.query(modelo), modelo, current_user)
+                 .filter(modelo.estudiante_id == estudiante_id,
+                         modelo.asignatura_id == asignatura_id)
+                 .order_by(modelo.ano_escolar_id.desc()).first())
+        if ficha is not None:
+            return get_tenant_or_404(db, AnoEscolar, ficha.ano_escolar_id,
+                                     current_user, name='anoescolar'), None
+
+    if len(pendientes) > 1:
+        anos = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+                .filter(AnoEscolar.id.in_(list(pendientes)))
+                .order_by(AnoEscolar.id.desc()).all())
+        return None, JSONResponse({
+            'error': ERROR_RECUPERACION_ANO_AMBIGUO,
+            'message': ('Hay procesos de recuperación pendientes en más de un '
+                        'año escolar. Indique sobre cuál está calificando.'),
+            'anos': [{'id': a.id, 'nombre': a.nombre,
+                      'pendientes': pendientes.get(a.id, 0)} for a in anos],
+        }, status_code=409)
+
+    ano = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+           .filter_by(activo=True).first())
+    if ano is None:
+        return None, JSONResponse({'error': 'No hay año escolar activo'},
+                                  status_code=404)
+    return ano, None
+
+
+
+
 @app.post("/api/ano-escolar/{id}/cerrar")
 async def cerrar_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    # C1 · SAFETY LOCK. Primero de todo: ni se resuelve el año, ni se lee el
+    # cuerpo.
+    #
+    # CORE-2 · Debajo del guard va el cierre CANÓNICO, que retorna siempre.
+    # El cuerpo legacy sigue en el archivo pero es inalcanzable, y A4-22 lo
+    # comprueba por AST además de exigir que no haya cambiado.
+    #
+    # Qué se reemplazó: el legacy creaba una fila de HistorialAcademico por
+    # cada estudiante ACTIVO del colegio —incluidos los que ya estaban en un
+    # curso del año siguiente— con `Estudiante.condicion` dentro, que es un
+    # campo de matrícula y no un resultado académico. El cierre nuevo no crea
+    # historial: solo marca el año.
+    if CIERRE_ANO_BLOQUEADO:
+        return _bloqueo_cierre_ano()
+
+    try:
+        ano_cerrado, vista = _cerrar_ano_canonico(
+            db, current_user, id, request=request)
+    except TransicionCierreInvalida as exc:
+        db.rollback()
+        cuerpo_error = {'error': exc.codigo, 'message': exc.mensaje}
+        if exc.codigo == ERROR_CIERRE_TIENE_EN_PROCESO:
+            # Dirección necesita saber A QUIÉN le falta qué. Un «no se puede
+            # cerrar» sin lista obliga a buscar a mano entre 300 alumnos.
+            _, _vista = _cerrar_ano_canonico(
+                db, current_user, id, solo_diagnostico=True)
+            cuerpo_error['pendientes'] = [
+                {'estudiante_id': f.get('estudiante_id') or f.get('id'),
+                 'nombre_completo': f.get('nombre_completo'),
+                 'curso': f.get('curso'),
+                 'motivo': f.get('motivo'),
+                 'bloqueos': f.get('bloqueos', []),
+                 'diagnosticos': f.get('diagnosticos', [])}
+                for f in _vista['filas'] if f['condicion'] == 'en_proceso']
+        return JSONResponse(cuerpo_error, status_code=exc.status)
+
+    return {
+        'message': 'Año escolar %s cerrado' % ano_cerrado.nombre,
+        'ano_id': ano_cerrado.id,
+        'ano_escolar': ano_cerrado.nombre,
+        'cohorte': vista['totales'],
+        'aplazados_pendientes': vista['totales']['aplazados'],
+    }
+
+    # ── A PARTIR DE AQUÍ: CÓDIGO LEGACY INALCANZABLE (CORE-2) ──────────
     ano = get_tenant_or_404(db, AnoEscolar, id, current_user, name='anoescolar')
     if getattr(ano, 'cerrado', False):
         return {'message': 'El año escolar ya estaba cerrado', 'ano_id': ano.id}
@@ -2935,9 +4587,48 @@ async def cerrar_ano_escolar(id, request: Request, db: Session = Depends(get_db)
 
 @app.post("/api/ano-escolar/{id}/reabrir")
 async def reabrir_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Reabrir un año escolar cerrado"""
+    """Reabrir un año escolar cerrado.
+
+    TODO (Cierre de Año, fase posterior) · RIESGO CONOCIDO, NO CORREGIDO AQUÍ.
+        C0.1 confirmó que reabrir NO comprueba si ya hubo movimientos
+        parciales. Si parte del alumnado fue promovido al año siguiente,
+        reabrir el anterior deja al colegio con estudiantes en cursos de B
+        mientras el año activo es A: las recuperaciones se escribirían
+        contra A para alumnos cuyo curso pertenece a B, y la
+        previsualización de A los incluiría con el grado de B.
+
+        La política segura necesita conocer el estado de transición
+        (cuántos alumnos siguen en el año origen), y ese estado se diseña
+        junto al nuevo writer.
+
+    CORE-2 · Ya hay estado de transición, así que la regla se puede escribir:
+
+        Si todavía NO se movió ni finalizó a nadie, reabrir es seguro y se
+        permite tal como antes.
+
+        Si la transición ya corrió —hay resultados definitivos registrados o
+        estudiantes en el año siguiente—, se RECHAZA. Reabrir ahí dejaría al
+        colegio con parte del alumnado en el año nuevo y el anterior otra vez
+        activo: las recuperaciones se escribirían contra un año cuyos alumnos
+        ya no están en él.
+
+    Y NO se deshace nada automáticamente. Despromover gente es una operación
+    de reversión con sus propias reglas y su propia auditoría, no el efecto
+    lateral de pulsar «reabrir».
+    """
     ano = get_tenant_or_404(db, AnoEscolar, id, current_user, name='anoescolar')
-    
+
+    ejecutada, motivos = _transicion_ejecutada(db, current_user, ano)
+    if ejecutada:
+        return JSONResponse({
+            'error': ERROR_ANO_CON_CIERRE_EJECUTADO,
+            'message': ('No se puede reabrir %s: la promoción ya se ejecutó '
+                        'sobre este año. %s. Revertirlo requiere una '
+                        'operación de reversión, no una reapertura.'
+                        % (ano.nombre, '; '.join(motivos))),
+            'motivos': motivos,
+        }, status_code=409)
+
     # Desactivar otros años activos del mismo colegio
     tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).update({AnoEscolar.activo: False})
     
@@ -2954,9 +4645,33 @@ async def reabrir_ano_escolar(id, request: Request, db: Session = Depends(get_db
 
 @app.post("/api/ano-escolar/{id}/activar")
 async def activar_ano_escolar(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Activar un año escolar existente (sin cerrarlo)"""
+    """Activar un año escolar existente (sin cerrarlo).
+
+    C1 · Un año CERRADO no puede quedar activo. Esta función nunca tocó
+    `cerrado`, así que activar un año cerrado dejaba `cerrado=True` y
+    `activo=True` a la vez — y media aplicación resuelve «el año en curso»
+    con `filter_by(activo=True)`: las recuperaciones, la creación del año
+    siguiente y la previsualización general habrían apuntado a un año
+    cerrado.
+
+    No se reabre nada automáticamente ni se infiere la intención: si hace
+    falta volver a trabajar sobre ese año, Dirección tiene el flujo
+    explícito de reapertura.
+    """
     ano = get_tenant_or_404(db, AnoEscolar, id, current_user, name='anoescolar')
-    
+
+    # ANTES de desactivar los demás años: un rechazo no puede dejar al
+    # colegio sin ningún año activo.
+    if getattr(ano, 'cerrado', False):
+        return JSONResponse({
+            'error': ERROR_ANO_CERRADO_NO_ACTIVABLE,
+            'message': (
+                'El año escolar %s está cerrado y no puede activarse. '
+                'Reábralo primero si necesita volver a trabajar sobre él.'
+                % ano.nombre
+            ),
+        }, status_code=409)
+
     # Desactivar otros años activos del mismo colegio
     tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).update({AnoEscolar.activo: False})
     
@@ -3008,6 +4723,18 @@ async def editar_mensaje(id, request: Request, db: Session = Depends(get_db), cu
 
 @app.post("/api/ano-escolar/promover")
 async def promover_estudiantes(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """C1 · SAFETY LOCK: bloqueado.
+
+    En la reproducción local NO movió a ningún estudiante: calcula el grado
+    siguiente y descarta el resultado, y su `commit()` no guarda nada. Aun
+    así respondía «Estudiantes promovidos», que es peor que no existir:
+    Dirección podía creer que la promoción se hizo. Se bloquea con el mismo
+    código legacy hasta decidir si se retira.
+    """
+    # RELEASE · Sin `if`. Ver `_bloqueo_promocion_legacy`: habilitar el Cierre
+    # canónico no puede resucitar este writer, y ninguna constante lo activa.
+    return _bloqueo_promocion_legacy()
+
     grados = tenant_filter(db.query(Grado), Grado, current_user).order_by(Grado.orden).all()
     grado_siguiente = {g.id: grados[i+1].id if i+1 < len(grados) else None for i, g in enumerate(grados)}
     
@@ -3690,12 +5417,32 @@ async def get_cursos(request: Request, db: Session = Depends(get_db), current_us
     # resultado es por-usuario, así que no participa del cache compartido.
     _niv = nivel_efectivo(current_user, request)
     _es_profesor = current_user.role == 'profesor'
-    ck = f'cursos:{current_user.colegio_id}:{_niv or "todos"}'
+
+    # ENTREGA-1.1 · `ano_id` opcional, para poder listar los cursos de un año
+    # CERRADO y emitir sus boletines. Sin el parametro, la lista es la de
+    # siempre: todos los cursos activos del colegio.
+    #
+    # Va en la CLAVE del cache. Si no, la primera respuesta —la de un año—
+    # se serviria para cualquier otro.
+    _ano_q = request.query_params.get('ano_id')
+    _ano_id = None
+    if _ano_q not in (None, '', 'todos'):
+        try:
+            _ano_id = int(_ano_q)
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'ano_id invalido'}, status_code=400)
+
+    ck = f'cursos:{current_user.colegio_id}:{_niv or "todos"}:{_ano_id or "todos"}'
     if not _es_profesor:
         cached = cache_get(ck)
         if cached: return cached
-    
-    cursos = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).join(Grado).outerjoin(Tanda).options(
+
+    _q = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True)
+    if _ano_id is not None:
+        # `tenant_filter` ya acota al colegio, asi que un `ano_id` ajeno no
+        # devuelve nada en vez de filtrar cursos de otro centro.
+        _q = _q.filter(Curso.ano_escolar_id == _ano_id)
+    cursos = _q.join(Grado).outerjoin(Tanda).options(
         selectinload(Curso.estudiantes), selectinload(Curso.grado), selectinload(Curso.tanda)
     ).order_by(Grado.orden, Tanda.nombre, Curso.nombre).all()
     if _niv is not None:
@@ -3724,6 +5471,7 @@ async def get_cursos(request: Request, db: Session = Depends(get_db), current_us
         'ciclo': c.grado.ciclo if c.grado else None,
         'tanda_id': c.tanda_id,
         'tanda': c.tanda.nombre if c.tanda else None,
+        'ano_escolar_id': c.ano_escolar_id,
         'capacidad': c.capacidad,
         'aula': c.aula,
         'estudiantes_count': sum(1 for e in c.estudiantes if e.activo)
@@ -5025,7 +6773,36 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
     # tienen el toggle en UI; un profesor verá retirados solo si los pide explícito.
     
     if request.query_params.get('curso_id'):
-        query = query.filter_by(curso_id=int(request.query_params.get('curso_id')))
+        _cid = int(request.query_params.get('curso_id'))
+        # ENTREGA-1.1 · Con `ano_id`, la COHORTE de ese curso en ese año.
+        #
+        # Despues de promover, el curso de A sigue existiendo pero sus
+        # estudiantes ya tienen `curso_id` de B. Filtrar por `curso_id`
+        # devolveria solo a los que NO se movieron, y la pantalla de boletines
+        # no podria ni ofrecer al promovido cuyo boletin de A se quiere
+        # reemitir. La cohorte historica se reconstruye con el MISMO helper
+        # que usan los lotes de boletines, asi que la lista de la pantalla y
+        # el PDF del curso hablan siempre de la misma gente.
+        _ano_q = request.query_params.get('ano_id')
+        _curso_obj = None
+        if _ano_q not in (None, '', 'todos'):
+            _ano_b, _err_b = _ano_de_boletin(db, current_user, _ano_q)
+            if _err_b:
+                return _err_b
+            _curso_obj = (tenant_filter(db.query(Curso), Curso, current_user)
+                          .filter(Curso.id == _cid).first())
+            if _curso_obj is None:
+                return JSONResponse({'error': 'Curso no encontrado'},
+                                    status_code=404)
+        if _curso_obj is not None:
+            _cohorte, _err_c = _cohorte_del_curso_en_ano(
+                db, current_user, _curso_obj, _ano_b)
+            if _err_c:
+                return _err_c
+            query = query.filter(
+                Estudiante.id.in_([e.id for e in _cohorte] or [0]))
+        else:
+            query = query.filter_by(curso_id=_cid)
     
     # Filtrar por cursos del profesor si no es direccion/coordinador
     if current_user.role == 'profesor':
@@ -8070,14 +9847,38 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
     if not tiene_asig:
         return JSONResponse({'error': 'No tiene asignación a este curso/asignatura'}, status_code=403)
     
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
-    
-    # Buscar la evaluación extra
-    ev = db.query(EvaluacionExtraSecundaria).filter_by(
+    # CORE-1: el año sale de la ficha pendiente, no de `activo=True`. Este era
+    # el caso reproducido en C0.1 §6: con el año nuevo activo, la Especial de
+    # un APLAZADO del año anterior respondía «No hay CF calculado» porque
+    # buscaba la ficha en el año equivocado, donde nunca existió.
+    ano, _err = _ano_de_recuperacion(
+        db, current_user, EvaluacionExtraSecundaria,
+        ano_id=data.get('ano_id'), estudiante_id=estudiante_id,
+        asignatura_id=asignatura_id)
+    if _err is not None:
+        return _err
+
+    # Buscar la evaluación extra. Con `tenant_filter`: la ficha tiene que ser
+    # del mismo colegio, no solo coincidir en los ids.
+    # CORE-2 · El curso del estudiante tiene que ser de ESTE año. Si ya fue
+    # promovido, la asignación que lo autorizaría sería la del curso nuevo.
+    _err_curso = _validar_curso_del_ano(db, current_user, estudiante_obj, ano)
+    if _err_curso is not None:
+        return _err_curso
+
+    ev = tenant_filter(db.query(EvaluacionExtraSecundaria),
+                       EvaluacionExtraSecundaria, current_user).filter_by(
         estudiante_id=estudiante_id, asignatura_id=asignatura_id, ano_escolar_id=ano.id
     ).first()
+
+    # CORE-2 · Año cerrado: EXACTAMENTE la fase pendiente, sin correcciones.
+    # Va ANTES de las validaciones propias del endpoint: si el año está
+    # cerrado, el motivo del rechazo es ese y no otro, y el mensaje tiene que
+    # decirlo.
+    _err_cerrado = _validar_escritura_en_ano_cerrado(ano, ev, tipo)
+    if _err_cerrado is not None:
+        return _err_cerrado
+
     if not ev or ev.cf_original is None:
         return JSONResponse({
             'error': 'No hay CF calculado para este estudiante en esta asignatura. Primero deben estar las 4 competencias completas.'
@@ -8179,14 +9980,37 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
     # se filtre en la división de primaria.
     if nivel_efectivo(current_user, request) == 'primaria':
         return {'pendientes': [], 'total': 0}
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+
+    # CORE-1: igual que en Primaria, el año viene del proceso pendiente y no
+    # del año activo, para que un APLAZADO del año anterior siga apareciendo.
+    _ano_param = request.query_params.get('ano_id')
+    ano, _err = _ano_de_recuperacion(
+        db, current_user, EvaluacionExtraSecundaria,
+        ano_id=int(_ano_param) if (_ano_param or '').isdigit() else None)
+    if _err is not None:
+        return _err
     if not ano:
         return {'pendientes': []}
     
     # v2.13.37: BACKFILL automático — estudiantes con las 4 competencias completas
     # y CF < 70 pasan a completivo automáticamente aunque sus notas se hayan
     # cargado antes (sin necesidad de re-guardar nota por nota).
+    #
+    # CORE-2 · Sobre un año CERRADO este backfill NO corre. Es un GET, y un
+    # GET sobre un año cerrado tiene que ser lectura pura: aquí dentro hay
+    # `ev.cf_original = cf_exacto`, `recalcular_todo()` y un `commit()`, que
+    # sobre un año ya emitido podrían reescribir resultados en los que ya se
+    # apoya un historial. Las fichas de un año cerrado se materializaron
+    # mientras estaba abierto; si alguna falta de verdad, eso es un defecto
+    # de datos que se arregla a propósito, no de refilón al abrir una lista.
+    if getattr(ano, 'cerrado', False):
+        _saltar_backfill = True
+    else:
+        _saltar_backfill = False
+
     try:
+        if _saltar_backfill:
+            raise _SaltarBackfill()
         califs_ano = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter_by(
             ano_escolar_id=ano.id
         ).all()
@@ -8226,6 +10050,8 @@ async def get_pendientes_evaluacion_extra(request: Request, db: Session = Depend
                 ev.cf_original = cf_exacto
             ev.recalcular_todo()
         db.commit()
+    except _SaltarBackfill:
+        pass
     except Exception as e:
         db.rollback()
         logger.error(f"Backfill evaluaciones extra falló: {e}")
@@ -11247,6 +13073,26 @@ def _guard_titular_primaria(db, curso, current_user):
     return None
 
 
+def _solo_profesor_pasa_lista(current_user):
+    """La regla de rol de la asistencia, aislada para poder adelantarla.
+
+    ENTREGA-1 · Vivía dentro de `_guard_asistencia`, que necesita curso y
+    asignatura para trabajar. El lote de asistencia, en cambio, resolvía
+    antes el caso «lista vacía» y contestaba 200 sin haber mirado el rol:
+    una secretaria recibía un «Sin cambios» afirmativo sobre un endpoint al
+    que no debería poder llamar. No escribía nada —no había nada que
+    escribir— pero la respuesta decía que la llamada era legítima.
+
+    Sacándola aquí, el permiso se puede comprobar lo primero y la política
+    sigue existiendo UNA sola vez.
+    """
+    if current_user.role != 'profesor':
+        return JSONResponse({
+            'error': 'Solo los profesores pueden registrar o modificar asistencia.'
+        }, status_code=403)
+    return None
+
+
 def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
                       asignatura_id=None):
     """
@@ -11277,10 +13123,9 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
     # de tests usan token de profesor; el backend, en cambio, dejaba entrar a
     # cualquier rol autenticado. Se alinea con la UI. Los GET de asistencia NO
     # se tocan: quién CONSULTA sigue exactamente igual.
-    if current_user.role != 'profesor':
-        return None, JSONResponse({
-            'error': 'Solo los profesores pueden registrar o modificar asistencia.'
-        }, status_code=403)
+    _err_rol = _solo_profesor_pasa_lista(current_user)
+    if _err_rol:
+        return None, _err_rol
 
     # R3.4.1 §1 — COHERENCIA ESTUDIANTE <-> CURSO. `curso_id` llega del cliente
     # y no puede ser la autoridad cuando hay un estudiante: sin esta comprobacion
@@ -11812,6 +13657,12 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     El lote se valida completo antes de escribir para evitar guardados parciales
     silenciosos y referencias cross-tenant.
     """
+    # ENTREGA-1 · El permiso, lo primero. Más abajo hay una salida temprana
+    # para el lote vacío que devolvía 200 sin haber mirado el rol.
+    _err_rol = _solo_profesor_pasa_lista(current_user)
+    if _err_rol:
+        return _err_rol
+
     data = await request.json()
     fecha_str = data.get('fecha', today_rd().isoformat())
     asignatura_id = data.get('asignatura_id')  # Puede ser None
@@ -12400,7 +14251,7 @@ async def get_historial_comunicaciones(estudiante_id, db: Session = Depends(get_
 # ============== BOLETINES ==============
 
 @app.get("/api/boletines/estudiante/{id}")
-async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_boletin_estudiante(id, request: Request, ano_id: int | None = None, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Obtener boletín de un estudiante con estructura completa de calificaciones.
     
     v2.13.7: lee AMBOS modelos (Calificacion legacy + CalificacionSecundaria
@@ -12415,14 +14266,33 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
     if _guard:
         return _guard
 
-    # Asistencia (sin cambios — el modelo Asistencia no fue afectado)
-    asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(estudiante_id=id).all()
-    presentes = sum(1 for a in asistencias if a.estado == 'presente')
-    total_dias = len(asistencias)
-    
     # ─── 1. CalificacionSecundaria (modelo nuevo MINERD) ───
     asignaturas_por_id: dict = {}  # asig_id → dict del boletín
-    ano_activo = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    # ENTREGA-1.1 · Con `ano_id` se emite el boletín de ESE año; sin él, el
+    # activo, como siempre. La variable conserva su nombre histórico.
+    ano_activo, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    _curso_ano, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano_activo, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
+
+    # ── ENTREGA-1 · La asistencia del boletín sale del cálculo canónico ──
+    #
+    # Aquí había un cuarto cálculo propio, y erraba en cuatro cosas a la vez:
+    #
+    #   · no filtraba por año, así que un estudiante con historia en el colegio
+    #     arrastraba al boletín las marcas de años anteriores;
+    #   · contaba `presente` como única asistencia, de modo que una `tardanza`
+    #     —que el contrato define como asistencia— bajaba el porcentaje;
+    #   · usaba `len(asistencias)`, es decir FILAS. En Secundaria la asistencia
+    #     es por materia: seis asignaturas convertían un día en seis «días»;
+    #   · y con cero registros devolvía 0 %, que se lee como «no vino nunca»
+    #     cuando lo cierto es que nadie pasó lista.
+    #
+    # Ahora es el mismo desglose que ven el PDF y Primaria.
+    asistencia_anual = _asistencia_anual_boletin(db, id, current_user, ano_activo)
     
     if ano_activo:
         califs_sec = tenant_filter(
@@ -12536,21 +14406,27 @@ async def get_boletin_estudiante(id, request: Request, db: Session = Depends(get
             'id': estudiante.id,
             'nombre': estudiante.nombre_completo,
             'matricula': estudiante.matricula,
-            'curso': estudiante.curso.nombre_completo if estudiante.curso else None,
-            'grado': estudiante.curso.grado.nombre if estudiante.curso and estudiante.curso.grado else None
+            # El curso y el grado del AÑO DEL BOLETÍN, no el curso actual:
+            # un promovido ya está en B y su boletín de A debe decir A.
+            'curso': _curso_ano.nombre_completo if _curso_ano else None,
+            'grado': _grado_ano.nombre if _grado_ano else None
         },
         'asignaturas': asignaturas,
+        # `asistencia` conserva su forma histórica para no romper a quien ya la
+        # consume; lo que cambia es que los números son los correctos y que
+        # `porcentaje` puede venir en None cuando no hay de dónde sacarlo.
         'asistencia': {
-            'presentes': presentes,
-            'total': total_dias,
-            'porcentaje': round(presentes / total_dias * 100, 1) if total_dias > 0 else 0
+            'presentes': asistencia_anual['asistencias'],
+            'total': asistencia_anual['dias_computados'],
+            'porcentaje': asistencia_anual['pct_asistencia'],
         },
+        'asistencia_anual': asistencia_anual,
         'promedio_general': round(promedio_general, 2)
     }
 
 
 @app.get("/api/boletines/estudiante/{id}/pdf")
-async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
+async def generar_boletin_pdf(id, request: Request, ano_id: int | None = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """Boletin para PADRES - reporte detallado de calificaciones (v2.13.36).
 
     Documento formal con el detalle completo por competencia y periodo.
@@ -12568,10 +14444,15 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
         return _guard
 
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
-    curso = estudiante.curso
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
     if not curso:
         return JSONResponse({'error': 'El estudiante no tiene curso asignado.'}, status_code=400)
 
@@ -12622,6 +14503,8 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
             asignaturas_data=asignaturas_data,
             config=config,
             ano_nombre=ano.nombre if ano else '',
+            asistencia_anual=_asistencia_anual_boletin(
+                db, estudiante.id, current_user, ano),
         )
     except Exception as e:
         logger.error(f"Error generando boletin de padres para estudiante {id}: {e}", exc_info=True)
@@ -12634,7 +14517,7 @@ async def generar_boletin_pdf(id, request: Request, db: Session = Depends(get_db
 
 
 @app.get("/api/boletines/curso/{curso_id}/pdf")
-async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
+async def generar_boletines_curso_pdf(curso_id, ano_id: int | None = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
     """Boletines para PADRES de todo un curso en un solo PDF (v2.13.36).
 
     Genera el boletin de padres detallado (por competencia y periodo) de
@@ -12645,13 +14528,19 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
 
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
 
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.apellido, Estudiante.nombre).all()
+    # ENTREGA-1.1 · La cohorte del curso EN ESE AÑO. Filtrar por
+    # `Estudiante.curso_id` devolvería, en un año ya promovido, solo a los
+    # que NO se movieron.
+    estudiantes, _err_coh = _cohorte_del_curso_en_ano(
+        db, current_user, curso, ano)
+    if _err_coh:
+        return _err_coh
 
     if not estudiantes:
         return JSONResponse({'error': 'El curso no tiene estudiantes activos.'}, status_code=400)
@@ -12693,6 +14582,10 @@ async def generar_boletines_curso_pdf(curso_id, db: Session = Depends(get_db), c
             buf = generar_boletin_padres(
                 estudiante=estudiante, curso=curso, asignaturas_data=asignaturas_data,
                 config=config, ano_nombre=ano.nombre if ano else '',
+                # El MISMO helper que el individual: la página del lote no
+                # puede decir algo distinto del PDF suelto.
+                asistencia_anual=_asistencia_anual_boletin(
+                    db, estudiante.id, current_user, ano),
             )
             reader = PdfReader(buf)
             for page in reader.pages:
@@ -12818,8 +14711,19 @@ def _asistencias_estudiantes(db, current_user, estudiante_ids, ano):
     return indice
 
 
-def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano):
-    """El contexto de A2 con lo que REALMENTE hay en la base."""
+def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano,
+                       decision=None):
+    """El contexto de A2 con lo que REALMENTE hay en la base.
+
+    CORE-2 · `decision` es la fila de `DecisionAcademicaEstudiante` de ese
+    estudiante en ese año, cuando existe. Antes A2 recibía las tres claves
+    humanas en None y un 3.º de Primaria quedaba EN_PROCESO para siempre: no
+    porque faltara un cálculo, sino porque no había dónde guardar el dato.
+
+    Los valores van TAL CUAL al contrato de A2. No se normalizan, no se
+    traducen y no se inventan: si alguien guardó un valor que A2 no reconoce,
+    A2 lo rechaza como contexto inconsistente, que es lo que debe pasar.
+    """
     diagnosticos = []
     if precarga['diag_grado']:
         diagnosticos.append(precarga['diag_grado'])
@@ -12834,7 +14738,49 @@ def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano):
 
     contexto = RAC.construir_contexto(
         precarga['grado_numero'], nivel, porcentaje, diagnosticos)
+
+    if decision is not None:
+        # Solo se añaden las claves REALMENTE decididas. Meter una clave en
+        # None no es lo mismo que no meterla: A2 distingue «no informado» de
+        # «informado como nada», y su validación de contexto mira si la clave
+        # está presente.
+        if decision.alfabetizacion_inicial is not None:
+            contexto['alfabetizacion_inicial'] = decision.alfabetizacion_inicial
+        if decision.decision_asistencia:
+            contexto['decision_asistencia'] = decision.decision_asistencia
+        if decision.decision_excepcional_segundo:
+            contexto['decision_excepcional_segundo'] = \
+                decision.decision_excepcional_segundo
+        if decision.repeticion_excepcional_segundo_ya_utilizada is not None:
+            contexto['repeticion_excepcional_segundo_ya_utilizada'] = \
+                decision.repeticion_excepcional_segundo_ya_utilizada
+
     return contexto, diagnosticos
+
+
+# Centinela para distinguir «no me pasaron la decision» de «la decision es
+# None porque este estudiante no tiene ninguna». Sin esto, el camino por
+# bloques volvia a consultar por estudiante y reaparecia el N+1 que la
+# precarga existe para evitar.
+_DECISION_NO_PRECARGADA = object()
+
+
+def _decisiones_de_estudiantes(db, current_user, estudiante_ids, ano):
+    """Las decisiones humanas de un bloque de estudiantes. -> {est_id: fila}
+
+    Una consulta por curso, no una por estudiante: es el mismo criterio que
+    el resto de la precarga canónica.
+    """
+    if not estudiante_ids or ano is None:
+        return {}
+    filas = (
+        tenant_filter(db.query(DecisionAcademicaEstudiante),
+                      DecisionAcademicaEstudiante, current_user)
+        .filter(DecisionAcademicaEstudiante.ano_escolar_id == ano.id,
+                DecisionAcademicaEstudiante.estudiante_id.in_(list(estudiante_ids)))
+        .all()
+    )
+    return {f.estudiante_id: f for f in filas}
 
 
 def _diagnosticos_curriculo(precarga, resultados, diagnosticos):
@@ -12859,7 +14805,8 @@ def _diagnosticos_curriculo(precarga, resultados, diagnosticos):
 def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
                                    competencias_por_asig=None,
                                    extras_por_asig=None,
-                                   asistencias=None):
+                                   asistencias=None,
+                                   decision=_DECISION_NO_PRECARGADA):
     """La situacion academica de UN estudiante de Secundaria.
 
     La usan el boletin individual y el de lote, sin variantes: si alguna vez
@@ -12883,8 +14830,12 @@ def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
         precarga['asignaturas'], competencias_por_asig, extras_por_asig,
         _calcular_cf_secundaria)
 
+    if decision is _DECISION_NO_PRECARGADA:
+        decision = _decisiones_de_estudiantes(
+            db, current_user, [estudiante.id], ano).get(estudiante.id)
+
     contexto, diagnosticos = _contexto_canonico(
-        precarga, RAC.RA.NIVEL_SECUNDARIA, asistencias, ano)
+        precarga, RAC.RA.NIVEL_SECUNDARIA, asistencias, ano, decision=decision)
 
     return RAC.construir_situacion_estudiante(
         RAC.RA.NIVEL_SECUNDARIA, precarga['grado_numero'], resultados,
@@ -12896,7 +14847,8 @@ def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
 def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
                                  competencias_por_asig=None,
                                  recuperaciones_por_asig=None,
-                                 asistencias=None):
+                                 asistencias=None,
+                                 decision=_DECISION_NO_PRECARGADA):
     """La situacion academica de UN estudiante de Primaria.
 
     Sustituye a `calculo_primaria.condicion_final_estudiante` en los caminos
@@ -12925,8 +14877,12 @@ def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
         recuperaciones_por_asig, precarga['grado_numero'],
         codigos_oficiales_esperados=precarga['curriculo_esperado'])
 
+    if decision is _DECISION_NO_PRECARGADA:
+        decision = _decisiones_de_estudiantes(
+            db, current_user, [estudiante.id], ano).get(estudiante.id)
+
     contexto, diagnosticos = _contexto_canonico(
-        precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano)
+        precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano, decision=decision)
     diagnosticos = _diagnosticos_curriculo(precarga, resultados, diagnosticos)
     if adicionales:
         diagnosticos.append('%s: %s' % (
@@ -12998,6 +14954,338 @@ def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano
     return resultado
 
 
+# ══ ENTREGA-1.1 · EL BOLETÍN DE UN AÑO SE EMITE CON LOS DATOS DE ESE AÑO ══
+#
+# Terminada una transición A -> B, un estudiante promovido tiene `curso_id`
+# de B. Su boletín de A, sin embargo, tiene que mostrar el curso, el grado,
+# las notas y la asistencia de A. Hasta aquí los ocho caminos de boletín
+# resolvían el año con `activo=True`, así que después de promover ya no había
+# forma de volver a emitir el documento del año cerrado.
+#
+# Estos tres helpers son todo lo que hace falta, y ninguno inventa verdad
+# académica: el año, el contexto de UN estudiante en ese año, y la cohorte de
+# UN curso en ese año.
+
+
+def _ano_de_boletin(db, current_user, ano_id=None):
+    """(año, error) para un boletín.
+
+    Con `ano_id` explícito manda ese año, resuelto por tenant: uno de otro
+    colegio da 404, igual que uno inexistente.
+
+    Sin él se conserva EXACTAMENTE el comportamiento anterior —el activo, y
+    si no hay, el más reciente— y el caso «no hay ningún año» se devuelve
+    como `(None, None)` para que cada endpoint siga tratándolo como siempre.
+    Este helper no cambia ninguna respuesta existente; solo añade la opción.
+    """
+    q = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+    if ano_id is not None:
+        ano = q.filter(AnoEscolar.id == int(ano_id)).first()
+        if ano is None:
+            return None, JSONResponse({'error': 'Año escolar no encontrado'},
+                                      status_code=404)
+        return ano, None
+    ano = q.filter_by(activo=True).first()
+    if not ano:
+        ano = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+               .order_by(AnoEscolar.id.desc()).first())
+    return ano, None
+
+
+def _historial_canonico_de(db, current_user, estudiante_id, ano):
+    """(historial | None, ambiguo) de UN estudiante en UN año.
+
+    El mismo criterio canónico que usa el Cierre: `condicion` es exactamente
+    PROMOVIDO o REPROBADO. Lo demás —«activo», «Inscrito», «Egresado», None—
+    lo escribió el writer antiguo copiando un campo de matrícula, y no
+    afirma ningún resultado académico.
+
+    Dos filas canónicas son dos verdades distintas sobre el mismo estudiante
+    y el mismo año. No se elige una: se avisa.
+    """
+    filas = (
+        tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
+                      current_user)
+        .filter(HistorialAcademico.estudiante_id == estudiante_id,
+                HistorialAcademico.ano_escolar_id == ano.id,
+                HistorialAcademico.condicion.in_(CONDICIONES_DEFINITIVAS))
+        .order_by(HistorialAcademico.id).all())
+    if len(filas) == 1:
+        return filas[0], False
+    return None, len(filas) > 1
+
+
+def _contexto_academico_del_ano(db, current_user, estudiante, ano,
+                                estricto=True):
+    """(curso, grado, error) del estudiante EN ese año escolar.
+
+    Dos casos, y el orden importa:
+
+      · si su curso actual pertenece al año pedido, ese es el contexto. Cubre
+        el año en curso y también al estudiante que sigue físicamente en A
+        —un APLAZADO, o un 6.º de Secundaria que terminó y no se mueve—, que
+        no necesita historial para imprimir su boletín de A;
+
+      · si ya fue movido a B, el curso y el grado de A salen de su historial
+        CANÓNICO de A, que los guarda precisamente para esto.
+
+    Sin historial canónico y sin pertenecer al año, no hay de dónde sacar el
+    contexto. No se recurre al curso actual —sería emitir el boletín de A con
+    el grado de B, que es la mezcla que todo esto existe para evitar— ni a
+    una fila legacy, que no afirma ningún resultado.
+
+    `estricto` distingue quién preguntó. Cuando el año llegó EXPLÍCITO, la
+    pregunta es «el boletín de ESE año» y no hay respuesta honesta sin
+    contexto: se falla cerrado. Cuando no llegó ninguno —una llamada antigua,
+    sin el parámetro— la pregunta es la de siempre, «el boletín», y se
+    conserva el comportamiento anterior: el curso actual del estudiante. No
+    es mejor, pero es el que esa llamada ya tenía, y ENTREGA-1.1 no rompe
+    clientes existentes para arreglar un caso que ahora tiene su parámetro.
+    """
+    curso = getattr(estudiante, 'curso', None)
+
+    def _grado_de(c):
+        return (db.get(Grado, c.grado_id) if c is not None and c.grado_id
+                else None)
+
+    if ano is None:
+        return curso, _grado_de(curso), None
+    if curso is not None and curso.ano_escolar_id == ano.id:
+        return curso, _grado_de(curso), None
+
+    historial, ambiguo = _historial_canonico_de(db, current_user,
+                                                estudiante.id, ano)
+    if ambiguo:
+        return None, None, JSONResponse({
+            'error': 'HISTORIAL_AMBIGUO',
+            'message': ('Hay más de un resultado académico registrado para '
+                        'este estudiante en ese año escolar. Corrija el '
+                        'historial antes de emitir el documento.'),
+        }, status_code=409)
+    if historial is None:
+        if not estricto:
+            return curso, _grado_de(curso), None
+        return None, None, JSONResponse({
+            'error': 'SIN_CONTEXTO_ACADEMICO',
+            'message': ('No existe contexto académico del estudiante para ese '
+                        'año escolar.'),
+        }, status_code=404)
+
+    curso_h = (tenant_filter(db.query(Curso), Curso, current_user)
+               .filter(Curso.id == historial.curso_id).first())
+    grado_h = (tenant_filter(db.query(Grado), Grado, current_user)
+               .filter(Grado.id == historial.grado_id).first())
+    return curso_h, grado_h, None
+
+
+def _cohorte_del_curso_en_ano(db, current_user, curso, ano):
+    """(estudiantes, error) que cursaron ESE curso en ESE año.
+
+    Después de promover, el curso de A sigue existiendo pero sus estudiantes
+    ya tienen `curso_id` de B. Buscar por `Estudiante.curso_id == curso_A.id`
+    devolvería justo a los que NO fueron promovidos: el lote histórico
+    perdería a la mayoría del curso.
+
+    La cohorte es la unión de dos conjuntos:
+
+      A. los que siguen físicamente en el curso —aplazados, en proceso, un
+         6.º de Secundaria que terminó y no se movió—;
+      B. los que tienen historial CANÓNICO de ese año apuntando a ese curso.
+
+    Una fila por estudiante. Las legacy no dan pertenencia: si alguien solo
+    aparece con una, no entra, porque esa fila no dice que cursara ahí.
+    """
+    actuales = (tenant_filter(db.query(Estudiante), Estudiante, current_user)
+                .filter_by(curso_id=curso.id, activo=True)
+                .order_by(Estudiante.no_lista, Estudiante.apellido).all())
+    if ano is None or curso.ano_escolar_id != ano.id:
+        return actuales, None
+
+    filas = (
+        tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
+                      current_user)
+        .filter(HistorialAcademico.ano_escolar_id == ano.id,
+                HistorialAcademico.condicion.in_(CONDICIONES_DEFINITIVAS))
+        .order_by(HistorialAcademico.id).all())
+    por_estudiante = {}
+    for h in filas:
+        por_estudiante.setdefault(h.estudiante_id, []).append(h)
+
+    # Solo importa la ambigüedad que toca a ESTE curso. Que otro curso del
+    # mismo año tenga un historial duplicado no dice nada sobre este lote.
+    ambiguos = sorted(eid for eid, v in por_estudiante.items()
+                      if len(v) > 1 and any(h.curso_id == curso.id for h in v))
+    if ambiguos:
+        return None, JSONResponse({
+            'error': 'HISTORIAL_AMBIGUO',
+            'message': ('Hay estudiantes con más de un resultado académico '
+                        'registrado en ese año escolar. Corrija el historial '
+                        'antes de emitir los documentos del curso.'),
+            'estudiantes': ambiguos,
+        }, status_code=409)
+
+    ya = {e.id for e in actuales}
+    faltan = [eid for eid, v in por_estudiante.items()
+              if len(v) == 1 and v[0].curso_id == curso.id and eid not in ya]
+    if faltan:
+        extra = (tenant_filter(db.query(Estudiante), Estudiante, current_user)
+                 .filter(Estudiante.id.in_(faltan))
+                 .order_by(Estudiante.no_lista, Estudiante.apellido).all())
+        actuales = actuales + list(extra)
+    return actuales, None
+
+
+# ── ENTREGA-1 · LA UNIDAD DE ASISTENCIA ES EL DÍA ──────────────────────
+#
+# El modelo lo dice sin ambigüedad. En PRIMARIA `asignatura_id` es NULL y un
+# índice único parcial garantiza UNA fila por (estudiante, fecha): una fila es
+# un día. En SECUNDARIA la asistencia es POR MATERIA, así que el mismo día
+# produce tantas filas como asignaturas tenga el estudiante ese día.
+#
+# Contar filas, entonces, cuenta días en Primaria y clases en Secundaria. Un
+# boletín que sumara filas diría que un alumno de Secundaria con seis materias
+# tuvo seis veces más días de clase que uno de Primaria, y el porcentaje de
+# ambos hablaría de cosas distintas bajo la misma etiqueta.
+#
+# La unidad del boletín es el DÍA, en los dos niveles. Cuando un día trae
+# varias marcas gana la de mayor prioridad, que es la que el sistema ya usaba:
+# presente > tardanza > excusa > ausente. El criterio no es arbitrario —
+# describe al estudiante, no a la materia: si vino, vino, aunque faltara a una
+# clase suelta.
+_PRIORIDAD_DIA_ASISTENCIA = {'presente': 4, 'tardanza': 3, 'excusa': 2,
+                             'ausente': 1}
+
+# Contrato congelado: `tardanza` es asistencia (el estudiante vino) y `excusa`
+# es ausencia JUSTIFICADA. Las dos distinciones se conservan enteras en el
+# desglose anual; aquí solo se agrupan para los totales.
+_DIA_PRESENCIAL = ('presente', 'tardanza')
+_DIA_AUSENCIA = ('ausente', 'excusa')
+
+
+def _dias_asistencia_del_ano(db, estudiante_id, current_user, ano):
+    """`{fecha: estado}` del estudiante dentro del año escolar dado.
+
+    Tenant-safe y acotado al año: sin el recorte, las marcas de años
+    anteriores entraban al boletín por el camino del «período más cercano».
+    """
+    filas = tenant_filter(
+        db.query(Asistencia), Asistencia, current_user
+    ).filter_by(estudiante_id=estudiante_id).all()
+    return _dias_asistencia_de_filas(filas, ano)
+
+
+def _dias_asistencia_de_filas(filas, ano):
+    """La misma deduplicación, sobre filas ya cargadas (camino por lotes)."""
+    _ini = getattr(ano, 'fecha_inicio', None)
+    _fin = getattr(ano, 'fecha_fin', None)
+    por_dia = {}
+    for a in filas or ():
+        fecha = getattr(a, 'fecha', None)
+        if not fecha:
+            continue
+        if _ini and _fin and not (_ini <= fecha <= _fin):
+            continue
+        estado = getattr(a, 'estado', None)
+        previo = por_dia.get(fecha)
+        if previo is None or (_PRIORIDAD_DIA_ASISTENCIA.get(estado, 0)
+                              > _PRIORIDAD_DIA_ASISTENCIA.get(previo, 0)):
+            por_dia[fecha] = estado
+    return por_dia
+
+
+def _resumen_anual_asistencia(dias, ano):
+    """Desglose ANUAL de asistencia a partir de los días ya deduplicados.
+
+    EL DENOMINADOR
+    --------------
+    EducaOne ya tenía declarada su política, y en dos sitios: A3
+    (`porcentaje_ausencias`, congelado) y el resumen por períodos de
+    /academico. En los dos, el denominador oficial es
+    `AnoEscolar.dias_trabajados` —los días hábiles que la dirección declara
+    mes a mes— y no «los días en que alguien pasó lista». La razón está
+    escrita en A3: a un curso al que se le pasó lista tres días, una sola
+    falta le daría 33 % de ausencia.
+
+    El boletín usaba su propio denominador. Aquí se alinea con el canónico.
+    Cuando `dias_trabajados` no está declarado se conserva el respaldo que el
+    resumen por períodos ya usaba —los días con registro—, pero DECLARADO en
+    la respuesta (`base_porcentaje`), para que la pantalla pueda advertirlo en
+    vez de presentarlo como un dato firme.
+
+    LA AUSENCIA ES EL NUMERADOR; LA ASISTENCIA ES SU COMPLEMENTO
+    ------------------------------------------------------------
+    Este es el punto fino, y conviene decirlo entero porque la aritmética
+    ingenua da un resultado absurdo.
+
+    Lo que A3 calcula sobre `dias_trabajados` son las AUSENCIAS: cuánto del
+    año lectivo se perdió el estudiante. Los días en que nadie pasó lista
+    cuentan, correctamente, como «no consta que faltara».
+
+    Si se aplicara el mismo denominador a las ASISTENCIAS, esos días se
+    volverían en contra del estudiante: con 195 días hábiles declarados y
+    trece días de lista pasada, un alumno con asistencia casi perfecta
+    aparecería con un 4,6 % de asistencia. El número sería cierto —asistió a
+    9 de 195— pero diría algo que nadie preguntó, y en un boletín se leería
+    como un desastre.
+
+    Por eso la ausencia se mide contra el denominador canónico y la
+    asistencia es su complemento. Las dos columnas de la plantilla están una
+    al lado de la otra y suman 100: así es como se leen.
+
+    Y si la declaración no puede sostener los datos —menos días hábiles que
+    días con registro— es la declaración la que está mal. No se adivina cuál
+    de los dos corregir: se cae al respaldo y se dice en `base_porcentaje`.
+
+    SIN REGISTROS NO ES CERO
+    ------------------------
+    Un estudiante sin ninguna marca no tiene 0 % de asistencia: no tiene
+    dato. Los porcentajes salen en None y `sin_registros` queda en True.
+    """
+    presentes = sum(1 for e in dias.values() if e == 'presente')
+    tardanzas = sum(1 for e in dias.values() if e == 'tardanza')
+    ausencias = sum(1 for e in dias.values() if e == 'ausente')
+    excusas = sum(1 for e in dias.values() if e == 'excusa')
+
+    asistidos = presentes + tardanzas
+    ausentados = ausencias + excusas
+    computados = asistidos + ausentados
+
+    trabajados = RAC.sumar_dias_trabajados(ano)
+    if not computados:
+        base, etiqueta = None, None
+    elif trabajados and trabajados >= computados:
+        base, etiqueta = trabajados, 'dias_trabajados'
+    else:
+        base, etiqueta = computados, 'dias_con_registro'
+
+    if base:
+        pct_ausencia = round(ausentados / base * 100, 1)
+        pct_asistencia = round(100.0 - pct_ausencia, 1)
+    else:
+        pct_ausencia = pct_asistencia = None
+
+    return {
+        'sin_registros': computados == 0,
+        'presentes': presentes,
+        'tardanzas': tardanzas,
+        'asistencias': asistidos,
+        'ausencias': ausencias,
+        'excusas': excusas,
+        'ausencias_totales': ausentados,
+        'dias_computados': computados,
+        'dias_trabajados': trabajados,
+        'base_porcentaje': etiqueta,
+        'pct_asistencia': pct_asistencia,
+        'pct_ausencia': pct_ausencia,
+    }
+
+
+def _asistencia_anual_boletin(db, estudiante_id, current_user, ano):
+    """El desglose anual que consumen boletines web y PDF."""
+    return _resumen_anual_asistencia(
+        _dias_asistencia_del_ano(db, estudiante_id, current_user, ano), ano)
+
+
 def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
     """Helper que arma el dict asistencias_por_periodo desde la BD.
     
@@ -13011,10 +15299,6 @@ def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
          al período más cercano (no perderla)
       3. Si no hay año escolar válido, usar el año calendario actual dividido en 4
     """
-    asistencias = tenant_filter(
-        db.query(Asistencia), Asistencia, current_user
-    ).filter_by(estudiante_id=estudiante_id).all()
-
     # v2.14.1 BUGFIX (3 en 1):
     #  a) Solo asistencias DENTRO del año escolar. Antes entraban registros de
     #     años anteriores y el fallback "período más cercano" los metía en P1-P4.
@@ -13024,19 +15308,12 @@ def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
     #  c) tardanza cuenta como ASISTENCIA (el estudiante vino) y excusa como
     #     AUSENCIA (justificada). Antes ambas se descartaban ('ausente_justificado'
     #     ni siquiera es un estado válido del sistema).
-    _ini = getattr(ano, 'fecha_inicio', None)
-    _fin = getattr(ano, 'fecha_fin', None)
-    if _ini and _fin:
-        asistencias = [a for a in asistencias if a.fecha and _ini <= a.fecha <= _fin]
-
-    _prioridad = {'presente': 4, 'tardanza': 3, 'excusa': 2, 'ausente': 1}
-    _por_dia = {}
-    for a in asistencias:
-        if not a.fecha:
-            continue
-        prev = _por_dia.get(a.fecha)
-        if prev is None or _prioridad.get(a.estado, 0) > _prioridad.get(prev, 0):
-            _por_dia[a.fecha] = a.estado
+    #
+    # ENTREGA-1 · Esas tres reglas viven ahora en `_dias_asistencia_del_ano`,
+    # tal cual, porque el desglose ANUAL tiene que salir de la MISMA
+    # deduplicación que el desglose por período. Cuando eran dos copias, nada
+    # impedía que se separaran y que el boletín se contradijera consigo mismo.
+    _por_dia = _dias_asistencia_del_ano(db, estudiante_id, current_user, ano)
     
     # Construir rangos de períodos con fallback
     rangos = []
@@ -13185,16 +15462,24 @@ def _construir_areas_primaria(db, estudiante_id, current_user, ano):
     return resultado
 
 
-def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curso=None):
+def _generar_pdf_primaria(db, estudiante, current_user, ano, config,
+                          _cache_curso=None, curso=None):
     """Genera el buffer del Informe de Aprendizaje de un estudiante de primaria.
 
     v2.17 PERF: `_cache_curso` es un dict opcional que el generador POR CURSO
     pasa para memoizar los datos que son IGUALES para todos los estudiantes del
     mismo curso (grado y maestro titular). Sin él, el comportamiento es idéntico
     al de siempre — un boletín individual no cambia en nada.
+
+    ENTREGA-1.1 · `curso` llega ya resuelto PARA EL AÑO del boletín. Aquí se
+    tomaba `estudiante.curso`, que es el curso ACTUAL: en un boletín histórico
+    de A, un estudiante ya promovido habría salido con el grado de B, y el
+    grado decide hasta qué plantilla oficial se usa. Sin `curso` el
+    comportamiento es el de siempre.
     """
     from boletin_primaria import generar_boletin_primaria
-    curso = estudiante.curso
+    if curso is None:
+        curso = estudiante.curso
     _ck = ('grado', curso.id) if curso else None
     if _cache_curso is not None and _ck in _cache_curso:
         grado = _cache_curso[_ck]
@@ -13206,19 +15491,24 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
 
     areas = _construir_areas_primaria(db, estudiante.id, current_user, ano)
     asistencias = _construir_asistencias_boletin(db, estudiante.id, current_user, ano)
+    asistencia_anual = _asistencia_anual_boletin(db, estudiante.id, current_user, ano)
 
     # v2.14.1 BUGFIX: la asistencia NUNCA se imprimía en el boletín — el helper
     # devuelve {'p1': {'asistencia', 'ausencia'}} y el PDF espera
     # {1: {'presentes', 'ausentes'}}. Se adapta aquí sin tocar el contrato del
     # helper (secundaria y el registro lo consumen con las claves originales).
+    #
+    # ENTREGA-1 · La condición era `is not None`, y el helper devuelve SIEMPRE
+    # los cuatro períodos con enteros —nunca None—, así que un curso al que
+    # nadie pasó lista imprimía «0» y «0» en las ocho casillas. Un cero es una
+    # afirmación: dice que el estudiante no faltó ningún día y tampoco vino
+    # ninguno. Ahora un período sin ningún registro se deja en blanco.
     asistencias_pdf = {}
     for p in range(1, 5):
         d = (asistencias or {}).get(f'p{p}') or {}
-        if d.get('asistencia') is not None or d.get('ausencia') is not None:
-            asistencias_pdf[p] = {
-                'presentes': d.get('asistencia') or 0,
-                'ausentes': d.get('ausencia') or 0,
-            }
+        _a, _au = d.get('asistencia') or 0, d.get('ausencia') or 0
+        if _a or _au:
+            asistencias_pdf[p] = {'presentes': _a, 'ausentes': _au}
 
     # v2.14.1 BUGFIX (reportado): el "docente del grado" salía con el PRIMER
     # profesor asignado al curso (orden arbitrario — podía ser el de inglés).
@@ -13281,6 +15571,7 @@ def _generar_pdf_primaria(db, estudiante, current_user, ano, config, _cache_curs
         situacion_final=situacion_final,
         condicion_final=condicion_texto,
         asistencias_por_periodo=asistencias_pdf,
+        asistencia_anual=asistencia_anual,
     )
 
 
@@ -13381,18 +15672,33 @@ async def get_recuperaciones_primaria_pendientes(
     # primaria no existen en la división de secundaria.
     if nivel_efectivo(current_user, request) == 'secundaria':
         return {'pendientes': [], 'resueltas': [], 'minimo': 65}
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
 
-    _sincronizar_recuperaciones_primaria(db, current_user, ano)
+    # CORE-1: el año sale del proceso pendiente, no de `activo=True`. Un
+    # APLAZADO de 2025-2026 sigue teniendo su recuperación aunque 2026-2027
+    # ya esté en curso; antes desaparecía de esta lista el día que Dirección
+    # activaba el año nuevo.
+    _ano_param = request.query_params.get('ano_id')
+    ano, _err = _ano_de_recuperacion(
+        db, current_user, RecuperacionPrimaria,
+        ano_id=int(_ano_param) if (_ano_param or '').isdigit() else None)
+    if _err is not None:
+        return _err
+
+    # Las fichas de un año CERRADO ya existen y no hay que crear ninguna. La
+    # sincronización solo tiene sentido mientras el año sigue abierto.
+    if not getattr(ano, 'cerrado', False):
+        _sincronizar_recuperaciones_primaria(db, current_user, ano)
 
     curso_id = request.query_params.get('curso_id')
     q = tenant_filter(db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user).filter_by(
         ano_escolar_id=ano.id)
     fichas = q.all()
     if not fichas:
-        return {'pendientes': [], 'resueltas': [], 'minimo': 65}
+        # El año viaja incluso cuando no hay nada pendiente: la pantalla
+        # necesita poder decir SOBRE QUE AÑO esta mirando.
+        return {'pendientes': [], 'resueltas': [], 'minimo': 65,
+                'ano_escolar_id': ano.id, 'ano_escolar': ano.nombre,
+                'ano_cerrado': bool(getattr(ano, 'cerrado', False))}
 
     est_ids = {f.estudiante_id for f in fichas}
     ests = {
@@ -13461,7 +15767,12 @@ async def get_recuperaciones_primaria_pendientes(
 
     pendientes.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
     resueltas.sort(key=lambda x: (x['curso'], x['estudiante_nombre']))
-    return {'pendientes': pendientes, 'resueltas': resueltas, 'minimo': 65}
+    # El año viaja en la respuesta para que la pantalla pueda decir SOBRE QUÉ
+    # AÑO se está calificando. Mezclar dos años sin etiquetarlos sería peor
+    # que no mostrarlos.
+    return {'pendientes': pendientes, 'resueltas': resueltas, 'minimo': 65,
+            'ano_escolar_id': ano.id, 'ano_escolar': ano.nombre,
+            'ano_cerrado': bool(getattr(ano, 'cerrado', False))}
 
 
 @app.post("/api/recuperaciones-primaria")
@@ -13519,9 +15830,22 @@ async def guardar_recuperacion_primaria(
     except (TypeError, ValueError):
         return JSONResponse({'error': 'Los puntos deben ser un número'}, status_code=400)
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
+    # CORE-1: el año se deriva de la ficha pendiente de ESTE estudiante en
+    # ESTA asignatura. Si el proceso quedó abierto en el año anterior, la nota
+    # entra ahí, que es donde el reglamento dice que va.
+    ano, _err = _ano_de_recuperacion(
+        db, current_user, RecuperacionPrimaria,
+        ano_id=data.get('ano_id'), estudiante_id=est_id,
+        asignatura_id=asig_id)
+    if _err is not None:
+        return _err
+
+    # CORE-2 · El curso del estudiante tiene que ser de ESTE año. Si ya fue
+    # movido al siguiente, su proceso de este quedó cerrado y la asignación
+    # que lo autorizaría sería la del curso nuevo.
+    _err_curso = _validar_curso_del_ano(db, current_user, _est_rec, ano)
+    if _err_curso is not None:
+        return _err_curso
 
     ficha = tenant_filter(db.query(RecuperacionPrimaria), RecuperacionPrimaria, current_user).filter_by(
         estudiante_id=est_id, asignatura_id=asig_id, ano_escolar_id=ano.id).first()
@@ -13529,6 +15853,11 @@ async def guardar_recuperacion_primaria(
         return JSONResponse(
             {'error': 'Esta área no tiene recuperación pendiente (su CF es 65 o más).'},
             status_code=400)
+
+    # CORE-2 · Año cerrado: EXACTAMENTE la fase pendiente, sin correcciones.
+    _err_cerrado = _validar_escritura_en_ano_cerrado(ano, ficha, tipo)
+    if _err_cerrado is not None:
+        return _err_cerrado
 
     # La recuperación es COMPLEMENTARIA: los puntos se suman a la CF del área.
     maximo = ficha.maximo_puntos()
@@ -13564,6 +15893,8 @@ async def guardar_recuperacion_primaria(
         'nota_final': ficha.nota_final,
         'condicion_final': ficha.condicion_final,
         'aprobado': (ficha.nota_final or 0) >= 65,
+        'ano_escolar_id': ano.id,
+        'ano_escolar': ano.nombre,
     }
 
 
@@ -14091,6 +16422,7 @@ async def retirar_recuperacion_cualitativa(
 @app.get("/api/boletines-primaria/estudiante/{id}")
 async def boletin_primaria_estudiante_json(
     id: int,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user)
 ):
@@ -14112,15 +16444,20 @@ async def boletin_primaria_estudiante_json(
     if _guard:
         return _guard
 
-    curso = estudiante.curso
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
     if not curso:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
     if _es_curso_secundaria(db, curso.id):
         return JSONResponse({'error': 'Este estudiante es de secundaria.'}, status_code=400)
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
 
@@ -14216,9 +16553,13 @@ async def boletin_primaria_estudiante_json(
     # v2.14.1 BUGFIX: se sumaba .get('presentes') sobre un dict cuyas claves
     # reales son 'asistencia'/'ausencia' — la asistencia de la vista previa
     # salía SIEMPRE 0 / 0%.
-    total_pres = sum((a or {}).get('asistencia', 0) or 0 for a in (asistencia or {}).values())
-    total_aus = sum((a or {}).get('ausencia', 0) or 0 for a in (asistencia or {}).values())
-    total_dias = total_pres + total_aus
+    #
+    # ENTREGA-1 · Y el total anual ya no se recompone sumando los cuatro
+    # períodos: sale del mismo desglose que usa el PDF, que además distingue
+    # presentes de tardanzas y ausencias de excusas.
+    asistencia_anual = _asistencia_anual_boletin(db, id, current_user, ano)
+    total_pres = asistencia_anual['asistencias']
+    total_dias = asistencia_anual['dias_computados']
 
     cfs = [a['cf_area'] for a in areas if a['cf_area'] is not None]
 
@@ -14237,8 +16578,9 @@ async def boletin_primaria_estudiante_json(
         'asistencia': {
             'presentes': total_pres,
             'total': total_dias,
-            'porcentaje': round(total_pres / total_dias * 100) if total_dias else 0,
+            'porcentaje': asistencia_anual['pct_asistencia'],
         },
+        'asistencia_anual': asistencia_anual,
         'condicion_final': condicion,
     }
 
@@ -14246,6 +16588,7 @@ async def boletin_primaria_estudiante_json(
 @app.get("/api/boletines-primaria/estudiante/{id}/pdf")
 async def boletin_primaria_estudiante_pdf(
     id: int,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
 ):
@@ -14257,7 +16600,18 @@ async def boletin_primaria_estudiante_pdf(
     if _guard:
         return _guard
 
-    curso = estudiante.curso
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
     if not curso:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
     if _es_curso_secundaria(db, curso.id):
@@ -14265,16 +16619,11 @@ async def boletin_primaria_estudiante_pdf(
             {'error': 'Este boletín es solo para primaria. Para secundaria usá el Boletín MINERD.'},
             status_code=400)
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
-    if not ano:
-        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
-
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
 
     try:
-        buf = _generar_pdf_primaria(db, estudiante, current_user, ano, config)
+        buf = _generar_pdf_primaria(db, estudiante, current_user, ano, config,
+                                    curso=curso)
     except FileNotFoundError:
         return JSONResponse({'error': 'No se encontró la plantilla oficial de ese grado.'}, status_code=500)
 
@@ -14286,6 +16635,7 @@ async def boletin_primaria_estudiante_pdf(
 @app.get("/api/boletines-primaria/curso/{curso_id}/pdf")
 async def boletin_primaria_curso_pdf(
     curso_id: int,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
 ):
@@ -14302,16 +16652,19 @@ async def boletin_primaria_curso_pdf(
     if _es_curso_secundaria(db, curso.id):
         return JSONResponse({'error': 'Este boletín es solo para primaria.'}, status_code=400)
 
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
 
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.no_lista, Estudiante.apellido).all()
+    estudiantes, _err_coh = _cohorte_del_curso_en_ano(
+        db, current_user, curso, ano)
+    if _err_coh:
+        return _err_coh
 
     if not estudiantes:
         return JSONResponse({'error': 'El curso no tiene estudiantes activos'}, status_code=404)
@@ -14321,7 +16674,11 @@ async def boletin_primaria_curso_pdf(
     _cache_curso = {}  # v2.17 PERF: memoiza grado y titular del curso
     for est in estudiantes:
         try:
-            buf = _generar_pdf_primaria(db, est, current_user, ano, config, _cache_curso)
+            # El curso del LOTE es el curso histórico pedido, el mismo para
+            # todos: reconstruimos la cohorte de ESE curso, no la de donde
+            # esté cada estudiante ahora.
+            buf = _generar_pdf_primaria(db, est, current_user, ano, config,
+                                        _cache_curso, curso=curso)
             for page in PdfReader(buf).pages:
                 writer.add_page(page)
             generados += 1
@@ -14344,6 +16701,7 @@ async def boletin_primaria_curso_pdf(
 async def generar_boletin_minerd_v2(
     id: int,
     request: Request,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))
 ):
@@ -14367,20 +16725,33 @@ async def generar_boletin_minerd_v2(
     if _guard:
         return _guard
 
-    curso = estudiante.curso
-    if not curso:
+    if not estudiante.curso_id:
         return JSONResponse({'error': 'Estudiante sin curso asignado'}, status_code=400)
+    
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
+    # El curso y el grado del AÑO PEDIDO. `curso` alimenta la portada, el
+    # ciclo de la plantilla y la construcción de calificaciones, así que
+    # tomarlo del año actual emitiría el boletín de A con el grado de B.
+    curso, _grado_ano, _err_ctx = _contexto_academico_del_ano(
+        db, current_user, estudiante, ano, estricto=ano_id is not None)
+    if _err_ctx:
+        return _err_ctx
+    if not curso:
+        return JSONResponse({'error': 'El estudiante no tiene curso asignado'}, status_code=400)
+    # ENTREGA-1.1 · El nivel se comprueba sobre el curso DEL AÑO PEDIDO. Se
+    # comprobaba sobre el curso actual, y un alumno que pasó de 6.º de
+    # Primaria a 1.º de Secundaria habría colado su año de primaria por este
+    # endpoint, que es de secundaria.
     if not _es_curso_secundaria(db, curso.id):
         return JSONResponse(
             {'error': 'Este boletín es solo para estudiantes de secundaria. Para primaria/legacy usá el botón "Descargar PDF" en /boletines.'},
             status_code=400
         )
-    
-    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        # v2.13.19: año cerrado tras promover → usar el más reciente
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado. Configurá uno en Configuración → Año Escolar.'}, status_code=404)
     
@@ -14397,6 +16768,7 @@ async def generar_boletin_minerd_v2(
     try:
         califs_por_asig = _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano)
         asistencias = _construir_asistencias_boletin(db, estudiante.id, current_user, ano)
+        asistencia_anual = _asistencia_anual_boletin(db, estudiante.id, current_user, ano)
     except Exception as e:
         logger.error(f"Error construyendo datos del boletín para estudiante {id}: {e}", exc_info=True)
         return JSONResponse({'error': f'Error preparando datos del boletín: {str(e)[:120]}'}, status_code=500)
@@ -14450,6 +16822,7 @@ async def generar_boletin_minerd_v2(
             curso=curso,
             calificaciones_por_asig=califs_por_asig,
             asistencias_por_periodo=asistencias,
+            asistencia_anual=asistencia_anual,
             config=config,
             ano_escolar=ano,
             observaciones=observaciones,
@@ -14479,6 +16852,7 @@ async def generar_boletin_minerd_v2(
 async def generar_boletines_curso_minerd_v2(
     curso_id: int,
     request: Request,
+    ano_id: int | None = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))
 ):
@@ -14492,19 +16866,24 @@ async def generar_boletines_curso_minerd_v2(
             status_code=400
         )
     
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.apellido, Estudiante.nombre).all()
-    if not estudiantes:
-        return JSONResponse({'error': 'No hay estudiantes en este curso'}, status_code=404)
-    
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        # v2.13.19: año cerrado tras promover → usar el más reciente
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    # ENTREGA-1.1 · `ano_id` explícito para reemitir un boletín histórico.
+    # Sin él, exactamente el comportamiento de antes.
+    #
+    # El año va ANTES que la cohorte, porque la cohorte depende de él: quién
+    # cursó este curso se responde para un año concreto.
+    ano, _err_ano = _ano_de_boletin(db, current_user, ano_id)
+    if _err_ano:
+        return _err_ano
     if not ano:
         return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+
+    estudiantes, _err_coh = _cohorte_del_curso_en_ano(
+        db, current_user, curso, ano)
+    if _err_coh:
+        return _err_coh
+    if not estudiantes:
+        return JSONResponse({'error': 'No hay estudiantes en este curso'}, status_code=404)
     
     # Combinar PDFs por estudiante en uno solo
     # v2.13.9: try/except por estudiante para que UN error no rompa todo el curso
@@ -14543,7 +16922,11 @@ async def generar_boletines_curso_minerd_v2(
     for est in estudiantes:
         try:
             califs = _construir_datos_boletin_secundaria(db, est, curso, current_user, ano)
+            # ENTREGA-1 · El lote llama a los MISMOS dos helpers que el
+            # individual. Mientras sea así, la página de un estudiante dentro
+            # del PDF del curso no puede decir algo distinto de su PDF suelto.
             asist = _construir_asistencias_boletin(db, est.id, current_user, ano)
+            asist_anual = _asistencia_anual_boletin(db, est.id, current_user, ano)
             if not califs:
                 continue  # skip si no tiene notas cargadas
             # ── R4-A3 · El MISMO helper que el boletín individual ──
@@ -14563,6 +16946,7 @@ async def generar_boletines_curso_minerd_v2(
                 estudiante=est, curso=curso,
                 calificaciones_por_asig=califs,
                 asistencias_por_periodo=asist,
+                asistencia_anual=asist_anual,
                 config=config, ano_escolar=ano,
                 situacion_final=situacion,
                 docente_nombre=docente_nombre,
@@ -15664,79 +18048,25 @@ def _fila_preview(estudiante, paquete, indice_grados, ambiguos, grado_actual):
 
 
 def _preview_promocion_canonica(db, current_user, ano):
-    """La previsualizacion de TODO el colegio, resuelta con A1/A2.
+    """La previsualizacion del año, resuelta con A1/A2 y con el historial.
 
-    Agrupa por curso y precarga por bloque: una precarga curricular y cuatro
-    consultas de datos academicos por CURSO, no por estudiante. Sin esto, un
-    colegio de 300 alumnos haria miles de viajes a la base.
+    CORE-2 · Antes esto empezaba por TODOS los estudiantes activos del
+    colegio y calculaba su situación contra `ano`. Mientras nadie se movía,
+    daba lo correcto. En cuanto la transición empezaba, no: un alumno ya
+    promovido tiene sus notas en el año origen pero su curso —y por tanto su
+    grado y su currículo— en el año destino, así que la previsualización del
+    año que se está cerrando lo evaluaba con el currículo del siguiente. Es
+    el defecto que C0.1 §4 reprodujo: «3ro → 4to, total_asig=9».
+
+    Ahora consume la cohorte canónica: los pendientes se calculan en vivo y
+    los ya procesados se LEEN de su historial, que guarda el año, el grado y
+    el curso de origen precisamente para esto.
 
     Es LECTURA PURA. No escribe, no mueve a nadie, no toca
     `Estudiante.condicion` —que es un campo administrativo y no la verdad
     academica— y no ejecuta ninguna promocion.
     """
-    estudiantes = tenant_filter(
-        db.query(Estudiante), Estudiante, current_user
-    ).filter_by(activo=True).order_by(
-        Estudiante.curso_id, Estudiante.no_lista, Estudiante.apellido).all()
-    if not estudiantes:
-        return []
-
-    indice_grados, ambiguos = _indice_grados_canonico(db, current_user)
-
-    por_curso = {}
-    for est in estudiantes:
-        por_curso.setdefault(est.curso_id, []).append(est)
-
-    filas = []
-    for curso_id, alumnos in por_curso.items():
-        curso = alumnos[0].curso if curso_id is not None else None
-        if curso is None or ano is None:
-            # Sin curso no hay grado, y sin grado no hay norma aplicable. El
-            # estudiante NO se omite: aparece en proceso y con el motivo.
-            for est in alumnos:
-                paquete = RAC.construir_situacion_estudiante(
-                    None, None, [], None, {},
-                    diagnosticos=[DIAG_ESTUDIANTE_SIN_CURSO])
-                filas.append(_fila_preview(est, paquete, indice_grados,
-                                           ambiguos, None))
-            continue
-
-        ids = [e.id for e in alumnos]
-        precarga = _precarga_curso_canonica(db, current_user, curso, ano,
-                                            estudiante_ids=ids)
-        asistencias = _asistencias_estudiantes(db, current_user, ids, ano)
-
-        if precarga['nivel'] == RAC.RA.NIVEL_SECUNDARIA:
-            comps = _datos_academicos_estudiantes(
-                db, current_user, ids, ano, CalificacionSecundaria)
-            extras = _datos_academicos_estudiantes(
-                db, current_user, ids, ano, EvaluacionExtraSecundaria)
-            for est in alumnos:
-                paquete = _situacion_canonica_secundaria(
-                    db, current_user, est, ano, precarga,
-                    competencias_por_asig=comps.get(est.id, {}),
-                    extras_por_asig={k: v[0] for k, v
-                                     in (extras.get(est.id) or {}).items() if v},
-                    asistencias=asistencias.get(est.id, []))
-                filas.append(_fila_preview(est, paquete, indice_grados,
-                                           ambiguos, precarga['grado']))
-        else:
-            comps = _datos_academicos_estudiantes(
-                db, current_user, ids, ano, CalificacionPrimaria)
-            recs = _datos_academicos_estudiantes(
-                db, current_user, ids, ano, RecuperacionPrimaria)
-            for est in alumnos:
-                paquete = _situacion_canonica_primaria(
-                    db, current_user, est, ano, precarga,
-                    competencias_por_asig=comps.get(est.id, {}),
-                    recuperaciones_por_asig={k: v[0] for k, v
-                                             in (recs.get(est.id) or {}).items() if v},
-                    asistencias=asistencias.get(est.id, []))
-                filas.append(_fila_preview(est, paquete, indice_grados,
-                                           ambiguos, precarga['grado']))
-
-    filas.sort(key=lambda f: ((f['curso'] or ''), f['nombre_completo'] or ''))
-    return filas
+    return _vista_cohorte_ano(db, current_user, ano)['filas']
 
 
 def _resolver_ano_preview(db, current_user, ano_id=None,
@@ -15842,7 +18172,19 @@ async def get_estudiantes_promocion(request: Request, ano_id: int = None, db: Se
 
 @app.post("/api/promocion/ejecutar")
 async def ejecutar_promocion(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Ejecutar la promoción de estudiantes al siguiente grado"""
+    """Ejecutar la promoción de estudiantes al siguiente grado.
+
+    C1 · SAFETY LOCK: bloqueado, y con código propio porque su problema es
+    distinto. Recibe IDs del cliente, no conoce el año origen ni el destino,
+    resuelve el grado con `orden + 1` y busca el curso destino por
+    (grado, tanda, activo) SIN filtrar `ano_escolar_id`: en la reproducción
+    local dejó al estudiante en un curso del año VIEJO. Era un bypass
+    completo del Cierre de Año.
+    """
+    # RELEASE · Sin `if`. Ver `_bloqueo_promocion_legacy`: habilitar el Cierre
+    # canónico no puede resucitar este writer, y ninguna constante lo activa.
+    return _bloqueo_promocion_legacy()
+
     data = await request.json()
     
     estudiantes_promover = data.get('estudiantes', [])  # Lista de IDs
@@ -15971,77 +18313,265 @@ async def get_mis_asignaturas_curso(curso_id, db: Session = Depends(get_db), cur
 # ============== CIERRE DE AÑO - DATOS REALES ==============
 
 @app.get("/api/cierre-ano/resumen")
-async def get_resumen_cierre_ano(db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    """Obtener resumen real de todos los cursos para cierre de año.
-    
-    v2.13.8: lee AMBOS modelos (Calificacion legacy + CalificacionSecundaria nuevo).
+async def get_resumen_cierre_ano(ano_id: int = None,
+                                 db: Session = Depends(get_db),
+                                 current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """El resumen por curso que Dirección ve antes de cerrar.
+
+    CORE-1 · Esta pantalla tenía su PROPIA regla de promoción: recalculaba
+    los CF a mano, mezclaba el modelo legacy con el nuevo y decidía
+    «promovido si todos los CF llegan a 70». Era la quinta verdad académica
+    del sistema, y no coincidía con las otras cuatro: ignoraba la cascada de
+    recuperaciones, la alfabetización inicial de 3.º, la asistencia y el
+    hecho de que en 1.º y 2.º de Primaria no hay repitencia.
+
+    Ahora consume A1/A2 como todo lo demás, y muestra los CUATRO estados
+    reales. Si alguna vez discrepa de la previsualización será porque alguien
+    dejó de llamar aquí.
+
+    LECTURA PURA: no escribe, no mueve a nadie, no cierra nada.
     """
-    cursos = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).join(Grado).outerjoin(Tanda).order_by(Grado.orden, Tanda.nombre, Curso.nombre).all()
-    resumen_cursos = []
-    
-    ano_activo_cr = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    
-    for curso in cursos:
-        estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso.id, activo=True).all()
-        promovidos = 0
-        reprobados = 0
-        promedios = []
-        
-        for est in estudiantes:
-            # CFs combinados de AMBOS modelos
-            cfs = []
-            asig_ids_nuevo = set()
-            
-            # 1. Modelo NUEVO
-            if ano_activo_cr:
-                califs_sec_est = tenant_filter(
-                    db.query(CalificacionSecundaria), CalificacionSecundaria, current_user
-                ).filter_by(estudiante_id=est.id, ano_escolar_id=ano_activo_cr.id).all()
-                from collections import defaultdict as _dd
-                por_asig = _dd(list)
-                for c in califs_sec_est:
-                    por_asig[c.asignatura_id].append(c)
-                for aid, comps in por_asig.items():
-                    pcs = []
-                    for p in range(1, 5):
-                        vals = [comp.valor_periodo(p) for comp in comps if hasattr(comp, 'valor_periodo') and comp.valor_periodo(p) is not None]
-                        if vals:
-                            pcs.append(sum(vals) / len(vals))
-                    if pcs:
-                        cf = sum(pcs) / len(pcs)
-                        cfs.append(cf)
-                        asig_ids_nuevo.add(aid)
-            
-            # 2. Modelo LEGACY (solo asignaturas no en modelo nuevo)
-            calificaciones = tenant_filter(db.query(Calificacion), Calificacion, current_user).filter_by(estudiante_id=est.id).all()
-            for c in calificaciones:
-                if c.asignatura_id in asig_ids_nuevo:
-                    continue
-                if c.cf is not None:
-                    cfs.append(c.cf)
-            
-            if cfs:
-                promedio_est = sum(cfs) / len(cfs)
-                promedios.append(promedio_est)
-                # Promovido si CF >= 70 en TODAS
-                todas_aprobadas = all(cf >= 70 for cf in cfs)
-                if todas_aprobadas:
-                    promovidos += 1
-                else:
-                    reprobados += 1
-        
-        promedio_curso = sum(promedios) / len(promedios) if promedios else 0
-        
-        resumen_cursos.append({
-            'id': curso.id,
-            'nombre': curso.nombre_completo,
-            'estudiantes': len(estudiantes),
-            'promovidos': promovidos,
-            'reprobados': reprobados,
-            'promedio': round(promedio_curso, 1)
+    # CORE-2.2 · El MISMO año del que habla `/cierre-ano/estado`.
+    ano, _err = _ano_visible_de_cierre(db, current_user, ano_id=ano_id)
+    if _err is not None:
+        return _err
+    if ano is None:
+        return {'cursos': [], 'ano_escolar_id': None, 'ano_escolar': None,
+                'totales': {'estudiantes': 0, 'promovidos': 0, 'reprobados': 0,
+                            'aplazados': 0, 'en_proceso': 0}}
+
+    # CORE-2 · La MISMA cohorte que la previsualización: pendientes
+    # calculados en vivo y procesados leídos del historial. Antes esto
+    # miraba a todos los estudiantes activos del colegio, así que en cuanto
+    # se movía a los promovidos desaparecían del resumen del año que se
+    # estaba cerrando —y los que quedaban se recalculaban con el grado del
+    # año nuevo—. Los totales de un año cerrado no pueden cambiar porque
+    # alguien haya sido promovido: eso ya ocurrió dentro de ese año.
+    vista = _vista_cohorte_ano(db, current_user, ano)
+    filas = vista['filas']
+
+    por_curso, totales = {}, {
+        'estudiantes': 0, 'promovidos': 0, 'reprobados': 0,
+        'aplazados': 0, 'en_proceso': 0,
+    }
+    _CLAVE = {'promovido': 'promovidos', 'reprobado': 'reprobados',
+              'aplazado': 'aplazados', 'en_proceso': 'en_proceso'}
+
+    for fila in filas:
+        nombre = fila.get('curso') or 'Sin curso'
+        bloque = por_curso.setdefault(nombre, {
+            'nombre': nombre, 'estudiantes': 0, 'promovidos': 0,
+            'reprobados': 0, 'aplazados': 0, 'en_proceso': 0, '_promedios': [],
         })
-    
-    return {'cursos': resumen_cursos}
+        bloque['estudiantes'] += 1
+        totales['estudiantes'] += 1
+        clave = _CLAVE.get(fila.get('condicion'), 'en_proceso')
+        bloque[clave] += 1
+        totales[clave] += 1
+        promedio = fila.get('promedio_general')
+        if isinstance(promedio, (int, float)) and not isinstance(promedio, bool):
+            bloque['_promedios'].append(promedio)
+
+    cursos_resumen = []
+    for bloque in por_curso.values():
+        promedios = bloque.pop('_promedios')
+        # Sin notas cargadas el promedio es None, nunca 0: un 0 es una nota, y
+        # fingirlo pintaría de rojo a un curso que simplemente no tiene datos.
+        bloque['promedio'] = (round(sum(promedios) / len(promedios), 1)
+                              if promedios else None)
+        cursos_resumen.append(bloque)
+    cursos_resumen.sort(key=lambda c: c['nombre'])
+
+    return {
+        'cursos': cursos_resumen,
+        'totales': totales,
+        'ano_escolar_id': ano.id,
+        'ano_escolar': ano.nombre,
+        'ano_cerrado': vista['ano_cerrado'],
+        'procesados': vista['totales']['procesados'],
+        'pendientes': vista['totales']['pendientes'],
+        'historiales_ambiguos': vista['historiales_ambiguos'],
+        'historiales_legacy_duplicados': vista['historiales_legacy_duplicados'],
+        'fiable': vista['fiable'],
+        'hay_procesos_pendientes': bool(totales['aplazados']
+                                        or totales['en_proceso']),
+    }
+
+@app.get("/api/cierre-ano/estado")
+async def get_estado_cierre_ano(ano_origen_id: int = None,
+                                ano_destino_id: int = None,
+                                db: Session = Depends(get_db),
+                                current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """En qué punto del Cierre está el colegio. Derivado de la base.
+
+    La pantalla de Cierre guardaba su fase en el estado de React y la perdía
+    en cada refresco. Esto la reconstruye: qué año es el origen, cuál el
+    destino, cuánta gente queda, si se puede cerrar, si se puede promover y
+    si la transición ya terminó. LECTURA PURA.
+    """
+    try:
+        return _estado_cierre_ano(db, current_user, ano_origen_id,
+                                  ano_destino_id)
+    except TransicionCierreInvalida as exc:
+        return _respuesta_transicion_invalida(exc)
+
+
+@app.get("/api/cierre-ano/decisiones")
+async def get_decisiones_academicas(ano_id: int = None,
+                                    db: Session = Depends(get_db),
+                                    current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Quién está EN_PROCESO esperando una decisión humana, y cuál.
+
+    Solo se listan los estudiantes cuyo bloqueo A2 se resuelve con un dato
+    que una persona tiene que aportar. Los que están EN_PROCESO por notas
+    faltantes no aparecen aquí: eso no lo arregla Dirección firmando nada.
+    """
+    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id,
+                                preferir_cerrado=True)
+    if ano is None:
+        return {'pendientes': [], 'ano_escolar_id': None, 'ano_escolar': None}
+
+    # Qué bloqueo de A2 se resuelve con qué dato humano.
+    _RESOLUBLES = {
+        RAC.PA.BLOQUEO_ALFABETIZACION_NO_INFORMADA: 'alfabetizacion_inicial',
+        RAC.PA.BLOQUEO_REVISION_ASISTENCIA: 'decision_asistencia',
+        RAC.PA.BLOQUEO_ANTECEDENTE_EXCEPCION_2DO:
+            'repeticion_excepcional_segundo_ya_utilizada',
+    }
+
+    vista = _vista_cohorte_ano(db, current_user, ano)
+    decisiones = _decisiones_de_estudiantes(
+        db, current_user, [f.get('estudiante_id') or f.get('id')
+                           for f in vista['filas']], ano)
+
+    pendientes = []
+    for fila in vista['filas']:
+        if fila['condicion'] != 'en_proceso' or fila.get('procesado'):
+            continue
+        campos = [_RESOLUBLES[b] for b in fila.get('bloqueos', [])
+                  if b in _RESOLUBLES]
+        if not campos:
+            continue
+        est_id = fila.get('estudiante_id') or fila.get('id')
+        actual = decisiones.get(est_id)
+        pendientes.append({
+            'estudiante_id': est_id,
+            'nombre_completo': fila.get('nombre_completo'),
+            'curso': fila.get('curso'),
+            'grado': fila.get('grado'),
+            'motivo': fila.get('motivo'),
+            'bloqueos': fila.get('bloqueos', []),
+            'campos_requeridos': campos,
+            'registrado': {
+                'alfabetizacion_inicial': getattr(actual, 'alfabetizacion_inicial', None),
+                'decision_asistencia': getattr(actual, 'decision_asistencia', None),
+                'decision_excepcional_segundo': getattr(
+                    actual, 'decision_excepcional_segundo', None),
+                'repeticion_excepcional_segundo_ya_utilizada': getattr(
+                    actual, 'repeticion_excepcional_segundo_ya_utilizada', None),
+                'observacion': getattr(actual, 'observacion', None),
+            } if actual else None,
+        })
+
+    return {
+        'pendientes': pendientes,
+        'total': len(pendientes),
+        'ano_escolar_id': ano.id,
+        'ano_escolar': ano.nombre,
+        'valores': {
+            'decision_asistencia': list(RAC.PA.DECISIONES_ASISTENCIA),
+            'decision_excepcional_segundo': [
+                RAC.PA.DECISION_EXCEPCIONAL_REPETIR],
+        },
+    }
+
+
+@app.post("/api/cierre-ano/decisiones")
+async def guardar_decision_academica(request: Request,
+                                     db: Session = Depends(get_db),
+                                     current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Dirección aporta el DATO humano. A2 sigue produciendo la condición.
+
+    Aquí NO se escribe «promovido» ni «reprobado». Se registra si el
+    estudiante logró la alfabetización, qué decidió el equipo sobre sus
+    ausencias o si el consejo autoriza la repetición excepcional de 2.º —y
+    nada más—. La situación académica se vuelve a calcular con A2 y se
+    devuelve, para que quien decidió vea el efecto de su decisión.
+
+    Queda registrado quién y cuándo: son actos administrativos.
+    """
+    data = await request.json()
+    est_id = data.get('estudiante_id')
+    ano_id = data.get('ano_id')
+
+    estudiante = get_tenant_or_404(db, Estudiante, est_id, current_user,
+                                   name='estudiante')
+    ano = get_tenant_or_404(db, AnoEscolar, ano_id, current_user,
+                            name='anoescolar')
+
+    curso = estudiante.curso
+    grado = getattr(curso, 'grado', None)
+    nivel = RAC.nivel_de_grado(grado) if grado is not None else None
+    grado_numero, _diag = (RAC.numero_de_grado(grado) if grado is not None
+                           else (None, None))
+
+    CAMPOS = ('alfabetizacion_inicial', 'decision_asistencia',
+              'decision_excepcional_segundo',
+              'repeticion_excepcional_segundo_ya_utilizada')
+    entrantes = {c: data[c] for c in CAMPOS if c in data}
+    if not entrantes:
+        return JSONResponse({
+            'error': ERROR_DECISION_VALOR_INVALIDO,
+            'message': 'No se indicó ninguna decisión.'}, status_code=400)
+
+    for campo, valor in entrantes.items():
+        problema = _validar_decision(campo, valor, grado_numero, nivel)
+        if problema:
+            return JSONResponse({
+                'error': ERROR_DECISION_FUERA_DE_LUGAR,
+                'message': problema, 'campo': campo}, status_code=400)
+
+    fila = (tenant_filter(db.query(DecisionAcademicaEstudiante),
+                          DecisionAcademicaEstudiante, current_user)
+            .filter(DecisionAcademicaEstudiante.estudiante_id == estudiante.id,
+                    DecisionAcademicaEstudiante.ano_escolar_id == ano.id)
+            .first())
+    antes = None
+    if fila is None:
+        fila = DecisionAcademicaEstudiante(
+            colegio_id=estudiante.colegio_id, estudiante_id=estudiante.id,
+            ano_escolar_id=ano.id, registrado_por=current_user.id)
+        db.add(fila)
+    else:
+        antes = {c: getattr(fila, c) for c in CAMPOS}
+        fila.actualizado_por = current_user.id
+
+    for campo, valor in entrantes.items():
+        setattr(fila, campo, valor)
+    if 'observacion' in data:
+        fila.observacion = data['observacion']
+
+    log_auditoria(db, 'DECISION_ACADEMICA', 'estudiantes', estudiante.id,
+                  antes, {'ano_escolar_id': ano.id, **entrantes},
+                  user=current_user, request=request)
+    db.commit()
+
+    # Se devuelve la situación RECALCULADA: la decisión no es el resultado,
+    # es una entrada del motor.
+    paquetes = _situaciones_por_estudiante(db, current_user, [estudiante], ano)
+    paquete = paquetes.get(estudiante.id)
+    situacion = (paquete or {}).get('situacion', {})
+
+    return {
+        'message': 'Decisión registrada',
+        'estudiante_id': estudiante.id,
+        'ano_escolar_id': ano.id,
+        'condicion_canonica': situacion.get('condicion'),
+        'condicion': CONDICION_UI.get(situacion.get('condicion'), 'en_proceso'),
+        'motivo': situacion.get('motivo'),
+        'bloqueos': list(situacion.get('bloqueos', ())),
+    }
+
 
 @app.get("/api/cierre-ano/promocion")
 async def get_datos_promocion(ano_id: int = None, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
@@ -16056,16 +18586,23 @@ async def get_datos_promocion(ano_id: int = None, db: Session = Depends(get_db),
     se conserva por compatibilidad; la verdad academica es identica.
 
     R4-A4.1 · EL AÑO ORIGEN
-        Sin `?ano_id=` toma el año CERRADO más reciente, no el activo. El
-        flujo de Cierre cierra un año y crea el siguiente, que queda activo y
-        vacío; mirar ahí convertía a un PROMOVIDO en EN_PROCESO por
-        CURRICULO_OFICIAL_INCOMPLETO. Si todavía no se cerró ninguno, usa el
-        activo: la pantalla sirve igual ANTES del cierre.
+        Sin `?ano_id=` NO se mira el año activo. El flujo de Cierre cierra un
+        año y crea el siguiente, que queda activo y vacío; mirar ahí
+        convertía a un PROMOVIDO en EN_PROCESO por
+        CURRICULO_OFICIAL_INCOMPLETO.
+
+    CORE-2.2 · La garantía de último recurso era «el cerrado más reciente», y
+        eso dejó de ser cierto: un año cerrado cuya promoción ya terminó no
+        es el año del que habla esta pantalla. Ahora se usa la misma
+        resolución que `/cierre-ano/estado` —origen si hay transición, activo
+        si no, nada si el origen es ambiguo—, así que las tres pantallas
+        hablan siempre del mismo año.
 
     Es PREVISUALIZACION: el POST de cierre no se toca aqui.
     """
-    ano = _resolver_ano_preview(db, current_user, ano_id=ano_id,
-                                preferir_cerrado=True)
+    ano, _err = _ano_visible_de_cierre(db, current_user, ano_id=ano_id)
+    if _err is not None:
+        return _err
     filas = _preview_promocion_canonica(db, current_user, ano)
     hay_pendientes = any(not f['listo_para_decidir'] for f in filas)
     return {
@@ -16095,7 +18632,70 @@ async def ejecutar_promocion_cierre_ano(request: Request, db: Session = Depends(
       - overrides (dict): {estudiante_id: 'repite'|'retira'}
 
     Requiere que exista un año CERRADO (el actual) antes de promover.
+
+    C1 · SAFETY LOCK: bloqueado. Ver `_bloqueo_cierre_ano`.
+
+    CORE-1 · El camino canónico de abajo REEMPLAZA por completo al cuerpo
+    legacy. El legacy sigue en el archivo —no se borra en este bloque— pero
+    queda INALCANZABLE: el `return` del camino nuevo es incondicional y está
+    al nivel superior de la función, así que ninguna ejecución llega más
+    abajo. `test_r4_a4` lo comprueba por AST, y también que el legacy siga
+    idéntico a la base `064c9326` para que nadie lo reescriba a escondidas.
+
+    Qué se reemplazó, exactamente:
+
+      · la deducción del año origen con «el último cerrado»
+        (`filter_by(cerrado=True).order_by(id.desc()).first()`) → ahora los
+        dos años son obligatorios y explícitos;
+      · `nuevo_ano_id` con caída al año activo → `ano_destino_id`, sin
+        fallback;
+      · el recorrido de TODOS los estudiantes activos del tenant → la
+        cohorte del año origen;
+      · `overrides.get(est.id, 'promueve')` → la condición canónica de A2;
+      · `Grado.orden + 1` y el «grado final del colegio» → destino por
+        (nivel, número académico);
+      · el curso destino por (grado, tanda) sin año → curso del año destino,
+        fail-closed si falta o si es ambiguo;
+      · `condicion = 'Egresado'` + `activo = False` en el último grado → 6.º
+        de Secundaria termina el nivel sin egresar ni desactivarse;
+      · el historial con `Estudiante.condicion` → historial con la situación
+        canónica, y solo para resultados definitivos.
     """
+    # Antes de `await request.json()`: el rechazo no depende del cuerpo.
+    if CIERRE_ANO_BLOQUEADO:
+        return _bloqueo_cierre_ano()
+
+    try:
+        cuerpo = await request.json()
+    except Exception:
+        cuerpo = {}
+
+    try:
+        plan, resultado = _cierre_canonico(
+            db, current_user,
+            cuerpo.get('ano_origen_id'), cuerpo.get('ano_destino_id'),
+            request=request)
+    except TransicionCierreInvalida as exc:
+        db.rollback()
+        respuesta = _respuesta_transicion_invalida(exc)
+        return respuesta
+
+    resumen = plan['resumen']
+    return {
+        'message': 'Promoción ejecutada',
+        'ano_origen_id': resumen['ano_origen_id'],
+        'ano_destino_id': resumen['ano_destino_id'],
+        'movidos': resultado['movidos'],
+        'promovidos': resumen['promovidos'],
+        'reprobados': resumen['reprobados'],
+        'aplazados': resumen['aplazados'],
+        'en_proceso': resumen['en_proceso'],
+        'bloqueados': resumen['bloqueados'],
+        'historiales_creados': resultado['historiales_creados'],
+        'detalle': plan['filas'],
+    }
+
+    # ── A PARTIR DE AQUÍ: CÓDIGO LEGACY INALCANZABLE (CORE-1) ──────────
     try:
         data = await request.json()
     except Exception:
@@ -18003,8 +20603,25 @@ async def validar_registro(curso_id: int, request: Request, db: Session = Depend
 
 
 @app.get("/api/registros/preview/{curso_id}")
+# ── ENTREGA-1 · Secretaría abre el Registro Escolar ──────────────────
+#
+# El menú y el acceso rápido del panel llevaban a Secretaría al Registro
+# Escolar desde siempre, pero el backend no la reconocía: al montar, la
+# página pide este endpoint y recibía 403, así que quedaba vacía con un
+# error. Una entrada de menú que siempre falla es peor que una ausente.
+#
+# Se le da ESTE endpoint y ningún otro. Es un GET, no escribe nada, y es
+# la única llamada que la página hace al cargar.
+#
+# Los cuatro endpoints de PDF del módulo NO se tocan, y conviene decir por
+# qué: el frontend nunca le ofreció esos botones —`canPreview` y
+# `canGenerate` no incluyen a secretaría— y la suite de tenant/roles
+# afirma desde v2.19.3-A que no entra al BORRADOR, que es el documento de
+# trabajo de quien llena el registro. Ampliar ahí sería inventar una
+# política nueva, no alinear la que hay. `guardar_dias_trabajados`, que sí
+# escribe, sigue siendo de dirección.
 async def preview_registro_v2(curso_id: int, request: Request, db: Session = Depends(get_db),
-                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
+                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """
     Preview completo del JSON que irá al PDF.
     Usado para debugging y auditoría antes de generar el documento.
@@ -18012,6 +20629,15 @@ async def preview_registro_v2(curso_id: int, request: Request, db: Session = Dep
     Permisos: cualquier docente del colegio (la seguridad multitenant
     impide ver cursos de otros colegios).
     """
+    # ENTREGA-1 · El curso se resuelve por tenant ANTES de nada.
+    #
+    # Estos endpoints pasaban `curso_id` crudo al validador, que respondía
+    # «El curso no pertenece a este colegio» para uno ajeno y «El curso con
+    # id=N no existe» para uno inventado. Ninguna de las dos filtra datos,
+    # pero juntas permiten averiguar QUÉ ids existen en otros colegios.
+    # `get_tenant_or_404` da 404 en los dos casos, que es el contrato del
+    # resto del sistema.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_secundaria, _normalizar_nivel, _extraer_grado_numero
     
     curso = db.query(Curso).filter_by(id=curso_id, colegio_id=current_user.colegio_id).first()
@@ -18274,6 +20900,8 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
     Vista previa del PDF de primaria con marca de agua BORRADOR.
     Genera SIEMPRE, ignorando errores y warnings.
     """
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_primaria, _extraer_grado_numero
     from registro_primaria import generar_registro_primaria_desde_sistema
     from registro_borrador import aplicar_marca_borrador
@@ -18408,11 +21036,24 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
 @app.get("/api/registros/primaria/{curso_id}")
 async def generar_registro_primaria_v2(curso_id: int, request: Request,
                                         db: Session = Depends(get_db),
-                                        current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
+                                        current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """
     Genera el PDF del Registro Escolar MINERD para un curso de PRIMARIA.
     Estructura por competencias (C1, C2, C3).
     """
+    # ENTREGA-1.1 · Secretaría emite el REGISTRO OFICIAL.
+    #
+    # Emitir el documento oficial del curso es trabajo administrativo, no
+    # académico: no escribe nada —este endpoint solo lee y compone un PDF— y
+    # es justo lo que una secretaría hace. ENTREGA-1 le dio la pantalla; sin
+    # esto podía verla y no podía entregar nada.
+    #
+    # El BORRADOR sigue fuera: `preview_pdf_primaria` y `preview_pdf_secundaria`
+    # conservan sus roles. Es el documento de trabajo de quien LLENA el
+    # registro, con su marca de agua y su «no apto para entrega oficial», y la
+    # suite de tenant/roles lo exige desde v2.19.3-A.
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_primaria
     from registro_primaria import generar_registro_primaria_desde_sistema
 
@@ -18569,6 +21210,8 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     endpoints de carga de notas — esto refleja la práctica real del MINERD
     donde el registro es un documento compartido del curso.
     """
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema
 
@@ -18725,7 +21368,7 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
 @app.get("/api/registros/secundaria/{curso_id}")
 async def generar_registro_secundaria_v2(curso_id: int, request: Request, 
                                           db: Session = Depends(get_db),
-                                          current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
+                                          current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
     """
     Genera el PDF del Registro Escolar MINERD para un curso de SECUNDARIA.
     
@@ -18735,6 +21378,8 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     3. Usa profesor titular del curso (no coordinador del colegio)
     4. Usa días trabajados configurados
     """
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema, get_asignaturas_por_grado
 
