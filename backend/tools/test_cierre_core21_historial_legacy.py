@@ -436,11 +436,12 @@ check('CORE2.1-15b y sigue activo, sin egresar, en su curso de A',
 
 print()
 print("=" * 104)
-print("BLOQUE 5 — el safety lock de C1 sigue puesto")
+print("BLOQUE 5 — los candados, en su estado de release")
 print("=" * 104)
 
-check('CORE2.1-16 la bandera sigue en True',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('CORE2.1-16 las banderas estan en su estado de release',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 
 print()

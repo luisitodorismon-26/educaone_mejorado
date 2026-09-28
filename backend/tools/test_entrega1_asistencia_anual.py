@@ -554,8 +554,10 @@ check('E1-PDF21 quien no pasa asistencia sigue obteniendo su PDF',
 
 
 print("\n=== NO SE TOCÓ LO CONGELADO ===")
-check('E1-Z1 el safety lock de Cierre sigue en True',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('E1-Z1 los candados de Cierre, en su estado de release',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True,
+      'ENTREGA-1 no los movio')
 check('E1-Z2 una sola deduplicación: los helpers la comparten',
       'self' not in inspect.getsource(APP._dias_asistencia_de_filas)
       and '_dias_asistencia_del_ano' in inspect.getsource(

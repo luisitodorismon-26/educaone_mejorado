@@ -1,15 +1,41 @@
 # -*- coding: utf-8 -*-
-"""CIERRE DE ANO C1 — safety lock / fail-closed de los writers antiguos.
+"""CIERRE DE ANO C1 — safety lock, ya en su contrato de PRODUCCION.
+
+QUE CAMBIO EN EL RELEASE
+========================
+C1 afirmaba que los CUATRO writers devolvian 409. Era cierto y era lo
+correcto mientras el flujo se reconstruia: no habia nada que habilitar.
+Ahora si lo hay, y los cuatro dejaron de ser lo mismo:
+
+  CANONICOS — `/api/ano-escolar/{id}/cerrar` y `/api/cierre-ano/promover`.
+  Son el flujo que CORE-1 y CORE-2 construyeron. Estan HABILITADOS. Lo que
+  se prueba de ellos aqui ya no es que rechacen, sino que el candado dejo de
+  interponerse, que siguen sin escribir cuando rechazan por una razon de
+  negocio, y que el interruptor de emergencia los vuelve a cerrar entero.
+
+  LEGACY — `/api/promocion/ejecutar` y `/api/ano-escolar/promover`. Mueven
+  estudiantes sin mirar su situacion academica ni el ano de destino. Siguen
+  devolviendo 409, antes de leer el cuerpo y sin tocar la base, y ahora de
+  forma PERMANENTE: su guarda no consulta ninguna bandera, asi que habilitar
+  el Cierre no puede resucitarlos.
+
+No se quito ni una comprobacion. Las que afirmaban el bloqueo de los
+canonicos se convirtieron en su contrario —que ya NO se bloquean— y se
+anadio el candado de emergencia y la prueba de mutacion del legacy.
 
 Que se prueba aqui:
 
-  · que los cuatro POST rechazan con 409 y contrato estable;
+  · que los dos LEGACY rechazan con 409 y contrato estable;
   · que rechazan SIN ESCRIBIR: cero INSERT, cero UPDATE, cero DELETE;
   · que rechazan ANTES de leer el cuerpo de la peticion;
+  · que siguen rechazando aunque se ponga `PROMOCION_LEGACY_BLOQUEADA` en
+    False: la politica no depende de una constante que alguien pueda voltear;
+  · que los dos CANONICOS ya NO devuelven el 409 del candado;
+  · que el interruptor de emergencia sigue funcionando;
   · que activar un ano cerrado se rechaza ANTES de desactivar los demas;
   · que las lecturas siguen funcionando;
-  · y que el lock esta VIVO: si se apaga la bandera, los tests que afirman
-    el bloqueo fallan. Un guard que no se puede romper no se esta probando.
+  · y que los guards estan VIVOS: si se apagan, los tests que afirman el
+    bloqueo fallan. Un guard que no se puede romper no se esta probando.
 
 Base temporal aislada. Nunca produccion.
 """
@@ -196,34 +222,69 @@ MENSAJE_ESPERADO = ('El Cierre de Año está temporalmente bloqueado mientras se
 db = SessionLocal()
 
 print("=" * 86)
-print("BLOQUE 1 — los cuatro writers rechazan con 409 y sin tocar la base")
+print("BLOQUE 1 — legacy bloqueado, canonico habilitado")
 print("=" * 86)
 
 col, viejo, nuevo, grados, ests = montar(db, 'Lock', 'LCK1')
 usr = usuario_real(db, col)
 antes = foto(db, col)
 
-# ── C1-1 ──────────────────────────────────────────────────────────
+# ── C1-1 · RELEASE: el canonico ya no choca contra el candado ──────
+#
+# `viejo` ya esta cerrado en el banco de pruebas, asi que el cierre canonico
+# lo rechaza por ESO. Lo que se comprueba es de QUE se le rechaza: si
+# siguiera saliendo `CIERRE_ANO_TEMPORALMENTE_BLOQUEADO`, el candado seguiria
+# interponiendose y el Cierre no estaria habilitado.
 with Vigilante(db) as v:
     r = asyncio.run(APP.cerrar_ano_escolar(
         id=viejo.id, request=Req({}), db=db, current_user=usr))
 c = cuerpo(r)
-check('C1-1  cerrar_ano_escolar -> 409 CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
-      r.status_code == 409 and c['error'] == 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
+check('C1-1  cerrar_ano_escolar YA NO devuelve el 409 del candado',
+      c.get('error') != 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
       'status=%s error=%s' % (r.status_code, c.get('error')))
-check('C1-2  cerrar_ano_escolar no escribe nada',
+check('C1-1b y llega al camino canonico, que lo rechaza por su estado real',
+      c.get('error') == 'ANO_ESCOLAR_YA_CERRADO', str(c.get('error')))
+check('C1-2  y aun rechazando no escribe nada',
       v.total == 0 and foto(db, col) == antes, repr(v))
 
-# ── C1-3 ──────────────────────────────────────────────────────────
+# ── C1-3 · RELEASE: lo mismo para la promocion canonica ────────────
 with Vigilante(db) as v:
     r = asyncio.run(APP.ejecutar_promocion_cierre_ano(
         request=Req({'nuevo_ano_id': nuevo.id}), db=db, current_user=usr))
 c = cuerpo(r)
-check('C1-3  cierre-ano/promover -> 409 con el mismo contrato',
-      r.status_code == 409 and c['error'] == 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
+check('C1-3  cierre-ano/promover YA NO devuelve el 409 del candado',
+      c.get('error') != 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
       'status=%s error=%s' % (r.status_code, c.get('error')))
-check('C1-4  cierre-ano/promover no mueve a nadie',
+check('C1-3b y llega al writer canonico, que exige contexto explicito',
+      c.get('error') == 'CIERRE_TRANSICION_INCOMPLETA', str(c.get('error')))
+check('C1-4  y aun rechazando no mueve a nadie',
       v.total == 0 and foto(db, col) == antes, repr(v))
+
+# ── C1-3c · El interruptor de emergencia sigue existiendo ──────────
+#
+# Poner la bandera en True vuelve a cerrar el Cierre entero sin tocar nada
+# mas. Es el unico camino de vuelta, y tiene que seguir funcionando.
+_antes_flag = APP.CIERRE_ANO_BLOQUEADO
+APP.CIERRE_ANO_BLOQUEADO = True
+try:
+    with Vigilante(db) as v:
+        r_em = asyncio.run(APP.cerrar_ano_escolar(
+            id=nuevo.id, request=Req({}), db=db, current_user=usr))
+        r_em2 = asyncio.run(APP.ejecutar_promocion_cierre_ano(
+            request=Req({'nuevo_ano_id': nuevo.id}), db=db, current_user=usr))
+    c_em, c_em2 = cuerpo(r_em), cuerpo(r_em2)
+    check('C1-3c el interruptor de emergencia vuelve a cerrar el Cierre',
+          r_em.status_code == 409
+          and c_em['error'] == 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO'
+          and r_em2.status_code == 409
+          and c_em2['error'] == 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
+          '%s / %s' % (c_em.get('error'), c_em2.get('error')))
+    check('C1-3d y cerrado de emergencia tampoco escribe',
+          v.total == 0 and foto(db, col) == antes, repr(v))
+finally:
+    APP.CIERRE_ANO_BLOQUEADO = _antes_flag
+check('C1-3e la bandera queda como estaba: el Cierre habilitado',
+      APP.CIERRE_ANO_BLOQUEADO is False, str(APP.CIERRE_ANO_BLOQUEADO))
 
 # ── C1-5 ──────────────────────────────────────────────────────────
 ids = [e.id for e in ests.values()]
@@ -256,9 +317,13 @@ print("=" * 86)
 
 # Si el guard estuviera despues del `await request.json()`, este json()
 # levantaria AssertionError y el test fallaria con excepcion, no con 409.
+#
+# RELEASE · Esto vale ahora solo para los LEGACY. Los canonicos estan
+# habilitados y leen el cuerpo a proposito: ahi viven `ano_origen_id` y
+# `ano_destino_id`, que es el contexto explicito que C2 les exigio. Lo que
+# de ellos sigue importando —que no escriban cuando rechazan— se comprueba
+# en C1-2 y C1-4.
 for nombre, fn, kw in [
-    ('cerrar_ano_escolar', APP.cerrar_ano_escolar, {'id': viejo.id}),
-    ('ejecutar_promocion_cierre_ano', APP.ejecutar_promocion_cierre_ano, {}),
     ('ejecutar_promocion', APP.ejecutar_promocion, {}),
     ('promover_estudiantes', APP.promover_estudiantes, {}),
 ]:
@@ -270,6 +335,72 @@ for nombre, fn, kw in [
     except AssertionError as ex:
         ok, det = False, str(ex)
     check('C1-9  %s rechaza sin leer el body' % nombre, ok, det)
+
+# ── C1-9c · MUTACION: la politica legacy no depende de una constante ──
+#
+# Esta es la comprobacion que impide reactivarlos por accidente. Se pone
+# `PROMOCION_LEGACY_BLOQUEADA` en False —lo que haria alguien que creyera
+# que es el interruptor— y los dos endpoints tienen que seguir rechazando,
+# porque sus guardas no la consultan.
+_antes_legacy = APP.PROMOCION_LEGACY_BLOQUEADA
+APP.PROMOCION_LEGACY_BLOQUEADA = False
+try:
+    with Vigilante(db) as v:
+        r_l1 = asyncio.run(APP.ejecutar_promocion(
+            request=Req({'estudiantes': [e.id for e in ests.values()]}),
+            db=db, current_user=usr))
+        r_l2 = asyncio.run(APP.promover_estudiantes(
+            request=Req({}), db=db, current_user=usr))
+    c_l1, c_l2 = cuerpo(r_l1), cuerpo(r_l2)
+    check('C1-9c poner la constante en False NO reactiva promocion/ejecutar',
+          r_l1.status_code == 409
+          and c_l1['error'] == 'PROMOCION_LEGACY_BLOQUEADA',
+          'status=%s error=%s' % (r_l1.status_code, c_l1.get('error')))
+    check('C1-9d ni ano-escolar/promover',
+          r_l2.status_code == 409
+          and c_l2['error'] == 'PROMOCION_LEGACY_BLOQUEADA',
+          'status=%s error=%s' % (r_l2.status_code, c_l2.get('error')))
+    check('C1-9e y con la constante apagada tampoco escriben',
+          v.total == 0 and foto(db, col) == antes, repr(v))
+finally:
+    APP.PROMOCION_LEGACY_BLOQUEADA = _antes_legacy
+
+# Y el codigo lo dice. Por AST y no por texto: `ERROR_PROMOCION_LEGACY_
+# BLOQUEADA` —el codigo de error que SI se usa— contiene como subcadena el
+# nombre de la constante, y una comparacion literal lo confundiria con una
+# lectura de la bandera.
+import ast as _ast  # noqa: E402
+import inspect as _insp  # noqa: E402
+import textwrap as _tw  # noqa: E402
+
+BANDERAS = {'PROMOCION_LEGACY_BLOQUEADA', 'CIERRE_ANO_BLOQUEADO'}
+
+
+def _lee_bandera(fn):
+    arbol = _ast.parse(_tw.dedent(_insp.getsource(fn)))
+    return {n.id for n in _ast.walk(arbol)
+            if isinstance(n, _ast.Name) and n.id in BANDERAS}
+
+
+def _tiene_condicion(fn):
+    arbol = _ast.parse(_tw.dedent(_insp.getsource(fn)))
+    cuerpo = arbol.body[0].body
+    cuerpo = [x for x in cuerpo
+              if not (isinstance(x, _ast.Expr)
+                      and isinstance(x.value, _ast.Constant))]
+    return not isinstance(cuerpo[0], _ast.Return)
+
+
+check('C1-9f la guarda legacy no LEE ninguna bandera',
+      _lee_bandera(APP._bloqueo_promocion_legacy) == set(),
+      str(_lee_bandera(APP._bloqueo_promocion_legacy)))
+for _fn in (APP.ejecutar_promocion, APP.promover_estudiantes):
+    check('C1-9g %s no LEE ninguna bandera' % _fn.__name__,
+          _lee_bandera(_fn) == set(), str(_lee_bandera(_fn)))
+    check('C1-9h %s rechaza en su PRIMERA sentencia, sin condicion'
+          % _fn.__name__,
+          not _tiene_condicion(_fn)
+          and 'return _bloqueo_promocion_legacy()' in _insp.getsource(_fn), '')
 
 print()
 print("=" * 86)
@@ -430,13 +561,21 @@ check('C1-C2 la respuesta trae error + message + bloqueado',
 FE = os.path.join(os.path.dirname(BK), 'frontend', 'src', 'pages',
                   'cierre-ano', 'CierreAnoPage.tsx')
 fe = io.open(FE, encoding='utf-8').read()
-usos = fe.count('disabled={CIERRE_BLOQUEADO')
-check('C1-C3 el frontend declara la bandera y deshabilita ambos botones',
-      'const CIERRE_BLOQUEADO = true;' in fe and usos == 2,
-      'botones deshabilitados por la bandera=%d' % usos)
-check('C1-C4 el frontend muestra el aviso informativo',
-      'Cierre de Año temporalmente deshabilitado' in fe,
-      '')
+usos = fe.count('disabled={cierreBloqueado')
+# RELEASE · La pantalla ya no lleva la bandera escrita a mano: la DERIVA de
+# `bloqueado_por_safety_lock`, que es la misma que decide el 409. Si alguien
+# volviera a cerrar el Cierre con el interruptor de emergencia, la pantalla
+# se entera sola; con el literal habia que acordarse de tocar dos sitios.
+check('C1-C3 el frontend DERIVA el bloqueo del backend, no lo escribe',
+      'const CIERRE_BLOQUEADO = true;' not in fe
+      and 'estado?.bloqueado_por_safety_lock === true' in fe, '')
+check('C1-C4 y los dos botones siguen atados a esa bandera derivada',
+      usos == 2, 'botones deshabilitados por la bandera=%d' % usos)
+check('C1-C5 el aviso «mientras se reconstruye» desaparecio',
+      'reconstruye' not in fe
+      and 'temporalmente deshabilitado' not in fe.lower(), '')
+check('C1-C6 pero sigue habiendo aviso si el candado vuelve a cerrarse',
+      'Cierre de Año deshabilitado' in fe, '')
 
 print()
 print("=" * 86)

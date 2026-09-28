@@ -19,7 +19,7 @@ Que se prueba aqui:
   · que reabrir despues de mover se rechaza;
   · que el estado del asistente se deriva de la base y sobrevive a un
     refresco;
-  · y que el safety lock de C1 sigue puesto.
+  · y que los candados quedaron donde el release los dejo.
 
 Base temporal aislada. Nunca produccion.
 """
@@ -86,8 +86,9 @@ def cuerpo(r):
 
 db = SessionLocal()
 
-check('CORE2-0  el safety lock de C1 esta puesto al empezar',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('CORE2-0  los candados estan en su estado de release al empezar',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 
 # ═══════════════════ EL COLEGIO ═══════════════════
@@ -619,8 +620,9 @@ check('CORE2-48 nunca presenta B como el año a cerrar',
       (_estado['ano_origen'] or {}).get('nombre'))
 check('CORE2-48b ni vuelve a ofrecer una promocion ya hecha',
       _estado['puede_promover'] is False, '')
-check('CORE2-49 informa el safety lock',
-      _estado['bloqueado_por_safety_lock'] is True, '')
+check('CORE2-49 informa el safety lock, y ahora dice que esta abierto',
+      _estado['bloqueado_por_safety_lock'] is False,
+      'la pantalla deriva de aqui si deshabilita los botones')
 
 
 print()
@@ -665,7 +667,7 @@ db.commit()
 
 print()
 print("=" * 100)
-print("BLOQUE 9 — el safety lock de C1 sigue puesto")
+print("BLOQUE 9 — legacy bloqueado, canonico habilitado")
 print("=" * 100)
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -686,12 +688,21 @@ with TestClient(APP.app) as cli:
     ]:
         r = cli.post(ruta, json=body,
                      headers={'Authorization': 'Bearer %s' % TOK})
-        check('CORE2-54 %s sigue en 409' % etiqueta,
-              r.status_code == 409 and r.json().get('error') == codigo,
-              'status=%s error=%s' % (r.status_code, r.json().get('error')))
+        # RELEASE · Los LEGACY siguen en 409 permanente; los CANONICOS
+        # solo tienen que haber dejado de chocar contra el candado.
+        _err = r.json().get('error')
+        if codigo == 'PROMOCION_LEGACY_BLOQUEADA':
+            check('CORE2-54 %s sigue en 409 PERMANENTE' % etiqueta,
+                  r.status_code == 409 and _err == codigo,
+                  'status=%s error=%s' % (r.status_code, _err))
+        else:
+            check('CORE2-54 %s ya no choca contra el candado' % etiqueta,
+                  _err != 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
+                  'status=%s error=%s' % (r.status_code, _err))
 
-check('CORE2-55 la bandera sigue en True al terminar',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('CORE2-55 las banderas siguen como al empezar',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 
 print()

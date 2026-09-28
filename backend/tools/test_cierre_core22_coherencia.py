@@ -315,8 +315,9 @@ check('CORE2.2-15 el origen ambiguo se puede ELEGIR, no solo leer',
       'elegirAnoOrigen' in fe
       and 'ano_origen_id: id' in fe, '')
 
-check('CORE2.2-16 el safety lock sigue en True',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('CORE2.2-16 los candados, en su estado de release',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 
 print()

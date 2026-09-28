@@ -65,10 +65,18 @@ interface EstudiantePromocion {
   listo_para_decidir: boolean;
 }
 
-// C1 · El backend rechaza con 409 los POST de cierre y promocion mientras se
-// reconstruye el flujo academico. Esta bandera NO es la proteccion: el backend
-// lo es. Aqui solo evita que Direccion llegue a un boton que va a fallar.
-const CIERRE_BLOQUEADO = true;
+// RELEASE · El Cierre canónico está habilitado. Lo que antes era una
+// constante en `true` —C1 lo dejó así mientras se reconstruía el flujo— pasa
+// a DERIVARSE del backend: `/cierre-ano/estado` publica
+// `bloqueado_por_safety_lock`, que es la misma bandera que decide el 409.
+//
+// Atarlo ahí y no a un literal tiene una consecuencia práctica: si alguien
+// vuelve a cerrar el Cierre con el interruptor de emergencia, la pantalla se
+// entera sola. Con la constante habría que acordarse de tocar dos sitios, y
+// el que se olvida siempre es este.
+//
+// Esto NO es la protección: el backend lo es. Aquí solo se evita que
+// Dirección llegue a un botón que va a fallar.
 
 // CORE-2 · La fase del asistente se DERIVA del backend, no del estado de
 // React. Antes «en qué paso voy», «cuál es el año origen» y «cuál el
@@ -145,6 +153,10 @@ export const CierreAnoPage = () => {
   // el activo y `anoEscolar` deja de apuntar al que se esta cerrando.
   const [anoOrigenId, setAnoOrigenId] = useState<number | null>(null);
   const [estado, setEstado] = useState<EstadoCierre | null>(null);
+  // La misma bandera que decide el 409 en el backend. Mientras no se conozca
+  // el estado se asume DESBLOQUEADO: el backend rechaza igual si no lo está,
+  // y presumir un bloqueo que no existe deja a Dirección sin poder cerrar.
+  const cierreBloqueado = estado?.bloqueado_por_safety_lock === true;
   const [decisiones, setDecisiones] = useState<DecisionPendiente[]>([]);
   const [guardandoDecision, setGuardandoDecision] = useState<number | null>(null);
   // v2.13.26: acción por estudiante: 'promueve' (default) | 'repite' | 'retira'
@@ -432,13 +444,13 @@ export const CierreAnoPage = () => {
         <p className="text-gray-500">Proceso de cierre y promoción de estudiantes</p>
       </div>
 
-      {CIERRE_BLOQUEADO && (
+      {cierreBloqueado && (
         <Alert variant="warning">
           <AlertTriangle size={18} className="inline mr-2" />
-          <strong>Cierre de Año temporalmente deshabilitado.</strong> Se está
-          completando el flujo académico seguro. Puede revisar la situación de
-          cada estudiante y las previsualizaciones con normalidad; lo que no se
-          puede ejecutar todavía es el cierre ni la promoción.
+          <strong>Cierre de Año deshabilitado.</strong> Puede revisar la
+          situación de cada estudiante y las previsualizaciones con
+          normalidad; lo que no se puede ejecutar es el cierre ni la
+          promoción. Consulte con soporte técnico.
         </Alert>
       )}
 
@@ -673,7 +685,7 @@ export const CierreAnoPage = () => {
                 onClick={() => setShowConfirmCierre(true)} 
                 variant="danger"
                 icon={<Lock size={18} />}
-                disabled={CIERRE_BLOQUEADO || !anoEscolar || anoEscolar.cerrado}
+                disabled={cierreBloqueado || !anoEscolar || anoEscolar.cerrado}
               >
                 Proceder al Cierre
               </Button>
@@ -843,7 +855,7 @@ export const CierreAnoPage = () => {
               <Button variant="secondary" onClick={() => setPaso(3)}>← Volver</Button>
               <Button
                 onClick={() => setShowConfirmPromocion(true)}
-                disabled={CIERRE_BLOQUEADO
+                disabled={cierreBloqueado
                   || estudiantesPromocion.length === 0
                   || estudiantesPromocion.every(e => !e.listo_para_decidir)}
                 icon={<GraduationCap size={18} />}

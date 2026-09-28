@@ -14,7 +14,8 @@ Que se prueba aqui:
   · que el reintento secuencial no vuelve a mover a nadie;
   · que un APLAZADO puede terminar su recuperacion del año anterior aunque
     el año nuevo ya este activo —el caso que C0.1 reprodujo roto—;
-  · y que el safety lock de C1 sigue devolviendo 409 por HTTP.
+  · y que los dos writers LEGACY siguen devolviendo 409 por HTTP, mientras
+    los dos CANONICOS ya no chocan contra el candado.
 
 Base temporal aislada. Nunca produccion.
 """
@@ -81,8 +82,9 @@ class Req:
 
 db = SessionLocal()
 
-check('CORE1-0  el safety lock de C1 esta puesto al empezar',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('CORE1-0  los candados estan en su estado de release al empezar',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 
 # ═══════════════════ EL COLEGIO ═══════════════════
@@ -667,7 +669,7 @@ check('CORE1-39 la cohorte NO es "todos los activos del colegio"',
 
 print()
 print("=" * 100)
-print("BLOQUE 7 — el safety lock de C1 sigue puesto")
+print("BLOQUE 7 — legacy bloqueado, canonico habilitado")
 print("=" * 100)
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -691,9 +693,17 @@ with TestClient(APP.app) as cli:
     for etiqueta, ruta, body, codigo in ENDPOINTS:
         r = cli.post(ruta, json=body,
                      headers={'Authorization': 'Bearer %s' % TOK_DIR})
-        check('CORE1-40 %s sigue en 409' % etiqueta,
-              r.status_code == 409 and r.json().get('error') == codigo,
-              'status=%s error=%s' % (r.status_code, r.json().get('error')))
+        # RELEASE · Los LEGACY siguen en 409 permanente; los CANONICOS
+        # solo tienen que haber dejado de chocar contra el candado.
+        _err = r.json().get('error')
+        if codigo == 'PROMOCION_LEGACY_BLOQUEADA':
+            check('CORE1-40 %s sigue en 409 PERMANENTE' % etiqueta,
+                  r.status_code == 409 and _err == codigo,
+                  'status=%s error=%s' % (r.status_code, _err))
+        else:
+            check('CORE1-40 %s ya no choca contra el candado' % etiqueta,
+                  _err != 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
+                  'status=%s error=%s' % (r.status_code, _err))
         rp = cli.post(ruta, json=body,
                       headers={'Authorization': 'Bearer %s' % TOK_PROF})
         ra = cli.post(ruta, json=body)
@@ -702,8 +712,9 @@ with TestClient(APP.app) as cli:
               and codigo not in rp.text and codigo not in ra.text,
               'prof=%s anon=%s' % (rp.status_code, ra.status_code))
 
-check('CORE1-42 la bandera sigue en True al terminar',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('CORE1-42 las banderas siguen como al empezar',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 
 print()

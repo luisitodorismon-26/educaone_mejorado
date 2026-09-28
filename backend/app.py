@@ -2917,7 +2917,36 @@ async def update_ano_escolar(id, request: Request, db: Session = Depends(get_db)
 # Las LECTURAS no se tocan. Las previsualizaciones de R4 siguen intactas,
 # que es justamente lo que Dirección necesita para revisar el año.
 
-CIERRE_ANO_BLOQUEADO = True
+# ── RELEASE · DOS CANDADOS, PORQUE PROTEGEN COSAS DISTINTAS ──────────
+#
+# C1 puso UNA bandera delante de cuatro POST, y eso fue correcto mientras el
+# flujo se reconstruía: no había nada que habilitar. Ahora sí lo hay, y los
+# cuatro dejaron de ser lo mismo.
+#
+#   CANÓNICOS — `/api/ano-escolar/{id}/cerrar` y `/api/cierre-ano/promover`.
+#   Son el flujo nuevo, el que CORE-1 y CORE-2 construyeron: consultan A1+A2,
+#   distinguen PROMOVIDO de APLAZADO, resuelven el grado destino por (nivel,
+#   grado), bloquean con EN_PROCESO, escriben historial solo para resultados
+#   definitivos y son idempotentes. Se habilitan.
+#
+#   LEGACY — `/api/promocion/ejecutar` y `/api/ano-escolar/promover`. Mueven
+#   estudiantes sin mirar su situación académica ni el año de destino. No se
+#   arreglan y no vuelven: quedan fuera de servicio de forma permanente.
+#
+# Si compartieran bandera, habilitar el Cierre resucitaría los dos writers
+# que todo este trabajo existía para retirar. Por eso son dos.
+#
+# El candado canónico se conserva como interruptor de emergencia: ponerlo en
+# True vuelve a cerrar el Cierre entero sin tocar nada más.
+CIERRE_ANO_BLOQUEADO = False
+
+# El legacy NO es un interruptor. Está declarado para que el estado del
+# sistema pueda informarlo y para que quede escrito en el código qué política
+# rige, pero las guardas NO lo consultan: devuelven 409 sin condición. Si lo
+# consultaran, bastaría un `= False` despistado —o un parche de terceros—
+# para reactivar dos writers que corrompen expedientes. Hay una prueba que
+# lo pone en False y comprueba que los endpoints siguen rechazando.
+PROMOCION_LEGACY_BLOQUEADA = True
 
 ERROR_CIERRE_BLOQUEADO = 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO'
 ERROR_PROMOCION_LEGACY_BLOQUEADA = 'PROMOCION_LEGACY_BLOQUEADA'
@@ -2945,6 +2974,22 @@ def _bloqueo_cierre_ano(codigo=ERROR_CIERRE_BLOQUEADO, mensaje=None):
         'message': mensaje or _MENSAJE_CIERRE,
         'bloqueado': True,
     }, status_code=409)
+
+
+def _bloqueo_promocion_legacy():
+    """El rechazo permanente de los dos writers antiguos.
+
+    SIN condición, a propósito. Quien lea esto buscando el `if` que lo
+    activa no lo va a encontrar: no existe. `PROMOCION_LEGACY_BLOQUEADA`
+    declara la política; esta función la aplica pase lo que pase con la
+    constante, con el candado del Cierre o con cualquier configuración.
+
+    Se devuelve ANTES de leer el cuerpo de la petición y antes de cualquier
+    consulta: el rechazo no puede dejar la base a medias porque no llega a
+    tocarla.
+    """
+    return _bloqueo_cierre_ano(ERROR_PROMOCION_LEGACY_BLOQUEADA,
+                               _MENSAJE_LEGACY)
 
 
 # ═══════════════ CIERRE DE AÑO C2 · TRANSICIÓN Y COHORTE ═══════════════
@@ -4686,9 +4731,9 @@ async def promover_estudiantes(request: Request, db: Session = Depends(get_db), 
     Dirección podía creer que la promoción se hizo. Se bloquea con el mismo
     código legacy hasta decidir si se retira.
     """
-    if CIERRE_ANO_BLOQUEADO:
-        return _bloqueo_cierre_ano(ERROR_PROMOCION_LEGACY_BLOQUEADA,
-                                   _MENSAJE_LEGACY)
+    # RELEASE · Sin `if`. Ver `_bloqueo_promocion_legacy`: habilitar el Cierre
+    # canónico no puede resucitar este writer, y ninguna constante lo activa.
+    return _bloqueo_promocion_legacy()
 
     grados = tenant_filter(db.query(Grado), Grado, current_user).order_by(Grado.orden).all()
     grado_siguiente = {g.id: grados[i+1].id if i+1 < len(grados) else None for i, g in enumerate(grados)}
@@ -18136,9 +18181,9 @@ async def ejecutar_promocion(request: Request, db: Session = Depends(get_db), cu
     local dejó al estudiante en un curso del año VIEJO. Era un bypass
     completo del Cierre de Año.
     """
-    if CIERRE_ANO_BLOQUEADO:
-        return _bloqueo_cierre_ano(ERROR_PROMOCION_LEGACY_BLOQUEADA,
-                                   _MENSAJE_LEGACY)
+    # RELEASE · Sin `if`. Ver `_bloqueo_promocion_legacy`: habilitar el Cierre
+    # canónico no puede resucitar este writer, y ninguna constante lo activa.
+    return _bloqueo_promocion_legacy()
 
     data = await request.json()
     

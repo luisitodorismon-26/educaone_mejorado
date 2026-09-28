@@ -11,8 +11,9 @@ Que se prueba aqui:
     nuevo, ni el de un tercer año;
   · que de ese filtro sale la idempotencia secuencial, sin ninguna columna
     ni marca nueva;
-  · y que el safety lock de C1 sigue puesto: los cuatro writers responden
-    409 y el RBAC no cambio.
+  · y que los candados estan donde el release los dejo: los dos writers
+    LEGACY responden 409 permanente, los dos CANONICOS ya no chocan contra
+    el candado, y el RBAC no cambio.
 
 Los helpers de C2 son PUROS: consultan y validan, no escriben. Por eso
 estas pruebas no necesitan apagar la bandera en ningun momento — y se
@@ -168,8 +169,9 @@ def cuerpo(resp):
 
 db = SessionLocal()
 
-check('C2-0  el safety lock de C1 esta puesto al empezar',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('C2-0  los candados estan en su estado de release al empezar',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 col, A, B, C, grados, tanda, cursos = montar(db, 'C2', 'C2A')
 DIR = usuario_real(db, col)
@@ -467,7 +469,7 @@ check('C2-14c leer curso y grado de la cohorte no produce N+1',
 
 print()
 print("=" * 94)
-print("BLOQUE 6 — el safety lock de C1 sigue intacto")
+print("BLOQUE 6 — legacy bloqueado, canonico habilitado")
 print("=" * 94)
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -496,11 +498,18 @@ with TestClient(APP.app) as cli:
     for etiqueta, ruta, body, codigo in ENDPOINTS:
         r = cli.post(ruta, json=body,
                      headers={'Authorization': 'Bearer %s' % TOK_DIR})
-        # C2-18 / C2-19: aunque el body traiga ya el contrato nuevo, el lock
-        # rechaza antes de leerlo. C2 no desbloquea nada.
-        check('C2-18 %s sigue en 409' % etiqueta,
-              r.status_code == 409 and r.json().get('error') == codigo,
-              'status=%s error=%s' % (r.status_code, r.json().get('error')))
+        # RELEASE · Los LEGACY siguen en 409 permanente. Los CANONICOS
+        # estan habilitados: de ellos se exige que el candado YA NO se
+        # interponga; su resultado academico lo prueban CORE-1 y CORE-2.
+        _err = r.json().get('error')
+        if codigo == 'PROMOCION_LEGACY_BLOQUEADA':
+            check('C2-18 %s sigue en 409 PERMANENTE' % etiqueta,
+                  r.status_code == 409 and _err == codigo,
+                  'status=%s error=%s' % (r.status_code, _err))
+        else:
+            check('C2-18 %s ya no choca contra el candado' % etiqueta,
+                  _err != 'CIERRE_ANO_TEMPORALMENTE_BLOQUEADO',
+                  'status=%s error=%s' % (r.status_code, _err))
 
         rp = cli.post(ruta, json=body,
                       headers={'Authorization': 'Bearer %s' % TOK_PROF})
@@ -510,8 +519,9 @@ with TestClient(APP.app) as cli:
               and codigo not in rp.text and codigo not in ra.text,
               'prof=%s anon=%s' % (rp.status_code, ra.status_code))
 
-check('C2-19 los cuatro writers de C1 siguen bloqueados',
-      APP.CIERRE_ANO_BLOQUEADO is True, '')
+check('C2-19 los candados no se movieron durante la suite',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True, '')
 
 # Y el año origen del colegio de prueba no se movio ni un poco.
 db.expire_all()
@@ -522,9 +532,10 @@ check('C2-19b ninguna llamada HTTP cambio el estado de los años',
       and db.get(M.AnoEscolar, B2_.id).cerrado is False,
       '')
 
-check('C2-Z  la bandera sigue en True al terminar',
-      APP.CIERRE_ANO_BLOQUEADO is True,
-      'ninguna prueba de C2 necesito apagarla')
+check('C2-Z  las banderas siguen como al empezar',
+      APP.CIERRE_ANO_BLOQUEADO is False
+      and APP.PROMOCION_LEGACY_BLOQUEADA is True,
+      'ninguna prueba de C2 necesito tocarlas')
 
 
 print()

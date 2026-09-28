@@ -641,8 +641,10 @@ with client:
     import app as APP  # noqa: E402
     import inspect  # noqa: E402
 
-    check('E11-Z1 el safety lock de Cierre sigue en True',
-          APP.CIERRE_ANO_BLOQUEADO is True, '')
+    check('E11-Z1 los candados de Cierre, en su estado de release',
+          APP.CIERRE_ANO_BLOQUEADO is False
+          and APP.PROMOCION_LEGACY_BLOQUEADA is True,
+          'ENTREGA-1 no los movio')
     for fn in ('_dias_asistencia_del_ano', '_dias_asistencia_de_filas',
                '_resumen_anual_asistencia', '_asistencia_anual_boletin'):
         check('E11-Z2 %s sigue existiendo, sin duplicar' % fn,

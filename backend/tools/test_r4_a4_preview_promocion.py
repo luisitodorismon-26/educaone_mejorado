@@ -667,7 +667,21 @@ def _huella(nodo):
     return _ast.dump(nodo, include_attributes=False)
 
 
+# RELEASE · El candado se partio en dos, y las guardas dejaron de tener la
+# misma forma.
+#
+#   CANONICA — `if CIERRE_ANO_BLOQUEADO: return ...`. Condicional a
+#   proposito: la bandera es el interruptor de emergencia que vuelve a
+#   cerrar el Cierre entero.
+#
+#   LEGACY — `return _bloqueo_promocion_legacy()`. SIN condicion, tambien a
+#   proposito: los dos writers antiguos no vuelven, y una bandera que
+#   alguien pudiera voltear los reactivaria.
+#
+# La legacy es la forma MAS fuerte, no una relajacion: no hay rama por la
+# que el cuerpo antiguo se ejecute.
 def _es_guard_c1(n):
+    """El guard CONDICIONAL del Cierre canonico."""
     import ast as _ast
     return (isinstance(n, _ast.If)
             and isinstance(n.test, _ast.Name)
@@ -675,6 +689,16 @@ def _es_guard_c1(n):
             and len(n.body) == 1
             and isinstance(n.body[0], _ast.Return)
             and not n.orelse)
+
+
+def _es_guard_legacy(n):
+    """El rechazo INCONDICIONAL de los writers antiguos."""
+    import ast as _ast
+    return (isinstance(n, _ast.Return)
+            and isinstance(n.value, _ast.Call)
+            and isinstance(n.value.func, _ast.Name)
+            and n.value.func.id == '_bloqueo_promocion_legacy'
+            and not n.value.args and not n.value.keywords)
 
 
 def _primera_sentencia(cuerpo):
@@ -704,19 +728,48 @@ def _exigir_cola_identica(nombre, cola, base):
                _huella(original)[:200], chr(10), _huella(actual)[:200]))
 
 
-@test("A4-22 los tres writers congelados: guard + legacy EXACTO")
+@test("A4-22 los dos writers LEGACY: rechazo incondicional + legacy EXACTO")
 def _():
     # `cola_legacy in cuerpo_actual` demostraba que la logica vieja seguia
     # AHI, pero no que fuera lo unico: entre el guard y esa cola cabia codigo
     # nuevo sin que la subcadena dejase de encontrarse. Aqui se compara
     # sentencia a sentencia, asi que cualquier linea ejecutable de mas —o de
     # menos, o movida— hace fallar el test.
+    #
+    # RELEASE · Lo unico que cambio es la FORMA del rechazo: de
+    # `if CIERRE_ANO_BLOQUEADO: return ...` a un `return` sin condicion. El
+    # cuerpo legacy de debajo se sigue exigiendo identico.
     for nombre in _WRITERS_CONGELADOS:
         base = _sentencias(_cuerpo_en(_SHA_C1_BASE, nombre))
         ahora = _sentencias(_cuerpo_actual(nombre))
-        assert _es_guard_c1(ahora[0]), (
-            '%s: su primera sentencia ejecutable no es el guard de C1' % nombre)
+        assert _es_guard_legacy(ahora[0]), (
+            '%s: su primera sentencia ejecutable no es el rechazo legacy '
+            'incondicional (%s)' % (nombre, type(ahora[0]).__name__))
         _exigir_cola_identica(nombre, ahora[1:], base)
+
+
+@test("A4-22g el rechazo legacy NO depende de ninguna bandera")
+def _():
+    # La comprobacion que impide reactivarlos por descuido. Un `if` sobre
+    # cualquier constante bastaria para que un `= False` los devolviera a
+    # produccion, y son justo los writers que mueven estudiantes sin mirar
+    # su situacion academica.
+    import ast as _ast
+    BANDERAS = {'CIERRE_ANO_BLOQUEADO', 'PROMOCION_LEGACY_BLOQUEADA'}
+    for nombre in _WRITERS_CONGELADOS:
+        cuerpo = _cuerpo_actual(nombre)
+        leidas = {n.id for n in _ast.walk(_ast.parse(cuerpo))
+                  if isinstance(n, _ast.Name) and n.id in BANDERAS}
+        assert not leidas, (
+            '%s: lee %s; su rechazo debe ser incondicional' % (nombre, leidas))
+    # Y la funcion que emite el rechazo tampoco la lee.
+    import inspect as _insp
+    import textwrap as _tw
+    import app as _APP
+    fuente = _tw.dedent(_insp.getsource(_APP._bloqueo_promocion_legacy))
+    leidas = {n.id for n in _ast.walk(_ast.parse(fuente))
+              if isinstance(n, _ast.Name) and n.id in BANDERAS}
+    assert not leidas, '_bloqueo_promocion_legacy lee %s' % leidas
 
 
 @test("A4-22d los writers reescritos: guard + prologo + legacy intacto")
@@ -792,21 +845,24 @@ def _():
             % prohibido)
 
 
-@test("A4-22b lo unico que se les antepuso es el safety lock de C1")
+@test("A4-22b cada writer conserva SU guarda como primera sentencia")
 def _():
-    import ast as _ast
-    for nombre in _WRITERS_C1:
+    # La PRIMERA sentencia ejecutable debe ser el guard que le corresponde.
+    # Si alguien colocase una consulta, un `await request.json()` o un log
+    # por delante, el rechazo dejaria de ser fail-closed limpio.
+    #
+    # RELEASE · Los canonicos conservan el guard condicional —su interruptor
+    # de emergencia—; los legacy tienen el rechazo incondicional.
+    for nombre in _WRITERS_REESCRITOS:
         n = _primera_sentencia(_cuerpo_actual(nombre))
-        # La PRIMERA sentencia ejecutable debe ser el guard. Si alguien
-        # colocase una consulta, un `await request.json()` o un log por
-        # delante, el rechazo dejaria de ser fail-closed limpio.
-        assert isinstance(n, _ast.If), (
-            '%s: su primera sentencia ya no es el guard (%s)'
+        assert _es_guard_c1(n), (
+            '%s: su primera sentencia ya no es el guard del Cierre (%s)'
             % (nombre, type(n).__name__))
-        assert isinstance(n.test, _ast.Name) and n.test.id == 'CIERRE_ANO_BLOQUEADO', (
-            '%s: la primera sentencia no comprueba CIERRE_ANO_BLOQUEADO' % nombre)
-        assert isinstance(n.body[0], _ast.Return), (
-            '%s: el guard no retorna de inmediato' % nombre)
+    for nombre in _WRITERS_CONGELADOS:
+        n = _primera_sentencia(_cuerpo_actual(nombre))
+        assert _es_guard_legacy(n), (
+            '%s: su primera sentencia ya no es el rechazo legacy (%s)'
+            % (nombre, type(n).__name__))
 
 
 def _esquema_modelos(fuente):
