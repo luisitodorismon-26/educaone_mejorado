@@ -6872,6 +6872,221 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
         return [e.to_dict() for e in query.all()]
     return {**pag, 'items': [e.to_dict() for e in pag['items']]}
 
+# ══ ADMIN · UNA FICHA CREADA POR ERROR NO ES UN ALUMNO QUE SE FUE ══════
+#
+# RETIRAR y ELIMINAR POR ERROR responden a dos preguntas distintas:
+#
+#   RETIRAR          el estudiante existió y se fue. Su expediente es parte
+#                    de la historia del centro: el maestro lo ve como
+#                    RETIRADO en la asistencia de aquel mes, sus notas siguen
+#                    ahí, y puede volver. No se borra nada, nunca.
+#
+#   ELIMINAR         la ficha nunca debió existir: un duplicado, una lista
+#   POR ERROR        equivocada, una persona que no es de este centro.
+#                    Dejarla como «Retirada» para siempre ensucia los
+#                    listados, las estadísticas y el Cierre con alguien que
+#                    no es nadie.
+#
+# ESTO NO RESUCITA EL PURGADO ANTIGUO
+# -----------------------------------
+# `DELETE /api/estudiantes/retirados/{id}` sigue exactamente como estaba:
+# responde 403 sin tocar la base, y su política no se discute aquí. Aquel
+# endpoint contemplaba 6 de las 14 tablas que referencian a un estudiante:
+# ante un expediente real fallaba con IntegrityError, y cuando la historia
+# vivía solo en esas 6 tenía ÉXITO y borraba notas vigentes en silencio.
+#
+# Esta ruta es nueva, se llama por su nombre, exige confirmación del id
+# exacto y un motivo, y borra las CATORCE tablas o ninguna.
+ERROR_ELIMINAR_ACTIVO = 'ESTUDIANTE_ACTIVO_NO_ELIMINABLE'
+ERROR_ELIMINAR_CONFIRMACION = 'CONFIRMACION_NO_COINCIDE'
+ERROR_ELIMINAR_SIN_MOTIVO = 'MOTIVO_REQUERIDO'
+ACCION_ELIMINAR_ERROR = 'ELIMINAR_ESTUDIANTE_ERROR_REGISTRO'
+
+# Las catorce tablas con clave ajena a `estudiantes`, leídas de models.py y
+# no asumidas. El orden importa: se borran las dependientes antes que la
+# fila del estudiante, que va la última.
+#
+# Si mañana alguien añade un modelo con `estudiante_id`, esta lista se queda
+# corta y el borrado dejaría huérfanos. Por eso hay una prueba que la compara
+# contra models.py y falla si aparece uno nuevo.
+_MODELOS_DEL_ESTUDIANTE = (
+    'Asistencia', 'Calificacion', 'CalificacionPrimaria',
+    'CalificacionSecundaria', 'CasoPsicologia',
+    'DecisionAcademicaEstudiante', 'EvalInternaEstudiante',
+    'EvaluacionExtraSecundaria', 'HistorialAcademico',
+    'HistorialComunicacionPadres', 'HistorialReportePadres',
+    'RecuperacionPedagogicaPrimaria', 'RecuperacionPrimaria',
+    'ReporteConducta',
+)
+
+
+def _impacto_eliminacion(db, current_user, estudiante):
+    """Qué se borraría. Cuenta y no toca nada.
+
+    Devuelve `{tabla: n}` solo con las que tienen filas, más el total.
+    """
+    import models as _M
+
+    conteos = {}
+    for nombre in _MODELOS_DEL_ESTUDIANTE:
+        modelo = getattr(_M, nombre, None)
+        if modelo is None:
+            continue
+        n = (tenant_filter(db.query(modelo), modelo, current_user)
+             .filter(modelo.estudiante_id == estudiante.id).count())
+        if n:
+            conteos[modelo.__tablename__] = n
+    return conteos
+
+
+@app.get("/api/estudiantes/{id}/impacto-eliminacion-error")
+async def impacto_eliminacion_error(id: int, db: Session = Depends(get_db),
+                                    current_user: Usuario = Depends(
+                                        RolesRequired('direccion'))):
+    """Qué desaparecería si se eliminara esta ficha. SOLO LECTURA.
+
+    Dirección tiene que poder ver el alcance ANTES de confirmar. Una ficha
+    creada por error suele tener cero de todo; si aparecen veinte
+    asistencias y un historial académico, probablemente no sea un error de
+    registro sino un estudiante real, y lo que toca es retirarlo.
+    """
+    est = get_tenant_or_404(db, Estudiante, id, current_user,
+                            name='estudiante')
+    curso = est.curso
+    conteos = _impacto_eliminacion(db, current_user, est)
+    return {
+        'estudiante_id': est.id,
+        'nombre': est.nombre_completo,
+        'matricula': est.matricula,
+        'curso': getattr(curso, 'nombre_completo', None),
+        'curso_id': est.curso_id,
+        'no_lista': est.no_lista,
+        'activo': bool(est.activo),
+        'condicion': est.condicion,
+        'eliminable': not est.activo,
+        'conteos': conteos,
+        'total_referencias': sum(conteos.values()),
+    }
+
+
+@app.post("/api/estudiantes/{id}/eliminar-por-error")
+async def eliminar_estudiante_por_error(id: int, request: Request,
+                                        db: Session = Depends(get_db),
+                                        current_user: Usuario = Depends(
+                                            RolesRequired('direccion'))):
+    """Elimina una ficha creada por error. Dirección, y solo Dirección.
+
+    TODO O NADA
+        Las catorce tablas y la fila del estudiante se borran en UNA
+        transacción. Si una falla, `rollback` y no queda ni media
+        eliminación ni una sola fila huérfana.
+
+    LA AUDITORÍA SOBREVIVE AL BORRADO
+        Se escribe ANTES de los deletes, dentro de la misma transacción, y
+        referencia el id como entero suelto —`log_auditoria` no tiene clave
+        ajena a `estudiantes`—. Así queda la traza sin que el estudiante
+        reaparezca en ningún listado.
+    """
+    est = get_tenant_or_404(db, Estudiante, id, current_user,
+                            name='estudiante')
+
+    try:
+        cuerpo = await request.json()
+    except Exception:
+        cuerpo = {}
+    if not isinstance(cuerpo, dict):
+        cuerpo = {}
+
+    # Retirar primero. Un estudiante activo no es una ficha errónea: está en
+    # listas de clase, en el horario y en la asistencia de esta semana.
+    if est.activo:
+        return JSONResponse({
+            'error': ERROR_ELIMINAR_ACTIVO,
+            'message': ('Retire primero al estudiante. Solo se puede eliminar '
+                        'una ficha que ya está retirada.'),
+        }, status_code=409)
+
+    motivo = (cuerpo.get('motivo') or '').strip()
+    if not motivo:
+        return JSONResponse({
+            'error': ERROR_ELIMINAR_SIN_MOTIVO,
+            'message': 'Indique por qué esta ficha fue creada por error.',
+        }, status_code=400)
+
+    # La confirmación es el id EXACTO, como entero. Un booleano, una cadena
+    # vacía o un id distinto no confirman nada: la idea es que Dirección
+    # tenga que mirar a quién está borrando.
+    confirmacion = cuerpo.get('confirmar_estudiante_id')
+    if isinstance(confirmacion, bool) or confirmacion is None:
+        confirmacion = None
+    else:
+        try:
+            confirmacion = int(confirmacion)
+        except (TypeError, ValueError):
+            confirmacion = None
+    if confirmacion != est.id:
+        return JSONResponse({
+            'error': ERROR_ELIMINAR_CONFIRMACION,
+            'message': ('Confirme el identificador exacto del estudiante que '
+                        'va a eliminar.'),
+            'estudiante_id': est.id,
+        }, status_code=409)
+
+    import models as _M
+
+    conteos = _impacto_eliminacion(db, current_user, est)
+    # Contar es parte de la operación: si falla, no se empieza a borrar. Va
+    # fuera del try a propósito —todavía no hay nada que deshacer— pero con
+    # su propio rechazo, porque un conteo roto significa que el esquema no es
+    # el que esta función cree.
+    huella = {
+        'estudiante_id': est.id,
+        'nombre': est.nombre_completo,
+        'matricula': est.matricula,
+        'curso_id': est.curso_id,
+        'curso': getattr(est.curso, 'nombre_completo', None),
+        'no_lista': est.no_lista,
+        'condicion': est.condicion,
+        'motivo_error_registro': motivo,
+        'conteos_eliminados': conteos,
+        'total_referencias': sum(conteos.values()),
+    }
+
+    try:
+        # La traza primero, dentro de la misma transacción: si el borrado
+        # falla, también se va.
+        log_auditoria(db, ACCION_ELIMINAR_ERROR, 'estudiantes', est.id,
+                      huella, None, user=current_user, request=request)
+
+        for nombre in _MODELOS_DEL_ESTUDIANTE:
+            modelo = getattr(_M, nombre, None)
+            if modelo is None:
+                continue
+            (tenant_filter(db.query(modelo), modelo, current_user)
+             .filter(modelo.estudiante_id == est.id)
+             .delete(synchronize_session=False))
+
+        db.delete(est)
+        db.commit()
+    except Exception as exc:                       # noqa: BLE001
+        db.rollback()
+        logger.error('eliminar-por-error falló para %s: %s', id, exc,
+                     exc_info=True)
+        return JSONResponse({
+            'error': 'ELIMINACION_FALLIDA',
+            'message': ('No se pudo eliminar la ficha. No se borró nada: el '
+                        'expediente sigue exactamente como estaba.'),
+        }, status_code=500)
+
+    cache_clear_tenant(current_user.colegio_id)
+    return {
+        'message': 'Ficha eliminada por error de registro',
+        'estudiante_id': huella['estudiante_id'],
+        'eliminados': conteos,
+        'total_referencias': huella['total_referencias'],
+    }
+
+
 @app.get("/api/estudiantes/retirados")
 async def get_estudiantes_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Los retirados del colegio. Solo LECTURA.

@@ -113,6 +113,13 @@ export const EstudiantesPage = () => {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [showImportModal, setShowImportModal] = useState(false);
+  // ADMIN · Eliminar por error de registro. Solo Dirección, y en dos pasos:
+  // primero se muestra QUÉ desaparece, después se confirma el id exacto.
+  const [impacto, setImpacto] = useState<any | null>(null);
+  const [motivoError, setMotivoError] = useState('');
+  const [confirmaId, setConfirmaId] = useState('');
+  const [eliminando, setEliminando] = useState(false);
+  const canEliminarPorError = user?.role === 'direccion';
   const [importCursoId, setImportCursoId] = useState<number | ''>('');
   const [importing, setImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -166,6 +173,46 @@ export const EstudiantesPage = () => {
       setMessage({ type: 'error', text: 'Error al cargar datos' });
     } finally {
       setLoading(false);
+    }
+  };
+
+  const abrirEliminarPorError = async (estudianteId: number) => {
+    setMotivoError('');
+    setConfirmaId('');
+    try {
+      const res = await api.get(
+        `/estudiantes/${estudianteId}/impacto-eliminacion-error`);
+      setImpacto(res.data);
+    } catch (e: any) {
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'No se pudo calcular el impacto',
+      });
+    }
+  };
+
+  const confirmarEliminarPorError = async () => {
+    if (!impacto) return;
+    setEliminando(true);
+    try {
+      const res = await api.post(
+        `/estudiantes/${impacto.estudiante_id}/eliminar-por-error`,
+        { confirmar_estudiante_id: impacto.estudiante_id, motivo: motivoError });
+      setMessage({
+        type: 'success',
+        text: `${res.data.message}. Referencias eliminadas: ${res.data.total_referencias}.`,
+      });
+      setImpacto(null);
+      loadData();
+    } catch (e: any) {
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'No se pudo eliminar la ficha',
+      });
+    } finally {
+      setEliminando(false);
     }
   };
 
@@ -545,6 +592,68 @@ export const EstudiantesPage = () => {
         </Alert>
       )}
 
+      {/* ADMIN · Eliminar por error de registro */}
+      {impacto && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-6 space-y-4">
+            <h2 className="text-lg font-semibold text-red-800">
+              Eliminar por error de registro
+            </h2>
+            <p className="text-sm text-gray-700">
+              Esta operación indica que esta ficha fue creada por error y que
+              la persona no debe formar parte del sistema. No es lo mismo que
+              retirar: un estudiante retirado conserva su expediente y puede
+              volver. Esto no se puede deshacer.
+            </p>
+            <div className="bg-gray-50 border rounded-lg p-3 text-sm">
+              <p><strong>{impacto.nombre}</strong></p>
+              <p className="text-gray-600">
+                Matrícula: {impacto.matricula || '—'} · Curso:{' '}
+                {impacto.curso || '—'} · Nº {impacto.no_lista ?? '—'} · ID{' '}
+                {impacto.estudiante_id}
+              </p>
+            </div>
+            <div className="text-sm">
+              <p className="font-medium mb-1">Desaparecerá también:</p>
+              {impacto.total_referencias === 0 ? (
+                <p className="text-gray-500">
+                  Ningún registro asociado. Es coherente con una ficha creada
+                  por error.
+                </p>
+              ) : (
+                <ul className="list-disc ml-5 text-gray-700">
+                  {Object.entries(impacto.conteos || {}).map(([t, n]) => (
+                    <li key={t}>{n as number} en {t.replace(/_/g, ' ')}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            {!impacto.eliminable && (
+              <Alert variant="warning">
+                Este estudiante sigue activo. Retírelo primero.
+              </Alert>
+            )}
+            <Input label="Motivo" value={motivoError}
+              onChange={e => setMotivoError(e.target.value)}
+              placeholder="Ficha creada por error, duplicado..." />
+            <Input label={`Escriba el ID exacto (${impacto.estudiante_id}) para confirmar`}
+              value={confirmaId}
+              onChange={e => setConfirmaId(e.target.value)} />
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="secondary" onClick={() => setImpacto(null)}>
+                Cancelar
+              </Button>
+              <Button variant="danger" loading={eliminando}
+                disabled={!impacto.eliminable || !motivoError.trim()
+                  || confirmaId.trim() !== String(impacto.estudiante_id)}
+                onClick={confirmarEliminarPorError}>
+                Eliminar definitivamente por error
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Vista de Estudiantes Retirados */}
       {activeTab === 'retirados' && canManageRetirados ? (
         <div className="bg-white rounded-lg border shadow-sm overflow-hidden">
@@ -582,6 +691,18 @@ export const EstudiantesPage = () => {
                         >
                           🔄 Reactivar
                         </button>
+                        {/* ADMIN · Solo Dirección. Secretaría administra el
+                            expediente; decidir que una persona nunca debió
+                            estar en el sistema no es administración. */}
+                        {canEliminarPorError && (
+                          <button
+                            onClick={() => abrirEliminarPorError(est.id)}
+                            className="px-3 py-1 bg-red-700 text-white text-sm rounded hover:bg-red-800"
+                            title="La ficha fue creada por error y debe desaparecer"
+                          >
+                            🗑️ Eliminar por error
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
