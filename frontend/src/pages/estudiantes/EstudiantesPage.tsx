@@ -240,7 +240,15 @@ export const EstudiantesPage = () => {
       loadData();
       closeModal();
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al guardar' });
+      // SECRETARÍA-2 · Los candados del expediente responden con un código
+      // (`CORRECCION_IDENTIDAD_REQUIERE_DIRECCION`) y con una explicación en
+      // `message`. Mostrar el código a quien está corrigiendo un teléfono no
+      // ayuda a nadie: se prefiere la frase, y el código queda en la red.
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'Error al guardar',
+      });
     } finally {
       setSaving(false);
     }
@@ -263,7 +271,11 @@ export const EstudiantesPage = () => {
       setMotivoRetiro('');
       loadData();
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al retirar estudiante' });
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'Error al retirar estudiante',
+      });
     }
   };
 
@@ -320,7 +332,14 @@ export const EstudiantesPage = () => {
     setForm(initialForm);
   };
 
-  const canEdit = user?.role === 'direccion' || user?.role === 'coordinador';
+  // SECRETARÍA-2 · Secretaría administra el expediente: crear, corregir
+  // datos de contacto, número de lista, retirar y reactivar. Lo que NO puede
+  // es sustituir la identidad de un expediente que ya tiene historia
+  // académica, ni moverlo de curso en un año con notas: el backend lo
+  // rechaza con 409 y la pantalla lo explica en vez de dejar un error seco.
+  const esSecretaria = user?.role === 'secretaria';
+  const canEdit = user?.role === 'direccion' || user?.role === 'coordinador'
+    || esSecretaria;
 
   const handleImportCSV = async () => {
     const file = fileInputRef.current?.files?.[0];

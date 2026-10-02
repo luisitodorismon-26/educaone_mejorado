@@ -6902,6 +6902,170 @@ async def get_estudiante(id, request: Request, db: Session = Depends(get_db), cu
     return est.to_dict()
 
 
+# ══ SECRETARÍA-2 · NO SUSTITUIR UNA PERSONA POR OTRA ═══════════════════
+#
+# El incidente real: se editó un expediente cambiando nombre y apellido —de
+# una estudiante a otro— sobre el MISMO `estudiante_id`. Las notas, la
+# asistencia y el historial que colgaban de ese id siguieron colgando de él.
+# Nadie borró nada y nadie falsificó una nota: simplemente el expediente pasó
+# a nombre de otra persona, con el rendimiento de la primera dentro.
+#
+# Abrir la edición a Secretaría sin cerrar esto multiplicaría el riesgo, así
+# que la frontera queda así: Secretaría administra el EXPEDIENTE —contactos,
+# dirección, tutores, número de lista—, y la IDENTIDAD de un expediente que
+# ya tiene historia solo la corrige Dirección.
+#
+# La lista de tablas NO se asume: sale de recorrer `models.py` y quedarse con
+# las que tienen clave ajena a `estudiantes`. Son catorce; aquí entran las
+# que constituyen un registro personal del estudiante. Quedan fuera los dos
+# historiales de COMUNICACIÓN con la familia: registran a quién se llamó y
+# cuándo, no qué hizo el estudiante, y bloquear por ellos impediría corregir
+# una tilde sin proteger nada.
+#
+# Psicología y conducta sí entran, aunque no sean académicas: que un caso
+# psicológico o un reporte disciplinario acaben a nombre de otra persona es
+# tan grave como que lo hagan unas calificaciones, o más.
+_TABLAS_HUELLA_ACADEMICA = (
+    ('calificaciones', 'Calificacion'),
+    ('calificaciones_primaria', 'CalificacionPrimaria'),
+    ('calificaciones_secundaria', 'CalificacionSecundaria'),
+    ('evaluaciones_extra_secundaria', 'EvaluacionExtraSecundaria'),
+    ('recuperaciones_primaria', 'RecuperacionPrimaria'),
+    ('recuperaciones_pedagogicas_primaria', 'RecuperacionPedagogicaPrimaria'),
+    ('asistencia', 'Asistencia'),
+    ('historial_academico', 'HistorialAcademico'),
+    ('decisiones_academicas', 'DecisionAcademicaEstudiante'),
+    ('evaluacion_interna', 'EvalInternaEstudiante'),
+)
+_TABLAS_HUELLA_PERSONAL = (
+    ('casos_psicologia', 'CasoPsicologia'),
+    ('reportes_conducta', 'ReporteConducta'),
+)
+
+# Cambiar cualquiera de estos campos convierte el expediente en el de otra
+# persona. El resto —teléfono, dirección, tutor, contacto de emergencia— se
+# corrige sin tocar quién es.
+_CAMPOS_IDENTIDAD = ('nombre', 'apellido', 'matricula', 'sexo',
+                     'fecha_nacimiento', 'cedula')
+
+ERROR_IDENTIDAD_REQUIERE_DIRECCION = 'CORRECCION_IDENTIDAD_REQUIERE_DIRECCION'
+ERROR_CURSO_REQUIERE_DIRECCION = 'CAMBIO_CURSO_REQUIERE_DIRECCION'
+
+
+def _huella_academica_estudiante(db, current_user, estudiante_id, ano=None):
+    """Qué hay ya escrito sobre este estudiante. Solo LEE.
+
+    Devuelve `{clave: n}` con las tablas que tienen filas; vacío si el
+    expediente está limpio. Con `ano`, se acota a ese año escolar: las tablas
+    que llevan `ano_escolar_id` se filtran por él, y la asistencia —que no lo
+    lleva— por el rango de fechas del año.
+
+    Acotar por año es lo que distingue los dos candados. La identidad se
+    protege con la huella COMPLETA: da igual de qué año sean las notas, si
+    existen, el expediente ya es de alguien. El cambio de curso se protege
+    con la del año afectado: mover a un estudiante de curso en un año en el
+    que todavía no tiene nada escrito no reinterpreta ninguna nota.
+    """
+    import models as _M
+
+    conteo = {}
+    for clave, nombre in (_TABLAS_HUELLA_ACADEMICA + _TABLAS_HUELLA_PERSONAL):
+        modelo = getattr(_M, nombre, None)
+        if modelo is None:          # el modelo podría no existir en una rama
+            continue
+        q = tenant_filter(db.query(modelo), modelo, current_user).filter(
+            modelo.estudiante_id == estudiante_id)
+        if ano is not None:
+            if hasattr(modelo, 'ano_escolar_id'):
+                q = q.filter(modelo.ano_escolar_id == ano.id)
+            elif hasattr(modelo, 'fecha'):
+                ini = getattr(ano, 'fecha_inicio', None)
+                fin = getattr(ano, 'fecha_fin', None)
+                if ini and fin:
+                    q = q.filter(modelo.fecha >= ini, modelo.fecha <= fin)
+            else:
+                # Sin forma de acotarla al año, no cuenta para el candado de
+                # curso: bloquear por algo que no sabemos de qué año es sería
+                # impedir una corrección legítima sin proteger nada.
+                continue
+        n = q.count()
+        if n:
+            conteo[clave] = n
+    return conteo
+
+
+def _identidad_cambia(estudiante, data):
+    """Los campos de identidad que esta petición cambiaría DE VERDAD.
+
+    Reenviar el mismo nombre que ya está guardado no es sustituir a nadie, y
+    el formulario de edición manda el expediente entero. Se comparan valores,
+    no la presencia de la clave.
+    """
+    cambios = []
+    for campo in _CAMPOS_IDENTIDAD:
+        if campo not in data:
+            continue
+        nuevo = data.get(campo)
+        actual = getattr(estudiante, campo, None)
+        if campo == 'fecha_nacimiento':
+            actual = actual.isoformat() if actual else None
+            nuevo = (str(nuevo).strip() or None) if nuevo is not None else None
+        else:
+            actual = (str(actual).strip() if actual is not None else '') or None
+            nuevo = (str(nuevo).strip() if nuevo is not None else '') or None
+        if nuevo != actual:
+            cambios.append(campo)
+    return cambios
+
+
+def _guard_expediente_secretaria(db, current_user, estudiante, data):
+    """Los dos candados de Secretaría sobre un expediente con historia.
+
+    Devuelve un JSONResponse 409 o None. No escribe nada: se comprueba ANTES
+    de mutar el objeto, para que un rechazo no deje el expediente a medias.
+
+    Dirección y coordinación conservan exactamente lo que podían hacer; esto
+    solo se aplica a Secretaría, que es quien gana el permiso ahora.
+    """
+    if getattr(current_user, 'role', None) != 'secretaria':
+        return None
+
+    cambios = _identidad_cambia(estudiante, data)
+    if cambios:
+        huella = _huella_academica_estudiante(db, current_user, estudiante.id)
+        if huella:
+            return JSONResponse({
+                'error': ERROR_IDENTIDAD_REQUIERE_DIRECCION,
+                'message': ('Este expediente ya contiene información '
+                            'académica. La corrección de identidad requiere '
+                            'revisión de Dirección para evitar sustituir un '
+                            'estudiante por otro.'),
+                'campos': cambios,
+                'huella': huella,
+            }, status_code=409)
+
+    # El cambio de curso se mide contra el año del curso que se abandona: es
+    # ahí donde están las notas que se reinterpretarían.
+    if 'curso_id' in data and data.get('curso_id') != estudiante.curso_id:
+        curso_actual = getattr(estudiante, 'curso', None)
+        ano = None
+        if curso_actual is not None and curso_actual.ano_escolar_id:
+            ano = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+                   .filter(AnoEscolar.id == curso_actual.ano_escolar_id).first())
+        huella = _huella_academica_estudiante(
+            db, current_user, estudiante.id, ano=ano)
+        if huella:
+            return JSONResponse({
+                'error': ERROR_CURSO_REQUIERE_DIRECCION,
+                'message': ('Este estudiante ya tiene calificaciones, '
+                            'asistencia o recuperaciones registradas en ese '
+                            'año escolar. Cambiar su curso requiere revisión '
+                            'de Dirección.'),
+                'huella': huella,
+            }, status_code=409)
+    return None
+
+
 def _validar_identidad_estudiante(db: Session, current_user: Usuario, *, matricula=None, curso_id=None, no_lista=None, excluir_id=None):
     """Valida duplicados operativos dentro del tenant.
 
@@ -6934,7 +7098,7 @@ def _validar_identidad_estudiante(db: Session, current_user: Usuario, *, matricu
 
 
 @app.post("/api/estudiantes")
-async def crear_estudiante(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def crear_estudiante(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
     """Crear estudiante. Valida que curso (si se provee) sea del mismo colegio."""
     try:
         data = await request.json()
@@ -7080,7 +7244,7 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
 
 
 @app.put("/api/estudiantes/{id}")
-async def update_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def update_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
     """Editar estudiante. Valida tenant del estudiante y del nuevo curso si cambia."""
     est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
     
@@ -7099,6 +7263,26 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
                   if data.get('curso_id') else None))
     if _guard:
         return _guard
+
+    # SECRETARÍA-2 · Los dos candados del expediente, antes de tocar el
+    # objeto: identidad y cambio de curso. Solo afectan a Secretaría.
+    _guard_exp = _guard_expediente_secretaria(db, current_user, est, data)
+    if _guard_exp:
+        return _guard_exp
+
+    # Y `condicion` no es un campo administrativo cualquiera: es el que el
+    # writer antiguo de promoción usaba como si fuera un resultado académico,
+    # y de ahí salió media reconstrucción del Cierre. Secretaría administra
+    # el expediente; quién está promovido lo decide A2.
+    if (getattr(current_user, 'role', None) == 'secretaria'
+            and 'condicion' in data
+            and (data.get('condicion') or None) != (est.condicion or None)):
+        return JSONResponse({
+            'error': 'CONDICION_ES_ACADEMICA',
+            'message': ('La condición del estudiante la determina el proceso '
+                        'académico. Para retirar o reactivar use las acciones '
+                        'de expediente.'),
+        }, status_code=409)
 
     datos_anteriores = est.to_dict()
 
@@ -7170,10 +7354,16 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
 
 
 @app.delete("/api/estudiantes/{id}")
-async def delete_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def delete_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Soft-delete (retiro) del estudiante. Valida tenant.
     Acepta body opcional con {motivo_retiro: str} para registrar la razón.
-    Setea fecha_retiro=hoy y retirado_por=usuario actual automáticamente."""
+    Setea fecha_retiro=hoy y retirado_por=usuario actual automáticamente.
+
+    SECRETARÍA-2 · Secretaría puede retirar. A pesar del verbo DELETE esto NO
+    borra: marca `activo=False`, guarda motivo, fecha y quién, y deja
+    auditoría. El expediente y sus notas siguen enteros, y se puede
+    reactivar. El borrado FÍSICO vive en `/api/estudiantes/retirados/{id}`,
+    sigue siendo de Dirección y además responde 403 desde P0."""
     est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
     
     # Body opcional con motivo
@@ -7198,7 +7388,7 @@ async def delete_estudiante(id, request: Request, db: Session = Depends(get_db),
 
 
 @app.post("/api/estudiantes/{id}/reactivar")
-async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Reactivar estudiante retirado. Limpia fecha_retiro, motivo y retirado_por.
     Valida tenant."""
     est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
@@ -7474,7 +7664,7 @@ def _guardia_nivel_lectura_curso(db, current_user, curso_id):
 
 
 @app.get("/api/horarios")
-async def get_horarios(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def get_horarios(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     # v2.19.8: la lista institucional respeta el lente de nivel. Bajo
     # 'Horarios — Primaria' solo salen los bloques de clase de cursos de
     # primaria; los bloques sin curso (libre/recreo del profesor) se conservan
@@ -7603,6 +7793,17 @@ _TIPOS_BLOQUE_VALIDOS = {'clase', 'libre', 'recreo'}
 
 def _validar_dia(dia: str):
     """Normaliza y valida el día. Levanta HTTPException si es inválido."""
+    # ── SECRETARÍA-2 · Organizar el horario es trabajo administrativo ──
+    #
+    # Secretaría ve, crea y edita bloques. No gana nada académico por esto:
+    # el motor de validación es el MISMO —conflictos de profesor, de curso y
+    # de aula, horas coherentes, tenant—, y además no puede usar esta
+    # pantalla para saltarse las asignaciones de profesor ya definidas
+    # (`_exige_asignacion_activa`, que ya existía y vale para todos los
+    # roles: no se duplicó nada).
+    #
+    # Lo que NO se le abre: retirar, reactivar y eliminar definitivamente un
+    # horario siguen siendo de Dirección. El requisito era agregar y editar.
     if not dia or not isinstance(dia, str):
         raise HTTPException(status_code=400, detail='dia es requerido')
     norm = _DIAS_NORM.get(dia.strip().lower())
@@ -7767,7 +7968,7 @@ def _exige_asignacion_activa(db, *, colegio_id, profesor_id, curso_id, asignatur
 
 
 @app.post("/api/horarios")
-async def crear_horario(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def crear_horario(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Crear horario. Valida que curso, asignatura y profesor pertenezcan al colegio del caller."""
     try:
         data = await request.json()
@@ -7853,6 +8054,11 @@ async def crear_horario(request: Request, background_tasks: BackgroundTasks, db:
         link='/horarios',
         evento_key=f'horario:{horario.id}:creado',
     )
+    # SECRETARÍA-2 · El horario no dejaba rastro en `log_auditoria`, y ahora
+    # lo toca también Secretaría: quién puso un bloque, cuándo y con qué
+    # datos tiene que poder reconstruirse. Mismo sistema que estudiantes.
+    log_auditoria(db, 'crear', 'horarios', horario.id, None, horario.to_dict(),
+                  user=current_user, request=request)
     db.commit()
     despachar_push(background_tasks, _notifs)
 
@@ -7861,10 +8067,14 @@ async def crear_horario(request: Request, background_tasks: BackgroundTasks, db:
 
 
 @app.put("/api/horarios/{id}")
-async def update_horario(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def update_horario(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Editar un horario existente. Valida tenant del horario y de los nuevos FK."""
+    # SECRETARÍA-2 · Foto del estado previo, antes de tocar nada.
     # Validar que el horario sea del colegio del caller
     horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    # SECRETARÍA-2 · Foto del estado previo, para que la auditoría pueda
+    # decir qué cambió. Se toma aquí, antes de que nada mute.
+    _horario_antes = horario.to_dict()
 
     # Identidad academica ANTES de tocar nada: profesor + curso + asignatura.
     # Se compara al final para exigir asignacion SOLO si la edicion la cambia.
@@ -8006,6 +8216,10 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
         # segundo cambio de aula el mismo día SÍ debe volver a avisar.
         evento_key=f'horario:{horario.id}:modificado:{int(now_rd().timestamp())}',
     )
+    # SECRETARÍA-2 · Con el ANTES capturado al principio, para que la
+    # auditoría diga qué cambió y no solo cómo quedó.
+    log_auditoria(db, 'editar', 'horarios', horario.id, _horario_antes,
+                  horario.to_dict(), user=current_user, request=request)
     db.commit()
     despachar_push(background_tasks, _notifs)
 

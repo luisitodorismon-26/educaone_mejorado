@@ -375,10 +375,6 @@ with client:
         ('E1S-40 crear usuario', '/api/usuarios',
          {'username': 'colado', 'password': 'x1234567', 'nombre': 'C',
           'apellido': 'C', 'email': 'c@c.com', 'role': 'profesor'}),
-        ('E1S-41 crear estudiante', '/api/estudiantes',
-         {'nombre': 'X', 'apellido': 'Y', 'sexo': 'M',
-          'fecha_nacimiento': '2012-01-01', 'curso_id': A['cursos']['pri'],
-          'matricula': 'COLADA'}),
         ('E1S-42 crear año escolar', '/api/ano-escolar',
          {'nombre': '2099-2100'}),
         ('E1S-43 cerrar el año', '/api/ano-escolar/%d/cerrar' % ANO_A_ID, {}),
@@ -391,13 +387,43 @@ with client:
         r = client.post(ruta, json=cuerpo, headers=auth(SEC_A))
         check(nombre, r.status_code == 403, '-> %d' % r.status_code)
 
+    # SECRETARIA-2 · Crear, editar y retirar estudiantes PASARON a ser
+    # trabajo de Secretaria: administra el expediente administrativo. Lo que
+    # sigue cerrado —y es lo que ENTREGA-1 protegia de verdad— es la verdad
+    # academica. Esas tres comprobaciones no se borran: se invierten aqui, y
+    # su cobertura completa vive en `test_secretaria2_expediente_horarios`.
+    r = client.post('/api/estudiantes', json={
+        'nombre': 'Nueva', 'apellido': 'Alumna', 'sexo': 'F',
+        'fecha_nacimiento': '2012-01-01', 'curso_id': A['cursos']['pri'],
+        'matricula': 'E1S-NUEVA', 'no_lista': 40,
+    }, headers=auth(SEC_A))
+    check('E1S-41 SECRETARIA-2: ahora SI crea estudiantes',
+          r.status_code in (200, 201), '-> %d' % r.status_code)
+    _NUEVO = r.json().get('id') if r.status_code in (200, 201) else None
+
+    if _NUEVO:
+        r = client.put('/api/estudiantes/%d' % _NUEVO,
+                       json={'telefono': '809-444-4444'}, headers=auth(SEC_A))
+        check('E1S-50 y corrige datos administrativos', r.status_code == 200,
+              '-> %d' % r.status_code)
+        r = client.request('DELETE', '/api/estudiantes/%d' % _NUEVO,
+                           json={'motivo_retiro': 'Prueba'},
+                           headers=auth(SEC_A))
+        check('E1S-52 y retira (logico, reversible)', r.status_code == 200,
+              '-> %d' % r.status_code)
+
+    # Pero NO sobre un expediente con huella academica: ese estudiante tiene
+    # asistencia cargada, asi que su identidad queda fuera de su alcance.
+    r = client.put('/api/estudiantes/%d' % A['ests']['pri'],
+                   json={'nombre': 'Sustituido'}, headers=auth(SEC_A))
+    check('E1S-52b y NO puede sustituir la identidad de uno con historia',
+          r.status_code == 409
+          and r.json().get('error') == 'CORRECCION_IDENTIDAD_REQUIERE_DIRECCION',
+          '-> %d' % r.status_code)
+
     PROHIBIDO_OTROS = [
-        ('E1S-50 editar estudiante', 'put',
-         '/api/estudiantes/%d' % A['ests']['pri'], {'nombre': 'Cambiado'}),
         ('E1S-51 desmarcar asistencia', 'delete',
          '/api/asistencia/%d' % A['ests']['pri'], None),
-        ('E1S-52 borrar estudiante', 'delete',
-         '/api/estudiantes/%d' % A['ests']['pri'], None),
         ('E1S-53 configuración del colegio', 'put',
          '/api/configuracion/colegio', {'nombre': 'Otro'}),
         ('E1S-54 editar año escolar', 'put',
@@ -423,7 +449,7 @@ with client:
     d = SessionLocal()
     try:
         est = d.get(M.Estudiante, A['ests']['pri'])
-        check('E1S-58 tras todos los intentos, el estudiante sigue intacto',
+        check('E1S-58 el expediente CON huella academica sigue intacto',
               est is not None and est.nombre == 'Est'
               and est.activo is True, est.nombre if est else 'BORRADO')
         check('E1S-59 y no se coló ninguna asistencia nueva',

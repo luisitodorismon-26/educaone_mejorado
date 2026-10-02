@@ -453,11 +453,30 @@ def _():
         d.close()
 
 
-@test("§B12 el guard no cambia quien puede escribir: sigue siendo Direccion")
+@test("§B12 el guard no cambia quien puede escribir")
 def _():
-    for u in ("p4", "coord", "sec", "psi"):
+    # El punto de §B12 es que el guard de ASIGNACION no toco el RBAC: quien
+    # no podia escribir horarios sigue sin poder.
+    #
+    # SECRETARIA-2 · `sec` sale de esta lista porque ese bloque le dio el
+    # permiso a proposito —organizar el horario es trabajo administrativo—.
+    # Lo que NO cambia, y es lo que de verdad protege este test, es que
+    # secretaria pasa por el MISMO guard: ver §B12b.
+    for u in ("p4", "coord", "psi"):
         r = _crear(u, asignatura_id=A_INGLES, hora_inicio="16:00", hora_fin="16:45")
         assert r.status_code == 403, (u, r.status_code)
+
+
+@test("§B12b secretaria escribe, pero NO se salta el guard de asignacion")
+def _():
+    # P4 si tiene Ingles en C_COMP, asi que este pasa.
+    r = _crear("sec", asignatura_id=A_INGLES, hora_inicio="16:00",
+               hora_fin="16:45")
+    assert r.status_code in (200, 201), (r.status_code, r.text[:160])
+    # P4 NO tiene Lengua en C_COMP: el guard la para igual que a Direccion.
+    r = _crear("sec", asignatura_id=A_LENGUA, hora_inicio="17:00",
+               hora_fin="17:45")
+    assert r.status_code == 409, (r.status_code, r.text[:160])
 
 
 @test("§B13 ESTE PR NO TOCA DATOS: ninguna fila preexistente fue modificada")
