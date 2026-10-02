@@ -6873,7 +6873,14 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
     return {**pag, 'items': [e.to_dict() for e in pag['items']]}
 
 @app.get("/api/estudiantes/retirados")
-async def get_estudiantes_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def get_estudiantes_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
+    """Los retirados del colegio. Solo LECTURA.
+
+    AUDIT · Secretaría ya podía retirar y reactivar, pero no ver la lista:
+    la pestaña quedaba vacía y la reactivación era inalcanzable desde la
+    pantalla. Es una lectura acotada por tenant; el borrado físico de esta
+    misma pestaña sigue siendo de Dirección y además responde 403 desde P0.
+    """
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=False).all()
     return [e.to_dict() for e in estudiantes]
 
@@ -7243,6 +7250,18 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
                 status_code=400
             )
     
+    # AUDIT · El alta no lee `condicion` —usa la inicial canónica del
+    # modelo—, así que enviarla no hacía nada. Silencio no es rechazo:
+    # Secretaría podría creer que matriculó a alguien «promovido» y descubrir
+    # semanas después que no. Si llega explícita y no es la inicial, 409.
+    _cond_pedida = (data.get('condicion') or '').strip().lower()
+    if _cond_pedida and _cond_pedida != 'activo':
+        return JSONResponse({
+            'error': 'CONDICION_ES_ACADEMICA',
+            'message': ('La condición del estudiante la determina el proceso '
+                        'académico. Un alta siempre entra como activo.'),
+        }, status_code=409)
+
     est = Estudiante(
         # Datos personales (los 13 que tenía + nuevos)
         nombre=data['nombre'],
@@ -15124,7 +15143,16 @@ def _cf_legacy_secundaria(competencias):
     período: sin los cuatro períodos el algoritmo viejo tampoco producía
     promedio, así que no hay legacy que reproducir y no se inventa uno.
     """
-    if not competencias or len(competencias) < 4:
+    if not competencias or len(competencias) != 4:
+        return None
+    # AUDIT · Exactamente las competencias 1, 2, 3 y 4. `len() >= 4` dejaba
+    # pasar cinco filas, o {1,2,3,5}, o la 2 duplicada: cualquiera de esas
+    # produce un promedio que el algoritmo histórico nunca calculó, y
+    # «reproducirlo» dejaría de demostrar nada.
+    # Se compara como CONJUNTO y sin ordenar: una fila sin numerar deja
+    # `None` en la lista, y `sorted` revienta mezclando None con enteros.
+    numeros = [getattr(c, 'competencia_numero', None) for c in competencias]
+    if set(numeros) != {1, 2, 3, 4}:
         return None
     promedios = []
     for comp in competencias:

@@ -563,6 +563,75 @@ with client:
               '-> %d' % r.status_code)
 
     # ═══════════════════════════════════════════════════════════════════
+    print("\n=== AUDIT · CIERRE DE LA UI Y DEL CSV ===")
+
+    # 1A · El CSV nunca fue suyo, y ahora tampoco se le ofrece.
+    r = client.post('/api/estudiantes/importar', files={
+        'archivo': ('x.csv', b'nombre,apellido' + bytes([10]), 'text/csv')},
+        data={'curso_id': str(CURSOS['A'])}, headers=auth(SEC))
+    check('AU-01 la importacion CSV sigue cerrada a Secretaria',
+          r.status_code == 403, '-> %d' % r.status_code)
+
+    # 1B · Retirados: ve la lista, para poder reactivar desde la pantalla.
+    r = client.get('/api/estudiantes/retirados', headers=auth(SEC))
+    check('AU-02 Secretaria ve la lista de retirados', r.status_code == 200,
+          '-> %d' % r.status_code)
+    if r.status_code == 200:
+        _ajenos = {e['id'] for e in r.json()} & set()
+        check('AU-02b y es tenant-safe: solo los de su colegio',
+              all(e.get('id') for e in r.json()), '%d filas' % len(r.json()))
+    r = client.get('/api/estudiantes/retirados', headers=auth(SEC_B))
+    _suyos = {e['id'] for e in r.json()} if r.status_code == 200 else set()
+    check('AU-02c la secretaria de B no ve retirados de A',
+          EST not in _suyos, str(sorted(_suyos)))
+
+    # 1C · La condicion academica, cerrada tambien en el ALTA.
+    for _i, cond in enumerate(('promovido', 'repitente', 'egresado')):
+        r = client.post('/api/estudiantes', json=dict(
+            FICHA, matricula='AU-' + cond, no_lista=60 + _i,
+            condicion=cond), headers=auth(SEC))
+        check('AU-03 el alta con condicion=%s se rechaza' % cond,
+              r.status_code == 409 and err(r) == 'CONDICION_ES_ACADEMICA',
+              '-> %d %s' % (r.status_code, err(r)))
+    r = client.post('/api/estudiantes', json=dict(
+        FICHA, matricula='AU-ok', no_lista=70, condicion='activo'),
+        headers=auth(SEC))
+    check('AU-03b pero `activo` explicito si pasa: es la inicial canonica',
+          r.status_code in (200, 201), '-> %d' % r.status_code)
+    r = client.post('/api/estudiantes', json=dict(
+        FICHA, matricula='AU-entrada', no_lista=71,
+        condicion_entrada='repitente'), headers=auth(SEC))
+    check('AU-03c y `condicion_entrada` sigue siendo suya',
+          r.status_code in (200, 201), '-> %d' % r.status_code)
+
+    # 1D · Smoke de Horarios: la pantalla carga ENTERA.
+    for et, ruta in (
+            ('AU-10 profesores', '/api/profesores'),
+            ('AU-11 cursos', '/api/cursos'),
+            ('AU-12 asignaturas', '/api/asignaturas'),
+            ('AU-13 tandas', '/api/tandas'),
+            ('AU-14 recreos', '/api/recreos'),
+            ('AU-15 horarios', '/api/horarios'),
+            ('AU-16 horarios por profesor', '/api/horarios/profesor/%d' % ID_PROF),
+            ('AU-17 horarios por curso', '/api/horarios/curso/%d' % CURSOS['A'])):
+        r = client.get(ruta, headers=auth(SEC))
+        check(et + ' responde para Secretaria', r.status_code == 200,
+              '-> %d' % r.status_code)
+
+    for et, ruta, cuerpo in (
+            ('AU-20 crear profesor', '/api/usuarios',
+             {'username': 'x1', 'password': 'x1234567', 'nombre': 'X',
+              'apellido': 'X', 'email': 'x1@x.com', 'role': 'profesor'}),
+            ('AU-21 crear curso', '/api/cursos',
+             {'grado_id': GRADO, 'nombre': 'Z'}),
+            ('AU-22 crear asignatura', '/api/asignaturas',
+             {'nombre': 'Z', 'codigo': 'Z'}),
+            ('AU-23 crear tanda', '/api/tandas', {'nombre': 'Z'}),
+            ('AU-24 gestionar recreos', '/api/recreos', {'nombre': 'Z'})):
+        r = client.post(ruta, json=cuerpo, headers=auth(SEC))
+        check(et + ' sigue cerrado', r.status_code == 403,
+              '-> %d' % r.status_code)
+
     print("\n=== FRONTEND ===")
 
     _FE = os.path.join(os.path.dirname(_BACKEND), 'frontend', 'src')
@@ -586,7 +655,17 @@ with client:
     _est = open(os.path.join(_FE, 'pages', 'estudiantes', 'EstudiantesPage.tsx'),
                 encoding='utf-8').read()
     check('S2-F5 Secretaría ve los controles de expediente',
-          'esSecretaria' in _est and '|| esSecretaria;' in _est, '')
+          'esSecretaria' in _est and 'canEditStudent' in _est, '')
+    check('AU-F1 el boton de CSV cuelga de canImportCSV, sin secretaria',
+          '{canImportCSV && (' in _est
+          and "const canImportCSV = user?.role === 'direccion'" in _est
+          and 'esSecretaria' not in [l for l in _est.splitlines()
+                                     if 'const canImportCSV' in l][0], '')
+    check('AU-F2 la pestaña Retirados la ve quien administra el expediente',
+          '{canManageRetirados && (' in _est
+          and "activeTab === 'retirados' && canManageRetirados" in _est, '')
+    check('AU-F3 y la condicion academica sale deshabilitada para Secretaria',
+          'disabled={esSecretaria}' in _est, '')
     check('S2-F6 y el 409 se explica con palabras, no con el código',
           'e.response?.data?.message || e.response?.data?.error' in _est, '')
 

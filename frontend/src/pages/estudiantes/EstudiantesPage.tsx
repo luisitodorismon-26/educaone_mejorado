@@ -151,8 +151,9 @@ export const EstudiantesPage = () => {
       setEstudiantes(estRes.data);
       setCursos(cursosRes.data);
       
-      // Cargar retirados si es dirección
-      if (user?.role === 'direccion') {
+      // AUDIT · Tambien Secretaria: ya podia retirar y reactivar, pero sin
+      // la lista la pestaña salia vacia y la reactivacion era inalcanzable.
+      if (user?.role === 'direccion' || user?.role === 'secretaria') {
         try {
           const retiradosRes = await api.get('/estudiantes/retirados');
           setEstudiantesRetirados(retiradosRes.data);
@@ -338,8 +339,17 @@ export const EstudiantesPage = () => {
   // académica, ni moverlo de curso en un año con notas: el backend lo
   // rechaza con 409 y la pantalla lo explica en vez de dejar un error seco.
   const esSecretaria = user?.role === 'secretaria';
-  const canEdit = user?.role === 'direccion' || user?.role === 'coordinador'
-    || esSecretaria;
+  // AUDIT · Editar un expediente y cargar un CSV no son el mismo permiso.
+  // El CSV crea decenas de fichas de golpe, sin que nadie las revise una a
+  // una, y el backend nunca se lo abrio a Secretaria: el boton solo le
+  // habria dado un 403. Se separan.
+  const canEditStudent = user?.role === 'direccion'
+    || user?.role === 'coordinador' || esSecretaria;
+  const canImportCSV = user?.role === 'direccion'
+    || user?.role === 'coordinador';
+  // Retirar, ver retirados y reactivar: expediente administrativo.
+  const canManageRetirados = canEditStudent;
+  const canEdit = canEditStudent;
 
   const handleImportCSV = async () => {
     const file = fileInputRef.current?.files?.[0];
@@ -483,15 +493,15 @@ export const EstudiantesPage = () => {
               Imprimir lista
             </Button>
           )}
-          {canEdit && (
-            <>
-              <Button variant="secondary" onClick={() => setShowImportModal(true)} icon={<span>📥</span>}>
-                Importar CSV
-              </Button>
-              <Button onClick={() => setShowModal(true)} icon={<span>+</span>}>
-                Nuevo Estudiante
-              </Button>
-            </>
+          {canImportCSV && (
+            <Button variant="secondary" onClick={() => setShowImportModal(true)} icon={<span>📥</span>}>
+              Importar CSV
+            </Button>
+          )}
+          {canEditStudent && (
+            <Button onClick={() => setShowModal(true)} icon={<span>+</span>}>
+              Nuevo Estudiante
+            </Button>
           )}
         </div>
       </div>
@@ -500,7 +510,7 @@ export const EstudiantesPage = () => {
       <NivelTabs value={nivelFiltro} onChange={(n) => { setNivelFiltro(n); setFiltros({ curso_id: '', grado: '', tanda: '' }); }} showAll />
 
       {/* Pestañas Activos/Retirados */}
-      {user?.role === 'direccion' && (
+      {canManageRetirados && (
         <div className="flex gap-2 border-b">
           <button
             onClick={() => setActiveTab('activos')}
@@ -536,7 +546,7 @@ export const EstudiantesPage = () => {
       )}
 
       {/* Vista de Estudiantes Retirados */}
-      {activeTab === 'retirados' && user?.role === 'direccion' ? (
+      {activeTab === 'retirados' && canManageRetirados ? (
         <div className="bg-white rounded-lg border shadow-sm overflow-hidden">
           <div className="p-4 bg-red-50 border-b border-red-200 flex items-center justify-between">
             <div>
@@ -709,7 +719,11 @@ export const EstudiantesPage = () => {
                 placeholder="Seleccionar curso" />
               <Input label="No. lista" type="number" value={form.no_lista}
                 onChange={e => setForm({ ...form, no_lista: parseInt(e.target.value) || 0 })} />
+              {/* AUDIT · La condicion la determina el proceso academico, y el
+                  backend la rechaza con 409 para Secretaria. Mostrarle un
+                  selector seria ofrecerle una decision que no le toca. */}
               <Select label="Condición actual" value={form.condicion || 'activo'}
+                disabled={esSecretaria}
                 onChange={e => setForm({ ...form, condicion: e.target.value })}
                 options={[
                   { value: 'activo', label: 'Activo' },

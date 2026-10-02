@@ -90,8 +90,16 @@ print("\n=== 1 · LA FÓRMULA HISTÓRICA, RECONSTRUIDA ===")
 class _Comp:
     """Una competencia con sus cuatro períodos. Igual interfaz que el modelo."""
 
-    def __init__(self, notas, rps=None, asignatura_id=1):
+    _n = [0]
+
+    def __init__(self, notas, rps=None, asignatura_id=1, numero=None):
         self.asignatura_id = asignatura_id
+        # El numero de competencia es parte de la estructura que el helper
+        # exige: sin el, no hay {1,2,3,4} que comprobar.
+        if numero is None:
+            _Comp._n[0] = _Comp._n[0] % 4 + 1
+            numero = _Comp._n[0]
+        self.competencia_numero = numero
         for i, v in enumerate(notas, 1):
             setattr(self, 'p%d' % i, v)
         for i in range(1, 5):
@@ -219,6 +227,99 @@ check('HF-24 ni con `cf_original` vacío', _ok is False, '')
 
 
 # ═══════════════════════════════════════════════════════════════════════
+print("\n=== 2b · ESTRUCTURA: EXACTAMENTE {1,2,3,4} ===")
+
+def _numeradas(numeros, notas=None):
+    comps = []
+    for i, n in enumerate(numeros):
+        c = _Comp((notas or NOTAS_CASO).get(((i % 4) + 1), [70, 70, 70, 70])
+                  if isinstance(notas or NOTAS_CASO, dict)
+                  else [70, 70, 70, 70])
+        c.competencia_numero = n
+        comps.append(c)
+    return comps
+
+
+# El caso bueno, para que la frontera signifique algo.
+_ok = [_Comp(NOTAS_CASO[c]) for c in (1, 2, 3, 4)]
+for i, c in enumerate(_ok, 1):
+    c.competencia_numero = i
+check('HF-70 con {1,2,3,4} se reconstruye',
+      APP._cf_legacy_secundaria(_ok) is not None, '')
+
+for et, numeros in (
+        ('HF-71 solo tres competencias', [1, 2, 3]),
+        ('HF-72 cinco competencias', [1, 2, 3, 4, 5]),
+        ('HF-73 numeracion {1,2,3,5}', [1, 2, 3, 5]),
+        ('HF-74 la 2 duplicada', [1, 2, 2, 4]),
+        ('HF-75 numeracion desde 0', [0, 1, 2, 3]),
+        ('HF-76 sin numero de competencia', [None, None, None, None])):
+    check(et + ' -> fail closed',
+          APP._cf_legacy_secundaria(_numeradas(numeros)) is None, '')
+
+# Desordenadas SI valen: el conjunto es lo que importa, no el orden.
+_desorden = [_Comp(NOTAS_CASO[c]) for c in (3, 1, 4, 2)]
+for c, n in zip(_desorden, (3, 1, 4, 2)):
+    c.competencia_numero = n
+check('HF-77 desordenadas si valen: el conjunto es {1,2,3,4}',
+      APP._cf_legacy_secundaria(_desorden) is not None
+      and abs(APP._cf_legacy_secundaria(_desorden)
+              - CF_LEGACY_ESPERADA) < 1e-9, '')
+
+
+print("\n=== 2c · FRONTERA: CUANDO LAS DOS CF REDONDEAN DISTINTO ===")
+
+# 69.5 exacta frente a 69.45 legacy: redondean a 70 y 69. Si el hotfix
+# dejara pasar una CF cuya oficial es otra, el boletin diria 70 con una base
+# de 69 —o al reves—, que es justo la mezcla que A1 existe para impedir.
+# Buscadas a proposito: la exacta da 69.5 (oficial 70) y la legacy 69.475
+# (oficial 69). Es el caso que de verdad distingue las dos bases, y el que
+# produciria un boletin con la nota de una y la ponderacion de la otra si el
+# hotfix entregara una CF y una oficial que no se correspondan.
+_FRONTERA = {1: [72, 79, 66, 75], 2: [65, 78, 66, 61],
+             3: [72, 76, 65, 72], 4: [71, 63, 64, 67]}
+_comps_f = [_Comp(_FRONTERA[c]) for c in (1, 2, 3, 4)]
+for i, c in enumerate(_comps_f, 1):
+    c.competencia_numero = i
+_pcf = [sum(_FRONTERA[c][p] for c in (1, 2, 3, 4)) / 4 for p in range(4)]
+_ex_f = sum(_pcf) / 4
+_lg_f = APP._cf_legacy_secundaria(_comps_f)
+print("     exacta=%r (oficial %s)   legacy=%r (oficial %s)"
+      % (_ex_f, APP.redondear_calificacion_final(_ex_f),
+         _lg_f, APP.redondear_calificacion_final(_lg_f)))
+
+_cfo, _lit, _cfe, _ok2 = APP._cf_con_compatibilidad_legacy(
+    APP.redondear_calificacion_final(_ex_f), 'C', _ex_f, _Ev(_lg_f), _comps_f)
+check('HF-80 si es legacy-compatible, se acepta la base historica',
+      _ok2 is True and abs(_cfe - _lg_f) < 1e-9, 'cf=%r' % _cfe)
+check('HF-81 y la CF oficial se recalcula desde ESA base, no desde la otra',
+      _cfo == APP.redondear_calificacion_final(_lg_f),
+      'oficial=%s  redondeo de la base=%s'
+      % (_cfo, APP.redondear_calificacion_final(_lg_f)))
+check('HF-82 nunca una oficial que no sea el redondeo de su exacta',
+      _cfo == APP.redondear_calificacion_final(_cfe),
+      '%s vs %s' % (_cfo, APP.redondear_calificacion_final(_cfe)))
+check('HF-82b y aqui las dos SI redondean distinto: 70 frente a 69',
+      APP.redondear_calificacion_final(_ex_f)
+      != APP.redondear_calificacion_final(_lg_f),
+      '%s vs %s' % (APP.redondear_calificacion_final(_ex_f),
+                    APP.redondear_calificacion_final(_lg_f)))
+check('HF-82c la oficial entregada es la de la base historica, no la nueva',
+      _cfo == APP.redondear_calificacion_final(_lg_f)
+      and _cfo != APP.redondear_calificacion_final(_ex_f), str(_cfo))
+
+# Y A1 lo confirma: con esa pareja NO puede salir CF_SECUNDARIA_CALLER_
+# INCONSISTENTE, que es exactamente «cf=69 con literal=70».
+_r = RA.resolver_nota_secundaria(evaluacion=_Ev(_lg_f), cf_exacto=_cfe,
+                                 cf_oficial=_cfo, area_curricular_codigo='MAT')
+check('HF-83 A1 no reporta ninguna incoherencia entre cf y su exacta',
+      RA.INCONSISTENCIA_CF_CALLER not in (_r.get('inconsistencias') or ())
+      and RA.INCONSISTENCIA_CF_DIVERGENTE not in (_r.get('inconsistencias') or ()),
+      str(_r.get('inconsistencias')))
+check('HF-84 y el literal que A1 clasifica es coherente con esa CF',
+      _r.get('estado') is not None, str(_r.get('estado')))
+
+
 print("\n=== 3 · EL CASO COMPLETO, A TRAVÉS DE A1 Y A2 ===")
 
 col = M.Colegio(nombre='HF', codigo='hf', activo=True)
