@@ -3372,6 +3372,58 @@ def _situaciones_por_estudiante(db, current_user, estudiantes, ano):
     return paquetes
 
 
+# ══ HOTFIX · «DATOS ACADÉMICOS INCONSISTENTES» NO DICE NADA ════════════
+#
+# Cuando A2 se niega a certificar por una inconsistencia, Dirección veía
+# exactamente eso: «Datos académicos inconsistentes». Nueve áreas, y ninguna
+# pista de cuál. El dato para decirlo ya está —A1 reporta las
+# inconsistencias POR ÁREA, con su código curricular— y solo faltaba
+# transportarlo.
+#
+# El boletín oficial conserva su texto corto: ahí no hay sitio y no es el
+# documento donde se corrige nada. La pantalla administrativa sí.
+#
+# Esto NO cambia ninguna decisión: no se añaden ni se quitan bloqueos, no se
+# toca A1 ni A2. Solo se explica lo que ya decidieron.
+_TEXTO_INCONSISTENCIA = {
+    RAC.RA.INCONSISTENCIA_CF_DIVERGENTE: (
+        'la calificación final almacenada no coincide con las '
+        'calificaciones actuales'),
+    RAC.RA.INCONSISTENCIA_FASE_SIN_BASE: (
+        'tiene fases de recuperación registradas sin la calificación final '
+        'que las sustenta'),
+    RAC.RA.INCONSISTENCIA_CF_CALLER: (
+        'la calificación oficial no es el redondeo de la exacta'),
+    RAC.RA.INCONSISTENCIA_ESPECIAL_EN_PRIMER_CICLO: (
+        'tiene una Recuperación Especial registrada, y en 1.º y 2.º no '
+        'aplica'),
+    RAC.RA.INCONSISTENCIA_GRADO_DESCONOCIDO: (
+        'no se pudo determinar el grado para aplicar la Recuperación '
+        'Especial'),
+}
+
+
+def _detalle_inconsistencias(paquete, nombres_por_codigo=None):
+    """Qué área concreta está inconsistente, y por qué. Lista de textos.
+
+    `nombres_por_codigo` permite nombrar la asignatura como la ve el colegio
+    («Inglés») en vez del código curricular («LEI»). Sin él se usa el código,
+    que sigue siendo infinitamente más útil que nada.
+    """
+    detalles = []
+    for resultado in (paquete.get('resultados') or ()):
+        incons = resultado.get('inconsistencias') or ()
+        if not incons:
+            continue
+        codigo = resultado.get('area_curricular_codigo') or '?'
+        nombre = (nombres_por_codigo or {}).get(codigo, codigo)
+        for inc in incons:
+            detalles.append('%s: %s' % (
+                nombre, _TEXTO_INCONSISTENCIA.get(
+                    inc, str(inc).replace('_', ' ').lower())))
+    return detalles
+
+
 def _fila_desde_historial(historial, estudiante, grado=None, curso=None):
     """La fila de un estudiante YA cerrado, reconstruida desde su historial.
 
@@ -3685,6 +3737,9 @@ def _plan_cierre(db, current_user, ano_origen, ano_destino):
             'promedio': _promedio_informativo(paquete['resultados']),
             'asistencia': _asistencia_del_paquete(paquete),
             'diagnosticos': list(paquete['diagnosticos']),
+            # HOTFIX · Qué área concreta bloquea, y por qué. `diagnosticos`
+            # dice que hay una inconsistencia; esto dice cuál y dónde.
+            'inconsistencias_detalle': _detalle_inconsistencias(paquete),
             'accion': ACCION_SIN_MOVIMIENTO,
             'grado_destino_id': None,
             'grado_destino': None,
@@ -15016,6 +15071,140 @@ def _diagnosticos_curriculo(precarga, resultados, diagnosticos):
     return diagnosticos
 
 
+# ══ HOTFIX · LA CF QUE YA ESTABA GUARDADA ══════════════════════════════
+#
+# EL SÍNTOMA
+#   Un boletín de 1.º de Secundaria salía PENDIENTE por «datos académicos
+#   inconsistentes». En Inglés, la CF guardada era 68.95 y la CF que el
+#   sistema reconstruye hoy desde las mismas notas es 68.9375. Las dos
+#   redondean a 69 y las dos dan la misma nota oficial, pero A1 compara las
+#   EXACTAS —y hace bien, porque las ponderaciones de la completiva (50/50) y
+#   de la extraordinaria (30/70) se calculan sobre la exacta, y 68.6 y 69.4
+#   comparten CF oficial siendo bases distintas—. Así que marcaba divergencia
+#   y A2 se negaba a certificar.
+#
+# POR QUÉ NO SE ARREGLA CON UNA TOLERANCIA
+#   `abs(a - b) < 0.1` haría pasar esta fila y, con ella, cualquier error
+#   real de menos de una décima. La auditoría de producción encontró
+#   divergencias mucho mayores, y algunas son errores de verdad. Una
+#   tolerancia no distingue un algoritmo viejo de un dato corrompido.
+#
+# QUÉ SE HACE EN SU LUGAR
+#   Se exige DEMOSTRAR que la diferencia la produjo el algoritmo histórico.
+#   El algoritmo está en el modelo y se confirmó numéricamente:
+#
+#       promedio de CADA competencia  = round(media de MAX(P,RP) de P1..P4, 1)
+#       CF legacy                     = media de esos cuatro promedios
+#
+#   El actual, en cambio, promedia primero por PERÍODO y luego los cuatro PC,
+#   sin redondeos intermedios. Con las notas del caso: legacy 68.95, exacta
+#   68.9375. Reconstruir el legacy desde las notas ACTUALES y comprobar que
+#   reproduce la CF guardada es una demostración, no una tolerancia: si
+#   alguien tocó una nota, deja de reproducirla y vuelve a bloquear.
+#
+#   `promedio_competencia` guardado NO se usa como fuente: es un caché que
+#   puede estar desactualizado. Se reconstruye desde P/RP.
+#
+# ALCANCE
+#   Esto es compatibilidad de LECTURA para datos ya creados. El algoritmo
+#   principal sigue siendo el exacto: una nota nueva se calcula como hoy.
+#   No se reescribe ninguna fila, no hay backfill, y las fases históricas
+#   —CEC, completiva, CEEX, extraordinaria, CE, especial— se dejan tal cual:
+#   fueron calculadas contra esa `cf_original` y recalcularlas las cambiaría.
+
+# Ruido de coma flotante, nada más. Es el mismo orden de magnitud que usa A1
+# para comparar dos exactas (1e-9). NO es una tolerancia académica.
+TOLERANCIA_CF_LEGACY = 1e-9
+
+
+def _cf_legacy_secundaria(competencias):
+    """La CF que el algoritmo HISTÓRICO daría con estas notas, o None.
+
+    None cuando no hay las cuatro competencias o a alguna le falta un
+    período: sin los cuatro períodos el algoritmo viejo tampoco producía
+    promedio, así que no hay legacy que reproducir y no se inventa uno.
+    """
+    if not competencias or len(competencias) < 4:
+        return None
+    promedios = []
+    for comp in competencias:
+        valores = []
+        for p in range(1, 5):
+            v = comp.valor_periodo(p)
+            if v is None:
+                return None
+            valores.append(v)
+        # `round(x, 1)` de Python, que es lo que corrió históricamente. NO se
+        # sustituye por ROUND_HALF_UP: produciría otro número y dejaría de
+        # reproducir los datos que existen.
+        promedios.append(round(sum(valores) / 4, 1))
+    if len(promedios) < 4:
+        return None
+    return sum(promedios) / 4
+
+
+def _cf_con_compatibilidad_legacy(cf_oficial, literal, cf_exacto, evaluacion,
+                                  competencias):
+    """(cf_oficial, literal, cf_exacto, compatibilidad_cf_legacy).
+
+    Devuelve lo mismo que recibió, salvo cuando puede DEMOSTRAR que la CF
+    guardada es la que produjo el algoritmo histórico con estas mismas notas.
+    En ese caso la exacta que se entrega a A1 es la guardada: así las fases
+    históricas se interpretan contra su propia base, que es la que usaron
+    para calcularse, y no aparece una divergencia que no existe.
+    """
+    cf_guardada = getattr(evaluacion, 'cf_original', None)
+    if cf_guardada is None or cf_exacto is None:
+        return cf_oficial, literal, cf_exacto, False
+    if abs(cf_guardada - cf_exacto) <= TOLERANCIA_CF_LEGACY:
+        return cf_oficial, literal, cf_exacto, False   # caso normal
+
+    cf_legacy = _cf_legacy_secundaria(competencias)
+    if cf_legacy is None:
+        return cf_oficial, literal, cf_exacto, False   # no hay nada que probar
+    if abs(cf_guardada - cf_legacy) > TOLERANCIA_CF_LEGACY:
+        # No coincide ni con la exacta ni con el legacy reconstruido: es una
+        # divergencia real. Se deja pasar intacta para que A1 la marque.
+        return cf_oficial, literal, cf_exacto, False
+
+    # Demostrado. La oficial se recalcula desde la base histórica para que
+    # siga siendo el redondeo de SU exacta —A1 también lo comprueba—.
+    return (redondear_calificacion_final(cf_guardada), literal,
+            cf_guardada, True)
+
+
+def _cf_secundaria_compatible(extras_por_asig):
+    """Envuelve `_calcular_cf_secundaria` para el resolutor de A1.
+
+    A3 recibe la función de CF INYECTADA, precisamente para no importar
+    `app`. Ese es el punto donde cabe la compatibilidad sin tocar A1 ni A3:
+    ambos son contratos congelados de R4 y ninguno cambia aquí.
+
+    Guarda además, por asignatura, si la fila resultó legacy-compatible, para
+    que la vista administrativa pueda explicarlo.
+    """
+    marcas = {}
+
+    def _envuelto(*args, **kwargs):
+        competencias = kwargs.get('competencias') or []
+        resultado = _calcular_cf_secundaria(*args, **kwargs)
+        if not kwargs.get('con_exacto') or len(resultado) != 3:
+            return resultado
+        cf_oficial, literal, cf_exacto = resultado
+        asignatura_id = (getattr(competencias[0], 'asignatura_id', None)
+                         if competencias else None)
+        evaluacion = (extras_por_asig or {}).get(asignatura_id)
+        cf_oficial, literal, cf_exacto, compatible = (
+            _cf_con_compatibilidad_legacy(cf_oficial, literal, cf_exacto,
+                                          evaluacion, competencias))
+        if asignatura_id is not None:
+            marcas[asignatura_id] = compatible
+        return cf_oficial, literal, cf_exacto
+
+    _envuelto.compatibilidad_cf_legacy = marcas
+    return _envuelto
+
+
 def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
                                    competencias_por_asig=None,
                                    extras_por_asig=None,
@@ -15040,9 +15229,13 @@ def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
         asistencias = _asistencias_estudiantes(
             db, current_user, [estudiante.id], ano).get(estudiante.id, [])
 
+    # HOTFIX · La CF que entra en A1 pasa por la compatibilidad histórica.
+    # Es el único punto donde se puede hacer sin tocar A1 ni A3, y está ahí
+    # precisamente porque A3 recibe esta función inyectada.
+    _cf_compat = _cf_secundaria_compatible(extras_por_asig)
     resultados = RAC.resultados_secundaria(
         precarga['asignaturas'], competencias_por_asig, extras_por_asig,
-        _calcular_cf_secundaria)
+        _cf_compat)
 
     if decision is _DECISION_NO_PRECARGADA:
         decision = _decisiones_de_estudiantes(
