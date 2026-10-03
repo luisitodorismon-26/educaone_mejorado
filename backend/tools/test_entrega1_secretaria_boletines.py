@@ -437,13 +437,20 @@ with client:
 
     PROHIBIDO_GET = [
         ('E1S-55 cohorte de promoción', '/api/promocion/estudiantes'),
-        ('E1S-56 estudiantes retirados', '/api/estudiantes/retirados'),
         ('E1S-57 notas de un curso completo',
          '/api/reportes/notas/curso/%d/periodo/1' % A['cursos']['sec']),
     ]
     for nombre, ruta in PROHIBIDO_GET:
         r = client.get(ruta, headers=auth(SEC_A))
         check(nombre, r.status_code == 403, '-> %d' % r.status_code)
+
+    # SECRETARIA-2 / AUDIT · La lista de retirados SI es suya, en lectura: ya
+    # podia retirar y reactivar, y sin la lista la pestaña salia vacia y la
+    # reactivacion era inalcanzable desde la pantalla. Lo que sigue cerrado es
+    # el borrado fisico de esa misma pestaña, comprobado en E1S-13.
+    r = client.get('/api/estudiantes/retirados', headers=auth(SEC_A))
+    check('E1S-56 la lista de retirados SI la ve, en lectura',
+          r.status_code == 200, '-> %d' % r.status_code)
 
     # Y que la negativa sea real: la base no cambió.
     d = SessionLocal()
