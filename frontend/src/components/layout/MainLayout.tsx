@@ -303,7 +303,7 @@ export const MainLayout = ({ children }: MainLayoutProps) => {
     { path: '/reportes', label: 'Reportes Conducta', icon: FileBarChart, roles: ['direccion', 'coordinador', 'profesor'], modulo: 'reportes_conducta', section: 'Personas' },
 
     // ─── PLANIFICACIÓN ───
-    { path: '/horarios', label: 'Horarios', icon: Clock, roles: ['direccion', 'coordinador', 'profesor'], section: 'Planificación' },
+    { path: '/horarios', label: 'Horarios', icon: Clock, roles: ['direccion', 'coordinador', 'profesor', 'secretaria'], section: 'Planificación' },
     { path: '/asignaciones', label: 'Asignaciones', icon: Users, roles: ['direccion'], section: 'Planificación' },
     { path: '/evaluaciones', label: 'Eval. Profesores', icon: ClipboardCheck, roles: ['direccion', 'coordinador'], modulo: 'eval_profesores', section: 'Planificación' },
 

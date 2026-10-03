@@ -113,6 +113,13 @@ export const EstudiantesPage = () => {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [showImportModal, setShowImportModal] = useState(false);
+  // ADMIN · Eliminar por error de registro. Solo Dirección, y en dos pasos:
+  // primero se muestra QUÉ desaparece, después se confirma el id exacto.
+  const [impacto, setImpacto] = useState<any | null>(null);
+  const [motivoError, setMotivoError] = useState('');
+  const [confirmaId, setConfirmaId] = useState('');
+  const [eliminando, setEliminando] = useState(false);
+  const canEliminarPorError = user?.role === 'direccion';
   const [importCursoId, setImportCursoId] = useState<number | ''>('');
   const [importing, setImporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -151,8 +158,9 @@ export const EstudiantesPage = () => {
       setEstudiantes(estRes.data);
       setCursos(cursosRes.data);
       
-      // Cargar retirados si es dirección
-      if (user?.role === 'direccion') {
+      // AUDIT · Tambien Secretaria: ya podia retirar y reactivar, pero sin
+      // la lista la pestaña salia vacia y la reactivacion era inalcanzable.
+      if (user?.role === 'direccion' || user?.role === 'secretaria') {
         try {
           const retiradosRes = await api.get('/estudiantes/retirados');
           setEstudiantesRetirados(retiradosRes.data);
@@ -165,6 +173,50 @@ export const EstudiantesPage = () => {
       setMessage({ type: 'error', text: 'Error al cargar datos' });
     } finally {
       setLoading(false);
+    }
+  };
+
+  const abrirEliminarPorError = async (estudianteId: number) => {
+    setMotivoError('');
+    setConfirmaId('');
+    try {
+      const res = await api.get(
+        `/estudiantes/${estudianteId}/impacto-eliminacion-error`);
+      setImpacto(res.data);
+    } catch (e: any) {
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'No se pudo calcular el impacto',
+      });
+    }
+  };
+
+  const confirmarEliminarPorError = async () => {
+    if (!impacto) return;
+    setEliminando(true);
+    try {
+      const res = await api.post(
+        `/estudiantes/${impacto.estudiante_id}/eliminar-por-error`,
+        // AUDIT-FINAL · Se envía lo que el usuario ESCRIBIÓ, no el id que la
+        // pantalla ya tenía. Mandar `impacto.estudiante_id` convertía la
+        // confirmación en un trámite: el backend recibía siempre el valor
+        // correcto aunque en el campo hubiera otra cosa.
+        { confirmar_estudiante_id: confirmaId.trim(), motivo: motivoError });
+      setMessage({
+        type: 'success',
+        text: `${res.data.message}. Referencias eliminadas: ${res.data.total_referencias}.`,
+      });
+      setImpacto(null);
+      loadData();
+    } catch (e: any) {
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'No se pudo eliminar la ficha',
+      });
+    } finally {
+      setEliminando(false);
     }
   };
 
@@ -240,7 +292,15 @@ export const EstudiantesPage = () => {
       loadData();
       closeModal();
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al guardar' });
+      // SECRETARÍA-2 · Los candados del expediente responden con un código
+      // (`CORRECCION_IDENTIDAD_REQUIERE_DIRECCION`) y con una explicación en
+      // `message`. Mostrar el código a quien está corrigiendo un teléfono no
+      // ayuda a nadie: se prefiere la frase, y el código queda en la red.
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'Error al guardar',
+      });
     } finally {
       setSaving(false);
     }
@@ -263,7 +323,11 @@ export const EstudiantesPage = () => {
       setMotivoRetiro('');
       loadData();
     } catch (e: any) {
-      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al retirar estudiante' });
+      setMessage({
+        type: 'error',
+        text: e.response?.data?.message || e.response?.data?.error
+          || 'Error al retirar estudiante',
+      });
     }
   };
 
@@ -320,7 +384,27 @@ export const EstudiantesPage = () => {
     setForm(initialForm);
   };
 
-  const canEdit = user?.role === 'direccion' || user?.role === 'coordinador';
+  // SECRETARÍA-2 · Secretaría administra el expediente: crear, corregir
+  // datos de contacto, número de lista, retirar y reactivar. Lo que NO puede
+  // es sustituir la identidad de un expediente que ya tiene historia
+  // académica, ni moverlo de curso en un año con notas: el backend lo
+  // rechaza con 409 y la pantalla lo explica en vez de dejar un error seco.
+  const esSecretaria = user?.role === 'secretaria';
+  // AUDIT · Editar un expediente y cargar un CSV no son el mismo permiso.
+  // El CSV crea decenas de fichas de golpe, sin que nadie las revise una a
+  // una, y el backend nunca se lo abrio a Secretaria: el boton solo le
+  // habria dado un 403. Se separan.
+  const canEditStudent = user?.role === 'direccion'
+    || user?.role === 'coordinador' || esSecretaria;
+  const canImportCSV = user?.role === 'direccion'
+    || user?.role === 'coordinador';
+  // AUDIT-FINAL · Retirar, ver retirados y reactivar NO es lo mismo que
+  // editar. El backend lo da a Dirección y Secretaría; Coordinación crea y
+  // edita pero no administra el retiro. Igualarlo a `canEditStudent` le
+  // habría puesto a Coordinación una pestaña y unos botones que terminan en
+  // 403, que es justo lo que este bloque viene a quitar.
+  const canManageRetirados = user?.role === 'direccion' || esSecretaria;
+  const canEdit = canEditStudent;
 
   const handleImportCSV = async () => {
     const file = fileInputRef.current?.files?.[0];
@@ -464,15 +548,15 @@ export const EstudiantesPage = () => {
               Imprimir lista
             </Button>
           )}
-          {canEdit && (
-            <>
-              <Button variant="secondary" onClick={() => setShowImportModal(true)} icon={<span>📥</span>}>
-                Importar CSV
-              </Button>
-              <Button onClick={() => setShowModal(true)} icon={<span>+</span>}>
-                Nuevo Estudiante
-              </Button>
-            </>
+          {canImportCSV && (
+            <Button variant="secondary" onClick={() => setShowImportModal(true)} icon={<span>📥</span>}>
+              Importar CSV
+            </Button>
+          )}
+          {canEditStudent && (
+            <Button onClick={() => setShowModal(true)} icon={<span>+</span>}>
+              Nuevo Estudiante
+            </Button>
           )}
         </div>
       </div>
@@ -481,7 +565,7 @@ export const EstudiantesPage = () => {
       <NivelTabs value={nivelFiltro} onChange={(n) => { setNivelFiltro(n); setFiltros({ curso_id: '', grado: '', tanda: '' }); }} showAll />
 
       {/* Pestañas Activos/Retirados */}
-      {user?.role === 'direccion' && (
+      {canManageRetirados && (
         <div className="flex gap-2 border-b">
           <button
             onClick={() => setActiveTab('activos')}
@@ -516,8 +600,70 @@ export const EstudiantesPage = () => {
         </Alert>
       )}
 
+      {/* ADMIN · Eliminar por error de registro */}
+      {impacto && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-6 space-y-4">
+            <h2 className="text-lg font-semibold text-red-800">
+              Eliminar por error de registro
+            </h2>
+            <p className="text-sm text-gray-700">
+              Esta operación indica que esta ficha fue creada por error y que
+              la persona no debe formar parte del sistema. No es lo mismo que
+              retirar: un estudiante retirado conserva su expediente y puede
+              volver. Esto no se puede deshacer.
+            </p>
+            <div className="bg-gray-50 border rounded-lg p-3 text-sm">
+              <p><strong>{impacto.nombre}</strong></p>
+              <p className="text-gray-600">
+                Matrícula: {impacto.matricula || '—'} · Curso:{' '}
+                {impacto.curso || '—'} · Nº {impacto.no_lista ?? '—'} · ID{' '}
+                {impacto.estudiante_id}
+              </p>
+            </div>
+            <div className="text-sm">
+              <p className="font-medium mb-1">Desaparecerá también:</p>
+              {impacto.total_referencias === 0 ? (
+                <p className="text-gray-500">
+                  Ningún registro asociado. Es coherente con una ficha creada
+                  por error.
+                </p>
+              ) : (
+                <ul className="list-disc ml-5 text-gray-700">
+                  {Object.entries(impacto.conteos || {}).map(([t, n]) => (
+                    <li key={t}>{n as number} en {t.replace(/_/g, ' ')}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            {!impacto.eliminable && (
+              <Alert variant="warning">
+                Este estudiante sigue activo. Retírelo primero.
+              </Alert>
+            )}
+            <Input label="Motivo" value={motivoError}
+              onChange={e => setMotivoError(e.target.value)}
+              placeholder="Ficha creada por error, duplicado..." />
+            <Input label={`Escriba el ID exacto (${impacto.estudiante_id}) para confirmar`}
+              value={confirmaId}
+              onChange={e => setConfirmaId(e.target.value)} />
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="secondary" onClick={() => setImpacto(null)}>
+                Cancelar
+              </Button>
+              <Button variant="danger" loading={eliminando}
+                disabled={!impacto.eliminable || !motivoError.trim()
+                  || confirmaId.trim() !== String(impacto.estudiante_id)}
+                onClick={confirmarEliminarPorError}>
+                Eliminar definitivamente por error
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Vista de Estudiantes Retirados */}
-      {activeTab === 'retirados' && user?.role === 'direccion' ? (
+      {activeTab === 'retirados' && canManageRetirados ? (
         <div className="bg-white rounded-lg border shadow-sm overflow-hidden">
           <div className="p-4 bg-red-50 border-b border-red-200 flex items-center justify-between">
             <div>
@@ -553,6 +699,18 @@ export const EstudiantesPage = () => {
                         >
                           🔄 Reactivar
                         </button>
+                        {/* ADMIN · Solo Dirección. Secretaría administra el
+                            expediente; decidir que una persona nunca debió
+                            estar en el sistema no es administración. */}
+                        {canEliminarPorError && (
+                          <button
+                            onClick={() => abrirEliminarPorError(est.id)}
+                            className="px-3 py-1 bg-red-700 text-white text-sm rounded hover:bg-red-800"
+                            title="La ficha fue creada por error y debe desaparecer"
+                          >
+                            🗑️ Eliminar por error
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -618,7 +776,7 @@ export const EstudiantesPage = () => {
             >
               Editar
             </button>
-            {user?.role === 'direccion' && (
+            {canManageRetirados && (
               <button
                 onClick={(ev) => { ev.stopPropagation(); handleDelete(e); }}
                 className="text-red-600 hover:text-red-800 text-sm"
@@ -690,7 +848,11 @@ export const EstudiantesPage = () => {
                 placeholder="Seleccionar curso" />
               <Input label="No. lista" type="number" value={form.no_lista}
                 onChange={e => setForm({ ...form, no_lista: parseInt(e.target.value) || 0 })} />
+              {/* AUDIT · La condicion la determina el proceso academico, y el
+                  backend la rechaza con 409 para Secretaria. Mostrarle un
+                  selector seria ofrecerle una decision que no le toca. */}
               <Select label="Condición actual" value={form.condicion || 'activo'}
+                disabled={esSecretaria}
                 onChange={e => setForm({ ...form, condicion: e.target.value })}
                 options={[
                   { value: 'activo', label: 'Activo' },

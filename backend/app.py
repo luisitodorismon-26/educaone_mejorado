@@ -3372,6 +3372,58 @@ def _situaciones_por_estudiante(db, current_user, estudiantes, ano):
     return paquetes
 
 
+# ══ HOTFIX · «DATOS ACADÉMICOS INCONSISTENTES» NO DICE NADA ════════════
+#
+# Cuando A2 se niega a certificar por una inconsistencia, Dirección veía
+# exactamente eso: «Datos académicos inconsistentes». Nueve áreas, y ninguna
+# pista de cuál. El dato para decirlo ya está —A1 reporta las
+# inconsistencias POR ÁREA, con su código curricular— y solo faltaba
+# transportarlo.
+#
+# El boletín oficial conserva su texto corto: ahí no hay sitio y no es el
+# documento donde se corrige nada. La pantalla administrativa sí.
+#
+# Esto NO cambia ninguna decisión: no se añaden ni se quitan bloqueos, no se
+# toca A1 ni A2. Solo se explica lo que ya decidieron.
+_TEXTO_INCONSISTENCIA = {
+    RAC.RA.INCONSISTENCIA_CF_DIVERGENTE: (
+        'la calificación final almacenada no coincide con las '
+        'calificaciones actuales'),
+    RAC.RA.INCONSISTENCIA_FASE_SIN_BASE: (
+        'tiene fases de recuperación registradas sin la calificación final '
+        'que las sustenta'),
+    RAC.RA.INCONSISTENCIA_CF_CALLER: (
+        'la calificación oficial no es el redondeo de la exacta'),
+    RAC.RA.INCONSISTENCIA_ESPECIAL_EN_PRIMER_CICLO: (
+        'tiene una Recuperación Especial registrada, y en 1.º y 2.º no '
+        'aplica'),
+    RAC.RA.INCONSISTENCIA_GRADO_DESCONOCIDO: (
+        'no se pudo determinar el grado para aplicar la Recuperación '
+        'Especial'),
+}
+
+
+def _detalle_inconsistencias(paquete, nombres_por_codigo=None):
+    """Qué área concreta está inconsistente, y por qué. Lista de textos.
+
+    `nombres_por_codigo` permite nombrar la asignatura como la ve el colegio
+    («Inglés») en vez del código curricular («LEI»). Sin él se usa el código,
+    que sigue siendo infinitamente más útil que nada.
+    """
+    detalles = []
+    for resultado in (paquete.get('resultados') or ()):
+        incons = resultado.get('inconsistencias') or ()
+        if not incons:
+            continue
+        codigo = resultado.get('area_curricular_codigo') or '?'
+        nombre = (nombres_por_codigo or {}).get(codigo, codigo)
+        for inc in incons:
+            detalles.append('%s: %s' % (
+                nombre, _TEXTO_INCONSISTENCIA.get(
+                    inc, str(inc).replace('_', ' ').lower())))
+    return detalles
+
+
 def _fila_desde_historial(historial, estudiante, grado=None, curso=None):
     """La fila de un estudiante YA cerrado, reconstruida desde su historial.
 
@@ -3685,6 +3737,9 @@ def _plan_cierre(db, current_user, ano_origen, ano_destino):
             'promedio': _promedio_informativo(paquete['resultados']),
             'asistencia': _asistencia_del_paquete(paquete),
             'diagnosticos': list(paquete['diagnosticos']),
+            # HOTFIX · Qué área concreta bloquea, y por qué. `diagnosticos`
+            # dice que hay una inconsistencia; esto dice cuál y dónde.
+            'inconsistencias_detalle': _detalle_inconsistencias(paquete),
             'accion': ACCION_SIN_MOVIMIENTO,
             'grado_destino_id': None,
             'grado_destino': None,
@@ -6817,9 +6872,282 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
         return [e.to_dict() for e in query.all()]
     return {**pag, 'items': [e.to_dict() for e in pag['items']]}
 
+# ══ AUDIT-FINAL · RETIRADO NO ES LO MISMO QUE INACTIVO ═════════════════
+#
+# `activo=False` significa «no está en las listas de clase». Hay más de una
+# razón para eso: un retiro, un egreso, una ficha a medias. Tratarlas todas
+# como «retirado» era inocuo mientras lo único que se podía hacer era
+# reactivar; con la eliminación definitiva ya no lo es, porque un egresado
+# que aparece en la pestaña de Retirados se puede borrar con un clic.
+#
+# El retiro deja una marca propia —`condicion='retirado'`, que es lo que
+# escribe `delete_estudiante`— y es esa marca la que manda. Se compara en
+# minúsculas porque el campo arrastra escrituras legacy con mayúsculas
+# distintas, y el canónico del sistema es minúscula.
+CONDICION_RETIRADO = 'retirado'
+ERROR_NO_ESTA_RETIRADO = 'ESTUDIANTE_NO_RETIRADO'
+_MENSAJE_NO_RETIRADO = ('Esta ficha no está retirada y no puede eliminarse '
+                        'por este flujo.')
+
+
+def _esta_retirado(estudiante):
+    """Inactivo Y marcado como retirado. Las dos cosas."""
+    return (not getattr(estudiante, 'activo', True)
+            and (getattr(estudiante, 'condicion', None) or '').strip().lower()
+            == CONDICION_RETIRADO)
+
+
+# ══ ADMIN · UNA FICHA CREADA POR ERROR NO ES UN ALUMNO QUE SE FUE ══════
+#
+# RETIRAR y ELIMINAR POR ERROR responden a dos preguntas distintas:
+#
+#   RETIRAR          el estudiante existió y se fue. Su expediente es parte
+#                    de la historia del centro: el maestro lo ve como
+#                    RETIRADO en la asistencia de aquel mes, sus notas siguen
+#                    ahí, y puede volver. No se borra nada, nunca.
+#
+#   ELIMINAR         la ficha nunca debió existir: un duplicado, una lista
+#   POR ERROR        equivocada, una persona que no es de este centro.
+#                    Dejarla como «Retirada» para siempre ensucia los
+#                    listados, las estadísticas y el Cierre con alguien que
+#                    no es nadie.
+#
+# ESTO NO RESUCITA EL PURGADO ANTIGUO
+# -----------------------------------
+# `DELETE /api/estudiantes/retirados/{id}` sigue exactamente como estaba:
+# responde 403 sin tocar la base, y su política no se discute aquí. Aquel
+# endpoint contemplaba 6 de las 14 tablas que referencian a un estudiante:
+# ante un expediente real fallaba con IntegrityError, y cuando la historia
+# vivía solo en esas 6 tenía ÉXITO y borraba notas vigentes en silencio.
+#
+# Esta ruta es nueva, se llama por su nombre, exige confirmación del id
+# exacto y un motivo, y borra las CATORCE tablas o ninguna.
+ERROR_ELIMINAR_ACTIVO = 'ESTUDIANTE_ACTIVO_NO_ELIMINABLE'
+ERROR_ELIMINAR_CONFIRMACION = 'CONFIRMACION_NO_COINCIDE'
+ERROR_ELIMINAR_SIN_MOTIVO = 'MOTIVO_REQUERIDO'
+ACCION_ELIMINAR_ERROR = 'ELIMINAR_ESTUDIANTE_ERROR_REGISTRO'
+
+# Las catorce tablas con clave ajena a `estudiantes`, leídas de models.py y
+# no asumidas. El orden importa: se borran las dependientes antes que la
+# fila del estudiante, que va la última.
+#
+# Si mañana alguien añade un modelo con `estudiante_id`, esta lista se queda
+# corta y el borrado dejaría huérfanos. Por eso hay una prueba que la compara
+# contra models.py y falla si aparece uno nuevo.
+_MODELOS_DEL_ESTUDIANTE = (
+    'Asistencia', 'Calificacion', 'CalificacionPrimaria',
+    'CalificacionSecundaria', 'CasoPsicologia',
+    'DecisionAcademicaEstudiante', 'EvalInternaEstudiante',
+    'EvaluacionExtraSecundaria', 'HistorialAcademico',
+    'HistorialComunicacionPadres', 'HistorialReportePadres',
+    'RecuperacionPedagogicaPrimaria', 'RecuperacionPrimaria',
+    'ReporteConducta',
+)
+
+
+def _impacto_eliminacion(db, current_user, estudiante):
+    """Qué se borraría. Cuenta y no toca nada.
+
+    Devuelve `{tabla: n}` solo con las que tienen filas, más el total.
+    """
+    import models as _M
+
+    conteos = {}
+    for nombre in _MODELOS_DEL_ESTUDIANTE:
+        modelo = getattr(_M, nombre, None)
+        if modelo is None:
+            continue
+        n = (tenant_filter(db.query(modelo), modelo, current_user)
+             .filter(modelo.estudiante_id == estudiante.id).count())
+        if n:
+            conteos[modelo.__tablename__] = n
+    return conteos
+
+
+@app.get("/api/estudiantes/{id}/impacto-eliminacion-error")
+async def impacto_eliminacion_error(id: int, db: Session = Depends(get_db),
+                                    current_user: Usuario = Depends(
+                                        RolesRequired('direccion'))):
+    """Qué desaparecería si se eliminara esta ficha. SOLO LECTURA.
+
+    Dirección tiene que poder ver el alcance ANTES de confirmar. Una ficha
+    creada por error suele tener cero de todo; si aparecen veinte
+    asistencias y un historial académico, probablemente no sea un error de
+    registro sino un estudiante real, y lo que toca es retirarlo.
+    """
+    est = get_tenant_or_404(db, Estudiante, id, current_user,
+                            name='estudiante')
+    curso = est.curso
+    conteos = _impacto_eliminacion(db, current_user, est)
+    return {
+        'estudiante_id': est.id,
+        'nombre': est.nombre_completo,
+        'matricula': est.matricula,
+        'curso': getattr(curso, 'nombre_completo', None),
+        'curso_id': est.curso_id,
+        'no_lista': est.no_lista,
+        'activo': bool(est.activo),
+        'condicion': est.condicion,
+        # AUDIT-FINAL · La ficha se puede MIRAR siempre; eliminarla, solo si
+        # está realmente retirada.
+        'eliminable': _esta_retirado(est),
+        'motivo_no_eliminable': (None if _esta_retirado(est)
+                                 else _MENSAJE_NO_RETIRADO),
+        'conteos': conteos,
+        'total_referencias': sum(conteos.values()),
+    }
+
+
+@app.post("/api/estudiantes/{id}/eliminar-por-error")
+async def eliminar_estudiante_por_error(id: int, request: Request,
+                                        db: Session = Depends(get_db),
+                                        current_user: Usuario = Depends(
+                                            RolesRequired('direccion'))):
+    """Elimina una ficha creada por error. Dirección, y solo Dirección.
+
+    TODO O NADA
+        Las catorce tablas y la fila del estudiante se borran en UNA
+        transacción. Si una falla, `rollback` y no queda ni media
+        eliminación ni una sola fila huérfana.
+
+    LA AUDITORÍA SOBREVIVE AL BORRADO
+        Se escribe ANTES de los deletes, dentro de la misma transacción, y
+        referencia el id como entero suelto —`log_auditoria` no tiene clave
+        ajena a `estudiantes`—. Así queda la traza sin que el estudiante
+        reaparezca en ningún listado.
+    """
+    est = get_tenant_or_404(db, Estudiante, id, current_user,
+                            name='estudiante')
+
+    try:
+        cuerpo = await request.json()
+    except Exception:
+        cuerpo = {}
+    if not isinstance(cuerpo, dict):
+        cuerpo = {}
+
+    # Retirar primero. Un estudiante activo no es una ficha errónea: está en
+    # listas de clase, en el horario y en la asistencia de esta semana.
+    if est.activo:
+        return JSONResponse({
+            'error': ERROR_ELIMINAR_ACTIVO,
+            'message': ('Retire primero al estudiante. Solo se puede eliminar '
+                        'una ficha que ya está retirada.'),
+        }, status_code=409)
+
+    # AUDIT-FINAL · Y estar inactivo no basta. Un egresado lo está porque
+    # terminó, no porque se fuera, y esta ruta borra para siempre.
+    if not _esta_retirado(est):
+        return JSONResponse({
+            'error': ERROR_NO_ESTA_RETIRADO,
+            'message': _MENSAJE_NO_RETIRADO,
+            'condicion': est.condicion,
+        }, status_code=409)
+
+    motivo = (cuerpo.get('motivo') or '').strip()
+    if not motivo:
+        return JSONResponse({
+            'error': ERROR_ELIMINAR_SIN_MOTIVO,
+            'message': 'Indique por qué esta ficha fue creada por error.',
+        }, status_code=400)
+
+    # La confirmación es el id EXACTO, como entero. Un booleano, una cadena
+    # vacía o un id distinto no confirman nada: la idea es que Dirección
+    # tenga que mirar a quién está borrando.
+    # AUDIT-FINAL · `int(confirmacion)` truncaba. Con `1.9` el usuario
+    # confirmaba el estudiante 1 sin haberlo escrito, y `True` vale 1 en
+    # Python. La confirmación existe para que Dirección tenga que mirar a
+    # quién borra, así que se exige representación EXACTA: o el entero JSON
+    # tal cual, o su cadena decimal canónica. Nada que haya que interpretar.
+    _conf = cuerpo.get('confirmar_estudiante_id')
+    confirmacion = None
+    if isinstance(_conf, bool):
+        confirmacion = None                    # True no es un identificador
+    elif isinstance(_conf, int):
+        confirmacion = _conf
+    elif isinstance(_conf, str):
+        _txt = _conf.strip()
+        # Solo dígitos: '1.0', ' 1 ' con decimales, '+1' o '0x1' no pasan.
+        if _txt.isdigit():
+            confirmacion = int(_txt)
+    if confirmacion != est.id:
+        return JSONResponse({
+            'error': ERROR_ELIMINAR_CONFIRMACION,
+            'message': ('Confirme el identificador exacto del estudiante que '
+                        'va a eliminar.'),
+            'estudiante_id': est.id,
+        }, status_code=409)
+
+    import models as _M
+
+    conteos = _impacto_eliminacion(db, current_user, est)
+    # Contar es parte de la operación: si falla, no se empieza a borrar. Va
+    # fuera del try a propósito —todavía no hay nada que deshacer— pero con
+    # su propio rechazo, porque un conteo roto significa que el esquema no es
+    # el que esta función cree.
+    huella = {
+        'estudiante_id': est.id,
+        'nombre': est.nombre_completo,
+        'matricula': est.matricula,
+        'curso_id': est.curso_id,
+        'curso': getattr(est.curso, 'nombre_completo', None),
+        'no_lista': est.no_lista,
+        'condicion': est.condicion,
+        'motivo_error_registro': motivo,
+        'conteos_eliminados': conteos,
+        'total_referencias': sum(conteos.values()),
+    }
+
+    try:
+        # La traza primero, dentro de la misma transacción: si el borrado
+        # falla, también se va.
+        log_auditoria(db, ACCION_ELIMINAR_ERROR, 'estudiantes', est.id,
+                      huella, None, user=current_user, request=request)
+
+        for nombre in _MODELOS_DEL_ESTUDIANTE:
+            modelo = getattr(_M, nombre, None)
+            if modelo is None:
+                continue
+            (tenant_filter(db.query(modelo), modelo, current_user)
+             .filter(modelo.estudiante_id == est.id)
+             .delete(synchronize_session=False))
+
+        db.delete(est)
+        db.commit()
+    except Exception as exc:                       # noqa: BLE001
+        db.rollback()
+        logger.error('eliminar-por-error falló para %s: %s', id, exc,
+                     exc_info=True)
+        return JSONResponse({
+            'error': 'ELIMINACION_FALLIDA',
+            'message': ('No se pudo eliminar la ficha. No se borró nada: el '
+                        'expediente sigue exactamente como estaba.'),
+        }, status_code=500)
+
+    cache_clear_tenant(current_user.colegio_id)
+    return {
+        'message': 'Ficha eliminada por error de registro',
+        'estudiante_id': huella['estudiante_id'],
+        'eliminados': conteos,
+        'total_referencias': huella['total_referencias'],
+    }
+
+
 @app.get("/api/estudiantes/retirados")
-async def get_estudiantes_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=False).all()
+async def get_estudiantes_retirados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
+    """Los retirados del colegio. Solo LECTURA.
+
+    AUDIT · Secretaría ya podía retirar y reactivar, pero no ver la lista:
+    la pestaña quedaba vacía y la reactivación era inalcanzable desde la
+    pantalla. Es una lectura acotada por tenant; el borrado físico de esta
+    misma pestaña sigue siendo de Dirección y además responde 403 desde P0.
+    """
+    # AUDIT-FINAL · Inactivo Y retirado. Un egresado también tiene
+    # `activo=False`, y colarlo aquí lo pondría a un clic de la eliminación
+    # definitiva.
+    estudiantes = [e for e in tenant_filter(
+        db.query(Estudiante), Estudiante, current_user
+    ).filter_by(activo=False).all() if _esta_retirado(e)]
     return [e.to_dict() for e in estudiantes]
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -6902,6 +7230,170 @@ async def get_estudiante(id, request: Request, db: Session = Depends(get_db), cu
     return est.to_dict()
 
 
+# ══ SECRETARÍA-2 · NO SUSTITUIR UNA PERSONA POR OTRA ═══════════════════
+#
+# El incidente real: se editó un expediente cambiando nombre y apellido —de
+# una estudiante a otro— sobre el MISMO `estudiante_id`. Las notas, la
+# asistencia y el historial que colgaban de ese id siguieron colgando de él.
+# Nadie borró nada y nadie falsificó una nota: simplemente el expediente pasó
+# a nombre de otra persona, con el rendimiento de la primera dentro.
+#
+# Abrir la edición a Secretaría sin cerrar esto multiplicaría el riesgo, así
+# que la frontera queda así: Secretaría administra el EXPEDIENTE —contactos,
+# dirección, tutores, número de lista—, y la IDENTIDAD de un expediente que
+# ya tiene historia solo la corrige Dirección.
+#
+# La lista de tablas NO se asume: sale de recorrer `models.py` y quedarse con
+# las que tienen clave ajena a `estudiantes`. Son catorce; aquí entran las
+# que constituyen un registro personal del estudiante. Quedan fuera los dos
+# historiales de COMUNICACIÓN con la familia: registran a quién se llamó y
+# cuándo, no qué hizo el estudiante, y bloquear por ellos impediría corregir
+# una tilde sin proteger nada.
+#
+# Psicología y conducta sí entran, aunque no sean académicas: que un caso
+# psicológico o un reporte disciplinario acaben a nombre de otra persona es
+# tan grave como que lo hagan unas calificaciones, o más.
+_TABLAS_HUELLA_ACADEMICA = (
+    ('calificaciones', 'Calificacion'),
+    ('calificaciones_primaria', 'CalificacionPrimaria'),
+    ('calificaciones_secundaria', 'CalificacionSecundaria'),
+    ('evaluaciones_extra_secundaria', 'EvaluacionExtraSecundaria'),
+    ('recuperaciones_primaria', 'RecuperacionPrimaria'),
+    ('recuperaciones_pedagogicas_primaria', 'RecuperacionPedagogicaPrimaria'),
+    ('asistencia', 'Asistencia'),
+    ('historial_academico', 'HistorialAcademico'),
+    ('decisiones_academicas', 'DecisionAcademicaEstudiante'),
+    ('evaluacion_interna', 'EvalInternaEstudiante'),
+)
+_TABLAS_HUELLA_PERSONAL = (
+    ('casos_psicologia', 'CasoPsicologia'),
+    ('reportes_conducta', 'ReporteConducta'),
+)
+
+# Cambiar cualquiera de estos campos convierte el expediente en el de otra
+# persona. El resto —teléfono, dirección, tutor, contacto de emergencia— se
+# corrige sin tocar quién es.
+_CAMPOS_IDENTIDAD = ('nombre', 'apellido', 'matricula', 'sexo',
+                     'fecha_nacimiento', 'cedula')
+
+ERROR_IDENTIDAD_REQUIERE_DIRECCION = 'CORRECCION_IDENTIDAD_REQUIERE_DIRECCION'
+ERROR_CURSO_REQUIERE_DIRECCION = 'CAMBIO_CURSO_REQUIERE_DIRECCION'
+
+
+def _huella_academica_estudiante(db, current_user, estudiante_id, ano=None):
+    """Qué hay ya escrito sobre este estudiante. Solo LEE.
+
+    Devuelve `{clave: n}` con las tablas que tienen filas; vacío si el
+    expediente está limpio. Con `ano`, se acota a ese año escolar: las tablas
+    que llevan `ano_escolar_id` se filtran por él, y la asistencia —que no lo
+    lleva— por el rango de fechas del año.
+
+    Acotar por año es lo que distingue los dos candados. La identidad se
+    protege con la huella COMPLETA: da igual de qué año sean las notas, si
+    existen, el expediente ya es de alguien. El cambio de curso se protege
+    con la del año afectado: mover a un estudiante de curso en un año en el
+    que todavía no tiene nada escrito no reinterpreta ninguna nota.
+    """
+    import models as _M
+
+    conteo = {}
+    for clave, nombre in (_TABLAS_HUELLA_ACADEMICA + _TABLAS_HUELLA_PERSONAL):
+        modelo = getattr(_M, nombre, None)
+        if modelo is None:          # el modelo podría no existir en una rama
+            continue
+        q = tenant_filter(db.query(modelo), modelo, current_user).filter(
+            modelo.estudiante_id == estudiante_id)
+        if ano is not None:
+            if hasattr(modelo, 'ano_escolar_id'):
+                q = q.filter(modelo.ano_escolar_id == ano.id)
+            elif hasattr(modelo, 'fecha'):
+                ini = getattr(ano, 'fecha_inicio', None)
+                fin = getattr(ano, 'fecha_fin', None)
+                if ini and fin:
+                    q = q.filter(modelo.fecha >= ini, modelo.fecha <= fin)
+            else:
+                # Sin forma de acotarla al año, no cuenta para el candado de
+                # curso: bloquear por algo que no sabemos de qué año es sería
+                # impedir una corrección legítima sin proteger nada.
+                continue
+        n = q.count()
+        if n:
+            conteo[clave] = n
+    return conteo
+
+
+def _identidad_cambia(estudiante, data):
+    """Los campos de identidad que esta petición cambiaría DE VERDAD.
+
+    Reenviar el mismo nombre que ya está guardado no es sustituir a nadie, y
+    el formulario de edición manda el expediente entero. Se comparan valores,
+    no la presencia de la clave.
+    """
+    cambios = []
+    for campo in _CAMPOS_IDENTIDAD:
+        if campo not in data:
+            continue
+        nuevo = data.get(campo)
+        actual = getattr(estudiante, campo, None)
+        if campo == 'fecha_nacimiento':
+            actual = actual.isoformat() if actual else None
+            nuevo = (str(nuevo).strip() or None) if nuevo is not None else None
+        else:
+            actual = (str(actual).strip() if actual is not None else '') or None
+            nuevo = (str(nuevo).strip() if nuevo is not None else '') or None
+        if nuevo != actual:
+            cambios.append(campo)
+    return cambios
+
+
+def _guard_expediente_secretaria(db, current_user, estudiante, data):
+    """Los dos candados de Secretaría sobre un expediente con historia.
+
+    Devuelve un JSONResponse 409 o None. No escribe nada: se comprueba ANTES
+    de mutar el objeto, para que un rechazo no deje el expediente a medias.
+
+    Dirección y coordinación conservan exactamente lo que podían hacer; esto
+    solo se aplica a Secretaría, que es quien gana el permiso ahora.
+    """
+    if getattr(current_user, 'role', None) != 'secretaria':
+        return None
+
+    cambios = _identidad_cambia(estudiante, data)
+    if cambios:
+        huella = _huella_academica_estudiante(db, current_user, estudiante.id)
+        if huella:
+            return JSONResponse({
+                'error': ERROR_IDENTIDAD_REQUIERE_DIRECCION,
+                'message': ('Este expediente ya contiene información '
+                            'académica. La corrección de identidad requiere '
+                            'revisión de Dirección para evitar sustituir un '
+                            'estudiante por otro.'),
+                'campos': cambios,
+                'huella': huella,
+            }, status_code=409)
+
+    # El cambio de curso se mide contra el año del curso que se abandona: es
+    # ahí donde están las notas que se reinterpretarían.
+    if 'curso_id' in data and data.get('curso_id') != estudiante.curso_id:
+        curso_actual = getattr(estudiante, 'curso', None)
+        ano = None
+        if curso_actual is not None and curso_actual.ano_escolar_id:
+            ano = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+                   .filter(AnoEscolar.id == curso_actual.ano_escolar_id).first())
+        huella = _huella_academica_estudiante(
+            db, current_user, estudiante.id, ano=ano)
+        if huella:
+            return JSONResponse({
+                'error': ERROR_CURSO_REQUIERE_DIRECCION,
+                'message': ('Este estudiante ya tiene calificaciones, '
+                            'asistencia o recuperaciones registradas en ese '
+                            'año escolar. Cambiar su curso requiere revisión '
+                            'de Dirección.'),
+                'huella': huella,
+            }, status_code=409)
+    return None
+
+
 def _validar_identidad_estudiante(db: Session, current_user: Usuario, *, matricula=None, curso_id=None, no_lista=None, excluir_id=None):
     """Valida duplicados operativos dentro del tenant.
 
@@ -6934,7 +7426,7 @@ def _validar_identidad_estudiante(db: Session, current_user: Usuario, *, matricu
 
 
 @app.post("/api/estudiantes")
-async def crear_estudiante(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def crear_estudiante(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
     """Crear estudiante. Valida que curso (si se provee) sea del mismo colegio."""
     try:
         data = await request.json()
@@ -7024,6 +7516,18 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
                 status_code=400
             )
     
+    # AUDIT · El alta no lee `condicion` —usa la inicial canónica del
+    # modelo—, así que enviarla no hacía nada. Silencio no es rechazo:
+    # Secretaría podría creer que matriculó a alguien «promovido» y descubrir
+    # semanas después que no. Si llega explícita y no es la inicial, 409.
+    _cond_pedida = (data.get('condicion') or '').strip().lower()
+    if _cond_pedida and _cond_pedida != 'activo':
+        return JSONResponse({
+            'error': 'CONDICION_ES_ACADEMICA',
+            'message': ('La condición del estudiante la determina el proceso '
+                        'académico. Un alta siempre entra como activo.'),
+        }, status_code=409)
+
     est = Estudiante(
         # Datos personales (los 13 que tenía + nuevos)
         nombre=data['nombre'],
@@ -7080,7 +7584,7 @@ async def crear_estudiante(request: Request, db: Session = Depends(get_db), curr
 
 
 @app.put("/api/estudiantes/{id}")
-async def update_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def update_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
     """Editar estudiante. Valida tenant del estudiante y del nuevo curso si cambia."""
     est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
     
@@ -7099,6 +7603,26 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
                   if data.get('curso_id') else None))
     if _guard:
         return _guard
+
+    # SECRETARÍA-2 · Los dos candados del expediente, antes de tocar el
+    # objeto: identidad y cambio de curso. Solo afectan a Secretaría.
+    _guard_exp = _guard_expediente_secretaria(db, current_user, est, data)
+    if _guard_exp:
+        return _guard_exp
+
+    # Y `condicion` no es un campo administrativo cualquiera: es el que el
+    # writer antiguo de promoción usaba como si fuera un resultado académico,
+    # y de ahí salió media reconstrucción del Cierre. Secretaría administra
+    # el expediente; quién está promovido lo decide A2.
+    if (getattr(current_user, 'role', None) == 'secretaria'
+            and 'condicion' in data
+            and (data.get('condicion') or None) != (est.condicion or None)):
+        return JSONResponse({
+            'error': 'CONDICION_ES_ACADEMICA',
+            'message': ('La condición del estudiante la determina el proceso '
+                        'académico. Para retirar o reactivar use las acciones '
+                        'de expediente.'),
+        }, status_code=409)
 
     datos_anteriores = est.to_dict()
 
@@ -7170,10 +7694,16 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
 
 
 @app.delete("/api/estudiantes/{id}")
-async def delete_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def delete_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Soft-delete (retiro) del estudiante. Valida tenant.
     Acepta body opcional con {motivo_retiro: str} para registrar la razón.
-    Setea fecha_retiro=hoy y retirado_por=usuario actual automáticamente."""
+    Setea fecha_retiro=hoy y retirado_por=usuario actual automáticamente.
+
+    SECRETARÍA-2 · Secretaría puede retirar. A pesar del verbo DELETE esto NO
+    borra: marca `activo=False`, guarda motivo, fecha y quién, y deja
+    auditoría. El expediente y sus notas siguen enteros, y se puede
+    reactivar. El borrado FÍSICO vive en `/api/estudiantes/retirados/{id}`,
+    sigue siendo de Dirección y además responde 403 desde P0."""
     est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
     
     # Body opcional con motivo
@@ -7198,10 +7728,23 @@ async def delete_estudiante(id, request: Request, db: Session = Depends(get_db),
 
 
 @app.post("/api/estudiantes/{id}/reactivar")
-async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Reactivar estudiante retirado. Limpia fecha_retiro, motivo y retirado_por.
-    Valida tenant."""
+    Valida tenant.
+
+    AUDIT-FINAL · Solo una ficha REALMENTE retirada. Un egresado está
+    inactivo por haber terminado, no por haberse ido: devolverlo a «activo»
+    por esta puerta le borraría el egreso sin que nadie lo decidiera.
+    """
     est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    if not _esta_retirado(est):
+        return JSONResponse({
+            'error': ERROR_NO_ESTA_RETIRADO,
+            'message': ('Esta ficha no está retirada. Solo se reactiva a quien '
+                        'fue retirado.'),
+            'condicion': est.condicion,
+            'activo': bool(est.activo),
+        }, status_code=409)
     est.activo = True
     est.condicion = 'activo'
     est.fecha_retiro = None
@@ -7474,7 +8017,7 @@ def _guardia_nivel_lectura_curso(db, current_user, curso_id):
 
 
 @app.get("/api/horarios")
-async def get_horarios(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def get_horarios(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     # v2.19.8: la lista institucional respeta el lente de nivel. Bajo
     # 'Horarios — Primaria' solo salen los bloques de clase de cursos de
     # primaria; los bloques sin curso (libre/recreo del profesor) se conservan
@@ -7603,6 +8146,17 @@ _TIPOS_BLOQUE_VALIDOS = {'clase', 'libre', 'recreo'}
 
 def _validar_dia(dia: str):
     """Normaliza y valida el día. Levanta HTTPException si es inválido."""
+    # ── SECRETARÍA-2 · Organizar el horario es trabajo administrativo ──
+    #
+    # Secretaría ve, crea y edita bloques. No gana nada académico por esto:
+    # el motor de validación es el MISMO —conflictos de profesor, de curso y
+    # de aula, horas coherentes, tenant—, y además no puede usar esta
+    # pantalla para saltarse las asignaciones de profesor ya definidas
+    # (`_exige_asignacion_activa`, que ya existía y vale para todos los
+    # roles: no se duplicó nada).
+    #
+    # Lo que NO se le abre: retirar, reactivar y eliminar definitivamente un
+    # horario siguen siendo de Dirección. El requisito era agregar y editar.
     if not dia or not isinstance(dia, str):
         raise HTTPException(status_code=400, detail='dia es requerido')
     norm = _DIAS_NORM.get(dia.strip().lower())
@@ -7767,7 +8321,7 @@ def _exige_asignacion_activa(db, *, colegio_id, profesor_id, curso_id, asignatur
 
 
 @app.post("/api/horarios")
-async def crear_horario(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def crear_horario(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Crear horario. Valida que curso, asignatura y profesor pertenezcan al colegio del caller."""
     try:
         data = await request.json()
@@ -7853,6 +8407,11 @@ async def crear_horario(request: Request, background_tasks: BackgroundTasks, db:
         link='/horarios',
         evento_key=f'horario:{horario.id}:creado',
     )
+    # SECRETARÍA-2 · El horario no dejaba rastro en `log_auditoria`, y ahora
+    # lo toca también Secretaría: quién puso un bloque, cuándo y con qué
+    # datos tiene que poder reconstruirse. Mismo sistema que estudiantes.
+    log_auditoria(db, 'crear', 'horarios', horario.id, None, horario.to_dict(),
+                  user=current_user, request=request)
     db.commit()
     despachar_push(background_tasks, _notifs)
 
@@ -7861,10 +8420,14 @@ async def crear_horario(request: Request, background_tasks: BackgroundTasks, db:
 
 
 @app.put("/api/horarios/{id}")
-async def update_horario(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
+async def update_horario(id, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Editar un horario existente. Valida tenant del horario y de los nuevos FK."""
+    # SECRETARÍA-2 · Foto del estado previo, antes de tocar nada.
     # Validar que el horario sea del colegio del caller
     horario = get_tenant_or_404(db, Horario, id, current_user, name='horario')
+    # SECRETARÍA-2 · Foto del estado previo, para que la auditoría pueda
+    # decir qué cambió. Se toma aquí, antes de que nada mute.
+    _horario_antes = horario.to_dict()
 
     # Identidad academica ANTES de tocar nada: profesor + curso + asignatura.
     # Se compara al final para exigir asignacion SOLO si la edicion la cambia.
@@ -8006,6 +8569,10 @@ async def update_horario(id, request: Request, background_tasks: BackgroundTasks
         # segundo cambio de aula el mismo día SÍ debe volver a avisar.
         evento_key=f'horario:{horario.id}:modificado:{int(now_rd().timestamp())}',
     )
+    # SECRETARÍA-2 · Con el ANTES capturado al principio, para que la
+    # auditoría diga qué cambió y no solo cómo quedó.
+    log_auditoria(db, 'editar', 'horarios', horario.id, _horario_antes,
+                  horario.to_dict(), user=current_user, request=request)
     db.commit()
     despachar_push(background_tasks, _notifs)
 
@@ -9149,11 +9716,9 @@ def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: 
     cf_exacto = sum(pcs) / 4
     cf = redondear_calificacion_final(cf_exacto)
     
-    # Literal MINERD
-    if cf >= 90: literal = 'A'
-    elif cf >= 80: literal = 'B'
-    elif cf >= 70: literal = 'C'
-    else: literal = 'F'
+    # Literal MINERD — la regla vive en `_literal_cf_secundaria`, para que
+    # la compatibilidad legacy no pueda quedarse con el literal de otra CF.
+    literal = _literal_cf_secundaria(cf)
     
     if con_exacto:
         return (cf, literal, cf_exacto)
@@ -14802,6 +15367,171 @@ def _diagnosticos_curriculo(precarga, resultados, diagnosticos):
     return diagnosticos
 
 
+# ══ HOTFIX · LA CF QUE YA ESTABA GUARDADA ══════════════════════════════
+#
+# EL SÍNTOMA
+#   Un boletín de 1.º de Secundaria salía PENDIENTE por «datos académicos
+#   inconsistentes». En Inglés, la CF guardada era 68.95 y la CF que el
+#   sistema reconstruye hoy desde las mismas notas es 68.9375. Las dos
+#   redondean a 69 y las dos dan la misma nota oficial, pero A1 compara las
+#   EXACTAS —y hace bien, porque las ponderaciones de la completiva (50/50) y
+#   de la extraordinaria (30/70) se calculan sobre la exacta, y 68.6 y 69.4
+#   comparten CF oficial siendo bases distintas—. Así que marcaba divergencia
+#   y A2 se negaba a certificar.
+#
+# POR QUÉ NO SE ARREGLA CON UNA TOLERANCIA
+#   `abs(a - b) < 0.1` haría pasar esta fila y, con ella, cualquier error
+#   real de menos de una décima. La auditoría de producción encontró
+#   divergencias mucho mayores, y algunas son errores de verdad. Una
+#   tolerancia no distingue un algoritmo viejo de un dato corrompido.
+#
+# QUÉ SE HACE EN SU LUGAR
+#   Se exige DEMOSTRAR que la diferencia la produjo el algoritmo histórico.
+#   El algoritmo está en el modelo y se confirmó numéricamente:
+#
+#       promedio de CADA competencia  = round(media de MAX(P,RP) de P1..P4, 1)
+#       CF legacy                     = media de esos cuatro promedios
+#
+#   El actual, en cambio, promedia primero por PERÍODO y luego los cuatro PC,
+#   sin redondeos intermedios. Con las notas del caso: legacy 68.95, exacta
+#   68.9375. Reconstruir el legacy desde las notas ACTUALES y comprobar que
+#   reproduce la CF guardada es una demostración, no una tolerancia: si
+#   alguien tocó una nota, deja de reproducirla y vuelve a bloquear.
+#
+#   `promedio_competencia` guardado NO se usa como fuente: es un caché que
+#   puede estar desactualizado. Se reconstruye desde P/RP.
+#
+# ALCANCE
+#   Esto es compatibilidad de LECTURA para datos ya creados. El algoritmo
+#   principal sigue siendo el exacto: una nota nueva se calcula como hoy.
+#   No se reescribe ninguna fila, no hay backfill, y las fases históricas
+#   —CEC, completiva, CEEX, extraordinaria, CE, especial— se dejan tal cual:
+#   fueron calculadas contra esa `cf_original` y recalcularlas las cambiaría.
+
+# Ruido de coma flotante, nada más. Es el mismo orden de magnitud que usa A1
+# para comparar dos exactas (1e-9). NO es una tolerancia académica.
+TOLERANCIA_CF_LEGACY = 1e-9
+
+
+def _literal_cf_secundaria(cf):
+    """El literal MINERD de una CF oficial. Una sola definición.
+
+    AUDIT-FINAL · Estaba escrita dentro de `_calcular_cf_secundaria`, así que
+    la compatibilidad legacy —que cambia la CF oficial— se quedaba con el
+    literal de la CF anterior. En la frontera eso produce un boletín que dice
+    69 con literal C: la nota de una base y la letra de otra.
+    """
+    if cf is None:
+        return None
+    if cf >= 90:
+        return 'A'
+    if cf >= 80:
+        return 'B'
+    if cf >= 70:
+        return 'C'
+    return 'F'
+
+
+def _cf_legacy_secundaria(competencias):
+    """La CF que el algoritmo HISTÓRICO daría con estas notas, o None.
+
+    None cuando no hay las cuatro competencias o a alguna le falta un
+    período: sin los cuatro períodos el algoritmo viejo tampoco producía
+    promedio, así que no hay legacy que reproducir y no se inventa uno.
+    """
+    if not competencias or len(competencias) != 4:
+        return None
+    # AUDIT · Exactamente las competencias 1, 2, 3 y 4. `len() >= 4` dejaba
+    # pasar cinco filas, o {1,2,3,5}, o la 2 duplicada: cualquiera de esas
+    # produce un promedio que el algoritmo histórico nunca calculó, y
+    # «reproducirlo» dejaría de demostrar nada.
+    # Se compara como CONJUNTO y sin ordenar: una fila sin numerar deja
+    # `None` en la lista, y `sorted` revienta mezclando None con enteros.
+    numeros = [getattr(c, 'competencia_numero', None) for c in competencias]
+    if set(numeros) != {1, 2, 3, 4}:
+        return None
+    promedios = []
+    for comp in competencias:
+        valores = []
+        for p in range(1, 5):
+            v = comp.valor_periodo(p)
+            if v is None:
+                return None
+            valores.append(v)
+        # `round(x, 1)` de Python, que es lo que corrió históricamente. NO se
+        # sustituye por ROUND_HALF_UP: produciría otro número y dejaría de
+        # reproducir los datos que existen.
+        promedios.append(round(sum(valores) / 4, 1))
+    if len(promedios) < 4:
+        return None
+    return sum(promedios) / 4
+
+
+def _cf_con_compatibilidad_legacy(cf_oficial, literal, cf_exacto, evaluacion,
+                                  competencias):
+    """(cf_oficial, literal, cf_exacto, compatibilidad_cf_legacy).
+
+    Devuelve lo mismo que recibió, salvo cuando puede DEMOSTRAR que la CF
+    guardada es la que produjo el algoritmo histórico con estas mismas notas.
+    En ese caso la exacta que se entrega a A1 es la guardada: así las fases
+    históricas se interpretan contra su propia base, que es la que usaron
+    para calcularse, y no aparece una divergencia que no existe.
+    """
+    cf_guardada = getattr(evaluacion, 'cf_original', None)
+    if cf_guardada is None or cf_exacto is None:
+        return cf_oficial, literal, cf_exacto, False
+    if abs(cf_guardada - cf_exacto) <= TOLERANCIA_CF_LEGACY:
+        return cf_oficial, literal, cf_exacto, False   # caso normal
+
+    cf_legacy = _cf_legacy_secundaria(competencias)
+    if cf_legacy is None:
+        return cf_oficial, literal, cf_exacto, False   # no hay nada que probar
+    if abs(cf_guardada - cf_legacy) > TOLERANCIA_CF_LEGACY:
+        # No coincide ni con la exacta ni con el legacy reconstruido: es una
+        # divergencia real. Se deja pasar intacta para que A1 la marque.
+        return cf_oficial, literal, cf_exacto, False
+
+    # Demostrado. La oficial se recalcula desde la base histórica para que
+    # siga siendo el redondeo de SU exacta —A1 también lo comprueba— Y el
+    # literal sale de ESA oficial, no de la anterior: en la frontera las dos
+    # bases cruzan el 70, y conservar el literal viejo daría «69 con C».
+    _oficial_legacy = redondear_calificacion_final(cf_guardada)
+    return (_oficial_legacy, _literal_cf_secundaria(_oficial_legacy),
+            cf_guardada, True)
+
+
+def _cf_secundaria_compatible(extras_por_asig):
+    """Envuelve `_calcular_cf_secundaria` para el resolutor de A1.
+
+    A3 recibe la función de CF INYECTADA, precisamente para no importar
+    `app`. Ese es el punto donde cabe la compatibilidad sin tocar A1 ni A3:
+    ambos son contratos congelados de R4 y ninguno cambia aquí.
+
+    Guarda además, por asignatura, si la fila resultó legacy-compatible, para
+    que la vista administrativa pueda explicarlo.
+    """
+    marcas = {}
+
+    def _envuelto(*args, **kwargs):
+        competencias = kwargs.get('competencias') or []
+        resultado = _calcular_cf_secundaria(*args, **kwargs)
+        if not kwargs.get('con_exacto') or len(resultado) != 3:
+            return resultado
+        cf_oficial, literal, cf_exacto = resultado
+        asignatura_id = (getattr(competencias[0], 'asignatura_id', None)
+                         if competencias else None)
+        evaluacion = (extras_por_asig or {}).get(asignatura_id)
+        cf_oficial, literal, cf_exacto, compatible = (
+            _cf_con_compatibilidad_legacy(cf_oficial, literal, cf_exacto,
+                                          evaluacion, competencias))
+        if asignatura_id is not None:
+            marcas[asignatura_id] = compatible
+        return cf_oficial, literal, cf_exacto
+
+    _envuelto.compatibilidad_cf_legacy = marcas
+    return _envuelto
+
+
 def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
                                    competencias_por_asig=None,
                                    extras_por_asig=None,
@@ -14826,9 +15556,13 @@ def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
         asistencias = _asistencias_estudiantes(
             db, current_user, [estudiante.id], ano).get(estudiante.id, [])
 
+    # HOTFIX · La CF que entra en A1 pasa por la compatibilidad histórica.
+    # Es el único punto donde se puede hacer sin tocar A1 ni A3, y está ahí
+    # precisamente porque A3 recibe esta función inyectada.
+    _cf_compat = _cf_secundaria_compatible(extras_por_asig)
     resultados = RAC.resultados_secundaria(
         precarga['asignaturas'], competencias_por_asig, extras_por_asig,
-        _calcular_cf_secundaria)
+        _cf_compat)
 
     if decision is _DECISION_NO_PRECARGADA:
         decision = _decisiones_de_estudiantes(

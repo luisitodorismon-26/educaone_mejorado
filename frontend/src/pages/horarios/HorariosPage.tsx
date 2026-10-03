@@ -258,7 +258,19 @@ export const HorariosPage = () => {
     nivel: '' as '' | 'primaria' | 'secundaria'
   });
 
-  const canEdit = user?.role === 'direccion';
+  // SECRETARÍA-2 · Dos permisos distintos, porque son dos cosas distintas.
+  //
+  //   canEdit   — organizar el horario: agregar bloques y editarlos. Es
+  //               trabajo administrativo, y Secretaría lo hace. El motor de
+  //               validación es el mismo para todos: conflictos de profesor,
+  //               de curso y de aula, horas coherentes, y la asignación
+  //               académica del docente, que ya exigía `_exige_asignacion_activa`.
+  //
+  //   canAdmin  — recreos, retirar bloques, reactivarlos y ver los retirados.
+  //               Sigue siendo de Dirección, y sus endpoints también. Si
+  //               Secretaría los viera, serían botones que siempre fallan.
+  const canEdit = user?.role === 'direccion' || user?.role === 'secretaria';
+  const canAdmin = user?.role === 'direccion';
 
   // v2.19.8: nivel efectivo del contexto (misma regla que el resto de EducaOne).
   // - nivel_asignado fijo (coordinación) manda siempre;
@@ -639,7 +651,7 @@ export const HorariosPage = () => {
           </h1>
         </div>
         <div className="flex items-center gap-3">
-          {canEdit && !requiereNivel && (
+          {canAdmin && !requiereNivel && (
             <Button onClick={() => openRecreoModal()} variant="secondary" icon={<Coffee size={16} />}>
               Gestionar Recreos
             </Button>
@@ -674,7 +686,7 @@ export const HorariosPage = () => {
       )}
 
       {/* Recreos configurados */}
-      {canEdit && !requiereNivel && recreos.length > 0 && (
+      {canAdmin && !requiereNivel && recreos.length > 0 && (
         <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
           <h4 className="font-medium text-amber-800 mb-2 flex items-center gap-2">
             <Coffee size={16} /> Recreos Configurados
@@ -900,7 +912,7 @@ export const HorariosPage = () => {
                                       duplicados desaparece: justo la decisión que le
                                       toca a Dirección. Van siempre visibles, no al pasar
                                       el ratón, porque son una elección y no un atajo. */}
-                                  {canEdit && repetido && (
+                                  {canAdmin && repetido && (
                                     <div className="mt-1 flex flex-wrap gap-1">
                                       {accionesRetiroDeGrupo(grupo).map(accion => (
                                         <button
@@ -933,7 +945,7 @@ export const HorariosPage = () => {
                                       {/* Con filas idénticas este botón no existe: no
                                           hay «el bloque», hay 34 y 35. Las acciones
                                           por id están dentro de la tarjeta. */}
-                                      {!repetido && (
+                                      {canAdmin && !repetido && (
                                         <button
                                           onClick={() => handleRetirar(horario.id)}
                                           className={`p-1 rounded ${anomala
@@ -969,7 +981,7 @@ export const HorariosPage = () => {
       {/* H2-B2 — LOS RETIRADOS, EN SU PROPIO PANEL.
           Nunca dentro de la cuadricula: alli solo va el horario vigente. Este
           acceso es de Direccion, que es quien puede devolverlos. */}
-      {canEdit && (
+      {canAdmin && (
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm">
           <button
             onClick={() => {
