@@ -198,7 +198,11 @@ export const EstudiantesPage = () => {
     try {
       const res = await api.post(
         `/estudiantes/${impacto.estudiante_id}/eliminar-por-error`,
-        { confirmar_estudiante_id: impacto.estudiante_id, motivo: motivoError });
+        // AUDIT-FINAL · Se envía lo que el usuario ESCRIBIÓ, no el id que la
+        // pantalla ya tenía. Mandar `impacto.estudiante_id` convertía la
+        // confirmación en un trámite: el backend recibía siempre el valor
+        // correcto aunque en el campo hubiera otra cosa.
+        { confirmar_estudiante_id: confirmaId.trim(), motivo: motivoError });
       setMessage({
         type: 'success',
         text: `${res.data.message}. Referencias eliminadas: ${res.data.total_referencias}.`,
@@ -394,8 +398,12 @@ export const EstudiantesPage = () => {
     || user?.role === 'coordinador' || esSecretaria;
   const canImportCSV = user?.role === 'direccion'
     || user?.role === 'coordinador';
-  // Retirar, ver retirados y reactivar: expediente administrativo.
-  const canManageRetirados = canEditStudent;
+  // AUDIT-FINAL · Retirar, ver retirados y reactivar NO es lo mismo que
+  // editar. El backend lo da a Dirección y Secretaría; Coordinación crea y
+  // edita pero no administra el retiro. Igualarlo a `canEditStudent` le
+  // habría puesto a Coordinación una pestaña y unos botones que terminan en
+  // 403, que es justo lo que este bloque viene a quitar.
+  const canManageRetirados = user?.role === 'direccion' || esSecretaria;
   const canEdit = canEditStudent;
 
   const handleImportCSV = async () => {
@@ -768,7 +776,7 @@ export const EstudiantesPage = () => {
             >
               Editar
             </button>
-            {user?.role === 'direccion' && (
+            {canManageRetirados && (
               <button
                 onClick={(ev) => { ev.stopPropagation(); handleDelete(e); }}
                 className="text-red-600 hover:text-red-800 text-sm"

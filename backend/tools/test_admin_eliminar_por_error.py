@@ -230,6 +230,7 @@ with client:
     poblar(E_VECINO)
     poblar(E_ROLLBACK)
     d.commit()
+    ID_COL, ID_CURSO = col.id, curso.id
     IDS = {'limpia': E_LIMPIA.id, 'todo': E_CON_TODO.id, 'activo': E_ACTIVO.id,
            'vecino': E_VECINO.id, 'ajeno': E_AJENO.id,
            'rollback': E_ROLLBACK.id}
@@ -516,6 +517,186 @@ with client:
           filas_de(IDS['vecino'])['estudiantes'] == 1, '')
 
     # ═══════════════════════════════════════════════════════════════════
+    print("\n=== AF · RETIRADO NO ES LO MISMO QUE INACTIVO ===")
+
+    # Un egresado: inactivo, pero NO retirado. Termino, no se fue.
+    d = SessionLocal()
+    try:
+        _eg = M.Estudiante(colegio_id=ID_COL, matricula='EL-EG', nombre='Egre',
+                           apellido='T', curso_id=ID_CURSO, no_lista=90,
+                           activo=False, condicion='egresado')
+        d.add(_eg)
+        d.flush()
+        ID_EGRESADO = _eg.id
+        _re = M.Estudiante(colegio_id=ID_COL, matricula='EL-RE', nombre='Reti',
+                           apellido='T', curso_id=ID_CURSO, no_lista=91,
+                           activo=False, condicion='retirado')
+        d.add(_re)
+        d.flush()
+        ID_RETIRADO = _re.id
+        d.commit()
+    finally:
+        d.close()
+
+    r = client.get('/api/estudiantes/retirados', headers=auth(DIR))
+    _ids = {e['id'] for e in r.json()} if r.status_code == 200 else set()
+    check('AF-01 el retirado real aparece en la lista',
+          ID_RETIRADO in _ids, str(sorted(_ids)))
+    check('AF-02 el EGRESADO no aparece: esta inactivo, no retirado',
+          ID_EGRESADO not in _ids, str(sorted(_ids)))
+
+    r = client.post('/api/estudiantes/%d/reactivar' % ID_EGRESADO,
+                    headers=auth(DIR))
+    check('AF-04 un egresado NO se reactiva por esta ruta',
+          r.status_code == 409 and err(r) == 'ESTUDIANTE_NO_RETIRADO',
+          '-> %d %s' % (r.status_code, err(r)))
+    d = SessionLocal()
+    try:
+        _e = d.get(M.Estudiante, ID_EGRESADO)
+        check('AF-04b y sigue egresado e inactivo',
+              _e.condicion == 'egresado' and _e.activo is False,
+              '%s / activo=%s' % (_e.condicion, _e.activo))
+    finally:
+        d.close()
+
+    r = client.post('/api/estudiantes/%d/eliminar-por-error' % ID_EGRESADO,
+                    json={'confirmar_estudiante_id': ID_EGRESADO,
+                          'motivo': 'intento'}, headers=auth(DIR))
+    check('AF-05 un egresado NO se elimina por esta ruta',
+          r.status_code == 409 and err(r) == 'ESTUDIANTE_NO_RETIRADO',
+          '-> %d %s' % (r.status_code, err(r)))
+    check('AF-05b y sigue existiendo',
+          filas_de(ID_EGRESADO)['estudiantes'] == 1, '')
+
+    r = client.get('/api/estudiantes/%d/impacto-eliminacion-error'
+                   % ID_EGRESADO, headers=auth(DIR))
+    check('AF-06 el preview lo deja MIRAR', r.status_code == 200,
+          '-> %d' % r.status_code)
+    check('AF-06b pero dice que no es eliminable, y por que',
+          r.status_code == 200 and r.json().get('eliminable') is False
+          and bool(r.json().get('motivo_no_eliminable')),
+          str(r.json().get('motivo_no_eliminable'))[:58])
+
+    # El retirado real sigue funcionando entero.
+    r = client.post('/api/estudiantes/%d/reactivar' % ID_RETIRADO,
+                    headers=auth(DIR))
+    check('AF-07 el retirado real SI se reactiva', r.status_code == 200,
+          '-> %d' % r.status_code)
+    r = client.request('DELETE', '/api/estudiantes/%d' % ID_RETIRADO,
+                       json={'motivo_retiro': 'otra vez'}, headers=auth(DIR))
+    check('AF-07b y se vuelve a retirar', r.status_code == 200,
+          '-> %d' % r.status_code)
+    r = client.post('/api/estudiantes/%d/eliminar-por-error' % ID_RETIRADO,
+                    json={'confirmar_estudiante_id': ID_RETIRADO,
+                          'motivo': 'ficha por error'}, headers=auth(DIR))
+    check('AF-07c y se elimina sin problema', r.status_code == 200,
+          '-> %d %s' % (r.status_code, err(r)))
+
+    print("\n=== AF · COORDINACION NO ADMINISTRA EL RETIRO ===")
+
+    # El frontend ya no le ofrece la pestaña ni el boton. El backend tampoco
+    # se lo da: si alguno de los dos cediera, volveria el boton muerto.
+    d = SessionLocal()
+    try:
+        _co = M.Estudiante(colegio_id=ID_COL, matricula='EL-CO', nombre='Coord',
+                           apellido='T', curso_id=ID_CURSO, no_lista=94,
+                           activo=True, condicion='activo')
+        d.add(_co)
+        d.commit()
+        ID_COORD_EST = _co.id
+    finally:
+        d.close()
+
+    r = client.get('/api/estudiantes/retirados', headers=auth(COORD))
+    check('AF-30 Coordinacion no lista retirados', r.status_code == 403,
+          '-> %d' % r.status_code)
+    r = client.request('DELETE', '/api/estudiantes/%d' % ID_COORD_EST,
+                       json={'motivo_retiro': 'x'}, headers=auth(COORD))
+    check('AF-31 ni retira', r.status_code == 403, '-> %d' % r.status_code)
+    r = client.post('/api/estudiantes/%d/reactivar' % ID_COORD_EST,
+                    headers=auth(COORD))
+    check('AF-32 ni reactiva', r.status_code == 403, '-> %d' % r.status_code)
+    check('AF-33 y el estudiante sigue activo e intacto',
+          filas_de(ID_COORD_EST)['estudiantes'] == 1, '')
+
+    # Pero conserva lo que ya tenia: crear y editar.
+    r = client.put('/api/estudiantes/%d' % ID_COORD_EST,
+                   json={'telefono': '809-111-2222'}, headers=auth(COORD))
+    check('AF-34 Coordinacion SI sigue editando', r.status_code == 200,
+          '-> %d' % r.status_code)
+
+    # Y Secretaria si administra el retiro, que es el otro lado del defecto.
+    r = client.request('DELETE', '/api/estudiantes/%d' % ID_COORD_EST,
+                       json={'motivo_retiro': 'por secretaria'},
+                       headers=auth(SEC))
+    check('AF-35 Secretaria SI retira', r.status_code == 200,
+          '-> %d' % r.status_code)
+    r = client.get('/api/estudiantes/retirados', headers=auth(SEC))
+    check('AF-36 y ve la lista para poder reactivar',
+          r.status_code == 200
+          and ID_COORD_EST in {e['id'] for e in r.json()},
+          '-> %d' % r.status_code)
+    r = client.post('/api/estudiantes/%d/reactivar' % ID_COORD_EST,
+                    headers=auth(SEC))
+    check('AF-37 y reactiva', r.status_code == 200, '-> %d' % r.status_code)
+    r = client.post('/api/estudiantes/%d/eliminar-por-error' % ID_COORD_EST,
+                    json={'confirmar_estudiante_id': ID_COORD_EST,
+                          'motivo': 'x'}, headers=auth(SEC))
+    check('AF-38 pero NO elimina por error: eso es de Direccion',
+          r.status_code == 403, '-> %d' % r.status_code)
+
+    print("\n=== AF · LA CONFIRMACION NO TRUNCA ===")
+
+    d = SessionLocal()
+    try:
+        _c = M.Estudiante(colegio_id=ID_COL, matricula='EL-CF', nombre='Conf',
+                          apellido='T', curso_id=ID_CURSO, no_lista=92,
+                          activo=False, condicion='retirado')
+        d.add(_c)
+        d.commit()
+        ID_CONF = _c.id
+    finally:
+        d.close()
+
+    for et, valor in (('AF-10 un booleano', True),
+                      ('AF-11 un float entero', float(ID_CONF)),
+                      ('AF-12 un float con decimales', ID_CONF + 0.9),
+                      ('AF-13 la cadena con .0', '%d.0' % ID_CONF),
+                      ('AF-14 una cadena vacia', ''),
+                      ('AF-15 un id distinto', ID_CONF + 1),
+                      ('AF-16 con signo mas', '+%d' % ID_CONF),
+                      ('AF-17 en hexadecimal', hex(ID_CONF))):
+        r = client.post('/api/estudiantes/%d/eliminar-por-error' % ID_CONF,
+                        json={'confirmar_estudiante_id': valor,
+                              'motivo': 'x'}, headers=auth(DIR))
+        check(et + ' se rechaza',
+              r.status_code == 409 and err(r) == 'CONFIRMACION_NO_COINCIDE',
+              '-> %d %s' % (r.status_code, err(r)))
+    check('AF-18 y ninguno de esos intentos borro la ficha',
+          filas_de(ID_CONF)['estudiantes'] == 1, '')
+
+    r = client.post('/api/estudiantes/%d/eliminar-por-error' % ID_CONF,
+                    json={'confirmar_estudiante_id': str(ID_CONF),
+                          'motivo': 'la cadena exacta'}, headers=auth(DIR))
+    check('AF-19 la cadena decimal exacta SI confirma', r.status_code == 200,
+          '-> %d %s' % (r.status_code, err(r)))
+
+    d = SessionLocal()
+    try:
+        _c2 = M.Estudiante(colegio_id=ID_COL, matricula='EL-CF2',
+                           nombre='Conf2', apellido='T', curso_id=curso.id,
+                           no_lista=93, activo=False, condicion='retirado')
+        d.add(_c2)
+        d.commit()
+        ID_CONF2 = _c2.id
+    finally:
+        d.close()
+    r = client.post('/api/estudiantes/%d/eliminar-por-error' % ID_CONF2,
+                    json={'confirmar_estudiante_id': ID_CONF2,
+                          'motivo': 'el entero'}, headers=auth(DIR))
+    check('AF-20 y el entero JSON tambien', r.status_code == 200,
+          '-> %d %s' % (r.status_code, err(r)))
+
     print("\n=== FRONTEND ===")
 
     _FE = os.path.join(os.path.dirname(_BACKEND), 'frontend', 'src')
@@ -533,8 +714,36 @@ with client:
     check('E-F4 y explica que no es lo mismo que retirar',
           'fue creada por error' in _est
           and 'no se puede deshacer' in _est, '')
-    check('E-F5 no hay ningún «eliminar todos» en la pantalla',
+    check('E-F5 no hay ningun eliminar-todos en la pantalla',
           'eliminar-todos' not in _est, '')
+    check('AF-F1 se envia la confirmacion ESCRITA, no el id que ya se tenia',
+          'confirmar_estudiante_id: confirmaId.trim()' in _est
+          and 'confirmar_estudiante_id: impacto.estudiante_id' not in _est, '')
+    def _declaracion(nombre):
+        """La constante COMPLETA: estas ocupan dos lineas."""
+        _ls = _est.splitlines()
+        _i = next(i for i, l in enumerate(_ls) if ('const %s' % nombre) in l)
+        _txt = ''
+        for l in _ls[_i:]:
+            _txt += ' ' + l.strip()
+            if ';' in l:
+                break
+        return _txt.strip()
+
+    _l_edit = _declaracion('canEditStudent')
+    _l_ret = _declaracion('canManageRetirados')
+    _l_csv = _declaracion('canImportCSV')
+    check('AF-F2 canManageRetirados = direccion + secretaria, sin coordinador',
+          'esSecretaria' in _l_ret and 'coordinador' not in _l_ret,
+          _l_ret.strip()[:74])
+    check('AF-F3 canEditStudent si incluye coordinador',
+          'coordinador' in _l_edit, _l_edit.strip()[:74])
+    check('AF-F4 canImportCSV sin secretaria',
+          'coordinador' in _l_csv and 'esSecretaria' not in _l_csv,
+          _l_csv.strip()[:74])
+    check('AF-F5 el boton Retirar cuelga de canManageRetirados',
+          '{canManageRetirados && (' in _est
+          and "{user?.role === 'direccion' && (" not in _est, '')
 
 print()
 print("=" * 98)

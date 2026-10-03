@@ -6872,6 +6872,31 @@ async def get_estudiantes(request: Request, db: Session = Depends(get_db), curre
         return [e.to_dict() for e in query.all()]
     return {**pag, 'items': [e.to_dict() for e in pag['items']]}
 
+# ══ AUDIT-FINAL · RETIRADO NO ES LO MISMO QUE INACTIVO ═════════════════
+#
+# `activo=False` significa «no está en las listas de clase». Hay más de una
+# razón para eso: un retiro, un egreso, una ficha a medias. Tratarlas todas
+# como «retirado» era inocuo mientras lo único que se podía hacer era
+# reactivar; con la eliminación definitiva ya no lo es, porque un egresado
+# que aparece en la pestaña de Retirados se puede borrar con un clic.
+#
+# El retiro deja una marca propia —`condicion='retirado'`, que es lo que
+# escribe `delete_estudiante`— y es esa marca la que manda. Se compara en
+# minúsculas porque el campo arrastra escrituras legacy con mayúsculas
+# distintas, y el canónico del sistema es minúscula.
+CONDICION_RETIRADO = 'retirado'
+ERROR_NO_ESTA_RETIRADO = 'ESTUDIANTE_NO_RETIRADO'
+_MENSAJE_NO_RETIRADO = ('Esta ficha no está retirada y no puede eliminarse '
+                        'por este flujo.')
+
+
+def _esta_retirado(estudiante):
+    """Inactivo Y marcado como retirado. Las dos cosas."""
+    return (not getattr(estudiante, 'activo', True)
+            and (getattr(estudiante, 'condicion', None) or '').strip().lower()
+            == CONDICION_RETIRADO)
+
+
 # ══ ADMIN · UNA FICHA CREADA POR ERROR NO ES UN ALUMNO QUE SE FUE ══════
 #
 # RETIRAR y ELIMINAR POR ERROR responden a dos preguntas distintas:
@@ -6963,7 +6988,11 @@ async def impacto_eliminacion_error(id: int, db: Session = Depends(get_db),
         'no_lista': est.no_lista,
         'activo': bool(est.activo),
         'condicion': est.condicion,
-        'eliminable': not est.activo,
+        # AUDIT-FINAL · La ficha se puede MIRAR siempre; eliminarla, solo si
+        # está realmente retirada.
+        'eliminable': _esta_retirado(est),
+        'motivo_no_eliminable': (None if _esta_retirado(est)
+                                 else _MENSAJE_NO_RETIRADO),
         'conteos': conteos,
         'total_referencias': sum(conteos.values()),
     }
@@ -7006,6 +7035,15 @@ async def eliminar_estudiante_por_error(id: int, request: Request,
                         'una ficha que ya está retirada.'),
         }, status_code=409)
 
+    # AUDIT-FINAL · Y estar inactivo no basta. Un egresado lo está porque
+    # terminó, no porque se fuera, y esta ruta borra para siempre.
+    if not _esta_retirado(est):
+        return JSONResponse({
+            'error': ERROR_NO_ESTA_RETIRADO,
+            'message': _MENSAJE_NO_RETIRADO,
+            'condicion': est.condicion,
+        }, status_code=409)
+
     motivo = (cuerpo.get('motivo') or '').strip()
     if not motivo:
         return JSONResponse({
@@ -7016,14 +7054,22 @@ async def eliminar_estudiante_por_error(id: int, request: Request,
     # La confirmación es el id EXACTO, como entero. Un booleano, una cadena
     # vacía o un id distinto no confirman nada: la idea es que Dirección
     # tenga que mirar a quién está borrando.
-    confirmacion = cuerpo.get('confirmar_estudiante_id')
-    if isinstance(confirmacion, bool) or confirmacion is None:
-        confirmacion = None
-    else:
-        try:
-            confirmacion = int(confirmacion)
-        except (TypeError, ValueError):
-            confirmacion = None
+    # AUDIT-FINAL · `int(confirmacion)` truncaba. Con `1.9` el usuario
+    # confirmaba el estudiante 1 sin haberlo escrito, y `True` vale 1 en
+    # Python. La confirmación existe para que Dirección tenga que mirar a
+    # quién borra, así que se exige representación EXACTA: o el entero JSON
+    # tal cual, o su cadena decimal canónica. Nada que haya que interpretar.
+    _conf = cuerpo.get('confirmar_estudiante_id')
+    confirmacion = None
+    if isinstance(_conf, bool):
+        confirmacion = None                    # True no es un identificador
+    elif isinstance(_conf, int):
+        confirmacion = _conf
+    elif isinstance(_conf, str):
+        _txt = _conf.strip()
+        # Solo dígitos: '1.0', ' 1 ' con decimales, '+1' o '0x1' no pasan.
+        if _txt.isdigit():
+            confirmacion = int(_txt)
     if confirmacion != est.id:
         return JSONResponse({
             'error': ERROR_ELIMINAR_CONFIRMACION,
@@ -7096,7 +7142,12 @@ async def get_estudiantes_retirados(request: Request, db: Session = Depends(get_
     pantalla. Es una lectura acotada por tenant; el borrado físico de esta
     misma pestaña sigue siendo de Dirección y además responde 403 desde P0.
     """
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=False).all()
+    # AUDIT-FINAL · Inactivo Y retirado. Un egresado también tiene
+    # `activo=False`, y colarlo aquí lo pondría a un clic de la eliminación
+    # definitiva.
+    estudiantes = [e for e in tenant_filter(
+        db.query(Estudiante), Estudiante, current_user
+    ).filter_by(activo=False).all() if _esta_retirado(e)]
     return [e.to_dict() for e in estudiantes]
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -7679,8 +7730,21 @@ async def delete_estudiante(id, request: Request, db: Session = Depends(get_db),
 @app.post("/api/estudiantes/{id}/reactivar")
 async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
     """Reactivar estudiante retirado. Limpia fecha_retiro, motivo y retirado_por.
-    Valida tenant."""
+    Valida tenant.
+
+    AUDIT-FINAL · Solo una ficha REALMENTE retirada. Un egresado está
+    inactivo por haber terminado, no por haberse ido: devolverlo a «activo»
+    por esta puerta le borraría el egreso sin que nadie lo decidiera.
+    """
     est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    if not _esta_retirado(est):
+        return JSONResponse({
+            'error': ERROR_NO_ESTA_RETIRADO,
+            'message': ('Esta ficha no está retirada. Solo se reactiva a quien '
+                        'fue retirado.'),
+            'condicion': est.condicion,
+            'activo': bool(est.activo),
+        }, status_code=409)
     est.activo = True
     est.condicion = 'activo'
     est.fecha_retiro = None
@@ -9652,11 +9716,9 @@ def _calcular_cf_secundaria(db, estudiante_id: int, asignatura_id: int, ano_id: 
     cf_exacto = sum(pcs) / 4
     cf = redondear_calificacion_final(cf_exacto)
     
-    # Literal MINERD
-    if cf >= 90: literal = 'A'
-    elif cf >= 80: literal = 'B'
-    elif cf >= 70: literal = 'C'
-    else: literal = 'F'
+    # Literal MINERD — la regla vive en `_literal_cf_secundaria`, para que
+    # la compatibilidad legacy no pueda quedarse con el literal de otra CF.
+    literal = _literal_cf_secundaria(cf)
     
     if con_exacto:
         return (cf, literal, cf_exacto)
@@ -15351,6 +15413,25 @@ def _diagnosticos_curriculo(precarga, resultados, diagnosticos):
 TOLERANCIA_CF_LEGACY = 1e-9
 
 
+def _literal_cf_secundaria(cf):
+    """El literal MINERD de una CF oficial. Una sola definición.
+
+    AUDIT-FINAL · Estaba escrita dentro de `_calcular_cf_secundaria`, así que
+    la compatibilidad legacy —que cambia la CF oficial— se quedaba con el
+    literal de la CF anterior. En la frontera eso produce un boletín que dice
+    69 con literal C: la nota de una base y la letra de otra.
+    """
+    if cf is None:
+        return None
+    if cf >= 90:
+        return 'A'
+    if cf >= 80:
+        return 'B'
+    if cf >= 70:
+        return 'C'
+    return 'F'
+
+
 def _cf_legacy_secundaria(competencias):
     """La CF que el algoritmo HISTÓRICO daría con estas notas, o None.
 
@@ -15411,8 +15492,11 @@ def _cf_con_compatibilidad_legacy(cf_oficial, literal, cf_exacto, evaluacion,
         return cf_oficial, literal, cf_exacto, False
 
     # Demostrado. La oficial se recalcula desde la base histórica para que
-    # siga siendo el redondeo de SU exacta —A1 también lo comprueba—.
-    return (redondear_calificacion_final(cf_guardada), literal,
+    # siga siendo el redondeo de SU exacta —A1 también lo comprueba— Y el
+    # literal sale de ESA oficial, no de la anterior: en la frontera las dos
+    # bases cruzan el 70, y conservar el literal viejo daría «69 con C».
+    _oficial_legacy = redondear_calificacion_final(cf_guardada)
+    return (_oficial_legacy, _literal_cf_secundaria(_oficial_legacy),
             cf_guardada, True)
 
 

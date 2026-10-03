@@ -312,6 +312,40 @@ check('HF-82c la oficial entregada es la de la base historica, no la nueva',
 # INCONSISTENTE, que es exactamente «cf=69 con literal=70».
 _r = RA.resolver_nota_secundaria(evaluacion=_Ev(_lg_f), cf_exacto=_cfe,
                                  cf_oficial=_cfo, area_curricular_codigo='MAT')
+# AUDIT-FINAL · EL LITERAL. Aqui esta el defecto que la auditoria encontro:
+# la CF oficial pasaba a 69 pero el literal seguia siendo el de la CF
+# anterior, 'C'. Un boletin con 69 y una C dice dos cosas distintas sobre la
+# misma asignatura, y la C afirma que aprobo.
+check('HF-85 el literal legacy sale de SU CF oficial, no de la anterior',
+      _lit == 'F', 'cf=%s literal=%s' % (_cfo, _lit))
+check('HF-86 nunca 69 con C',
+      not (_cfo == 69 and _lit == 'C'), '%s + %s' % (_cfo, _lit))
+check('HF-87 la terna entregada es coherente: 69 / F / 69.475',
+      _cfo == 69 and _lit == 'F' and abs(_cfe - 69.475) < 1e-9,
+      '%s / %s / %r' % (_cfo, _lit, _cfe))
+check('HF-88 y el literal de la base NUEVA habria sido otro',
+      APP._literal_cf_secundaria(
+          APP.redondear_calificacion_final(_ex_f)) == 'C',
+      'la exacta daba 70 -> C')
+
+# Las fronteras de los cuatro tramos, que son baratas.
+for _cf, _esperado in ((69, 'F'), (70, 'C'), (79, 'C'), (80, 'B'),
+                       (89, 'B'), (90, 'A'), (100, 'A'), (0, 'F')):
+    check('HF-89 literal de %s es %s' % (_cf, _esperado),
+          APP._literal_cf_secundaria(_cf) == _esperado,
+          str(APP._literal_cf_secundaria(_cf)))
+check('HF-89b y sin CF no hay literal',
+      APP._literal_cf_secundaria(None) is None, '')
+
+# Una sola definicion: el calculo normal usa el MISMO helper.
+import inspect as _i0  # noqa: E402
+check('HF-90 `_calcular_cf_secundaria` usa el mismo helper, sin copiarlo',
+      '_literal_cf_secundaria(cf)' in _i0.getsource(APP._calcular_cf_secundaria)
+      and "elif cf >= 80" not in _i0.getsource(APP._calcular_cf_secundaria), '')
+check('HF-91 y la compatibilidad legacy tambien',
+      '_literal_cf_secundaria(' in _i0.getsource(
+          APP._cf_con_compatibilidad_legacy), '')
+
 check('HF-83 A1 no reporta ninguna incoherencia entre cf y su exacta',
       RA.INCONSISTENCIA_CF_CALLER not in (_r.get('inconsistencias') or ())
       and RA.INCONSISTENCIA_CF_DIVERGENTE not in (_r.get('inconsistencias') or ()),
