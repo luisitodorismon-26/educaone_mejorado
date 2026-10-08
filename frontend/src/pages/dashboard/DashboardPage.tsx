@@ -12,6 +12,7 @@ import {
   ResponsiveContainer, PieChart, Pie, Cell, Legend
 } from 'recharts';
 import { colorPorNombreCurso } from '../../utils/colorPorCurso';
+import { labelCurso } from '../../utils/labelCurso';
 
 interface Stats {
   estudiantes: number; profesores: number; cursos: number;
@@ -113,6 +114,7 @@ export const DashboardPage = () => {
   const [dashDireccion, setDashDireccion] = useState<DashboardDireccion | null>(null);
   const [dashPsicologia, setDashPsicologia] = useState<DashboardPsicologia | null>(null);
   const [dashSecretaria, setDashSecretaria] = useState<DashboardSecretaria | null>(null);
+  const [cursosSecretaria, setCursosSecretaria] = useState<any[]>([]);
   const [notas, setNotas] = useState<NotaPersonal[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -154,6 +156,10 @@ export const DashboardPage = () => {
         promises.push(api.get('/dashboard/psicologia').catch(() => ({ data: null })));
       } else if (esSecretaria) {
         promises.push(api.get('/dashboard/secretaria').catch(() => ({ data: null })));
+        // El dashboard de Secretaría necesita el grado + sección + tanda.
+        // /dashboard/secretaria trae un rótulo corto que puede ser solo "A".
+        // /cursos ya expone la identidad completa y tenant-safe del curso.
+        promises.push(api.get('/cursos').catch(() => ({ data: [] })));
       }
       const results = await Promise.all(promises);
       setStats(results[0].data);
@@ -165,7 +171,10 @@ export const DashboardPage = () => {
         if (results[4]?.data) setGraficos(results[4].data);
         if (results[5]?.data) setDashDireccion(results[5].data);
       } else if (esPsicologia && results[4]?.data) setDashPsicologia(results[4].data);
-      else if (esSecretaria && results[4]?.data) setDashSecretaria(results[4].data);
+      else if (esSecretaria) {
+        if (results[4]?.data) setDashSecretaria(results[4].data);
+        setCursosSecretaria(results[5]?.data || []);
+      }
     } catch (error) { console.error('Error cargando dashboard:', error); }
     finally { setLoading(false); }
   };
@@ -249,6 +258,19 @@ export const DashboardPage = () => {
       </div>
     </div>
   ) : null;
+
+  const cursosSecretariaPorId = new Map(
+    cursosSecretaria.map((c: any) => [Number(c.id), c])
+  );
+  const estudiantesPorCursoSecretaria = (dashSecretaria?.estudiantes_por_curso || []).map((c) => {
+    const cursoCompleto = cursosSecretariaPorId.get(Number(c.curso_id));
+    return {
+      ...c,
+      // Formato inequívoco: "2do Secundaria A · Vespertina".
+      // Si /cursos fallara, conservamos el texto original como fallback.
+      curso: cursoCompleto ? labelCurso(cursoCompleto) : (c.curso || `Curso ${c.curso_id}`),
+    };
+  });
 
   const getRoleLabel = () => {
     const labels: Record<string, string> = { profesor: 'Panel de Control — Profesor', direccion: 'Panel de Control — Dirección', coordinador: 'Panel de Control — Coordinación', psicologia: 'Panel de Control — Psicología', secretaria: 'Panel de Control — Secretaría' };
@@ -558,9 +580,9 @@ export const DashboardPage = () => {
         {/* Estudiantes por curso */}
         <div className="bg-white rounded-xl shadow-sm border p-6">
           <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2 mb-4"><GraduationCap className="text-blue-600" /> Estudiantes por Curso</h2>
-          {dashSecretaria.estudiantes_por_curso.length > 0 ? (
+          {estudiantesPorCursoSecretaria.length > 0 ? (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-              {dashSecretaria.estudiantes_por_curso.map((c) => (
+              {estudiantesPorCursoSecretaria.map((c) => (
                 <div key={c.curso_id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg border hover:shadow-sm transition-shadow">
                   <div className="min-w-0 flex-1">
                     <p className="font-semibold text-gray-800 truncate">{c.curso}</p>
@@ -588,18 +610,18 @@ export const DashboardPage = () => {
         </div>
 
         {/* Gráfico de distribución */}
-        {dashSecretaria.estudiantes_por_curso.length > 0 && (
+        {estudiantesPorCursoSecretaria.length > 0 && (
           <div className="bg-white rounded-xl shadow-sm border p-6">
             <h2 className="text-lg font-bold text-gray-800 mb-4">Distribución de Matrícula</h2>
             <div className="h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={dashSecretaria.estudiantes_por_curso.filter(c => c.estudiantes > 0)}>
+                <BarChart data={estudiantesPorCursoSecretaria.filter(c => c.estudiantes > 0)}>
                   <CartesianGrid strokeDasharray="3 3" />
                   <XAxis dataKey="curso" tick={{ fontSize: 11 }} />
                   <YAxis />
                   <Tooltip />
                   <Bar dataKey="estudiantes" radius={[4, 4, 0, 0]}>
-                    {dashSecretaria.estudiantes_por_curso.filter(c => c.estudiantes > 0).map((c) => (
+                    {estudiantesPorCursoSecretaria.filter(c => c.estudiantes > 0).map((c) => (
                       <Cell key={`curso-${c.curso}`} fill={colorPorNombreCurso(c.curso)} />
                     ))}
                   </Bar>
