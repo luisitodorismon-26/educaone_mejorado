@@ -738,8 +738,10 @@ with client:
           _l_ret.strip()[:74])
     check('AF-F3 canEditStudent si incluye coordinador',
           'coordinador' in _l_edit, _l_edit.strip()[:74])
-    check('AF-F4 canImportCSV sin secretaria',
-          'coordinador' in _l_csv and 'esSecretaria' not in _l_csv,
+    # PILOTO-2026 · el usuario decidió que Secretaría SÍ importe por CSV (es
+    # un alta en lote; el alta individual ya era suya).
+    check('AF-F4 canImportCSV incluye a Secretaria y a coordinador',
+          'coordinador' in _l_csv and 'esSecretaria' in _l_csv,
           _l_csv.strip()[:74])
     check('AF-F5 el boton Retirar cuelga de canManageRetirados',
           '{canManageRetirados && (' in _est

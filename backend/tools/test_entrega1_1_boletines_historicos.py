@@ -312,9 +312,12 @@ with client:
     check('E11-H4b en B: 20 ausencias y ningún presente',
           (ab['presentes'], ab['ausencias']) == (0, 20),
           str((ab['presentes'], ab['ausencias'])))
+    # ASISTENCIA CANÓNICA · con cobertura incompleta el % oficial es N/D en
+    # los dos años; lo que se compara es el % sobre los días registrados.
     check('E11-H4c los porcentajes son distintos',
-          aa['pct_asistencia'] != ab['pct_asistencia'],
-          '%s vs %s' % (aa['pct_asistencia'], ab['pct_asistencia']))
+          aa['pct_asistencia_registrado'] != ab['pct_asistencia_registrado'],
+          '%s vs %s' % (aa['pct_asistencia_registrado'],
+                        ab['pct_asistencia_registrado']))
 
     # ═══════════════════════════════════════════════════════════════════
     print("\n=== H6 · INDIVIDUAL HISTÓRICO == LOTE HISTÓRICO ===")
@@ -339,11 +342,14 @@ with client:
                         for p in _PR(_io.BytesIO(r_ind.content)).pages)
         t_lote = "".join((p.extract_text() or '')
                          for p in _PR(_io.BytesIO(r_lote.content)).pages)
-        _pa = aa['pct_asistencia']
-        check('E11-H6c el porcentaje anual de A sale en el individual',
-              ('%d%%' % round(_pa)) in t_ind, '%d%%' % round(_pa))
-        check('E11-H6d y el mismo en el lote', ('%d%%' % round(_pa)) in t_lote,
-              '%d%%' % round(_pa))
+        # ASISTENCIA CANÓNICA · A tiene cobertura incompleta: el PDF imprime
+        # N/D como porcentaje y la cobertura de A (no la de B).
+        # (Informe de Primaria: la cobertura va en dos renglones dentro de la
+        # celda «% de Anual».)
+        _cob = '%d de %d días' % (aa['dias_computados'], aa['dias_lectivos'])
+        check('E11-H6c la asistencia anual de A sale en el individual: N/D + cobertura',
+              aa['pct_asistencia'] is None and 'N/D' in t_ind and _cob in t_ind, _cob)
+        check('E11-H6d y la misma en el lote', _cob in t_lote, _cob)
         check('E11-H6e el lote nombra al promovido', 'PROM' in t_lote, '')
         check('E11-H6f y también al aplazado', 'APLA' in t_lote, '')
         check('E11-H6g el grado impreso es el de A, no el de B',
@@ -588,10 +594,13 @@ with client:
               and _exc in textos['E11-SEC6 MINERD del curso'], _exc)
         check('E11-SEC10 y el lote incluye al promovido que ya esta en B',
               'PROMS' in textos['E11-SEC6 MINERD del curso'], '')
-        check('E11-SEC11 el de padres lleva el mismo porcentaje de A',
-              ('%.1f%%' % _pa_s) in textos['E11-SEC7 padres individual']
-              and ('%.1f%%' % _pa_s) in textos['E11-SEC8 padres del curso'],
-              '%.1f%%' % _pa_s)
+        _a_s = ja_s['asistencia_anual']
+        _cob_s = ('Cobertura: %d de %d días registrados'
+                  % (_a_s['dias_computados'], _a_s['dias_lectivos']))
+        check('E11-SEC11 el de padres lleva la misma asistencia de A (N/D + cobertura)',
+              _pa_s is None
+              and _cob_s in textos['E11-SEC7 padres individual']
+              and _cob_s in textos['E11-SEC8 padres del curso'], _cob_s)
 
     print("\n=== EL FRONTEND MANDA EL ANO EN TODAS PARTES ===")
 
@@ -645,10 +654,16 @@ with client:
           APP.CIERRE_ANO_BLOQUEADO is False
           and APP.PROMOCION_LEGACY_BLOQUEADA is True,
           'ENTREGA-1 no los movio')
-    for fn in ('_dias_asistencia_del_ano', '_dias_asistencia_de_filas',
-               '_resumen_anual_asistencia', '_asistencia_anual_boletin'):
+    # ASISTENCIA CANÓNICA · la deduplicación y el resumen viven ahora en
+    # `asistencia_canonica`; los helpers del boletín solo la llaman.
+    for fn in ('_asistencia_canonica', '_asistencia_anual_boletin',
+               '_construir_asistencias_boletin'):
         check('E11-Z2 %s sigue existiendo, sin duplicar' % fn,
               callable(getattr(APP, fn, None)), '')
+    for fn in ('_dias_asistencia_del_ano', '_dias_asistencia_de_filas',
+               '_resumen_anual_asistencia'):
+        check('E11-Z2b %s ya no existe: no hay un segundo cálculo' % fn,
+              getattr(APP, fn, None) is None, '')
     check('E11-Z3 el boletín histórico usa ESOS helpers, no otra fórmula',
           '_asistencia_anual_boletin' in inspect.getsource(
               APP.boletin_primaria_estudiante_json), '')

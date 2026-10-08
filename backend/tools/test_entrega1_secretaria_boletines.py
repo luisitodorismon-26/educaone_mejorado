@@ -569,10 +569,14 @@ with client:
         web = client.get('/api/boletines-primaria/estudiante/%d'
                          % A['ests']['pri'], headers=auth(SEC_A)).json()
         pa = web['asistencia_anual']['pct_asistencia']
-        check('E1S-72 el porcentaje anual sale impreso en el PDF individual',
-              ('%d%%' % round(pa)) in t_ind, '%d%%' % round(pa))
-        check('E1S-73 y exactamente el mismo en la página del lote',
-              ('%d%%' % round(pa)) in t_lote, '%d%%' % round(pa))
+        # ASISTENCIA CANÓNICA · la lista de este fixture no cubre todos los
+        # días lectivos: el % oficial es N/D y se imprime la cobertura.
+        _an = web['asistencia_anual']
+        _cob = '%d de %d días' % (_an['dias_computados'], _an['dias_lectivos'])
+        check('E1S-72 el PDF individual imprime N/D y la cobertura',
+              pa is None and 'N/D' in t_ind and _cob in t_ind, _cob)
+        check('E1S-73 y exactamente lo mismo en la página del lote',
+              'N/D' in t_lote and _cob in t_lote, _cob)
         check('E1S-74 la vista web coincide con los dos',
               web['asistencia']['porcentaje'] == pa, str(pa))
         check('E1S-75 el desglose web distingue tardanzas y excusas',

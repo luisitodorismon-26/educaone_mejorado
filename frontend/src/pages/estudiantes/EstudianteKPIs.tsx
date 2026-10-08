@@ -168,7 +168,7 @@ export const EstudianteKPIs: React.FC<Props> = ({ estudianteId, cursoId, esSecun
         </div>
         <div className="bg-gray-50 rounded-lg p-2.5 text-center">
           <p className={`text-xl font-bold ${colorPct(pctAsistenciaMes)}`}>
-            {pctAsistenciaMes !== null ? `${pctAsistenciaMes}%` : '—'}
+            {pctAsistenciaMes !== null ? `${pctAsistenciaMes}%` : 'N/D'}
           </p>
           <p className="text-[10px] text-gray-500 uppercase">Asist. mes</p>
         </div>

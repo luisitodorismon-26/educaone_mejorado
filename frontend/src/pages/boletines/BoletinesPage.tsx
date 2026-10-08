@@ -97,7 +97,11 @@ interface AsistenciaAnual {
   ausencias: number;
   excusas: number;
   dias_computados: number;
-  dias_trabajados: number | null;
+  // Asistencia canónica: días lectivos que le aplican al estudiante y cuántos
+  // de ellos NO tienen lista (sin dato: ni presente ni ausente).
+  dias_lectivos?: number;
+  sin_dato?: number;
+  cobertura_pct?: number | null;
   base_porcentaje: 'dias_trabajados' | 'dias_con_registro' | null;
   pct_asistencia: number | null;
   pct_ausencia: number | null;
@@ -137,9 +141,9 @@ function TarjetaAsistencia({ anual, porcentajeLegacy }: {
       ) : (
         <>
           <p className="text-xl font-bold text-emerald-600 text-center">
-            {anual!.pct_asistencia !== null
-              ? `${anual!.pct_asistencia.toFixed(1)}%`
-              : (porcentajeLegacy != null ? `${porcentajeLegacy.toFixed(1)}%` : '—')}
+            {/* Solo hay % oficial con cobertura completa. Sin ella: N/D, sin
+                caer a ningún porcentaje alternativo. */}
+            {anual!.pct_asistencia !== null ? `${anual!.pct_asistencia.toFixed(1)}%` : 'N/D'}
           </p>
           <div className="mt-2 grid grid-cols-2 gap-x-3 text-xs text-gray-700">
             <span>Asistencias: <strong>{anual!.asistencias}</strong></span>
@@ -152,14 +156,14 @@ function TarjetaAsistencia({ anual, porcentajeLegacy }: {
               Ausencia anual: <strong>{anual!.pct_ausencia.toFixed(1)}%</strong>
             </p>
           )}
-          {/* Cuando la dirección no declaró los días hábiles del año, el
-              porcentaje se calcula sobre los días con lista pasada. Es el
-              respaldo que el sistema ya usaba, pero se avisa en vez de
-              presentarlo como un dato firme. */}
-          {anual!.base_porcentaje === 'dias_con_registro' && (
-            <p className="text-[11px] text-amber-700 text-center mt-1">
-              Calculado sobre {anual!.dias_computados} días con lista pasada
-              (no hay días hábiles declarados para el año).
+          {/* El porcentaje es sobre los días CON lista. Si hay días lectivos
+              sin lista, se dice cuántos: un 100 % de 6 días no es un 100 %
+              del año, y esos días no cuentan ni como presentes ni como
+              ausentes. */}
+          {anual!.dias_lectivos != null && (
+            <p className={`text-[11px] text-center mt-1 ${(anual!.sin_dato ?? 0) > 0 ? 'text-amber-700' : 'text-gray-500'}`}>
+              Cobertura: {anual!.dias_computados} de {anual!.dias_lectivos} días registrados
+              {(anual!.sin_dato ?? 0) > 0 ? ' — porcentaje no evaluable' : ''}
             </p>
           )}
         </>

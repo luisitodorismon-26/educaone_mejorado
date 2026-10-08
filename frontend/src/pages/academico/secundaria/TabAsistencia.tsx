@@ -29,10 +29,15 @@ interface ResumenAsistencia {
   ausencia_mes?: number;
   tardanza_mes?: number;
   pct_asistencia_mes?: number | null;
-  // v2.13.5 — alineado con Registro MINERD
-  dias_trabajados_mes?: number | null;
-  denominador_mes?: number;
-  _usa_dias_trabajados?: boolean;
+  // Asistencia canónica: misma fuente que el boletín y el motor.
+  // El % solo existe con cobertura completa; si no, viene null (N/D).
+  dias_lectivos?: number;
+  dias_computados?: number;
+  sin_dato?: number;
+  cobertura_completa?: boolean;
+  dias_lectivos_mes?: number;
+  dias_computados_mes?: number;
+  sin_dato_mes?: number;
 }
 
 interface Props {
@@ -78,17 +83,21 @@ export const TabAsistencia: React.FC<Props> = ({ cursoId, onAbrirFicha }) => {
     );
   }
 
-  // Total general del curso (anual)
+  // Totales del curso. El % del curso solo existe si TODOS sus estudiantes
+  // tienen cobertura completa; si no, N/D (la misma regla que el boletín).
   const sumaAsis = datos.reduce((acc, d) => acc + d.total_asistencia, 0);
   const sumaAus = datos.reduce((acc, d) => acc + d.total_ausencia, 0);
-  const totalDias = sumaAsis + sumaAus;
-  const pctCurso = totalDias > 0 ? Math.round((sumaAsis / totalDias) * 100) : null;
+  const sumaLect = datos.reduce((acc, d) => acc + (d.dias_lectivos || 0), 0);
+  const sumaDato = datos.reduce((acc, d) => acc + (d.dias_computados || 0), 0);
+  const pctCurso = datos.every(d => d.pct_asistencia_anual !== null) && sumaLect > 0
+    ? Math.round((sumaAsis / sumaLect) * 100) : null;
 
-  // Mensual (v2.13.1)
   const sumaAsisMes = datos.reduce((acc, d) => acc + (d.asistencia_mes || 0), 0);
-  const sumaAusMes = datos.reduce((acc, d) => acc + (d.ausencia_mes || 0), 0);
-  const totalMes = sumaAsisMes + sumaAusMes;
-  const pctMesCurso = totalMes > 0 ? Math.round((sumaAsisMes / totalMes) * 100) : null;
+  const sumaLectMes = datos.reduce((acc, d) => acc + (d.dias_lectivos_mes || 0), 0);
+  const pctMesCurso = datos.every(d => d.pct_asistencia_mes !== null && d.pct_asistencia_mes !== undefined) && sumaLectMes > 0
+    ? Math.round((sumaAsisMes / sumaLectMes) * 100) : null;
+  const pctTexto = (pct: number | null | undefined) =>
+    pct !== null && pct !== undefined ? `${Math.round(pct)}%` : 'N/D';
   
   // Nombre del mes actual en español (o el que vino del backend)
   const mesActual = datos[0]?.mes || (new Date().getMonth() + 1);
@@ -116,13 +125,13 @@ export const TabAsistencia: React.FC<Props> = ({ cursoId, onAbrirFicha }) => {
         </Link>
       </div>
 
-      {/* v2.13.5: Banner si NO hay dias_trabajados configurados */}
-      {datos.length > 0 && datos[0]._usa_dias_trabajados === false && (
+      {/* Cobertura: si faltan listas, el % no se puede calcular (N/D). */}
+      {sumaLect > sumaDato && (
         <div className="bg-amber-50 border-l-4 border-amber-400 p-3 rounded">
           <p className="text-sm text-amber-900">
-            <strong>⚠️ Cálculo aproximado:</strong> el % se calcula sobre los días que TIENEN registro de asistencia.
-            Para % preciso alineado con MINERD, la dirección debe configurar los <strong>días trabajados</strong> del año
-            en <Link to="/registro-escolar" className="underline font-medium">Registro Escolar</Link>.
+            <strong>Cobertura: {sumaDato} de {sumaLect} días-estudiante registrados.</strong>{' '}
+            Mientras falten listas, el porcentaje aparece como <strong>N/D</strong>: un día sin lista no cuenta
+            como asistencia ni como falta.
           </p>
         </div>
       )}
@@ -145,19 +154,10 @@ export const TabAsistencia: React.FC<Props> = ({ cursoId, onAbrirFicha }) => {
             <div>
               <p className="font-medium text-gray-700 mb-1">Porcentajes</p>
               <ul className="list-disc list-inside text-xs space-y-0.5">
-                {datos.length > 0 && datos[0]._usa_dias_trabajados ? (
-                  <>
-                    <li><strong>% Mes</strong> = asistencias / <strong>días trabajados del mes</strong> × 100</li>
-                    <li>Los días trabajados los configura la dirección en Registro Escolar</li>
-                    <li>Esto es exactamente lo que MINERD usa oficialmente</li>
-                  </>
-                ) : (
-                  <>
-                    <li><strong>% Anual</strong> = A / (A + F) del año completo</li>
-                    <li><strong>% Mes</strong> = A / (A + F) solo del mes actual</li>
-                    <li>Si no hay registros → se muestra "—"</li>
-                  </>
-                )}
+                <li>Días lectivos = días hábiles desde el inicio del año del colegio (o desde el alta del estudiante), sin feriados</li>
+                <li><strong>% Anual</strong> = asistencias / días lectivos del año, solo si todos tienen lista</li>
+                <li><strong>% Mes</strong> = lo mismo, solo del mes</li>
+                <li>Si falta alguna lista → <strong>N/D</strong> (es el mismo cálculo del boletín)</li>
               </ul>
             </div>
           </div>
@@ -188,13 +188,13 @@ export const TabAsistencia: React.FC<Props> = ({ cursoId, onAbrirFicha }) => {
         </div>
         <div className="bg-blue-50 rounded-lg p-3 text-center">
           <p className={`text-2xl font-bold ${colorPct(pctCurso)}`}>
-            {pctCurso !== null ? `${pctCurso}%` : '—'}
+            {pctTexto(pctCurso)}
           </p>
           <p className="text-xs text-blue-600">% asistencia anual</p>
         </div>
         <div className="bg-indigo-50 rounded-lg p-3 text-center">
           <p className={`text-2xl font-bold ${colorPct(pctMesCurso)}`}>
-            {pctMesCurso !== null ? `${pctMesCurso}%` : '—'}
+            {pctTexto(pctMesCurso)}
           </p>
           <p className="text-xs text-indigo-600">% este mes ({nombreMesActual})</p>
         </div>
@@ -218,11 +218,6 @@ export const TabAsistencia: React.FC<Props> = ({ cursoId, onAbrirFicha }) => {
                 <th className="px-3 py-2 text-center font-medium text-gray-600">% Anual</th>
                 <th className="px-3 py-2 text-center font-medium text-indigo-700 bg-indigo-50">
                   % Mes ({nombreMesActual})
-                  {datos.length > 0 && datos[0]._usa_dias_trabajados && datos[0].dias_trabajados_mes && (
-                    <div className="text-[10px] font-normal text-indigo-600">
-                      base: {datos[0].dias_trabajados_mes} días MINERD
-                    </div>
-                  )}
                 </th>
               </tr>
               <tr className="bg-gray-50 text-xs">
@@ -268,25 +263,15 @@ export const TabAsistencia: React.FC<Props> = ({ cursoId, onAbrirFicha }) => {
                   <td className="px-1 py-2 text-center font-medium text-red-700 bg-blue-50">{d.total_ausencia}</td>
                   <td
                     className={`px-3 py-2 text-center font-bold ${colorPct(d.pct_asistencia_anual)}`}
-                    title={
-                      d.pct_asistencia_anual !== null
-                        ? `${d.total_asistencia} asistencias / ${d.total_asistencia + d.total_ausencia} días registrados × 100 = ${d.pct_asistencia_anual}%`
-                        : 'Sin registros de asistencia este año'
-                    }
+                    title={`Cobertura: ${d.dias_computados ?? 0} de ${d.dias_lectivos ?? 0} días registrados`}
                   >
-                    {d.pct_asistencia_anual !== null ? `${d.pct_asistencia_anual}%` : '—'}
+                    {pctTexto(d.pct_asistencia_anual)}
                   </td>
                   <td
                     className={`px-3 py-2 text-center font-bold bg-indigo-50 ${colorPct(d.pct_asistencia_mes)}`}
-                    title={
-                      d.pct_asistencia_mes !== null && d.pct_asistencia_mes !== undefined
-                        ? (d._usa_dias_trabajados && d.dias_trabajados_mes
-                            ? `${d.asistencia_mes || 0} asistencias / ${d.dias_trabajados_mes} días trabajados (MINERD) × 100 = ${d.pct_asistencia_mes}%`
-                            : `${d.asistencia_mes || 0} asistencias / ${(d.asistencia_mes || 0) + (d.ausencia_mes || 0)} días registrados en ${nombreMesActual} × 100 = ${d.pct_asistencia_mes}%`)
-                        : `Sin registros de asistencia en ${nombreMesActual}`
-                    }
+                    title={`Cobertura de ${nombreMesActual}: ${d.dias_computados_mes ?? 0} de ${d.dias_lectivos_mes ?? 0} días registrados`}
                   >
-                    {d.pct_asistencia_mes !== null && d.pct_asistencia_mes !== undefined ? `${d.pct_asistencia_mes}%` : '—'}
+                    {pctTexto(d.pct_asistencia_mes)}
                   </td>
                 </tr>
               ))}

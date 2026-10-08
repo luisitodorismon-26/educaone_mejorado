@@ -228,6 +228,12 @@ with client:
                          no_lista=_n[0], activo=True, condicion='activo')
         d.add(e)
         d.flush()
+        # ASISTENCIA CANÓNICA · lista completa en el año de origen: sin dato,
+        # A2 no certifica y el Cierre no tendría a quién promover.
+        from test_utils import asistencia_completa
+        if c.ano_escolar_id == A.id:
+            asistencia_completa(d, M, e, c.id, col.id, A)
+            d.flush()
         return e
 
     def notas_sec(e, codigos, nota):

@@ -47,6 +47,7 @@ from reglas_academicas import redondear_calificacion_final
 # R4-A3: el puente a los motores canonicos A1/A2. No decide nada por su
 # cuenta; traduce filas ORM a lo que A1 y A2 esperan.
 import resultado_academico_consumidores as RAC
+import asistencia_canonica as ASIS
 from models import (
     Colegio, ConfiguracionColegio, AnoEscolar, Grado, Tanda, Recreo,
     Asignatura, Curso, Estudiante, AsignacionProfesor, Horario, Calificacion,
@@ -3681,7 +3682,15 @@ def _curso_destino_canonico(cursos_destino, grado_destino, curso_origen):
 
 
 def _asistencia_del_paquete(paquete):
-    """El % de ausencias que A2 ya calculó, para guardarlo en el historial."""
+    """El % de asistencia que se guarda en el historial.
+
+    ASISTENCIA CANÓNICA · es el MISMO número que imprime el boletín: el de
+    `asistencia_canonica`, que viaja en el paquete. El respaldo por el
+    contexto solo cubre paquetes armados fuera de los caminos canónicos.
+    """
+    asistencia = paquete.get('asistencia')
+    if isinstance(asistencia, dict):
+        return asistencia.get('pct_asistencia')
     contexto = paquete.get('contexto') or {}
     pct = contexto.get('porcentaje_ausencias_no_justificadas')
     if isinstance(pct, (int, float)) and not isinstance(pct, bool):
@@ -7684,6 +7693,7 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
                 {'error': f"fecha_nacimiento inválida. Formato esperado YYYY-MM-DD"},
                 status_code=400
             )
+
     
     log_auditoria(db, 'editar', 'estudiantes', est.id, datos_anteriores, est.to_dict(), user=current_user, request=request)
     db.commit()
@@ -7755,123 +7765,199 @@ async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_d
     cache_clear_tenant(current_user.colegio_id)
     return {'message': 'Estudiante reactivado'}
 
+# Condición de ENTRADA que el CSV puede declarar. Son las del Registro
+# Escolar (columna «Promovido | Repitente | Reingreso») más nuevo/transferido.
+# NO es `Estudiante.condicion`: esa es administrativa/académica y un alta
+# siempre entra «activo». Antes el CSV escribía «Nuevo» o «Promovido» en
+# `condicion` y dejaba fichas con una condición que nadie había decidido.
+_CONDICIONES_ENTRADA_CSV = ('nuevo', 'promovido', 'repitente', 'reingreso',
+                            'transferido')
+
+
 @app.post("/api/estudiantes/importar")
-async def importar_estudiantes(request: Request, archivo: UploadFile = File(...), curso_id: int = Form(...), db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
-    """Importar estudiantes desde archivo CSV"""
-    
-    if not archivo or not archivo.filename.endswith('.csv'):
+async def importar_estudiantes(request: Request, archivo: UploadFile = File(...), curso_id: int = Form(...),
+                               modo: str = Form('importar'),
+                               db: Session = Depends(get_db),
+                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
+    """Importar estudiantes desde CSV.
+
+    SECRETARÍA · Puede importar: dar de alta decenas de estudiantes uno por
+    uno no es práctico, y el alta individual ya era suya. La importación es
+    exactamente un alta en lote: no toca notas, asistencia ni condición
+    académica, así que no le abre nada que no tuviera.
+
+    `modo=preview` valida el archivo entero y devuelve lo que pasaría, SIN
+    escribir. `modo=importar` (por defecto) es TODO O NADA: si una sola fila
+    tiene un error no se importa ninguna, y la respuesta trae la lista de
+    errores. Antes se importaban las válidas y se saltaban las malas, y
+    corregir el CSV y volver a subirlo duplicaba las que ya habían entrado.
+
+    Columnas: nombre, apellido (obligatorias); matricula, no_lista, genero,
+    condicion_entrada (o `condicion`, por compatibilidad con la plantilla
+    vieja), escuela_procedencia.
+    """
+    modo = (modo or 'importar').strip().lower()
+    if modo not in ('preview', 'importar'):
+        return JSONResponse({'error': "modo debe ser 'preview' o 'importar'"}, status_code=400)
+
+    if not archivo or not (archivo.filename or '').lower().endswith('.csv'):
         return JSONResponse({'error': 'El archivo debe ser CSV'}, status_code=400)
-    
+
     if not curso_id:
         return JSONResponse({'error': 'Debe seleccionar un curso'}, status_code=400)
-    
-    # Verificar límite del plan
-    if current_user.colegio_id:
-        colegio = db.get(Colegio, current_user.colegio_id)
-        if colegio and colegio.max_estudiantes:
-            count_actual = tenant_filter(db.query(func.count(Estudiante.id)), Estudiante, current_user).filter(Estudiante.activo == True).scalar() or 0
-            if count_actual >= colegio.max_estudiantes:
-                return JSONResponse({
-                    'error': f'Límite de estudiantes alcanzado ({colegio.max_estudiantes}). Actualice su plan.'
-                }, status_code=403)
-    
+
     # Verificar que el curso existe Y pertenece al colegio del usuario.
     # ANTES usaba db.get(Curso, curso_id) sin validar colegio, lo cual
     # permitía a un director importar estudiantes a un curso de OTRO colegio.
     # Bug confirmado por pentest. Fix: get_tenant_or_404 valida ambos.
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    
+    # Mismos candados que el alta individual.
+    _guard = validar_nivel_escritura(db, current_user, curso_id=curso.id)
+    if _guard:
+        return _guard
+    assert_nivel_curso_activo(db, current_user, curso.id)
+
     try:
         file_content = await archivo.read()
-        stream = io.StringIO(file_content.decode('utf-8-sig'))
-        reader = csv.DictReader(stream)
-        
-        count = 0
-        errores = []
+        texto = file_content.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        return JSONResponse({'error': 'El CSV debe estar en UTF-8'}, status_code=400)
+    reader = csv.DictReader(io.StringIO(texto))
 
-        # Precargar identidades existentes para detectar duplicados sin hacer
-        # una query por fila y también detectar duplicados dentro del propio CSV.
-        existentes_tenant = tenant_filter(db.query(Estudiante), Estudiante, current_user).all()
-        matriculas_usadas = {
-            (e.matricula or '').strip().lower() for e in existentes_tenant if (e.matricula or '').strip()
-        }
-        numeros_usados = {
-            e.no_lista for e in existentes_tenant
-            if e.activo and e.curso_id == curso_id and e.no_lista is not None
-        }
+    # Identidades existentes, para detectar duplicados contra la base y dentro
+    # del propio CSV sin una consulta por fila.
+    existentes_tenant = tenant_filter(db.query(Estudiante), Estudiante, current_user).all()
+    matriculas_usadas = {
+        (e.matricula or '').strip().lower() for e in existentes_tenant if (e.matricula or '').strip()
+    }
+    numeros_usados = {
+        e.no_lista for e in existentes_tenant
+        if e.activo and e.curso_id == curso.id and e.no_lista is not None
+    }
 
-        cupos_restantes = None
-        if current_user.colegio_id:
-            colegio = db.get(Colegio, current_user.colegio_id)
-            if colegio and colegio.max_estudiantes:
-                count_actual = sum(1 for e in existentes_tenant if e.activo)
-                cupos_restantes = max(0, colegio.max_estudiantes - count_actual)
+    cupos_restantes = None
+    if current_user.colegio_id:
+        colegio = db.get(Colegio, current_user.colegio_id)
+        if colegio and colegio.max_estudiantes:
+            count_actual = sum(1 for e in existentes_tenant if e.activo)
+            cupos_restantes = max(0, colegio.max_estudiantes - count_actual)
 
-        for i, row in enumerate(reader, start=2):
-            nombre = (row.get('nombre') or '').strip()
-            apellido = (row.get('apellido') or '').strip()
-            if not nombre or not apellido:
-                errores.append(f"Fila {i}: nombre y apellido son requeridos")
+    validas, errores = [], []
+    for i, row in enumerate(reader, start=2):
+        row = {(k or '').strip().lower(): (v or '').strip()
+               for k, v in row.items() if isinstance(v, str) or v is None}
+        nombre, apellido = row.get('nombre', ''), row.get('apellido', '')
+        if not nombre or not apellido:
+            errores.append(f"Fila {i}: nombre y apellido son requeridos")
+            continue
+        if len(nombre) > 100 or len(apellido) > 100:
+            errores.append(f"Fila {i}: nombre y apellido no pueden pasar de 100 caracteres")
+            continue
+
+        matricula = row.get('matricula') or None
+        matricula_key = matricula.lower() if matricula else None
+        if matricula_key and matricula_key in matriculas_usadas:
+            errores.append(f"Fila {i}: matrícula duplicada ({matricula})")
+            continue
+
+        no_lista = None
+        if row.get('no_lista'):
+            try:
+                no_lista = int(row['no_lista'])
+                if no_lista <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errores.append(f"Fila {i}: no_lista debe ser un entero positivo")
+                continue
+            if no_lista in numeros_usados:
+                errores.append(f"Fila {i}: número de lista duplicado en el curso ({no_lista})")
                 continue
 
-            matricula = (row.get('matricula') or '').strip() or None
-            matricula_key = matricula.lower() if matricula else None
-            if matricula_key and matricula_key in matriculas_usadas:
-                errores.append(f"Fila {i}: matrícula duplicada ({matricula})")
-                continue
+        genero = (row.get('genero') or row.get('sexo') or 'M').upper()[:1]
+        if genero not in ('M', 'F'):
+            errores.append(f"Fila {i}: género inválido ({row.get('genero')}); use M o F")
+            continue
 
-            no_lista = None
-            if (row.get('no_lista') or '').strip():
-                try:
-                    no_lista = int(row.get('no_lista'))
-                    if no_lista <= 0:
-                        raise ValueError
-                except (TypeError, ValueError):
-                    errores.append(f"Fila {i}: no_lista debe ser un entero positivo")
-                    continue
-                if no_lista in numeros_usados:
-                    errores.append(f"Fila {i}: número de lista duplicado en el curso ({no_lista})")
-                    continue
+        cond_entrada = (row.get('condicion_entrada') or row.get('condicion') or 'nuevo').lower()
+        if cond_entrada not in _CONDICIONES_ENTRADA_CSV:
+            errores.append(f"Fila {i}: condición de entrada inválida ({cond_entrada}); "
+                           f"use {', '.join(_CONDICIONES_ENTRADA_CSV)}")
+            continue
 
-            genero = (row.get('genero') or 'M').strip().upper()[:1]
-            if genero not in ('M', 'F'):
-                errores.append(f"Fila {i}: género inválido ({row.get('genero')}); use M o F")
-                continue
+        if cupos_restantes is not None and len(validas) >= cupos_restantes:
+            errores.append(f"Fila {i}: límite de estudiantes del plan alcanzado")
+            continue
 
-            if cupos_restantes is not None and count >= cupos_restantes:
-                errores.append(f"Fila {i}: límite de estudiantes del plan alcanzado")
-                continue
+        validas.append({
+            'fila': i, 'nombre': nombre, 'apellido': apellido,
+            'matricula': matricula, 'no_lista': no_lista, 'sexo': genero,
+            'condicion_entrada': cond_entrada,
+            'escuela_procedencia': row.get('escuela_procedencia') or None,
+        })
+        if matricula_key:
+            matriculas_usadas.add(matricula_key)
+        if no_lista is not None:
+            numeros_usados.add(no_lista)
 
-            est = Estudiante(
-                matricula=matricula,
-                no_lista=no_lista,
-                nombre=nombre,
-                apellido=apellido,
-                sexo=genero,
-                curso_id=curso_id,
-                condicion=(row.get('condicion') or 'Nuevo').strip(),
-                activo=True,
-                colegio_id=current_user.colegio_id
-            )
-            db.add(est)
-            if matricula_key:
-                matriculas_usadas.add(matricula_key)
-            if no_lista is not None:
-                numeros_usados.add(no_lista)
-            count += 1
-        
-        db.commit()
-        log_auditoria(db, 'importar', 'estudiantes', None, None, {'cantidad': count, 'curso_id': curso_id}, user=current_user, request=request)
-        db.commit()  # v2.13.5: persistir log
-        
+    def _resumen(v):
+        return {k: (x.isoformat() if hasattr(x, 'isoformat') else x) for k, x in v.items()}
+
+    if modo == 'preview':
         return {
-            'message': f'{count} estudiantes importados correctamente',
-            'importados': count,
-            'errores': errores
+            'preview': True,
+            'curso_id': curso.id,
+            'validas': len(validas),
+            'errores': errores,
+            'se_importaria': len(validas) if not errores else 0,
+            'filas': [_resumen(v) for v in validas[:200]],
         }
+
+    if errores:
+        return JSONResponse({
+            'error': ('El CSV tiene %d error(es); no se importó ninguna fila. '
+                      'Corrija el archivo y vuelva a subirlo.' % len(errores)),
+            'importados': 0,
+            'errores': errores,
+        }, status_code=400)
+    if not validas:
+        return JSONResponse({'error': 'El CSV no tiene filas', 'importados': 0,
+                             'errores': []}, status_code=400)
+
+    try:
+        for v in validas:
+            db.add(Estudiante(
+                matricula=v['matricula'],
+                no_lista=v['no_lista'],
+                nombre=v['nombre'],
+                apellido=v['apellido'],
+                sexo=v['sexo'],
+                curso_id=curso.id,
+                condicion='activo',
+                condicion_entrada=v['condicion_entrada'],
+                escuela_procedencia=v['escuela_procedencia'],
+                activo=True,
+                colegio_id=current_user.colegio_id,
+            ))
+        log_auditoria(db, 'importar', 'estudiantes', None, None,
+                      {'cantidad': len(validas), 'curso_id': curso.id,
+                       'archivo': archivo.filename},
+                      user=current_user, request=request)
+        # UNA transacción: las fichas y su auditoría entran juntas o no entra
+        # nada.
+        db.commit()
     except Exception as e:
         db.rollback()
-        return JSONResponse({'error': f'Error al procesar archivo: {str(e)}'}, status_code=400)
+        logger.exception("Importación CSV fallida")
+        return JSONResponse({'error': 'No se pudo importar; no se guardó ninguna fila',
+                             'detalle': str(e)[:200]}, status_code=400)
+
+    cache_clear(f'cursos:{current_user.colegio_id}')
+    cache_clear_tenant(current_user.colegio_id)
+    return {
+        'message': f'{len(validas)} estudiantes importados correctamente',
+        'importados': len(validas),
+        'errores': [],
+    }
 
 # ============== ASIGNACIONES ==============
 
@@ -15244,7 +15330,44 @@ def _precarga_curso_canonica(db, current_user, curso, ano, estudiante_ids=None):
         'fuente_curriculo': fuente,
         'diag_curriculo': diag_curriculo,
         'dias_trabajados': RAC.sumar_dias_trabajados(ano),
+        # Una consulta por curso, no una por estudiante: el calendario es del
+        # colegio, igual para todos.
+        'calendario_asistencia': _calendario_asistencia(db, current_user),
     }
+
+
+def _calendario_asistencia(db, current_user):
+    """Calendario lectivo del colegio para `asistencia_canonica`.
+
+    `DiaNoLaborable` activos (fechas y recurrentes) y si el centro da clase
+    sábado o domingo. Un feriado que falte aquí NO convierte un hueco en
+    asistencia: solo agranda el intervalo de incertidumbre.
+    """
+    dias = tenant_filter(db.query(DiaNoLaborable), DiaNoLaborable,
+                         current_user).filter_by(activo=True).all()
+    config = tenant_filter(db.query(ConfiguracionColegio),
+                           ConfiguracionColegio, current_user).first()
+    return ASIS.calendario(
+        [(d.fecha, bool(d.recurrente)) for d in dias],
+        permite_sabado=getattr(config, 'permite_sabado', False) if config else False,
+        permite_domingo=getattr(config, 'permite_domingo', False) if config else False,
+    )
+
+
+def _asistencia_canonica(db, current_user, estudiante, ano, filas=None,
+                         calendario=None):
+    """La asistencia canónica de UN estudiante. Ver `asistencia_canonica`.
+
+    Es lo que consumen el motor, el boletín, el Registro y el Cierre. Nadie
+    más cuenta días.
+    """
+    if filas is None:
+        filas = tenant_filter(db.query(Asistencia), Asistencia,
+                              current_user).filter_by(
+                                  estudiante_id=estudiante.id).all()
+    if calendario is None:
+        calendario = _calendario_asistencia(db, current_user)
+    return ASIS.resolver(filas, ano, estudiante, today_rd(), calendario)
 
 
 def _datos_academicos_estudiantes(db, current_user, estudiante_ids, ano, modelo):
@@ -15277,7 +15400,7 @@ def _asistencias_estudiantes(db, current_user, estudiante_ids, ano):
 
 
 def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano,
-                       decision=None):
+                       decision=None, estudiante=None, asistencia=None):
     """El contexto de A2 con lo que REALMENTE hay en la base.
 
     CORE-2 · `decision` es la fila de `DecisionAcademicaEstudiante` de ese
@@ -15293,13 +15416,19 @@ def _contexto_canonico(precarga, nivel, asistencias_estudiante, ano,
     if precarga['diag_grado']:
         diagnosticos.append(precarga['diag_grado'])
 
-    ausencias = RAC.dias_no_justificados(
-        asistencias_estudiante,
-        getattr(ano, 'fecha_inicio', None), getattr(ano, 'fecha_fin', None))
-    porcentaje, diag_asist = RAC.porcentaje_ausencias(
-        ausencias, precarga['dias_trabajados'])
-    if diag_asist:
-        diagnosticos.append(diag_asist)
+    # ASISTENCIA CANÓNICA · el porcentaje sale de `asistencia_canonica`, la
+    # misma función que alimenta boletín, Registro y Cierre. Ya no se divide
+    # entre `dias_trabajados` tratando el día sin lista como presente: sin
+    # dato es sin dato, y si la respuesta de A2 depende de esos huecos, no se
+    # le entrega número y A2 bloquea con ASISTENCIA_NO_EVALUADA.
+    if asistencia is None:
+        asistencia = ASIS.resolver(
+            asistencias_estudiante, ano, estudiante, today_rd(),
+            precarga.get('calendario_asistencia'))
+    porcentaje = asistencia['porcentaje_a2']
+    if asistencia['diagnostico']:
+        diagnosticos.append(asistencia['diagnostico'])
+    diagnosticos.extend(asistencia['advertencias'])
 
     contexto = RAC.construir_contexto(
         precarga['grado_numero'], nivel, porcentaje, diagnosticos)
@@ -15568,14 +15697,22 @@ def _situacion_canonica_secundaria(db, current_user, estudiante, ano, precarga,
         decision = _decisiones_de_estudiantes(
             db, current_user, [estudiante.id], ano).get(estudiante.id)
 
+    asistencia = ASIS.resolver(
+        asistencias, ano, estudiante, today_rd(),
+        precarga.get('calendario_asistencia'))
     contexto, diagnosticos = _contexto_canonico(
-        precarga, RAC.RA.NIVEL_SECUNDARIA, asistencias, ano, decision=decision)
+        precarga, RAC.RA.NIVEL_SECUNDARIA, asistencias, ano, decision=decision,
+        estudiante=estudiante, asistencia=asistencia)
 
-    return RAC.construir_situacion_estudiante(
+    paquete = RAC.construir_situacion_estudiante(
         RAC.RA.NIVEL_SECUNDARIA, precarga['grado_numero'], resultados,
         precarga['curriculo_esperado'], contexto,
         diagnosticos=_diagnosticos_curriculo(precarga, resultados, diagnosticos),
         fuente_curriculo=precarga['fuente_curriculo'])
+    # La asistencia canónica viaja con el paquete: boletín y Cierre la leen de
+    # aquí y no vuelven a contar.
+    paquete['asistencia'] = asistencia
+    return paquete
 
 
 def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
@@ -15615,18 +15752,24 @@ def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
         decision = _decisiones_de_estudiantes(
             db, current_user, [estudiante.id], ano).get(estudiante.id)
 
+    asistencia = ASIS.resolver(
+        asistencias, ano, estudiante, today_rd(),
+        precarga.get('calendario_asistencia'))
     contexto, diagnosticos = _contexto_canonico(
-        precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano, decision=decision)
+        precarga, RAC.RA.NIVEL_PRIMARIA, asistencias, ano, decision=decision,
+        estudiante=estudiante, asistencia=asistencia)
     diagnosticos = _diagnosticos_curriculo(precarga, resultados, diagnosticos)
     if adicionales:
         diagnosticos.append('%s: %s' % (
             RAC.DIAG_AREAS_ADICIONALES, ', '.join(sorted(set(adicionales)))))
 
-    return RAC.construir_situacion_estudiante(
+    paquete = RAC.construir_situacion_estudiante(
         RAC.RA.NIVEL_PRIMARIA, precarga['grado_numero'], resultados,
         precarga['curriculo_esperado'], contexto,
         diagnosticos=diagnosticos,
         fuente_curriculo=precarga['fuente_curriculo'])
+    paquete['asistencia'] = asistencia
+    return paquete
 
 
 def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano):
@@ -15886,8 +16029,7 @@ def _cohorte_del_curso_en_ano(db, current_user, curso, ano):
 # presente > tardanza > excusa > ausente. El criterio no es arbitrario —
 # describe al estudiante, no a la materia: si vino, vino, aunque faltara a una
 # clase suelta.
-_PRIORIDAD_DIA_ASISTENCIA = {'presente': 4, 'tardanza': 3, 'excusa': 2,
-                             'ausente': 1}
+_PRIORIDAD_DIA_ASISTENCIA = ASIS.PRIORIDAD_ESTADO
 
 # Contrato congelado: `tardanza` es asistencia (el estudiante vino) y `excusa`
 # es ausencia JUSTIFICADA. Las dos distinciones se conservan enteras en el
@@ -15896,242 +16038,53 @@ _DIA_PRESENCIAL = ('presente', 'tardanza')
 _DIA_AUSENCIA = ('ausente', 'excusa')
 
 
-def _dias_asistencia_del_ano(db, estudiante_id, current_user, ano):
-    """`{fecha: estado}` del estudiante dentro del año escolar dado.
+# ASISTENCIA CANÓNICA · El boletín ya no cuenta días. Antes tenía su propia
+# deduplicación, su propio denominador (`dias_trabajados`, que convertía el
+# día sin lista en asistencia) y su propio reparto por período (que mandaba
+# al «período más cercano» lo que caía fuera). Ahora las tres cosas salen de
+# `asistencia_canonica.resolver`, la MISMA función que alimenta a A2, al
+# Registro y al Cierre:
+#
+#   · sin fila = SIN DATO, ni asistencia ni ausencia;
+#   · antes del inicio del año (o del alta, si llegó después) y después
+#     del retiro = NO APLICA;
+#   · el porcentaje oficial solo existe con cobertura completa (si no, N/D),
+#     y la cobertura dice sobre cuántos de los días lectivos se sabe algo.
+#
+# Los nombres y las claves de salida se conservan: las tres plantillas PDF y
+# el frontend los leen tal cual.
 
-    Tenant-safe y acotado al año: sin el recorte, las marcas de años
-    anteriores entraban al boletín por el camino del «período más cercano».
-    """
-    filas = tenant_filter(
-        db.query(Asistencia), Asistencia, current_user
-    ).filter_by(estudiante_id=estudiante_id).all()
-    return _dias_asistencia_de_filas(filas, ano)
-
-
-def _dias_asistencia_de_filas(filas, ano):
-    """La misma deduplicación, sobre filas ya cargadas (camino por lotes)."""
-    _ini = getattr(ano, 'fecha_inicio', None)
-    _fin = getattr(ano, 'fecha_fin', None)
-    por_dia = {}
-    for a in filas or ():
-        fecha = getattr(a, 'fecha', None)
-        if not fecha:
-            continue
-        if _ini and _fin and not (_ini <= fecha <= _fin):
-            continue
-        estado = getattr(a, 'estado', None)
-        previo = por_dia.get(fecha)
-        if previo is None or (_PRIORIDAD_DIA_ASISTENCIA.get(estado, 0)
-                              > _PRIORIDAD_DIA_ASISTENCIA.get(previo, 0)):
-            por_dia[fecha] = estado
-    return por_dia
+def _estudiante_tenant(db, current_user, estudiante_id):
+    est = tenant_filter(db.query(Estudiante), Estudiante,
+                        current_user).filter_by(id=estudiante_id).first()
+    # Un id ajeno no filtra nada: se resuelve sobre un estudiante vacío y sin
+    # filas, que da «sin registros».
+    return est
 
 
-def _resumen_anual_asistencia(dias, ano):
-    """Desglose ANUAL de asistencia a partir de los días ya deduplicados.
-
-    EL DENOMINADOR
-    --------------
-    EducaOne ya tenía declarada su política, y en dos sitios: A3
-    (`porcentaje_ausencias`, congelado) y el resumen por períodos de
-    /academico. En los dos, el denominador oficial es
-    `AnoEscolar.dias_trabajados` —los días hábiles que la dirección declara
-    mes a mes— y no «los días en que alguien pasó lista». La razón está
-    escrita en A3: a un curso al que se le pasó lista tres días, una sola
-    falta le daría 33 % de ausencia.
-
-    El boletín usaba su propio denominador. Aquí se alinea con el canónico.
-    Cuando `dias_trabajados` no está declarado se conserva el respaldo que el
-    resumen por períodos ya usaba —los días con registro—, pero DECLARADO en
-    la respuesta (`base_porcentaje`), para que la pantalla pueda advertirlo en
-    vez de presentarlo como un dato firme.
-
-    LA AUSENCIA ES EL NUMERADOR; LA ASISTENCIA ES SU COMPLEMENTO
-    ------------------------------------------------------------
-    Este es el punto fino, y conviene decirlo entero porque la aritmética
-    ingenua da un resultado absurdo.
-
-    Lo que A3 calcula sobre `dias_trabajados` son las AUSENCIAS: cuánto del
-    año lectivo se perdió el estudiante. Los días en que nadie pasó lista
-    cuentan, correctamente, como «no consta que faltara».
-
-    Si se aplicara el mismo denominador a las ASISTENCIAS, esos días se
-    volverían en contra del estudiante: con 195 días hábiles declarados y
-    trece días de lista pasada, un alumno con asistencia casi perfecta
-    aparecería con un 4,6 % de asistencia. El número sería cierto —asistió a
-    9 de 195— pero diría algo que nadie preguntó, y en un boletín se leería
-    como un desastre.
-
-    Por eso la ausencia se mide contra el denominador canónico y la
-    asistencia es su complemento. Las dos columnas de la plantilla están una
-    al lado de la otra y suman 100: así es como se leen.
-
-    Y si la declaración no puede sostener los datos —menos días hábiles que
-    días con registro— es la declaración la que está mal. No se adivina cuál
-    de los dos corregir: se cae al respaldo y se dice en `base_porcentaje`.
-
-    SIN REGISTROS NO ES CERO
-    ------------------------
-    Un estudiante sin ninguna marca no tiene 0 % de asistencia: no tiene
-    dato. Los porcentajes salen en None y `sin_registros` queda en True.
-    """
-    presentes = sum(1 for e in dias.values() if e == 'presente')
-    tardanzas = sum(1 for e in dias.values() if e == 'tardanza')
-    ausencias = sum(1 for e in dias.values() if e == 'ausente')
-    excusas = sum(1 for e in dias.values() if e == 'excusa')
-
-    asistidos = presentes + tardanzas
-    ausentados = ausencias + excusas
-    computados = asistidos + ausentados
-
-    trabajados = RAC.sumar_dias_trabajados(ano)
-    if not computados:
-        base, etiqueta = None, None
-    elif trabajados and trabajados >= computados:
-        base, etiqueta = trabajados, 'dias_trabajados'
-    else:
-        base, etiqueta = computados, 'dias_con_registro'
-
-    if base:
-        pct_ausencia = round(ausentados / base * 100, 1)
-        pct_asistencia = round(100.0 - pct_ausencia, 1)
-    else:
-        pct_ausencia = pct_asistencia = None
-
-    return {
-        'sin_registros': computados == 0,
-        'presentes': presentes,
-        'tardanzas': tardanzas,
-        'asistencias': asistidos,
-        'ausencias': ausencias,
-        'excusas': excusas,
-        'ausencias_totales': ausentados,
-        'dias_computados': computados,
-        'dias_trabajados': trabajados,
-        'base_porcentaje': etiqueta,
-        'pct_asistencia': pct_asistencia,
-        'pct_ausencia': pct_ausencia,
-    }
+def _asistencia_canonica_boletin(db, estudiante_id, current_user, ano):
+    est = _estudiante_tenant(db, current_user, estudiante_id)
+    if est is None:
+        return ASIS.resolver([], ano, None, today_rd(),
+                             _calendario_asistencia(db, current_user))
+    return _asistencia_canonica(db, current_user, est, ano)
 
 
 def _asistencia_anual_boletin(db, estudiante_id, current_user, ano):
     """El desglose anual que consumen boletines web y PDF."""
-    return _resumen_anual_asistencia(
-        _dias_asistencia_del_ano(db, estudiante_id, current_user, ano), ano)
+    return ASIS.anual_boletin(
+        _asistencia_canonica_boletin(db, estudiante_id, current_user, ano))
 
 
 def _construir_asistencias_boletin(db, estudiante_id, current_user, ano):
-    """Helper que arma el dict asistencias_por_periodo desde la BD.
-    
-    Los períodos (P1-P4) están definidos en AnoEscolar como p1_inicio/p1_fin, etc.
-    
-    v2.13.3: si AnoEscolar no tiene los rangos p1_inicio/p1_fin configurados,
-    o si una asistencia cae FUERA de todos los rangos, ya NO se descarta
-    silenciosamente. En cambio, se hace fallback inteligente:
-      1. Si AnoEscolar tiene fecha_inicio y fecha_fin, dividir en 4 trimestres iguales
-      2. Si una fecha cae fuera de todo rango pero está dentro del año, mapearla
-         al período más cercano (no perderla)
-      3. Si no hay año escolar válido, usar el año calendario actual dividido en 4
-    """
-    # v2.14.1 BUGFIX (3 en 1):
-    #  a) Solo asistencias DENTRO del año escolar. Antes entraban registros de
-    #     años anteriores y el fallback "período más cercano" los metía en P1-P4.
-    #  b) Dedup POR DÍA: si el colegio pasa lista por asignatura, un día tiene
-    #     varias filas y cada una sumaba (días inflados). Ahora un día = un voto,
-    #     con la misma prioridad de v2.13.5: presente > tardanza > excusa > ausente.
-    #  c) tardanza cuenta como ASISTENCIA (el estudiante vino) y excusa como
-    #     AUSENCIA (justificada). Antes ambas se descartaban ('ausente_justificado'
-    #     ni siquiera es un estado válido del sistema).
-    #
-    # ENTREGA-1 · Esas tres reglas viven ahora en `_dias_asistencia_del_ano`,
-    # tal cual, porque el desglose ANUAL tiene que salir de la MISMA
-    # deduplicación que el desglose por período. Cuando eran dos copias, nada
-    # impedía que se separaran y que el boletín se contradijera consigo mismo.
-    _por_dia = _dias_asistencia_del_ano(db, estudiante_id, current_user, ano)
-    
-    # Construir rangos de períodos con fallback
-    rangos = []
-    if ano:
-        for p in range(1, 5):
-            ini = getattr(ano, f'p{p}_inicio', None)
-            fin = getattr(ano, f'p{p}_fin', None)
-            if ini and fin:
-                rangos.append((p, ini, fin))
-    
-    # Fallback 1: si no hay períodos configurados, dividir el rango del año en 4
-    if not rangos and ano:
-        fi = getattr(ano, 'fecha_inicio', None)
-        ff = getattr(ano, 'fecha_fin', None)
-        if fi and ff:
-            from datetime import timedelta as _td
-            total_dias = (ff - fi).days
-            if total_dias > 0:
-                paso = total_dias // 4
-                for p in range(1, 5):
-                    ini_p = fi + _td(days=paso * (p - 1))
-                    fin_p = ff if p == 4 else fi + _td(days=paso * p - 1)
-                    rangos.append((p, ini_p, fin_p))
-    
-    # Fallback 2: si todavía no hay rangos, usar año calendario actual
-    if not rangos:
-        from datetime import date as _date
-        hoy = today_rd()
-        year = hoy.year
-        rangos = [
-            (1, _date(year, 1, 1), _date(year, 3, 31)),
-            (2, _date(year, 4, 1), _date(year, 6, 30)),
-            (3, _date(year, 7, 1), _date(year, 9, 30)),
-            (4, _date(year, 10, 1), _date(year, 12, 31)),
-        ]
-    
-    def periodo_de_fecha(fecha):
-        # Match exacto
-        for p, ini, fin in rangos:
-            if ini <= fecha <= fin:
-                return p
-        # Fallback: período más cercano por proximidad al inicio/fin
-        # (en lugar de descartar la asistencia, la mapeamos al más cercano)
-        mejor_p = None
-        mejor_dist = None
-        for p, ini, fin in rangos:
-            d_ini = abs((fecha - ini).days)
-            d_fin = abs((fecha - fin).days)
-            dist = min(d_ini, d_fin)
-            if mejor_dist is None or dist < mejor_dist:
-                mejor_dist = dist
-                mejor_p = p
-        return mejor_p
-    
-    conteo = {1: {'a': 0, 'au': 0}, 2: {'a': 0, 'au': 0},
-              3: {'a': 0, 'au': 0}, 4: {'a': 0, 'au': 0}}
-    total_a = 0
-    total_au = 0
-    for fecha_dia, estado_dia in _por_dia.items():
-        p = periodo_de_fecha(fecha_dia)
-        if p:
-            if estado_dia in ('presente', 'tardanza'):
-                conteo[p]['a'] += 1
-                total_a += 1
-            elif estado_dia in ('ausente', 'excusa'):
-                conteo[p]['au'] += 1
-                total_au += 1
-    
-    total = total_a + total_au
-    
-    resultado = {}
-    for p in range(1, 5):
-        d = conteo[p]
-        sub_total = d['a'] + d['au']
-        resultado[f'p{p}'] = {
-            'asistencia': d['a'],
-            'ausencia': d['au'],
-            # v2.13.3: % POR PERÍODO (no anual). Antes confundía: el campo decía 'anual'
-            # pero realmente era del período. El frontend renombra al mostrar.
-            'pct_asistencia_anual': round((d['a'] / sub_total * 100), 0) if sub_total > 0 else None,
-            'pct_ausencia_anual': round((d['au'] / sub_total * 100), 0) if sub_total > 0 else None,
-        }
-    return resultado
+    """`{'p1': {'asistencia', 'ausencia', 'pct_asistencia_anual', ...}}`.
 
+    Mismas claves de siempre, misma fuente que el anual y que A2. Un día
+    fuera de todos los rangos de período ya no se manda al «más cercano»:
+    cuenta en el anual y en ningún período, que es lo que realmente es.
+    """
+    return ASIS.periodos_boletin(
+        _asistencia_canonica_boletin(db, estudiante_id, current_user, ano))
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -17727,35 +17680,34 @@ async def get_resumen_asistencia_por_periodos(
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user)
 ):
-    """Resumen de asistencia agrupado por períodos P1-P4 del año activo.
-    
+    """Resumen de asistencia P1-P4, anual y de un mes, por estudiante.
+
     Usado por la tab "Asistencia" en /academico.
-    
-    v2.13.5 (Opción 4 — alineado con Registro Escolar MINERD):
-    Cuando el AnoEscolar tiene `dias_trabajados` configurados por mes (dict
-    de la forma {'ago': 8, 'sep': 22, ...}), el % se calcula así:
-    
-        % = presentes / dias_trabajados_del_mes × 100
-    
-    Esto es lo que MINERD oficialmente usa: la dirección define cuántos
-    días hábiles tuvo el colegio en cada mes (descontando feriados, días
-    de planificación, etc.), y el % refleja qué fracción de esos días
-    asistió el estudiante.
-    
-    Si dias_trabajados NO está configurado, fallback al cálculo anterior
-    (presentes / días_con_registro × 100), con bandera `_sin_dias_trabajados`
-    para que el frontend muestre aviso.
+
+    ASISTENCIA CANÓNICA · Antes esta pantalla tenía su propia fórmula
+    (presentes / `dias_trabajados` del mes, o presentes / días con registro)
+    y podía mostrar un % distinto del boletín. Ahora sale de
+    `asistencia_canonica`, la misma función que usan A2, el boletín, el
+    Registro y el Cierre:
+
+      · días lectivos del colegio desde su `fecha_inicio` (o desde el alta
+        del estudiante si llegó después);
+      · un día sin lista es SIN DATO, ni asistencia ni falta;
+      · el % solo existe con cobertura completa del período que se mira
+        (año o mes); si no, None y la pantalla muestra N/D con la cobertura.
+
+    Las claves de siempre se conservan; las de `dias_trabajados` quedan en
+    None porque ya no son el denominador.
     """
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     if not ano:
         return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
-    
+
     estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
         curso_id=curso.id, activo=True
     ).order_by(Estudiante.apellido, Estudiante.nombre).all()
-    
-    # Mes a calcular para % mensual (default: mes actual)
+
     try:
         mes_param = int(request.query_params.get('mes', today_rd().month))
         ano_param = int(request.query_params.get('ano', today_rd().year))
@@ -17764,102 +17716,45 @@ async def get_resumen_asistencia_por_periodos(
         ano_param = today_rd().year
     if not (1 <= mes_param <= 12):
         mes_param = today_rd().month
-    
-    # v2.13.5: leer dias_trabajados del año (Registro MINERD)
-    dias_trabajados_dict = ano.get_dias_trabajados() if hasattr(ano, 'get_dias_trabajados') else {}
-    # Mapear número de mes → clave en dias_trabajados (que usa abreviaciones español)
-    nombres_meses_corto = ['', 'ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic']
-    mes_key = nombres_meses_corto[mes_param] if 1 <= mes_param <= 12 else None
-    
-    dias_trabajados_mes = None
-    try:
-        if mes_key and mes_key in dias_trabajados_dict:
-            dias_trabajados_mes = int(dias_trabajados_dict[mes_key])
-    except (ValueError, TypeError):
-        dias_trabajados_mes = None
-    
-    usa_dias_trabajados = dias_trabajados_mes is not None and dias_trabajados_mes > 0
-    
-    # Pre-fetch asistencias del mes para TODOS los estudiantes (sin N+1)
-    from sqlalchemy import extract as _extract
-    est_ids = [e.id for e in estudiantes]
-    asists_mes_todas = []
-    if est_ids:
-        asists_mes_todas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
-            Asistencia.estudiante_id.in_(est_ids),
-            _extract('month', Asistencia.fecha) == mes_param,
-            _extract('year', Asistencia.fecha) == ano_param
-        ).all()
-    
-    asists_por_est = {}
-    for a in asists_mes_todas:
-        asists_por_est.setdefault(a.estudiante_id, []).append(a)
-    
+
+    # Una consulta para todo el curso y el calendario una sola vez.
+    filas_por_est = _asistencias_estudiantes(
+        db, current_user, [e.id for e in estudiantes], ano)
+    calendario = _calendario_asistencia(db, current_user)
+
     resultado = []
     for est in estudiantes:
-        # Desglose P1-P4 (anual, para el boletín)
-        periodos = _construir_asistencias_boletin(db, est.id, current_user, ano)
-        total_a = sum((periodos.get(f'p{p}') or {}).get('asistencia', 0) or 0 for p in range(1, 5))
-        total_au = sum((periodos.get(f'p{p}') or {}).get('ausencia', 0) or 0 for p in range(1, 5))
-        total = total_a + total_au
-        
-        # Cálculo MENSUAL del estudiante
-        # v2.13.5: bug fix — antes el default 'ausente' tenía la misma prioridad
-        # que un 'ausente' real, así que NUNCA se asignaba ausencia. Por eso veías
-        # "100%" en muchos estudiantes aunque tuvieran ausencias.
-        # Ahora: si un día tiene MÚLTIPLES registros, gana el de prioridad mayor;
-        # si solo tiene UNO, ese gana. Sin defaults artificiales.
-        mis_asists_mes = asists_por_est.get(est.id, [])
-        prioridad = {'presente': 4, 'tardanza': 3, 'excusa': 2, 'ausente': 1}
-        por_dia = {}
-        for a in mis_asists_mes:
-            key = a.fecha.isoformat() if a.fecha else ''
-            if not key:
-                continue
-            estado_nuevo = a.estado
-            estado_actual = por_dia.get(key)  # None si nunca se asignó
-            if estado_actual is None:
-                # Primera vez que veo este día: asignar
-                por_dia[key] = estado_nuevo
-            elif prioridad.get(estado_nuevo, 0) > prioridad.get(estado_actual, 0):
-                # Ya había un estado para este día, pero el nuevo tiene mayor prioridad
-                por_dia[key] = estado_nuevo
-        n_pres_mes = sum(1 for e in por_dia.values() if e == 'presente')
-        n_aus_mes = sum(1 for e in por_dia.values() if e == 'ausente')
-        n_tard_mes = sum(1 for e in por_dia.values() if e == 'tardanza')
-        
-        # v2.13.5 Opción 4: si hay dias_trabajados configurados, usar como denominador
-        if usa_dias_trabajados:
-            # % = presentes / dias_trabajados_del_mes
-            pct_mes = round(n_pres_mes / dias_trabajados_mes * 100, 0)
-            # Cap a 100 por si el profesor cargó más días que los dias_trabajados configurados
-            pct_mes = min(pct_mes, 100)
-            denominador_mes = dias_trabajados_mes
-        else:
-            # Fallback: cálculo viejo (presentes / días con registro)
-            total_con_registro = n_pres_mes + n_aus_mes
-            pct_mes = round(n_pres_mes / total_con_registro * 100, 0) if total_con_registro > 0 else None
-            denominador_mes = total_con_registro
-        
+        r = _asistencia_canonica(db, current_user, est, ano,
+                                 filas=filas_por_est.get(est.id, []),
+                                 calendario=calendario)
+        mes = ASIS._contar({f: e for f, e in r['dias'].items()
+                            if f.month == mes_param and f.year == ano_param})
         resultado.append({
             'estudiante_id': est.id,
             'estudiante': est.nombre_completo,
-            'periodos': periodos,
-            'total_asistencia': total_a,
-            'total_ausencia': total_au,
-            'pct_asistencia_anual': round((total_a / total * 100), 0) if total > 0 else None,
+            'periodos': ASIS.periodos_boletin(r),
+            'total_asistencia': r['asistencias'],
+            'total_ausencia': r['ausencias_totales'],
+            'pct_asistencia_anual': r['pct_asistencia'],
+            'dias_lectivos': r['dias_lectivos'],
+            'dias_computados': r['con_dato'],
+            'sin_dato': r['sin_dato'],
+            'cobertura_completa': r['cobertura_completa'],
             'mes': mes_param,
             'ano_calendario': ano_param,
-            'asistencia_mes': n_pres_mes,
-            'ausencia_mes': n_aus_mes,
-            'tardanza_mes': n_tard_mes,
-            'pct_asistencia_mes': pct_mes,
-            # v2.13.5: campos nuevos para transparencia frontend
-            'dias_trabajados_mes': dias_trabajados_mes,
-            'denominador_mes': denominador_mes,
-            '_usa_dias_trabajados': usa_dias_trabajados,
+            'asistencia_mes': mes['asistencias'],
+            'ausencia_mes': mes['ausencias_totales'],
+            'tardanza_mes': mes['tardanzas'],
+            'pct_asistencia_mes': mes['pct_asistencia'],
+            'dias_lectivos_mes': mes['dias_lectivos'],
+            'dias_computados_mes': mes['con_dato'],
+            'sin_dato_mes': mes['sin_dato'],
+            # Ya no son el denominador; se conservan por compatibilidad.
+            'dias_trabajados_mes': None,
+            'denominador_mes': mes['dias_lectivos'],
+            '_usa_dias_trabajados': False,
         })
-    
+
     return resultado
 
 

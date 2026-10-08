@@ -122,6 +122,7 @@ export const EstudiantesPage = () => {
   const canEliminarPorError = user?.role === 'direccion';
   const [importCursoId, setImportCursoId] = useState<number | ''>('');
   const [importing, setImporting] = useState(false);
+  const [importPreview, setImportPreview] = useState<{ validas: number; errores: string[] } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [showProgreso, setShowProgreso] = useState(false);
   const [progresoData, setProgresoData] = useState<any>(null);
@@ -396,8 +397,10 @@ export const EstudiantesPage = () => {
   // habria dado un 403. Se separan.
   const canEditStudent = user?.role === 'direccion'
     || user?.role === 'coordinador' || esSecretaria;
+  // El alta en lote es un alta: Secretaría ya daba de alta uno por uno, así
+  // que importar por CSV no le abre nada nuevo (no toca notas ni asistencia).
   const canImportCSV = user?.role === 'direccion'
-    || user?.role === 'coordinador';
+    || user?.role === 'coordinador' || esSecretaria;
   // AUDIT-FINAL · Retirar, ver retirados y reactivar NO es lo mismo que
   // editar. El backend lo da a Dirección y Secretaría; Coordinación crea y
   // edita pero no administra el retiro. Igualarlo a `canEditStudent` le
@@ -417,6 +420,7 @@ export const EstudiantesPage = () => {
     const formData = new FormData();
     formData.append('archivo', file);
     formData.append('curso_id', String(importCursoId));
+    formData.append('modo', 'importar');
 
     try {
       const res = await api.post('/estudiantes/importar', formData, {
@@ -425,10 +429,38 @@ export const EstudiantesPage = () => {
       setMessage({ type: 'success', text: res.data.message });
       setShowImportModal(false);
       setImportCursoId('');
+      setImportPreview(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
       loadData();
     } catch (e: any) {
+      // Todo o nada: si hay errores no entró ninguna fila, y se listan.
+      const errs: string[] = e.response?.data?.errores || [];
+      if (errs.length) setImportPreview({ validas: 0, errores: errs });
       setMessage({ type: 'error', text: e.response?.data?.error || 'Error al importar' });
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  // Valida el archivo entero SIN escribir nada.
+  const handlePreviewCSV = async () => {
+    const file = fileInputRef.current?.files?.[0];
+    if (!file || !importCursoId) {
+      setMessage({ type: 'error', text: 'Seleccione un archivo y un curso' });
+      return;
+    }
+    setImporting(true);
+    const formData = new FormData();
+    formData.append('archivo', file);
+    formData.append('curso_id', String(importCursoId));
+    formData.append('modo', 'preview');
+    try {
+      const res = await api.post('/estudiantes/importar', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+      setImportPreview({ validas: res.data.validas, errores: res.data.errores || [] });
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al validar' });
     } finally {
       setImporting(false);
     }
@@ -1170,7 +1202,10 @@ export const EstudiantesPage = () => {
         size="md"
         footer={
           <>
-            <Button variant="secondary" onClick={() => setShowImportModal(false)}>Cancelar</Button>
+            <Button variant="secondary" onClick={() => { setShowImportModal(false); setImportPreview(null); }}>Cancelar</Button>
+            <Button variant="secondary" onClick={handlePreviewCSV} loading={importing}>
+              Previsualizar
+            </Button>
             <Button onClick={handleImportCSV} loading={importing}>
               Importar
             </Button>
@@ -1203,7 +1238,7 @@ export const EstudiantesPage = () => {
               <p className="text-sm font-medium text-blue-800">📋 Formato del CSV:</p>
               <button
                 onClick={() => {
-                  const plantilla = 'nombre,apellido,matricula,no_lista,genero,condicion\nJuan,Pérez,2024001,1,M,Nuevo\nMaría,García,2024002,2,F,Promovido\nCarlos,Rodríguez,2024003,3,M,Nuevo';
+                  const plantilla = 'nombre,apellido,matricula,no_lista,genero,condicion_entrada,escuela_procedencia\nJuan,Pérez,2024001,1,M,nuevo,\nMaría,García,2024002,2,F,promovido,\nCarlos,Rodríguez,2024003,3,M,transferido,Escuela Anterior';
                   const blob = new Blob([plantilla], { type: 'text/csv' });
                   const url = window.URL.createObjectURL(blob);
                   const a = document.createElement('a');
@@ -1217,14 +1252,30 @@ export const EstudiantesPage = () => {
               </button>
             </div>
             <code className="text-xs bg-white px-2 py-1 rounded border block">
-              nombre,apellido,matricula,no_lista,genero,condicion
+              nombre,apellido,matricula,no_lista,genero,condicion_entrada,escuela_procedencia
             </code>
             <p className="text-xs text-blue-600 mt-2">
               • Solo <strong>nombre</strong> y <strong>apellido</strong> son obligatorios<br/>
               • Género: M o F<br/>
-              • Condición: Nuevo, Promovido o Repitente
+              • Condición de entrada: nuevo, promovido, repitente, reingreso o transferido<br/>
+              • Si entra con el año ya empezado, su asistencia cuenta desde el día en que se importa<br/>
+              • Si una fila tiene error, <strong>no se importa ninguna</strong>. Use «Previsualizar» primero.
             </p>
           </div>
+          {importPreview && (
+            <div className={'p-3 rounded-lg border text-sm ' + (importPreview.errores.length ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200')}>
+              {importPreview.errores.length === 0 ? (
+                <p className="text-green-800">✅ {importPreview.validas} fila(s) válidas. Listo para importar.</p>
+              ) : (
+                <>
+                  <p className="font-medium text-red-800 mb-1">{importPreview.errores.length} error(es) — no se importará ninguna fila:</p>
+                  <ul className="text-xs text-red-700 list-disc pl-5 max-h-40 overflow-y-auto">
+                    {importPreview.errores.map((er, i) => <li key={i}>{er}</li>)}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
         </div>
       </Modal>
 

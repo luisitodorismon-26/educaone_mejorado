@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(_AQUI))
 sys.path.insert(0, _AQUI)
 
 from test_utils import aislar_base_de_datos, verificar_engine_aislado  # noqa: E402
+from test_utils import fechar_ano, asistencia_completa  # noqa: E402
 
 _TMP = aislar_base_de_datos('r4_a4')
 from database import engine, SessionLocal                      # noqa: E402
@@ -96,6 +97,9 @@ _DB.add(_COL)
 _DB.flush()
 _ANO = M.AnoEscolar(colegio_id=_COL.id, nombre='2025-2026', activo=True)
 _ANO.set_dias_trabajados(DIAS)
+# ASISTENCIA CANÓNICA · días lectivos del año y, en `estudiante`, la lista
+# completa de cada uno: sin dato, A2 no certifica.
+fechar_ano(_ANO)
 _DB.add(_ANO)
 _DB.flush()
 
@@ -175,6 +179,9 @@ def estudiante(curso_obj=None):
                      no_lista=_contador[0], activo=True)
     _DB.add(e)
     _DB.commit()
+    if curso_obj is not None:
+        asistencia_completa(_DB, M, e, curso_obj.id, _COL.id, _ANO)
+        _DB.commit()
     return e
 
 
@@ -432,16 +439,19 @@ def _():
 
 @test("A4-14 una ausencia desconocida NO se convierte en 0")
 def _():
-    # Con dias trabajados declarados sale un numero; sin ellos, None.
+    # ASISTENCIA CANÓNICA · con lista completa sale un número; con días
+    # lectivos SIN lista (se alarga el año una semana), None: nunca 0 %.
     con = fila(_E_PROM)['porcentaje_ausencias_no_justificadas']
-    assert con is not None, 'con dias declarados debe calcularse'
-    _ANO.set_dias_trabajados({})
+    assert con is not None, 'con cobertura completa debe calcularse'
+    import datetime as _dt
+    _fin = _ANO.fecha_fin
+    _ANO.fecha_fin = _fin + _dt.timedelta(days=7)
     _DB.commit()
     try:
         sin = fila(_E_PROM)['porcentaje_ausencias_no_justificadas']
-        igual(sin, None, 'sin denominador fiable, None; nunca 0%')
+        igual(sin, None, 'con dias sin dato, None; nunca 0%')
     finally:
-        _ANO.set_dias_trabajados(DIAS)
+        _ANO.fecha_fin = _fin
         _DB.commit()
 
 
@@ -1112,6 +1122,7 @@ _DB2.flush()
 _ANO_A = M.AnoEscolar(colegio_id=_COL2.id, nombre='2025-2026', activo=False,
                       cerrado=True)
 _ANO_A.set_dias_trabajados(DIAS)
+fechar_ano(_ANO_A)
 # Ano B: el destino. Activo y sin una sola calificacion.
 _ANO_B = M.AnoEscolar(colegio_id=_COL2.id, nombre='2026-2027', activo=True,
                       cerrado=False)
@@ -1128,6 +1139,8 @@ _DB2.flush()
 _EST2 = M.Estudiante(colegio_id=_COL2.id, matricula='A4Y-1', nombre='E',
                      apellido='S', curso_id=_CURSO2.id, activo=True)
 _DB2.add(_EST2)
+_DB2.flush()
+asistencia_completa(_DB2, M, _EST2, _CURSO2.id, _COL2.id, _ANO_A)
 _DB2.flush()
 for _cod in AREAS_SEC:
     _a = M.Asignatura(colegio_id=_COL2.id, nombre=_cod, codigo=_cod[:10],
@@ -1226,6 +1239,7 @@ def _():
     ano = M.AnoEscolar(colegio_id=col.id, nombre='2025-2026', activo=True,
                        cerrado=False)
     ano.set_dias_trabajados(DIAS)
+    fechar_ano(ano)
     grd = M.Grado(colegio_id=col.id, nombre='2do Primaria', nivel='primaria',
                   orden=8, activo=True)
     _DB2.add_all([ano, grd])
@@ -1240,6 +1254,7 @@ def _():
                        apellido='S', curso_id=c.id, activo=True)
     _DB2.add(est)
     _DB2.flush()
+    asistencia_completa(_DB2, M, est, c.id, col.id, ano)
     for cod in AD.curriculo_oficial_esperado(RA.NIVEL_PRIMARIA, 2)[0]:
         a = M.Asignatura(colegio_id=col.id, nombre=cod, codigo=cod[:10],
                          area='X', area_curricular_codigo=cod, activo=True)

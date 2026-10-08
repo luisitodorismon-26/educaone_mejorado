@@ -565,12 +565,67 @@ with client:
     # ═══════════════════════════════════════════════════════════════════
     print("\n=== AUDIT · CIERRE DE LA UI Y DEL CSV ===")
 
-    # 1A · El CSV nunca fue suyo, y ahora tampoco se le ofrece.
-    r = client.post('/api/estudiantes/importar', files={
-        'archivo': ('x.csv', b'nombre,apellido' + bytes([10]), 'text/csv')},
-        data={'curso_id': str(CURSOS['A'])}, headers=auth(SEC))
-    check('AU-01 la importacion CSV sigue cerrada a Secretaria',
-          r.status_code == 403, '-> %d' % r.status_code)
+    # 1A · PILOTO-2026 · Secretaría SÍ importa por CSV: es un alta en lote y
+    # el alta individual ya era suya. No le abre notas, asistencia ni
+    # condición académica.
+    def _csv(texto):
+        return {'archivo': ('e.csv', texto.encode('utf-8'), 'text/csv')}
+
+    _antes = len(client.get('/api/estudiantes', headers=auth(SEC)).json())
+    _bueno = ('nombre,apellido,matricula,no_lista,genero,condicion_entrada,'
+              'escuela_procedencia\n'
+              'Ana,CSV,CSV-001,91,F,nuevo,\n'
+              'Luis,CSV,CSV-002,92,M,transferido,Escuela X\n')
+    r = client.post('/api/estudiantes/importar', files=_csv(_bueno),
+                    data={'curso_id': str(CURSOS['A']), 'modo': 'preview'},
+                    headers=auth(SEC))
+    check('AU-01 Secretaria puede PREVISUALIZAR un CSV',
+          r.status_code == 200 and r.json().get('validas') == 2
+          and r.json().get('errores') == [], '-> %d %s' % (r.status_code, r.text[:120]))
+    _despues_prev = len(client.get('/api/estudiantes', headers=auth(SEC)).json())
+    check('AU-01b la previsualizacion NO escribe nada', _despues_prev == _antes,
+          '%d -> %d' % (_antes, _despues_prev))
+
+    _malo = ('nombre,apellido,matricula,no_lista,genero\n'
+             'Eva,CSV,CSV-003,93,F\n'
+             ',SinNombre,CSV-004,94,M\n')
+    r = client.post('/api/estudiantes/importar', files=_csv(_malo),
+                    data={'curso_id': str(CURSOS['A'])}, headers=auth(SEC))
+    _tras_malo = len(client.get('/api/estudiantes', headers=auth(SEC)).json())
+    check('AU-01c TODO O NADA: una fila mala y no entra ninguna',
+          r.status_code == 400 and _tras_malo == _antes
+          and len(r.json().get('errores') or []) == 1,
+          '-> %d, %d -> %d' % (r.status_code, _antes, _tras_malo))
+
+    r = client.post('/api/estudiantes/importar', files=_csv(_bueno),
+                    data={'curso_id': str(CURSOS['A'])}, headers=auth(SEC))
+    check('AU-01d Secretaria importa el CSV valido',
+          r.status_code == 200 and r.json().get('importados') == 2,
+          '-> %d %s' % (r.status_code, r.text[:120]))
+    _imp = [e for e in client.get('/api/estudiantes', headers=auth(SEC)).json()
+            if (e.get('matricula') or '').startswith('CSV-')]
+    check('AU-01e las fichas entran ACTIVAS: la condicion no la decide el CSV',
+          len(_imp) == 2 and all(e.get('condicion') == 'activo' for e in _imp),
+          str([e.get('condicion') for e in _imp]))
+    _tr = [e for e in _imp if e.get('matricula') == 'CSV-002']
+    check('AU-01f y el trasladado guarda su condicion de entrada y procedencia',
+          _tr and _tr[0].get('condicion_entrada') == 'transferido'
+          and _tr[0].get('escuela_procedencia') == 'Escuela X', str(_tr))
+    r = client.post('/api/estudiantes/importar', files=_csv(_bueno),
+                    data={'curso_id': str(CURSOS['A'])}, headers=auth(SEC))
+    check('AU-01g reimportar el mismo CSV no duplica: matricula repetida',
+          r.status_code == 400 and r.json().get('importados') == 0, '-> %d' % r.status_code)
+    r = client.post('/api/estudiantes/importar', files=_csv(_bueno),
+                    data={'curso_id': str(CURSOS['A'])}, headers=auth(SEC_B))
+    check('AU-01h la secretaria de B no importa en un curso de A',
+          r.status_code in (403, 404), '-> %d' % r.status_code)
+    _vieja = 'nombre,apellido,condicion\nZoe,CSV,Promovido\n'
+    r = client.post('/api/estudiantes/importar', files=_csv(_vieja),
+                    data={'curso_id': str(CURSOS['A']), 'modo': 'preview'},
+                    headers=auth(SEC))
+    check('AU-01i la plantilla vieja (columna condicion) se lee como ENTRADA',
+          r.status_code == 200 and r.json()['filas'][0]['condicion_entrada'] == 'promovido',
+          r.text[:120])
 
     # 1B · Retirados: ve la lista, para poder reactivar desde la pantalla.
     r = client.get('/api/estudiantes/retirados', headers=auth(SEC))

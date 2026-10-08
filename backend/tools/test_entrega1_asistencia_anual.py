@@ -152,10 +152,10 @@ r = anual(e_a)
 check('E1-A1 cinco presentes = cinco asistencias',
       r['presentes'] == 5 and r['asistencias'] == 5, str(r['asistencias']))
 check('E1-A2 sin ausencias, la ausencia anual es 0 %',
-      r['ausencias'] == 0 and r['excusas'] == 0 and r['pct_ausencia'] == 0.0,
-      str(r['pct_ausencia']))
-check('E1-A3 asistencia perfecta = 100 %', r['pct_asistencia'] == 100.0,
-      str(r['pct_asistencia']))
+      r['ausencias'] == 0 and r['excusas'] == 0 and r['pct_ausencia_registrado'] == 0.0,
+      str(r['pct_ausencia_registrado']))
+check('E1-A3 asistencia perfecta = 100 %', r['pct_asistencia_registrado'] == 100.0,
+      str(r['pct_asistencia_registrado']))
 
 # ── B. Presente + tardanza ─────────────────────────────────────────────
 e_b = nuevo_estudiante(COL, C_PRI, 'B')
@@ -170,8 +170,8 @@ check('E1-B1 la tardanza CUENTA como asistencia',
       'asistencias=%d tardanzas=%d' % (r['asistencias'], r['tardanzas']))
 check('E1-B2 y no se disfraza de presente: se distinguen',
       r['presentes'] == 3, str(r['presentes']))
-check('E1-B3 llegar tarde no genera ausencia', r['pct_ausencia'] == 0.0,
-      str(r['pct_ausencia']))
+check('E1-B3 llegar tarde no genera ausencia', r['pct_ausencia_registrado'] == 0.0,
+      str(r['pct_ausencia_registrado']))
 
 # ── C. Ausencia injustificada ──────────────────────────────────────────
 e_c = nuevo_estudiante(COL, C_PRI, 'C')
@@ -184,11 +184,22 @@ r = anual(e_c)
 check('E1-C1 cuatro ausencias injustificadas, contadas aparte',
       r['ausencias'] == 4 and r['excusas'] == 0,
       'ausencias=%d excusas=%d' % (r['ausencias'], r['excusas']))
-check('E1-C2 la ausencia se mide contra los días hábiles declarados',
-      r['base_porcentaje'] == 'dias_trabajados'
-      and r['dias_trabajados'] == TOTAL_DIAS
-      and r['pct_ausencia'] == round(4 / TOTAL_DIAS * 100, 1),
-      '%s%% de %d' % (r['pct_ausencia'], TOTAL_DIAS))
+# ASISTENCIA CANÓNICA · el día sin lista es SIN DATO: el porcentaje es sobre
+# los días CON dato y la cobertura dice sobre cuántos de los lectivos se sabe.
+check('E1-C2 la ausencia se mide sobre los días CON dato, no sobre los declarados',
+      r['base_porcentaje'] is None
+      and r['dias_computados'] == 8
+      and r['pct_ausencia_registrado'] == 50.0,
+      '%s%% de %d' % (r['pct_ausencia_registrado'], r['dias_computados']))
+check('E1-C2c con cobertura incompleta NO hay porcentaje oficial: N/D',
+      r['pct_asistencia'] is None and r['pct_ausencia'] is None
+      and r['cobertura_completa'] is False, str(r['pct_asistencia']))
+check('E1-C2b y los días lectivos sin lista quedan como SIN DATO, a la vista',
+      r['dias_lectivos'] > r['dias_computados']
+      and r['sin_dato'] == r['dias_lectivos'] - r['dias_computados']
+      and r['cobertura_pct'] < 100,
+      'lectivos=%s sin_dato=%s cobertura=%s' % (
+          r['dias_lectivos'], r['sin_dato'], r['cobertura_pct']))
 
 # ── D. Excusa ──────────────────────────────────────────────────────────
 e_d = nuevo_estudiante(COL, C_PRI, 'D')
@@ -204,8 +215,8 @@ check('E1-D1 la excusa es ausencia JUSTIFICADA, nunca presente',
       % (r['excusas'], r['ausencias'], r['presentes']))
 # C y D faltaron los mismos días; lo que cambia es el MOTIVO, no el total.
 check('E1-D2 justificada o no, el día perdido cuenta igual en el total',
-      anual(e_d)['pct_ausencia'] == anual(e_c)['pct_ausencia'],
-      str(r['pct_ausencia']))
+      anual(e_d)['pct_ausencia_registrado'] == anual(e_c)['pct_ausencia_registrado'],
+      str(r['pct_ausencia_registrado']))
 check('E1-D3 pero el desglose NO mezcla las dos ausencias',
       anual(e_c)['ausencias'] == 4 and anual(e_c)['excusas'] == 0
       and anual(e_d)['ausencias'] == 0 and anual(e_d)['excusas'] == 4, '')
@@ -227,8 +238,8 @@ check('E1-E2 asistencias = presentes + tardanzas', r['asistencias'] == 6,
 check('E1-E3 los diez días quedan todos contados',
       r['dias_computados'] == 10, str(r['dias_computados']))
 check('E1-E4 asistencia y ausencia son complementarias',
-      abs(r['pct_asistencia'] + r['pct_ausencia'] - 100.0) < 0.05,
-      '%s + %s' % (r['pct_asistencia'], r['pct_ausencia']))
+      abs(r['pct_asistencia_registrado'] + r['pct_ausencia_registrado'] - 100.0) < 0.05,
+      '%s + %s' % (r['pct_asistencia_registrado'], r['pct_ausencia_registrado']))
 
 
 print("\n=== F · SECUNDARIA: UN DÍA ES UN DÍA, NO UNA CLASE ===")
@@ -256,7 +267,7 @@ check('E1-F3 los conteos suman los días, no las clases',
 #   día 2 = presente/tardanza/presente  -> el estudiante vino
 #   día 5 = presente/presente/ausente   -> también vino, aunque faltara a una
 #           clase suelta. La prioridad describe al ESTUDIANTE, no a la materia.
-_dias = APP._dias_asistencia_del_ano(db, e_f.id, DIR, ANO)
+_dias = APP._asistencia_canonica_boletin(db, e_f.id, DIR, ANO)['dias']
 check('E1-F4 un día presente/tardanza/presente cuenta como presente',
       _dias[D[1]] == 'presente', str(_dias[D[1]]))
 check('E1-F4b faltar a UNA materia no convierte el día en ausencia',
@@ -268,8 +279,8 @@ check('E1-F4d el reparto final es el de los días, no el de las filas',
       == (4, 1, 2, 2), str((r['presentes'], r['tardanzas'],
                             r['ausencias'], r['excusas'])))
 check('E1-F5 y el porcentaje no se multiplica por el número de materias',
-      0 <= r['pct_asistencia'] <= 100 and 0 <= r['pct_ausencia'] <= 100,
-      '%s / %s' % (r['pct_asistencia'], r['pct_ausencia']))
+      0 <= r['pct_asistencia_registrado'] <= 100 and 0 <= r['pct_ausencia_registrado'] <= 100,
+      '%s / %s' % (r['pct_asistencia_registrado'], r['pct_ausencia_registrado']))
 check('E1-F6 el desglose anual coincide con la suma de los períodos',
       sum((APP._construir_asistencias_boletin(db, e_f.id, DIR, ANO)
            .get('p%d' % p) or {}).get('asistencia', 0) for p in range(1, 5))
@@ -284,13 +295,13 @@ r = anual(e_g)
 check('E1-G1 se declara explícitamente que no hay datos',
       r['sin_registros'] is True, '')
 check('E1-G2 el porcentaje es None, NO 0',
-      r['pct_asistencia'] is None and r['pct_ausencia'] is None,
-      '%s / %s' % (r['pct_asistencia'], r['pct_ausencia']))
+      r['pct_asistencia_registrado'] is None and r['pct_ausencia_registrado'] is None,
+      '%s / %s' % (r['pct_asistencia_registrado'], r['pct_ausencia_registrado']))
 check('E1-G3 sin base declarada tampoco se inventa una',
       r['base_porcentaje'] is None, str(r['base_porcentaje']))
 check('E1-G4 y quien SÍ tiene cero ausencias se distingue del que no tiene datos',
       anual(e_a)['sin_registros'] is False
-      and anual(e_a)['pct_ausencia'] == 0.0, '')
+      and anual(e_a)['pct_ausencia_registrado'] == 0.0, '')
 
 # El PDF de Primaria tampoco puede imprimir ceros inventados.
 _pdf_vacio = APP._construir_asistencias_boletin(db, e_g.id, DIR, ANO)
@@ -324,8 +335,8 @@ check('E1-H2 el boletín de B ve solo los días de B',
       rb['dias_computados'] == 7 and rb['presentes'] == 0,
       'dias=%d presentes=%d' % (rb['dias_computados'], rb['presentes']))
 check('E1-H3 nunca notas de A con asistencia de B',
-      ra['pct_asistencia'] == 100.0 and rb['pct_asistencia'] < 100.0,
-      'A=%s B=%s' % (ra['pct_asistencia'], rb['pct_asistencia']))
+      ra['pct_asistencia_registrado'] == 100.0 and rb['pct_asistencia_registrado'] < 100.0,
+      'A=%s B=%s' % (ra['pct_asistencia_registrado'], rb['pct_asistencia_registrado']))
 
 
 print("\n=== I · AISLAMIENTO ENTRE COLEGIOS ===")
@@ -353,9 +364,9 @@ for et, est, ano_ in (('A', e_a, ANO), ('E', e_e, ANO), ('F', e_f, ANO),
                       ('H', e_h, ANO_B), ('C', e_c, ANO)):
     rr = anual(est, ano_)
     ok = all(v is None or 0.0 <= v <= 100.0
-             for v in (rr['pct_asistencia'], rr['pct_ausencia']))
+             for v in (rr['pct_asistencia_registrado'], rr['pct_ausencia_registrado']))
     check('E1-J-%s los dos porcentajes caen en 0..100' % et, ok,
-          '%s / %s' % (rr['pct_asistencia'], rr['pct_ausencia']))
+          '%s / %s' % (rr['pct_asistencia_registrado'], rr['pct_ausencia_registrado']))
 
 # Denominador de respaldo: un año SIN días hábiles declarados.
 ANO_SD = nuevo_ano(COL, '2024-2025', dt.date(2024, 8, 19), dt.date(2025, 6, 13),
@@ -366,12 +377,12 @@ for i, est in enumerate(['presente'] * 8 + ['ausente'] * 2):
     marcar(COL, e_j, C_SD, dt.date(2024, 9, 2) + dt.timedelta(days=i), est)
 db.commit()
 rj = anual(e_j, ANO_SD)
-check('E1-J-base sin días hábiles declarados se usa el respaldo, DECLARADO',
-      rj['base_porcentaje'] == 'dias_con_registro'
-      and rj['dias_trabajados'] is None, str(rj['base_porcentaje']))
+check('E1-J-base sin días hábiles declarados nada cambia: sin cobertura no hay base oficial',
+      rj['base_porcentaje'] is None and rj['cobertura_completa'] is False,
+      str(rj['base_porcentaje']))
 check('E1-J-base2 y el respaldo también da complementarios que suman 100',
-      rj['pct_ausencia'] == 20.0 and rj['pct_asistencia'] == 80.0,
-      '%s / %s' % (rj['pct_asistencia'], rj['pct_ausencia']))
+      rj['pct_ausencia_registrado'] == 20.0 and rj['pct_asistencia_registrado'] == 80.0,
+      '%s / %s' % (rj['pct_asistencia_registrado'], rj['pct_ausencia_registrado']))
 
 # Declaración incoherente: menos días hábiles que días con lista pasada.
 ANO_INC = nuevo_ano(COL, '2023-2024', dt.date(2023, 8, 21), dt.date(2024, 6, 14),
@@ -384,10 +395,11 @@ for i in range(8):
            'presente' if i < 6 else 'ausente')
 db.commit()
 rk = anual(e_k, ANO_INC)
-check('E1-J-inc una declaración que no sostiene los datos no se usa',
-      rk['base_porcentaje'] == 'dias_con_registro', str(rk['base_porcentaje']))
-check('E1-J-inc2 y el porcentaje sigue siendo posible', 0 <= rk['pct_ausencia'] <= 100,
-      str(rk['pct_ausencia']))
+check('E1-J-inc `dias_trabajados` ya no es denominador: decide la cobertura',
+      rk['base_porcentaje'] is None and rk['pct_ausencia'] is None,
+      str(rk['base_porcentaje']))
+check('E1-J-inc2 y el porcentaje sigue siendo posible', 0 <= rk['pct_ausencia_registrado'] <= 100,
+      str(rk['pct_ausencia_registrado']))
 
 
 print("\n=== K · WEB, PDF INDIVIDUAL Y PDF DE CURSO DICEN LO MISMO ===")
@@ -480,9 +492,8 @@ _r = anual(e_e)
 check('E1-PDF9 el PDF de Primaria se genera y tiene 2 páginas',
       len(PdfReader(APP._generar_pdf_primaria(db, e_e, DIR, ANO, None)).pages) == 2,
       '')
-check('E1-PDF10 el porcentaje anual aparece impreso en el PDF',
-      ('%d%%' % round(_r['pct_asistencia'])) in txt,
-      '%d%%' % round(_r['pct_asistencia']))
+check('E1-PDF10 cobertura incompleta: la celda anual dice N/D, no un %',
+      _r['pct_asistencia'] is None and 'N/D' in txt, '')
 
 buf_s = generar_boletin_secundaria_minerd(
     estudiante=e_f, curso=C_SEC, calificaciones_por_asig={},
@@ -531,9 +542,13 @@ check('E1-PDF18 con el mismo desglose que el MINERD y la web',
       ('Asistencias: %d' % _rf['asistencias']) in txt_p
       and ('Tardanzas: %d' % _rf['tardanzas']) in txt_p
       and ('Excusas: %d' % _rf['excusas']) in txt_p, '')
-check('E1-PDF19 y el mismo porcentaje',
-      ('%.1f%%' % _rf['pct_asistencia']) in txt_p,
-      '%.1f%%' % _rf['pct_asistencia'])
+check('E1-PDF19 y la misma cobertura, sin porcentaje oficial',
+      'Porcentaje: N/D' in txt_p
+      and ('Cobertura: %d de %d días registrados'
+           % (_rf['dias_computados'], _rf['dias_lectivos'])) in txt_p, '')
+check('E1-PDF19b el MINERD separa PORCENTAJE de COBERTURA',
+      'N/D' in txt_s and ('Cobertura: %d de %d' % (_rf['dias_computados'],
+                                                   _rf['dias_lectivos'])) in txt_s, '')
 
 buf_pv = generar_boletin_padres(
     estudiante=e_g, curso=C_PRI, asignaturas_data=_asig_data, config=None,
@@ -558,13 +573,14 @@ check('E1-Z1 los candados de Cierre, en su estado de release',
       APP.CIERRE_ANO_BLOQUEADO is False
       and APP.PROMOCION_LEGACY_BLOQUEADA is True,
       'ENTREGA-1 no los movio')
-check('E1-Z2 una sola deduplicación: los helpers la comparten',
-      'self' not in inspect.getsource(APP._dias_asistencia_de_filas)
-      and '_dias_asistencia_del_ano' in inspect.getsource(
-          APP._construir_asistencias_boletin), '')
-check('E1-Z3 el denominador sale del módulo congelado A3',
-      'RAC.sumar_dias_trabajados' in inspect.getsource(
-          APP._resumen_anual_asistencia), '')
+check('E1-Z2 una sola fuente: período y anual salen de la asistencia canónica',
+      '_asistencia_canonica_boletin' in inspect.getsource(
+          APP._construir_asistencias_boletin)
+      and '_asistencia_canonica_boletin' in inspect.getsource(
+          APP._asistencia_anual_boletin), '')
+check('E1-Z3 y A2 lee la MISMA función que el boletín',
+      'ASIS.resolver' in inspect.getsource(APP._contexto_canonico)
+      and 'ASIS.resolver' in inspect.getsource(APP._asistencia_canonica), '')
 
 print()
 print("=" * 96)
