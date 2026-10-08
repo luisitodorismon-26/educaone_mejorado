@@ -31,7 +31,7 @@ BK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BK)
 sys.path.insert(0, os.path.join(BK, "tools"))
 
-from test_utils import aislar_base_de_datos  # noqa: E402
+from test_utils import aislar_base_de_datos, fechar_ano, asistencia_completa  # noqa: E402
 
 TMP = aislar_base_de_datos('c_core1')
 
@@ -100,6 +100,9 @@ A = M.AnoEscolar(colegio_id=COL.id, nombre='2025-2026', activo=False, cerrado=Tr
 B = M.AnoEscolar(colegio_id=COL.id, nombre='2026-2027', activo=True, cerrado=False)
 A.set_dias_trabajados(DIAS)
 B.set_dias_trabajados(DIAS)
+# ASISTENCIA CANÓNICA · el año de origen necesita fechas para tener días
+# lectivos, y cada alumno su lista completa (ver `alumno`).
+fechar_ano(A)
 db.add_all([A, B])
 db.flush()
 
@@ -177,6 +180,9 @@ def alumno(c=None, activo=True, colegio=None):
                      activo=activo, condicion='activo')
     db.add(e)
     db.commit()
+    if c is not None and c.ano_escolar_id == A.id:
+        asistencia_completa(db, M, e, c.id, (colegio or COL).id, A)
+        db.commit()
     return e
 
 

@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Set
 
 from sqlalchemy.orm import Session
 
+import asistencia_canonica as ASIS
 from models import (
     AnoEscolar,
     Asistencia,
@@ -186,6 +187,18 @@ def build_asistencia_registro(
         q = q.filter(Asistencia.asignatura_id == asignatura_id)
 
     registros = q.all()
+
+    # ASISTENCIA CANÓNICA · primera lista de cada estudiante en el año, en
+    # CUALQUIER curso o materia: es lo que usa el motor para decidir desde
+    # cuándo le cuenta la asistencia a quien se dio de alta tarde. Una sola
+    # consulta agrupada para todo el curso.
+    from sqlalchemy import func as _func
+    _desde = getattr(ano, 'fecha_inicio', None) if ano else None
+    _qp = db.query(Asistencia.estudiante_id, _func.min(Asistencia.fecha)).filter(
+        Asistencia.estudiante_id.in_(est_ids))
+    if _desde is not None:
+        _qp = _qp.filter(Asistencia.fecha >= _desde)
+    primera_por_est = dict(_qp.group_by(Asistencia.estudiante_id).all())
     if not registros and not fechas_esperadas_por_mes:
         return []
 
@@ -279,16 +292,35 @@ def build_asistencia_registro(
         # tiene que llenarse: contarla como celda esperada haria que el validador
         # pidiera asistencia de una clase que no se dio, que es justo lo que S1
         # viene a evitar.
-        celdas_esperadas = dias_computables * len(estudiantes)
+        # ASISTENCIA CANÓNICA · la fecha real de cada columna, para saber si
+        # ese día le APLICA al estudiante (inicio del año o alta / retiro).
+        fecha_por_dia = {}
+        for _f in sorted(fechas_mes):
+            fecha_por_dia.setdefault(_f.day, _f)
+
+        celdas_esperadas = 0
         celdas_con_registro = 0
 
         for est in estudiantes:
             valores = []
             presentes = 0
+            tardanzas = 0
             ausentes = 0
+            con_dato = 0
+            esperadas_est = 0
 
             for dia in dias_unicos:
                 codigo = por_mes.get(mes_num, {}).get(dia, {}).get(est.id, '')
+                _fecha_col = fecha_por_dia.get(dia)
+                # NO APLICA: antes de que el estudiante perteneciera al centro o
+                # después de su retiro. La celda se marca «-» y no cuenta para
+                # nada: ni numerador, ni denominador, ni cobertura. Una marca
+                # que exista igual se conserva a la vista —no se oculta
+                # historia— pero tampoco se suma.
+                if _fecha_col is not None and not ASIS.aplica_en(
+                        ano, est, _fecha_col, primera_por_est.get(est.id)):
+                    valores.append(codigo or '-')
+                    continue
                 valores.append(codigo)
                 # S1 — UN DIA NO IMPARTIDO NO CUENTA PARA NADIE. Queda fuera del
                 # numerador, del denominador y de la cobertura: si no hubo clase,
@@ -299,21 +331,37 @@ def build_asistencia_registro(
                 # app.py; esto cubre lo que pudiera venir de antes.
                 if dia in sesiones_mes:
                     continue
+                celdas_esperadas += 1
+                esperadas_est += 1
                 if codigo:
                     celdas_con_registro += 1
+                    con_dato += 1
                 if codigo == 'P':
                     presentes += 1
+                elif codigo == 'T':
+                    tardanzas += 1
                 elif codigo == 'A':
                     ausentes += 1
 
-            porcentaje = round((presentes / dias_computables) * 100, 1) if dias_computables > 0 else 0.0
+            # ASISTENCIA CANÓNICA · la celda vacía es SIN DATO, no ausencia, y
+            # la tardanza es asistencia, como en el boletín y en A2. El
+            # porcentaje es OFICIAL solo con cobertura completa del mes para
+            # ese estudiante; con huecos no se imprime (None): ni un 0 que diga
+            # «no vino nunca» ni un 100 sacado de pocos días.
+            cobertura_completa = esperadas_est > 0 and con_dato == esperadas_est
+            porcentaje = (round(((presentes + tardanzas) / con_dato) * 100, 1)
+                          if cobertura_completa else None)
             filas.append({
                 'no': est_index[est.id],
                 'estudiante_id': est.id,
                 'nombre': est.nombre_completo,
                 'valores': valores,
                 'presentes': presentes,
+                'tardanzas': tardanzas,
                 'ausentes': ausentes,
+                'con_dato': con_dato,
+                'dias_aplicables': esperadas_est,
+                'cobertura_completa': cobertura_completa,
                 'porcentaje': porcentaje,
             })
 

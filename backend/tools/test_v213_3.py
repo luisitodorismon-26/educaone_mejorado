@@ -104,13 +104,15 @@ db.commit()
 
 result = _construir_asistencias_boletin(db, 1, director, ano)
 total_asis = sum((result.get(f'p{p}') or {}).get('asistencia', 0) for p in range(1, 5))
-print(f"Total presencias (esperado 1, mapeada al período más cercano): {total_asis}")
-assert total_asis == 1, f"❌ Asistencia perdida, esperaba 1 dio {total_asis}"
-# Debería caer en P4 (el más cercano)
-p4_asis = (result.get('p4') or {}).get('asistencia', 0)
-print(f"En P4 (esperado 1): {p4_asis}")
-assert p4_asis == 1, f"❌ No cayó en P4, dio {result}"
-print("✅ Test 2 OK — fechas fuera de rango se mapean al período más cercano")
+# ASISTENCIA CANÓNICA · un día dentro del año pero fuera de TODOS los rangos
+# P1-P4 ya no se asigna al «período más cercano» (eso era inventar el
+# período). Se conserva en el ANUAL y no cae en ningún período.
+from app import _asistencia_anual_boletin
+anual = _asistencia_anual_boletin(db, 1, director, ano)
+print(f"Presencias en períodos (esperado 0): {total_asis}; en el anual (esperado 1): {anual['asistencias']}")
+assert total_asis == 0, f"❌ Se asignó a un período inventado: {result}"
+assert anual['asistencias'] == 1, f"❌ Asistencia perdida del anual: {anual}"
+print("✅ Test 2 OK — fuera de rango: cuenta en el anual, no se inventa período")
 
 # Test 3: stats_service lee CalificacionSecundaria
 print("\n=== Test 3: get_stats_cursos lee CalificacionSecundaria ===")

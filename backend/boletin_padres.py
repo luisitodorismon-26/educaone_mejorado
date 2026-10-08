@@ -287,6 +287,12 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
             if _pa is not None and _pau is not None:
                 _txt += ('   ·   Asistencia: %.1f%%   ·   Ausencia: %.1f%%'
                          % (_pa, _pau))
+            else:
+                _txt += '   ·   Porcentaje: N/D'
+            _lect = asistencia_anual.get('dias_lectivos')
+            if _lect:
+                _txt += ('   ·   Cobertura: %d de %d días registrados'
+                         % (asistencia_anual.get('dias_computados') or 0, _lect))
             c.drawString(margin + 94, row_y + 3, _txt)
 
     # ─── Nota aclaratoria ───

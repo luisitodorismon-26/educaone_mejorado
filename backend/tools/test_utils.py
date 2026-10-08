@@ -257,3 +257,50 @@ def verificar_engine_aislado(engine, tmpdir):
             % ('; '.join(problemas), db_real or engine.url, esperado))
         raise SystemExit(9)
     return True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ASISTENCIA CANÓNICA · fixtures
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Desde la asistencia canónica, un día lectivo SIN lista no cuenta como
+# presente: A2 solo certifica con cobertura COMPLETA. Las suites que prueban
+# otra cosa (Cierre, promoción, boletines) necesitan entonces que sus
+# estudiantes tengan asistencia real, o quedarían todos EN_PROCESO por
+# asistencia y lo que prueban dejaría de verse.
+#
+# Una semana lectiva YA PASADA basta: la ventana de asistencia termina hoy, y
+# una semana en el futuro no tendría días que evaluar.
+
+def semana_lectiva_pasada():
+    """(lunes, viernes) de una semana fija ya pasada, igual para todas las
+    suites: 2026-03-02 .. 2026-03-06."""
+    import datetime as _dt
+    return _dt.date(2026, 3, 2), _dt.date(2026, 3, 6)
+
+
+def fechar_ano(ano):
+    """Le da al año la semana lectiva de prueba si no tiene fechas."""
+    ini, fin = semana_lectiva_pasada()
+    if getattr(ano, 'fecha_inicio', None) is None:
+        ano.fecha_inicio = ini
+    if getattr(ano, 'fecha_fin', None) is None:
+        ano.fecha_fin = fin
+    return ano
+
+
+def asistencia_completa(db, M, estudiante, curso_id, colegio_id, ano,
+                        estado='presente'):
+    """Una marca por cada día hábil del año (hasta hoy) para ese estudiante."""
+    import datetime as _dt
+    if ano is None or ano.fecha_inicio is None or ano.fecha_fin is None:
+        return 0
+    fin = min(ano.fecha_fin, _dt.date.today())
+    d, n = ano.fecha_inicio, 0
+    while d <= fin:
+        if d.weekday() < 5:
+            db.add(M.Asistencia(colegio_id=colegio_id, estudiante_id=estudiante.id,
+                                curso_id=curso_id, fecha=d, estado=estado))
+            n += 1
+        d += _dt.timedelta(days=1)
+    return n

@@ -78,101 +78,71 @@ estado = {e['nombre']: e['cantidad'] for e in r['estado_estudiantes']}
 assert estado.get('Aprobados', 0) > 0, f"❌ Sin aprobados, estado: {estado}"
 print(f"✅ Aprobados: {estado.get('Aprobados')}, Reprobados: {estado.get('Reprobados')}, En Proceso: {estado.get('En Proceso')}")
 
-# ─── Test 3: asistencia con dias_trabajados ───
-print("\n=== Test 3: asistencia con dias_trabajados configurados ===")
-# Configurar dias_trabajados: mayo = 20 días hábiles
-ano.set_dias_trabajados({'may': 20})
-db.commit()
-
-# Estudiante 1: 18 presentes en mayo, 2 ausentes
-import calendar
-mes_actual = 5
-ano_actual = 2026
-for dia in range(1, 19):
-    a = Asistencia(colegio_id=1, estudiante_id=1, curso_id=1,
-                   fecha=date(ano_actual, mes_actual, dia), estado='presente')
-    db.add(a)
-for dia in [19, 20]:
-    a = Asistencia(colegio_id=1, estudiante_id=1, curso_id=1,
-                   fecha=date(ano_actual, mes_actual, dia), estado='ausente')
-    db.add(a)
-db.commit()
-
+# ─── Test 3-5: /academico usa la ASISTENCIA CANÓNICA ───
+# Antes esta pantalla dividía entre `dias_trabajados` del mes (o entre los
+# días con registro). Ahora dice exactamente lo mismo que el boletín: días
+# lectivos del colegio, un día sin lista es SIN DATO y el % solo existe con
+# cobertura completa del mes.
 import app
 from unittest.mock import MagicMock
 
+mes_actual = 5
+ano_actual = 2026
 req = MagicMock()
 req.query_params = {'mes': str(mes_actual), 'ano': str(ano_actual)}
-result = asyncio.run(app.get_resumen_asistencia_por_periodos(
-    1, req, db=db, current_user=director
-))
-print(f"Resultado completo del estudiante 1: {[r for r in result if r['estudiante_id']==1]}")
-est1 = next(r for r in result if r['estudiante_id'] == 1)
-print(f"  dias_trabajados_mes: {est1['dias_trabajados_mes']}")
-print(f"  asistencia_mes: {est1['asistencia_mes']}")
-print(f"  pct_asistencia_mes: {est1['pct_asistencia_mes']}")
-print(f"  _usa_dias_trabajados: {est1['_usa_dias_trabajados']}")
 
-# 18 / 20 = 90%
-assert est1['_usa_dias_trabajados'] is True
-assert est1['dias_trabajados_mes'] == 20
-assert est1['asistencia_mes'] == 18
-expected = round(18 / 20 * 100, 0)  # 90
-assert est1['pct_asistencia_mes'] == expected, f"❌ Esperaba {expected}%, dio {est1['pct_asistencia_mes']}"
-print(f"✅ % = 18/20 × 100 = {est1['pct_asistencia_mes']}% ✓")
 
-# ─── Test 4: fallback cuando NO hay dias_trabajados ───
-print("\n=== Test 4: fallback sin dias_trabajados ===")
-# Reset asistencias estudiante 1 y cargarlas en días distintos
-db.query(Asistencia).filter(Asistencia.estudiante_id == 1).delete()
-db.commit()
-# 18 presentes (días 1-18) y 2 ausentes (días 19, 20)
-for dia in range(1, 19):
-    a = Asistencia(colegio_id=1, estudiante_id=1, curso_id=1,
-                   fecha=date(ano_actual, mes_actual, dia), estado='presente')
-    db.add(a)
-for dia in [19, 20]:
-    a = Asistencia(colegio_id=1, estudiante_id=1, curso_id=1,
-                   fecha=date(ano_actual, mes_actual, dia), estado='ausente')
-    db.add(a)
-db.commit()
+def fila_de(est_id):
+    res = asyncio.run(app.get_resumen_asistencia_por_periodos(
+        1, req, db=db, current_user=director))
+    return next(r for r in res if r['estudiante_id'] == est_id)
 
-ano.set_dias_trabajados({})  # vaciar
-db.commit()
 
-result2 = asyncio.run(app.get_resumen_asistencia_por_periodos(
-    1, req, db=db, current_user=director
-))
-est1_b = next(r for r in result2 if r['estudiante_id'] == 1)
-print(f"  _usa_dias_trabajados: {est1_b['_usa_dias_trabajados']}")
-print(f"  asistencia_mes: {est1_b['asistencia_mes']}, ausencia_mes: {est1_b['ausencia_mes']}")
-print(f"  pct_asistencia_mes: {est1_b['pct_asistencia_mes']}")
-assert est1_b['_usa_dias_trabajados'] is False
-# 18 / (18+2) = 90
-assert est1_b['pct_asistencia_mes'] == 90, f"Esperaba 90, dio {est1_b['pct_asistencia_mes']}"
-print(f"✅ Fallback: 18/(18+2) × 100 = {est1_b['pct_asistencia_mes']}% ✓")
+def habiles_mayo(desde, hasta):
+    return [date(ano_actual, mes_actual, d) for d in range(desde, hasta + 1)
+            if date(ano_actual, mes_actual, d).weekday() < 5]
 
-# ─── Test 5: % no excede 100 cuando cargas más que dias_trabajados ───
-print("\n=== Test 5: cap a 100% si presentes > dias_trabajados ===")
-# Estudiante 2: 25 presentes (más que dias_trabajados=20)
-db.query(Asistencia).filter(Asistencia.estudiante_id == 2).delete()
-db.commit()
-for dia in range(1, 26):
-    a = Asistencia(colegio_id=1, estudiante_id=2, curso_id=1,
-                   fecha=date(ano_actual, mes_actual, dia), estado='presente')
-    db.add(a)
-db.commit()
 
+print("\n=== Test 3: mes con huecos -> N/D, aunque haya dias_trabajados ===")
 ano.set_dias_trabajados({'may': 20})
 db.commit()
+for dia in range(1, 19):
+    db.add(Asistencia(colegio_id=1, estudiante_id=1, curso_id=1,
+                      fecha=date(ano_actual, mes_actual, dia), estado='presente'))
+for dia in [19, 20]:
+    db.add(Asistencia(colegio_id=1, estudiante_id=1, curso_id=1,
+                      fecha=date(ano_actual, mes_actual, dia), estado='ausente'))
+db.commit()
+est1 = fila_de(1)
+print(f"  asistencia_mes={est1['asistencia_mes']} sin_dato_mes={est1['sin_dato_mes']} "
+      f"pct_asistencia_mes={est1['pct_asistencia_mes']}")
+assert est1['_usa_dias_trabajados'] is False, 'dias_trabajados ya no es el denominador'
+assert est1['asistencia_mes'] == 18
+assert est1['sin_dato_mes'] > 0
+assert est1['pct_asistencia_mes'] is None, f"❌ con huecos debe ser N/D, dio {est1['pct_asistencia_mes']}"
+print("✅ Mes incompleto: % N/D, no un 90 % inventado")
 
-result3 = asyncio.run(app.get_resumen_asistencia_por_periodos(
-    1, req, db=db, current_user=director
-))
-est2 = next(r for r in result3 if r['estudiante_id'] == 2)
-print(f"  asistencia_mes: {est2['asistencia_mes']}, dias_trabajados: {est2['dias_trabajados_mes']}")
+print("\n=== Test 4: mes completo -> % real ===")
+for f in habiles_mayo(21, 31):
+    db.add(Asistencia(colegio_id=1, estudiante_id=1, curso_id=1, fecha=f, estado='presente'))
+db.commit()
+est1_b = fila_de(1)
+_lect = est1_b['dias_lectivos_mes']
+_esperado = round(est1_b['asistencia_mes'] * 100.0 / _lect, 1)
+print(f"  {est1_b['asistencia_mes']} de {_lect} días -> {est1_b['pct_asistencia_mes']}%")
+assert est1_b['sin_dato_mes'] == 0
+assert est1_b['pct_asistencia_mes'] == _esperado, f"❌ Esperaba {_esperado}, dio {est1_b['pct_asistencia_mes']}"
+_an = app._asistencia_anual_boletin(db, 1, director, ano)
+assert est1_b['total_asistencia'] == _an['asistencias'], 'el anual es el del boletín'
+print(f"✅ Mes completo: {est1_b['pct_asistencia_mes']}% (mismo cálculo que el boletín)")
+
+print("\n=== Test 5: nunca pasa de 100 % ===")
+for f in habiles_mayo(1, 31):
+    db.add(Asistencia(colegio_id=1, estudiante_id=2, curso_id=1, fecha=f, estado='presente'))
+db.commit()
+est2 = fila_de(2)
 print(f"  pct_asistencia_mes: {est2['pct_asistencia_mes']}")
-assert est2['pct_asistencia_mes'] == 100, f"❌ Debería caparse a 100, dio {est2['pct_asistencia_mes']}"
-print("✅ % capado a 100 cuando presentes > dias_trabajados")
+assert est2['pct_asistencia_mes'] == 100.0, f"❌ Esperaba 100, dio {est2['pct_asistencia_mes']}"
+print("✅ 100 % con todo presente, sin pasarse")
 
 print("\n🎉 TODOS LOS TESTS v2.13.5 PASARON")

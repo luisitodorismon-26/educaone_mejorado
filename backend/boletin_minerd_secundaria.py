@@ -865,12 +865,13 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
         _pa = asistencia_anual.get('pct_asistencia')
         _pau = asistencia_anual.get('pct_ausencia')
         _y_medio = _y((asist_y_map['p1'] + asist_y_map['p4']) / 2.0)
-        if _pa is not None:
-            c.drawCentredString(ASIST_X['pct_asis'], _y_medio - 3,
-                                f"{int(round(_pa))}%")
-        if _pau is not None:
-            c.drawCentredString(ASIST_X['pct_ausen'], _y_medio - 3,
-                                f"{int(round(_pau))}%")
+        # ASISTENCIA CANÓNICA · el % oficial solo existe con cobertura
+        # completa. Con huecos la celda dice N/D: hay registros, pero no
+        # alcanzan para un porcentaje del año.
+        c.drawCentredString(ASIST_X['pct_asis'], _y_medio - 3,
+                            f"{int(round(_pa))}%" if _pa is not None else 'N/D')
+        c.drawCentredString(ASIST_X['pct_ausen'], _y_medio - 3,
+                            f"{int(round(_pau))}%" if _pau is not None else 'N/D')
 
     # ── Detalle anual, bajo la tabla ───────────────────────────────────
     #
@@ -899,9 +900,16 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
                         asistencia_anual.get('excusas', 0)))
         _pa = asistencia_anual.get('pct_asistencia')
         _pau = asistencia_anual.get('pct_ausencia')
+        # PORCENTAJE y COBERTURA son dos datos distintos y se imprimen los dos.
         if _pa is not None and _pau is not None:
-            c.drawString(ASIST_X['asis'] - 66, _y(_ay + 16),
-                         'Asistencia: %.1f%%   Ausencia: %.1f%%' % (_pa, _pau))
+            _txt = 'Asistencia: %.1f%%   Ausencia: %.1f%%' % (_pa, _pau)
+        else:
+            _txt = 'Porcentaje: N/D (registro incompleto)'
+        _lect = asistencia_anual.get('dias_lectivos')
+        _cd = asistencia_anual.get('dias_computados')
+        if _lect:
+            _txt += '   Cobertura: %d de %d días registrados' % (_cd or 0, _lect)
+        c.drawString(ASIST_X['asis'] - 66, _y(_ay + 16), _txt)
     
     # Situación final del estudiante (Promovido/a o Repitente)
     if situacion_final:

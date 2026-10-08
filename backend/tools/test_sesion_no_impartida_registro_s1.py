@@ -211,8 +211,10 @@ def _():
 def _():
     _seed(asistencia_en=[f for f in LUNES if f != EL_16])
     mes = _marzo(_matriz())
-    # sin declarar, el 16 es un dia lectivo vacio: 4 de 5 = 80%
-    assert mes["filas"][0]["porcentaje"] == 80.0, mes["filas"][0]["porcentaje"]
+    # ASISTENCIA CANÓNICA · sin declarar, el 16 es un día lectivo SIN DATO:
+    # no es ausencia, así que no hay 80 %; con cobertura incompleta no hay
+    # porcentaje oficial.
+    assert mes["filas"][0]["porcentaje"] is None, mes["filas"][0]["porcentaje"]
     _declarar()
     mes = _marzo(_matriz())
     assert mes["total_dias"] == 5, mes["total_dias"]
@@ -228,7 +230,9 @@ def _():
         _declarar(fecha=f, motivo="SUSP_CURSO")
     mes = _marzo(_matriz())
     assert mes["dias_computables"] == 0
-    assert mes["filas"][0]["porcentaje"] == 0.0
+    # Sin ningún día que evaluar no hay porcentaje: None, nunca un 0 % que
+    # diga «no vino nunca».
+    assert mes["filas"][0]["porcentaje"] is None
     assert len(mes["dias"]) == 5, mes["dias"]
 
 

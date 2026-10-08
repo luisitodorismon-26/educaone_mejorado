@@ -25,7 +25,7 @@ BK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BK)
 sys.path.insert(0, os.path.join(BK, "tools"))
 
-from test_utils import aislar_base_de_datos  # noqa: E402
+from test_utils import aislar_base_de_datos, fechar_ano, asistencia_completa  # noqa: E402
 
 TMP = aislar_base_de_datos('c_core21')
 
@@ -94,6 +94,7 @@ def montar(codigo, historial=(), cerrado=True, con_destino=False,
     A = M.AnoEscolar(colegio_id=col.id, nombre='2025-2026',
                      activo=not cerrado, cerrado=cerrado)
     A.set_dias_trabajados(DIAS)
+    fechar_ano(A)   # ASISTENCIA CANÓNICA · días lectivos del año de origen
     db.add(A)
     db.flush()
     B = None
@@ -129,6 +130,10 @@ def montar(codigo, historial=(), cerrado=True, con_destino=False,
                        nombre='E', apellido='S', curso_id=cA.id,
                        activo=True, condicion='activo')
     db.add(est)
+    db.flush()
+    # Lista completa: sin ella A2 no certifica y la suite dejaría de probar
+    # el historial para probar la asistencia.
+    asistencia_completa(db, M, est, cA.id, col.id, A)
     db.flush()
 
     if notas_reales:

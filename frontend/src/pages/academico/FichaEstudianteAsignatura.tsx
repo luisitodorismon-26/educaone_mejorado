@@ -663,7 +663,7 @@ export const FichaEstudianteAsignatura: React.FC = () => {
                       <td className="px-3 py-2 text-center font-medium">
                         {p?.pct_asistencia_anual !== null && p?.pct_asistencia_anual !== undefined
                           ? `${p.pct_asistencia_anual}%`
-                          : '—'}
+                          : 'N/D'}
                       </td>
                     </tr>
                   );

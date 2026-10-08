@@ -464,12 +464,24 @@ def _dibujar_tabla(c: canvas.Canvas, areas_data, grado_nombre,
         pct_a = asistencia_anual.get('pct_asistencia')
         pct_au = asistencia_anual.get('pct_ausencia')
         y_medio = _y((ASISTENCIA_Y[1] + ASISTENCIA_Y[4]) / 2.0)
-        if pct_a is not None:
-            c.drawCentredString(ASISTENCIA_X['pct_asistencia'], y_medio,
-                                f"{round(pct_a)}%")
-        if pct_au is not None:
-            c.drawCentredString(ASISTENCIA_X['pct_ausencia'], y_medio,
-                                f"{round(pct_au)}%")
+        # ASISTENCIA CANÓNICA · sin cobertura completa no hay % oficial: N/D.
+        c.drawCentredString(ASISTENCIA_X['pct_asistencia'], y_medio,
+                            f"{round(pct_a)}%" if pct_a is not None else 'N/D')
+        c.drawCentredString(ASISTENCIA_X['pct_ausencia'], y_medio,
+                            f"{round(pct_au)}%" if pct_au is not None else 'N/D')
+        # PORCENTAJE y COBERTURA son datos distintos: bajo la tabla se dice
+        # sobre cuántos días lectivos hay registro.
+        # Va DENTRO de la celda fusionada «% de Anual», debajo del valor: la
+        # plantilla no tiene otro hueco y bajo la tabla se pisaría el borde.
+        _lect = asistencia_anual.get('dias_lectivos')
+        if _lect:
+            c.setFont("Helvetica", 6)
+            c.drawCentredString(ASISTENCIA_X['pct_asistencia'], y_medio - 13,
+                                'Cobertura:')
+            c.drawCentredString(ASISTENCIA_X['pct_asistencia'], y_medio - 20,
+                                '%d de %d días'
+                                % (asistencia_anual.get('dias_computados') or 0, _lect))
+            c.setFont("Helvetica", 8)
 
 
 def generar_boletin_primaria(estudiante, curso, grado_nombre, areas_data, config,

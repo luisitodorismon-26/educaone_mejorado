@@ -459,7 +459,25 @@ def area_de(paq, codigo):
     return None
 
 
-def situacion():
+def _asistencia_completa(a):
+    """Un `presente` por cada día hábil del año, en memoria.
+
+    ASISTENCIA CANÓNICA · el día sin lista ya no cuenta como presente, así que
+    el caso de regresión necesita una asistencia REAL completa para que la
+    única variable sea la CF. Sin ella, A2 bloquea por asistencia (HF-33b).
+    """
+    from types import SimpleNamespace as _NS
+    filas, d = [], a.fecha_inicio
+    while d <= a.fecha_fin:
+        if d.weekday() < 5:
+            filas.append(_NS(fecha=d, estado='presente', asignatura_id=None))
+        d += dt.timedelta(days=1)
+    return filas
+
+
+def situacion(asistencias=None):
+    if asistencias is None:
+        asistencias = _asistencia_completa(ano)
     precarga = APP._precarga_curso_canonica(
         db, usr, curso, ano, estudiante_ids=[est.id])
     comps = APP._datos_academicos_estudiantes(
@@ -470,7 +488,7 @@ def situacion():
         db, usr, est, ano, precarga,
         competencias_por_asig=comps,
         extras_por_asig={k: v[0] for k, v in extras.items() if v},
-        asistencias=[])
+        asistencias=asistencias)
 
 
 paq = situacion()
@@ -494,6 +512,15 @@ check('HF-33 A2 ya no se queda en EN_PROCESO por la CF',
       _sit != PA.EN_PROCESO, str(_sit))
 check('HF-34 y con todo lo demás aprobado, el resultado es PROMOVIDO',
       _sit == PA.PROMOVIDO, str(_sit))
+
+# ASISTENCIA CANÓNICA · sin ninguna lista, los días son SIN DATO: A2 no
+# certifica. Antes ese mismo caso salía PROMOVIDO porque el hueco contaba
+# como asistencia.
+_sin_lista = situacion(asistencias=[])
+check('HF-34b sin ninguna lista, la asistencia NO se presume: EN_PROCESO',
+      _sin_lista['situacion']['condicion'] == PA.EN_PROCESO
+      and PA.BLOQUEO_ASISTENCIA_NO_EVALUADA in _sin_lista['situacion']['bloqueos'],
+      str(_sin_lista['situacion']['bloqueos']))
 
 # La fila histórica no se tocó.
 db.expire_all()
@@ -556,7 +583,7 @@ _lote = APP._situacion_canonica_secundaria(
     db, usr, est, ano, _precarga,
     competencias_por_asig=_comps.get(est.id, {}),
     extras_por_asig={k: v[0] for k, v in (_extras.get(est.id) or {}).items() if v},
-    asistencias=[])
+    asistencias=_asistencia_completa(ano))
 check('HF-51 el lote llega a la misma situación que el individual',
       _lote['situacion']['condicion'] == _a['situacion']['condicion'],
       str(_lote['situacion']['condicion']))

@@ -38,6 +38,7 @@ from test_utils import aislar_base_de_datos, verificar_engine_aislado  # noqa: E
 
 _TMP = aislar_base_de_datos('r4_a3')
 from database import engine                                    # noqa: E402
+import asistencia_canonica as ASIS                              # noqa: E402
 verificar_engine_aislado(engine, _TMP)
 
 import models as M                                             # noqa: E402
@@ -910,23 +911,33 @@ def _():
 def _():
     p = APP._precarga_curso_canonica(_DB, _USER, _CURSO, _ANO)
     paquete = APP._situacion_canonica_secundaria(_DB, _USER, _EST, _ANO, p)
+    # ASISTENCIA CANÓNICA · un año sin fechas no tiene días lectivos: no se
+    # puede evaluar la asistencia y A2 no certifica.
     igual(paquete['situacion']['condicion'], PA.EN_PROCESO,
-          'sin dias_trabajados declarados no hay denominador fiable')
+          'sin fechas del año no hay dias lectivos')
     igual(paquete['situacion']['bloqueos'], (PA.BLOQUEO_ASISTENCIA_NO_EVALUADA,))
-    assert AD.DIAG_DIAS_TRABAJADOS_NO_DECLARADOS in paquete['diagnosticos'], \
+    assert ASIS.DIAG_ANO_SIN_FECHAS in paquete['diagnosticos'], \
         paquete['diagnosticos']
     igual(len(paquete['resultados']), len(AREAS_SEC),
           'Musica no produce resultado oficial')
 
 
-@test("T3  con dias trabajados declarados, promueve")
+@test("T3  con asistencia registrada en todos los dias lectivos, promueve")
 def _():
-    _ANO.set_dias_trabajados({'ago': 20, 'sep': 20, 'oct': 20, 'nov': 20,
-                              'dic': 15, 'ene': 20, 'feb': 18, 'mar': 20,
-                              'abr': 18, 'may': 20, 'jun': 15})
+    # ASISTENCIA CANÓNICA · `dias_trabajados` ya no es el denominador: lo son
+    # los días lectivos del año, y cada uno tiene que tener dato.
+    import datetime as _dt
+    _ANO.fecha_inicio = _dt.date(2026, 3, 2)
+    _ANO.fecha_fin = _dt.date(2026, 3, 13)
+    d = _ANO.fecha_inicio
+    while d <= _ANO.fecha_fin:
+        if d.weekday() < 5:
+            _DB.add(M.Asistencia(colegio_id=_COL.id, estudiante_id=_EST.id,
+                                 curso_id=_CURSO.id, fecha=d,
+                                 estado='presente'))
+        d += _dt.timedelta(days=1)
     _DB.commit()
     p = APP._precarga_curso_canonica(_DB, _USER, _CURSO, _ANO)
-    igual(p['dias_trabajados'], 206)
     paquete = APP._situacion_canonica_secundaria(_DB, _USER, _EST, _ANO, p)
     igual(paquete['situacion']['condicion'], PA.PROMOVIDO,
           str(paquete['situacion']['bloqueos']))
@@ -991,7 +1002,8 @@ def _():
           'tres consultas para TODO el curso, no tres por estudiante')
     assert comps.get(_EST.id), 'la precarga trajo las competencias'
     igual(extras, {})
-    igual(asist, {})
+    # T3 sembró la asistencia del estudiante: llega TODA en la misma consulta.
+    igual(sorted(asist), [_EST.id])
 
 
 
