@@ -104,8 +104,11 @@ export const AppRouter = () => {
           <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><AsistenciaPage /></MainLayout></ProtectedRoute>
         } />
         
+        {/* SECRETARÍA-2 ya le dio Horarios en el menú, en la página y en el
+            backend (consultar/crear/editar); la ruta se había quedado sin ella
+            y la devolvía al dashboard. */}
         <Route path="/horarios" element={
-          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor']}><MainLayout><HorariosPage /></MainLayout></ProtectedRoute>
+          <ProtectedRoute roles={['direccion', 'coordinador', 'profesor', 'secretaria']}><MainLayout><HorariosPage /></MainLayout></ProtectedRoute>
         } />
         
         <Route path="/asignaciones" element={

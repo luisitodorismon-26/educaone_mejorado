@@ -283,11 +283,29 @@ export const HorariosPage = () => {
   const nivelVista = typeof window !== 'undefined'
     ? localStorage.getItem('educaone_nivel_vista')
     : null;
+
+  // SECRETARÍA sin nivel fijo administra horarios de AMBOS niveles, pero no
+  // tiene el selector global de división (eso es de Dirección). Su selector es
+  // LOCAL de esta página: vive solo en este estado, no se guarda en
+  // localStorage y no cambia ninguna otra pantalla. El valor global guardado
+  // (`educaone_nivel_vista`, quizá de una sesión de Dirección en el mismo
+  // navegador) NUNCA es su autoridad aquí.
+  const esSecretariaSinNivel = user?.role === 'secretaria' && !nivelFijo;
+  const [nivelLocal, setNivelLocal] = useState<'primaria' | 'secundaria' | null>(null);
+
   const nivelActivo: 'primaria' | 'secundaria' | null =
     nivelFijo
       ? nivelFijo
-      : (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null);
+      : esSecretariaSinNivel
+        ? nivelLocal
+        : (nivelVista === 'primaria' || nivelVista === 'secundaria' ? nivelVista : null);
   const nivelLabel = sufijoNivelTitulo(user?.role, nivelActivo);
+
+  // Las lecturas que dependen del nivel llevan el X-Nivel de ESTA página.
+  // `nivelLocal: true` le pide al interceptor que no lo pise con el global.
+  const cfgNivel: any = esSecretariaSinNivel
+    ? { headers: nivelLocal ? { 'X-Nivel': nivelLocal } : {}, nivelLocal: true }
+    : undefined;
 
   // v2.19.8: administrar horarios por CURSO y RECREOS exige un contexto de nivel
   // concreto. Dirección en "Todos" (sin lente) NO puede: no elegimos un recreo
@@ -296,20 +314,39 @@ export const HorariosPage = () => {
   // se muestra completo aunque cruce niveles.
   const requiereNivel = user?.role !== 'profesor' && !nivelActivo;
 
-  useEffect(() => { loadInicial(); }, []);
-  useEffect(() => { 
+  // Secretaría: cada cambio de nivel recarga cursos, recreos y horarios de ese
+  // nivel y limpia la selección anterior (un curso de Primaria no puede quedar
+  // elegido bajo Secundaria). Para los demás roles, igual que siempre: una vez.
+  useEffect(() => {
+    if (esSecretariaSinNivel) {
+      setCursoId(0);
+      setHorarios([]);
+    }
+    loadInicial();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nivelLocal]);
+  useEffect(() => {
     if (vistaActual === 'profesor' && profesorId) loadHorariosProfesor();
     else if (vistaActual === 'curso' && cursoId) loadHorariosCurso();
-  }, [profesorId, cursoId, vistaActual]);
+    // `nivelLocal`: el horario del profesor elegido se vuelve a pedir con el
+    // nivel nuevo. Para los demás roles nunca cambia.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profesorId, cursoId, vistaActual, nivelLocal]);
 
   const loadInicial = async () => {
+    // Secretaría sin nivel elegido: no se carga nada que dependa del nivel;
+    // la pantalla le pide elegir Primaria o Secundaria.
+    if (esSecretariaSinNivel && !nivelLocal) {
+      setLoading(false);
+      return;
+    }
     try {
       const [p, c, a, t, r] = await Promise.all([
         api.get('/profesores'),
-        api.get('/cursos'),
+        api.get('/cursos', cfgNivel),
         api.get('/asignaturas'),
         api.get('/tandas'),
-        api.get('/recreos')
+        api.get('/recreos', cfgNivel)
       ]);
       setProfesores(p.data);
       setCursos(c.data);
@@ -335,7 +372,7 @@ export const HorariosPage = () => {
   const loadHorariosProfesor = async () => {
     setLoading(true);
     try {
-      const res = await api.get(`/horarios/profesor/${profesorId}`);
+      const res = await api.get(`/horarios/profesor/${profesorId}`, cfgNivel);
       setHorarios(res.data);
     } catch (e) {
       console.error('Error cargando horarios:', e);
@@ -347,7 +384,7 @@ export const HorariosPage = () => {
   const loadHorariosCurso = async () => {
     setLoading(true);
     try {
-      const res = await api.get(`/horarios/curso/${cursoId}`);
+      const res = await api.get(`/horarios/curso/${cursoId}`, cfgNivel);
       setHorarios(res.data);
     } catch (e) {
       console.error('Error cargando horarios:', e);
@@ -649,6 +686,22 @@ export const HorariosPage = () => {
           <h1 className="text-2xl font-bold text-slate-800">
             Horarios{nivelLabel ? <span className="text-slate-400 font-semibold"> — {nivelLabel}</span> : null}
           </h1>
+          {/* Selector LOCAL de Secretaría: solo afecta esta página. */}
+          {esSecretariaSinNivel && (
+            <div className="ml-2 inline-flex rounded-lg border border-slate-200 bg-white p-0.5" role="group" aria-label="Nivel de los horarios">
+              {(['primaria', 'secundaria'] as const).map(n => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setNivelLocal(n)}
+                  aria-pressed={nivelLocal === n}
+                  className={`px-3 py-1 text-sm font-medium rounded-md ${nivelLocal === n ? 'bg-blue-600 text-white' : 'text-slate-600 hover:bg-slate-50'}`}
+                >
+                  {n === 'primaria' ? 'Primaria' : 'Secundaria'}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-3">
           {canAdmin && !requiereNivel && (
@@ -677,10 +730,14 @@ export const HorariosPage = () => {
         <div className="bg-white rounded-xl border border-slate-200 p-12 text-center">
           <Clock size={48} className="mx-auto text-slate-300 mb-4" />
           <h3 className="text-lg font-semibold text-slate-600">
-            Selecciona Primaria o Secundaria para administrar horarios y recreos por nivel
+            {esSecretariaSinNivel
+              ? 'Elige Primaria o Secundaria para administrar el horario.'
+              : 'Selecciona Primaria o Secundaria para administrar horarios y recreos por nivel'}
           </h3>
           <p className="text-sm text-slate-400 mt-2">
-            Usa el selector de división en la parte superior de la pantalla.
+            {esSecretariaSinNivel
+              ? 'Usa el selector Primaria | Secundaria junto al título.'
+              : 'Usa el selector de división en la parte superior de la pantalla.'}
           </p>
         </div>
       )}
