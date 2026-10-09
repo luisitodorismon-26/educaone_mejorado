@@ -26,6 +26,15 @@ api.interceptors.request.use((config) => {
   // aplica solo a usuarios sin nivel fijo (dirección); para coordinadores el
   // lente fijo manda y este header se ignora. Un solo punto: las páginas ni
   // se enteran de que existe la división.
+  //
+  // Excepción explícita y opt-in: una petición marcada `nivelLocal: true`
+  // trae su PROPIO X-Nivel elegido en la página (o ninguno) y aquí no se
+  // toca. Hoy solo la usa Horarios para Secretaría, cuyo selector es local de
+  // esa pantalla: el valor global guardado (p. ej. de una sesión de Dirección
+  // en el mismo navegador) no puede pisarlo. Sin la marca, todo sigue igual.
+  if ((config as any).nivelLocal) {
+    return config;
+  }
   const nivelVista = localStorage.getItem('educaone_nivel_vista');
   if (nivelVista === 'primaria' || nivelVista === 'secundaria') {
     config.headers['X-Nivel'] = nivelVista;

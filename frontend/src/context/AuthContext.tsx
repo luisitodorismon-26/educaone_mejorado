@@ -26,6 +26,20 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+// Vista de división guardada por el selector global (Dirección, y
+// Coordinación/Psicología sin nivel fijo). `services/api.ts` la manda como
+// X-Nivel en TODAS las peticiones. Se borra al cerrar sesión, y al entrar
+// como Secretaría —que no tiene selector global— antes de que ninguna
+// pantalla pida datos: así nunca hereda la vista de otra sesión del mismo
+// navegador. La lógica de nivel de los demás roles no cambia.
+const CLAVE_NIVEL_VISTA = 'educaone_nivel_vista';
+
+const limpiarNivelVistaSiSecretaria = (role?: string | null) => {
+  if (role === 'secretaria') {
+    try { localStorage.removeItem(CLAVE_NIVEL_VISTA); } catch {}
+  }
+};
+
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -43,6 +57,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     
     try {
       const res = await api.get('/auth/me');
+      limpiarNivelVistaSiSecretaria(res.data?.role);
       setUser(res.data);
     } catch {
       localStorage.removeItem('token');
@@ -61,6 +76,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     localStorage.removeItem('superadmin_user');
     localStorage.setItem('token', token);
     localStorage.setItem('user', JSON.stringify(userData));
+    limpiarNivelVistaSiSecretaria(userData?.role);
     // Invalidar cache de niveles — el nuevo usuario puede ser de un colegio
     // distinto con plan diferente (solo primaria, mixto, etc.)
     try {
@@ -99,6 +115,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       localStorage.removeItem('user');
       localStorage.removeItem('superadmin_token');
       localStorage.removeItem('superadmin_user');
+      // La vista de división es de la sesión que se cierra: no pasa a la
+      // siguiente persona que use este navegador.
+      localStorage.removeItem(CLAVE_NIVEL_VISTA);
       // Invalidar cache de niveles para que el siguiente login lo recargue limpio
       try {
         const { invalidateNivelesCache } = await import('../hooks/useNivelesActivos');

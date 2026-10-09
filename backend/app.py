@@ -24829,14 +24829,50 @@ async def get_dashboard_secretaria(db: Session = Depends(get_db), current_user: 
     from sqlalchemy import func
     
     # Estudiantes por curso
-    cursos = tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).order_by(Curso.nombre).all()
+    #
+    # El rótulo sale de las relaciones REALES Curso -> Grado -> Tanda, aquí,
+    # en el backend. Antes se enviaba solo `Curso.nombre`, que es la SECCIÓN
+    # ("A", o vacía), y el frontend intentaba completarlo cruzando con
+    # /api/cursos; pero /api/cursos aplica el lente de nivel (X-Nivel), así
+    # que los cursos del otro nivel no aparecían en el cruce y quedaban como
+    # "A". Este endpoint NO aplica lente: Secretaría ve todos los cursos
+    # activos de su colegio, incluidos los que tienen 0 estudiantes.
+    #
+    # UNA consulta: cursos activos + Grado + Tanda + conteo de estudiantes
+    # activos por curso (subconsulta agrupada). Dentro del bucle no hay SQL:
+    # el número de consultas no crece con la cantidad de cursos.
+    conteo = (tenant_filter(db.query(Estudiante.curso_id.label('curso_id'),
+                                     func.count(Estudiante.id).label('n')),
+                            Estudiante, current_user)
+              .filter(Estudiante.activo == True)
+              .group_by(Estudiante.curso_id)
+              .subquery())
+    filas = (tenant_filter(db.query(Curso.id, Curso.nombre, Grado.nombre, Grado.nivel,
+                                    Tanda.nombre, func.coalesce(conteo.c.n, 0)),
+                           Curso, current_user)
+             .filter(Curso.activo == True)
+             .outerjoin(Grado, Curso.grado_id == Grado.id)
+             .outerjoin(Tanda, Curso.tanda_id == Tanda.id)
+             .outerjoin(conteo, conteo.c.curso_id == Curso.id)
+             .order_by(Grado.orden, Tanda.nombre, Curso.nombre)
+             .all())
     estudiantes_por_curso = []
-    for curso in cursos:
-        count = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso.id, activo=True).count()
+    for curso_id, seccion, grado_nombre, grado_nivel, tanda_nombre, n_est in filas:
+        grado_nombre = (grado_nombre or '').strip()
+        seccion = (seccion or '').strip()
+        tanda_nombre = (tanda_nombre or '').strip()
+        base = ' '.join(p for p in (grado_nombre, seccion) if p)
+        # Mismo formato que `labelCurso` del frontend:
+        # "2do Secundaria A · Vespertina" / "4to Secundaria · Matutina".
+        rotulo = (base + ' · ' + tanda_nombre) if (base and tanda_nombre) else base
         estudiantes_por_curso.append({
-            'curso_id': curso.id,
-            'curso': curso.nombre,
-            'estudiantes': count
+            'curso_id': curso_id,
+            'curso': rotulo or ('Curso %d' % curso_id),
+            'grado': grado_nombre or None,
+            'nivel': _canon_nivel(grado_nivel),
+            'seccion': seccion,
+            'tanda': tanda_nombre or None,
+            'estudiantes': int(n_est or 0),
         })
     
     # Matriculados recientes (últimos 7 días)
@@ -24866,7 +24902,7 @@ async def get_dashboard_secretaria(db: Session = Depends(get_db), current_user: 
         'matriculados_hoy': matriculados_hoy,
         'matriculados_semana': matriculados_recientes,
         'cursos_vacios': cursos_vacios,
-        'total_cursos': len(cursos),
+        'total_cursos': len(estudiantes_por_curso),
         'estudiantes_por_curso': estudiantes_por_curso,
         'ano_escolar': ano.nombre if ano else 'No configurado',
         'periodo_activo': ano.periodo_activo if ano else 0
