@@ -72,7 +72,9 @@ const PLANTILLAS_HOGAR = [
 
 export const ReportesPage = () => {
   const { user } = useAuth();
-  const [activeTab, setActiveTab] = useState('conducta');
+  // Al entrar se ven juntos Conducta, Académico y Asistencia: lo pendiente
+  // salta a la vista sin recorrer las tres pestañas.
+  const [activeTab, setActiveTab] = useState('todos');
   const [reportes, setReportes] = useState<Reporte[]>([]);
   const [estudiantes, setEstudiantes] = useState<any[]>([]);
   const [cursos, setCursos] = useState<any[]>([]);
@@ -103,6 +105,19 @@ export const ReportesPage = () => {
   const [filtroCurso, setFiltroCurso] = useState(0);
   // v2.19.3-B: filtro por quien levantó el reporte, pedido por Dirección.
   const [filtroReportador, setFiltroReportador] = useState(0);
+  // Lo activa la tarjeta "Casos Graves". Se muestra como un chip quitable en
+  // la barra de filtros, así que nunca filtra sin que se vea.
+  const [filtroGravedad, setFiltroGravedad] = useState('');
+
+  // Tarjetas superiores: llevan a "Todos" con el filtro de estado/gravedad
+  // correspondiente. Curso y reportador se respetan tal como estén.
+  const verDesdeTarjeta = (estado: string, gravedad: string) => {
+    setActiveTab('todos');
+    setFiltroEstado(estado);
+    setFiltroGravedad(gravedad);
+  };
+  const tarjetaActiva = (estado: string, gravedad: string) =>
+    activeTab === 'todos' && filtroEstado === estado && filtroGravedad === gravedad;
 
   // v2.19.4: Dirección también puede levantar un reporte.
   //
@@ -333,6 +348,7 @@ export const ReportesPage = () => {
     if (activeTab === 'academico' && r.tipo !== 'academico') return false;
     if (activeTab === 'asistencia' && r.tipo !== 'asistencia') return false;
     if (filtroEstado && r.estado !== filtroEstado) return false;
+    if (filtroGravedad && r.gravedad !== filtroGravedad) return false;
     // v2.19.3-B: se compara ID contra ID.
     //
     // Antes: r.estudiante_curso !== cursos.find(c => c.id === filtroCurso)?.nombre
@@ -439,15 +455,27 @@ export const ReportesPage = () => {
 
       {/* Stats Cards */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard title="Total Reportes" value={stats.total} icon={FileBarChart} color="blue" />
-        <StatCard title="Pendientes" value={stats.pendientes} icon={AlertCircle} color="amber" />
-        <StatCard title="Resueltos" value={stats.resueltos} icon={TrendingUp} color="emerald" />
-        <StatCard title="Casos Graves" value={stats.graves} icon={AlertCircle} color="red" />
+        <StatCard title="Total Reportes" value={stats.total} icon={FileBarChart} color="blue"
+          onClick={() => verDesdeTarjeta('', '')} active={tarjetaActiva('', '')} />
+        <StatCard title="Pendientes" value={stats.pendientes} icon={AlertCircle} color="amber"
+          onClick={() => verDesdeTarjeta('pendiente', '')} active={tarjetaActiva('pendiente', '')} />
+        <StatCard title="Resueltos" value={stats.resueltos} icon={TrendingUp} color="emerald"
+          onClick={() => verDesdeTarjeta('resuelto', '')} active={tarjetaActiva('resuelto', '')} />
+        <StatCard title="Casos Graves" value={stats.graves} icon={AlertCircle} color="red"
+          onClick={() => verDesdeTarjeta('', 'grave')} active={tarjetaActiva('', 'grave')} />
       </div>
 
       {/* Tabs y Filtros */}
       <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
         <div className="flex border-b border-slate-200 overflow-x-auto">
+          <button
+            onClick={() => setActiveTab('todos')}
+            className={`flex-shrink-0 px-4 py-3 text-sm font-medium transition-colors whitespace-nowrap ${
+              activeTab === 'todos' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:bg-slate-50'
+            }`}
+          >
+            📋 Todos
+          </button>
           <button
             onClick={() => setActiveTab('conducta')}
             className={`flex-shrink-0 px-4 py-3 text-sm font-medium transition-colors whitespace-nowrap ${
@@ -471,14 +499,6 @@ export const ReportesPage = () => {
             }`}
           >
             📅 Asistencia
-          </button>
-          <button
-            onClick={() => setActiveTab('todos')}
-            className={`flex-shrink-0 px-4 py-3 text-sm font-medium transition-colors whitespace-nowrap ${
-              activeTab === 'todos' ? 'bg-blue-50 text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:bg-slate-50'
-            }`}
-          >
-            📋 Todos
           </button>
         </div>
 
@@ -529,6 +549,16 @@ export const ReportesPage = () => {
                 ))}
               </select>
             </div>
+          )}
+          {filtroGravedad === 'grave' && (
+            <button
+              type="button"
+              onClick={() => setFiltroGravedad('')}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-sm font-medium bg-red-100 text-red-700 hover:bg-red-200"
+              title="Quitar el filtro de casos graves"
+            >
+              Solo casos graves ✕
+            </button>
           )}
         </div>
 
@@ -1021,7 +1051,10 @@ export const ReportesPage = () => {
 };
 
 // Stat Card Component
-const StatCard = ({ title, value, icon: Icon, color }: { title: string; value: number; icon: any; color: string }) => {
+const StatCard = ({ title, value, icon: Icon, color, onClick, active = false }: {
+  title: string; value: number; icon: any; color: string;
+  onClick?: () => void; active?: boolean;
+}) => {
   const colors: Record<string, string> = {
     blue: 'bg-blue-50 text-blue-600',
     amber: 'bg-amber-50 text-amber-600',
@@ -1030,7 +1063,14 @@ const StatCard = ({ title, value, icon: Icon, color }: { title: string; value: n
   };
 
   return (
-    <div className="bg-white p-4 rounded-xl border border-slate-200">
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`w-full text-left bg-white p-4 rounded-xl border transition-shadow hover:shadow-sm ${
+        active ? 'border-blue-500 ring-2 ring-blue-200' : 'border-slate-200'
+      }`}
+    >
       <div className="flex items-center justify-between">
         <div>
           <p className="text-xs text-slate-500 font-medium">{title}</p>
@@ -1040,7 +1080,7 @@ const StatCard = ({ title, value, icon: Icon, color }: { title: string; value: n
           <Icon size={20} />
         </div>
       </div>
-    </div>
+    </button>
   );
 };
 
