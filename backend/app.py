@@ -21657,6 +21657,10 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
     except Exception as e:
+        # REG-1: asistencia fuera del año / más meses que formularios -> 422.
+        _r = _respuesta_conflicto_espec(e)
+        if _r is not None:
+            return _r
         import traceback
         logger.error(f"Error preview primaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({'error': 'Error generando preview', 'detalle': str(e)}, status_code=500)
@@ -21812,6 +21816,10 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
     except Exception as e:
+        # REG-1: asistencia fuera del año / más meses que formularios -> 422.
+        _r = _respuesta_conflicto_espec(e)
+        if _r is not None:
+            return _r
         import traceback
         logger.error(f"Error generando registro primaria: {e}\n{traceback.format_exc()}")
         return JSONResponse({
@@ -22340,7 +22348,12 @@ def _cargar_especificacion_curricular(db: Session, current_user, curso, grado_nu
 def _respuesta_conflicto_espec(exc):
     """Traduce las anomalías de la especificación curricular a HTTP."""
     from registro_escolar import EspecificacionCurricularOverflow
+    from registro_asistencia import RegistroAsistenciaError
     if isinstance(exc, EspecificacionCurricularOverflow):
+        return JSONResponse(exc.detalle, status_code=422)
+    # REG-1: asistencia fuera del año escolar o más meses que huecos. Es un
+    # dato que el centro debe corregir, no un fallo del servidor.
+    if isinstance(exc, RegistroAsistenciaError):
         return JSONResponse(exc.detalle, status_code=422)
     if isinstance(exc, EspecificacionCurricularConflicto):
         return JSONResponse(exc.detalle, status_code=409)

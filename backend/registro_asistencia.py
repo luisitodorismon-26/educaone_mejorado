@@ -14,7 +14,7 @@ cae en modo legacy usando únicamente las fechas registradas.
 """
 
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Dict, List, Optional, Set
 
 from sqlalchemy.orm import Session
@@ -60,9 +60,116 @@ MES_CLAVE_CORTA = {
 }
 
 
-def _orden_mes(mes_num: int) -> int:
-    orden_meses = [8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7]
-    return orden_meses.index(mes_num) if mes_num in orden_meses else 99
+# ─────────────────────────── REG-1 · TIEMPO DEL REGISTRO ───────────────────────────
+#
+# Un mes del Registro es la pareja (año, mes), nunca el número de mes solo, y la
+# secuencia sale del año escolar DE ESE COLEGIO: de `fecha_inicio` a `fecha_fin`.
+# Un centro que empieza el 7 de septiembre imprime septiembre en el primer hueco;
+# uno que empieza en agosto, agosto. No hay un calendario universal agosto→julio.
+#
+# Cada mes conserva su POSICIÓN aunque esté vacío: si una materia no tiene marcas
+# en septiembre, septiembre sigue ocupando el primer hueco y octubre el segundo.
+# Dónde se imprime una marca lo decide su fecha real, no cuándo se digitó: una
+# asistencia del 15-sep cargada en octubre cae en septiembre, en su columna.
+
+
+class RegistroAsistenciaError(Exception):
+    """El Registro no se puede emitir sin esconder o mover asistencia.
+
+    `detalle` es un dict serializable que app.py devuelve tal cual (422).
+    """
+
+    def __init__(self, detalle: Dict):
+        self.detalle = detalle
+        super().__init__(detalle.get('mensaje', detalle.get('motivo', 'asistencia')))
+
+
+class AsistenciaFueraDelAnoEscolar(RegistroAsistenciaError):
+    """Hay asistencia registrada fuera de fecha_inicio..fecha_fin del año."""
+
+
+class MesesExcedenPlantilla(RegistroAsistenciaError):
+    """El año tiene más meses que huecos la hoja oficial."""
+
+
+class MatrizAsistencia(list):
+    """La lista de meses de siempre, más lo que el Registro necesita saber.
+
+    Sigue siendo una `list` de dicts de mes, así que todos los consumidores
+    existentes la recorren igual. Además lleva:
+      · `fuera_de_rango`: asistencias cuya fecha no cae en el año escolar. NO se
+        colocan en ningún mes —no se mueven ni se esconden— y el Registro se
+        niega a emitirse mientras existan (ver `verificar_dentro_del_ano`).
+      · `meses_del_ano`: la secuencia (año, mes) que define los huecos.
+    """
+
+    def __init__(self, meses=(), fuera_de_rango=None, meses_del_ano=None,
+                 inicio=None, fin=None):
+        super().__init__(meses)
+        self.fuera_de_rango = list(fuera_de_rango or [])
+        self.meses_del_ano = list(meses_del_ano or [])
+        self.inicio = inicio.isoformat() if inicio else None
+        self.fin = fin.isoformat() if fin else None
+
+
+def meses_del_ano(ano: Optional[AnoEscolar]) -> List[tuple]:
+    """Secuencia cronológica (año, mes) de fecha_inicio a fecha_fin, ambos incluidos.
+
+    Vacía si el año no tiene las dos fechas: entonces no hay huecos que respetar
+    y los meses salen de las propias marcas, también en orden cronológico.
+    """
+    if not ano or not ano.fecha_inicio or not ano.fecha_fin or ano.fecha_inicio > ano.fecha_fin:
+        return []
+    y, m = ano.fecha_inicio.year, ano.fecha_inicio.month
+    fin = (ano.fecha_fin.year, ano.fecha_fin.month)
+    salida = []
+    while (y, m) <= fin:
+        salida.append((y, m))
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return salida
+
+
+def verificar_dentro_del_ano(matriz, contexto: str = '') -> None:
+    """FAIL CLOSED: asistencia fuera del año escolar no tiene mes donde
+    imprimirse sin moverla de fecha. Se rechaza con las fechas exactas, para
+    que se corrijan en origen. Una matriz vieja (lista simple) pasa."""
+    fuera = getattr(matriz, 'fuera_de_rango', None) or []
+    if not fuera:
+        return
+    fechas = sorted({f['fecha'] for f in fuera})
+    raise AsistenciaFueraDelAnoEscolar({
+        'motivo': 'ASISTENCIA_FUERA_DEL_ANO_ESCOLAR',
+        'mensaje': (f'{contexto}: hay {len(fuera)} asistencia(s) registradas fuera del '
+                    f'año escolar ({getattr(matriz, "inicio", None)} a '
+                    f'{getattr(matriz, "fin", None)}). No se imprimen en otro mes ni se '
+                    f'ocultan: corrija su fecha o el rango del año antes de emitir el '
+                    f'Registro.').lstrip(': '),
+        'contexto': contexto,
+        'total': len(fuera),
+        'fechas': [f.isoformat() for f in fechas[:50]],
+        'rango_ano': [getattr(matriz, 'inicio', None), getattr(matriz, 'fin', None)],
+    })
+
+
+def verificar_huecos(meses_necesarios: int, huecos: int, contexto: str = '') -> None:
+    """FAIL CLOSED: más meses que huecos en la hoja. Imprimir solo los que
+    caben escondería el resto, así que no se imprime."""
+    if meses_necesarios > huecos:
+        raise MesesExcedenPlantilla({
+            'motivo': 'MESES_EXCEDEN_PLANTILLA',
+            'mensaje': (f'{contexto}: el año escolar ocupa {meses_necesarios} meses y la '
+                        f'hoja oficial solo tiene {huecos}. No se imprime un Registro '
+                        f'recortado.').lstrip(': '),
+            'contexto': contexto,
+            'meses': meses_necesarios,
+            'huecos': huecos,
+        })
+
+
+def meses_necesarios(matriz) -> int:
+    """Huecos que pide la matriz: hasta el último mes con posición, inclusive."""
+    posiciones = [m.get('posicion', i) for i, m in enumerate(matriz or []) if m]
+    return max(posiciones) + 1 if posiciones else 0
 
 
 def _dias_no_laborables_set(db: Session, colegio_id: Optional[int], ano: Optional[AnoEscolar]) -> Set:
@@ -129,11 +236,12 @@ def _construir_fechas_esperadas(
     ano: Optional[AnoEscolar],
     dias_horario: Set[str],
     dias_no_laborables: Set,
-) -> Dict[int, List]:
+) -> Dict[tuple, List]:
+    """Días de clase esperados por horario, indexados por (año, mes)."""
     if not ano or not ano.fecha_inicio or not ano.fecha_fin or not dias_horario:
         return {}
 
-    fechas_por_mes: Dict[int, List] = defaultdict(list)
+    fechas_por_mes: Dict[tuple, List] = defaultdict(list)
     actual = ano.fecha_inicio
 
     while actual <= ano.fecha_fin:
@@ -141,7 +249,7 @@ def _construir_fechas_esperadas(
         es_no_laborable = actual in dias_no_laborables or (actual.month, actual.day) in dias_no_laborables
 
         if dia_nombre in dias_horario and not es_no_laborable:
-            fechas_por_mes[actual.month].append(actual)
+            fechas_por_mes[(actual.year, actual.month)].append(actual)
 
         actual += timedelta(days=1)
 
@@ -202,55 +310,43 @@ def build_asistencia_registro(
     if not registros and not fechas_esperadas_por_mes:
         return []
 
+    # REG-1 · los huecos del Registro: (año, mes) de fecha_inicio a fecha_fin.
+    secuencia = meses_del_ano(ano)
+    en_ano = set(secuencia)
+
+    # Una marca vive en el (año, mes) de su fecha REAL. Si esa fecha no cae en
+    # el año escolar no se coloca en ningún mes —ni en el mismo número de mes de
+    # otro año, que es lo que pasaba al indexar solo por mes—: queda anotada en
+    # `fuera_de_rango` y el Registro se niega a emitirse con ella escondida.
     prioridad = {'A': 4, 'T': 3, 'E': 2, 'P': 1, '': 0}
-    por_mes: Dict[int, Dict[int, Dict[int, str]]] = defaultdict(lambda: defaultdict(dict))
+    por_mes: Dict[tuple, Dict[int, Dict[int, str]]] = defaultdict(lambda: defaultdict(dict))
+    fuera_de_rango = []
 
     for r in registros:
         codigo = ESTADO_A_CODIGO.get((r.estado or '').lower(), '')
         if not codigo:
             continue
-        existente = por_mes[r.fecha.month][r.fecha.day].get(r.estudiante_id, '')
+        if secuencia and not (ano.fecha_inicio <= r.fecha <= ano.fecha_fin):
+            fuera_de_rango.append({'fecha': r.fecha, 'estudiante_id': r.estudiante_id,
+                                   'asignatura_id': r.asignatura_id})
+            continue
+        clave = (r.fecha.year, r.fecha.month)
+        existente = por_mes[clave][r.fecha.day].get(r.estudiante_id, '')
         if prioridad.get(codigo, 0) > prioridad.get(existente, 0):
-            por_mes[r.fecha.month][r.fecha.day][r.estudiante_id] = codigo
+            por_mes[clave][r.fecha.day][r.estudiante_id] = codigo
 
-    if not fechas_esperadas_por_mes:
-        for mes_num, dias_dict in por_mes.items():
-            fechas_esperadas_por_mes[mes_num] = []
-            for dia in sorted(dias_dict.keys()):
-                if ano and ano.fecha_inicio and ano.fecha_fin:
-                    year = ano.fecha_inicio.year if mes_num >= 8 else ano.fecha_fin.year
-                else:
-                    sample = next(iter(dias_dict[dia].keys()), None)
-                    year = registros[0].fecha.year if registros else 2000
-                    if sample:
-                        year = next((r.fecha.year for r in registros if r.estudiante_id == sample and r.fecha.month == mes_num and r.fecha.day == dia), year)
-                from datetime import date
-                fechas_esperadas_por_mes[mes_num].append(date(year, mes_num, dia))
-
-    # v2.19.7: TODO día con asistencia registrada tiene que tener su columna.
-    #
-    # La rejilla se armaba solo con los días esperados por horario dentro del
-    # rango del año escolar. Cuando ese rango NO cubre las fechas realmente
-    # capturadas —que es el caso del colegio en producción: año escolar
-    # 2024-09-01→2025-06-30 y asistencia tomada en 2026-07..09— los registros
-    # caían fuera de la rejilla y la hoja salía vacía pese a existir cientos de
-    # marcas. El respaldo de "modo legacy" de arriba no ayudaba: solo se activa
-    # si la rejilla queda COMPLETAMENTE vacía, y acá tenía diez meses (los del
-    # año escolar) que simplemente no intersecaban con ningún registro.
-    #
-    # Acá se añaden únicamente los días que YA tienen registro y que no estaban
-    # en la rejilla. No se inventa ninguna marca: un día agregado se llena solo
-    # con lo que haya en la base, y los días esperados sin registro siguen
-    # apareciendo vacíos como hasta ahora.
-    anio_real_por_mes_dia = {}
-    for r in registros:
-        anio_real_por_mes_dia.setdefault((r.fecha.month, r.fecha.day), r.fecha.year)
-
-    for (mes_num, dia), anio in anio_real_por_mes_dia.items():
-        lista = fechas_esperadas_por_mes.setdefault(mes_num, [])
-        if dia not in {f.day for f in lista}:
-            from datetime import date
-            lista.append(date(anio, mes_num, dia))
+    # v2.19.7: TODO día con asistencia registrada tiene que tener su columna,
+    # aunque el horario no lo esperara (cambio de horario, día recuperado...).
+    # Ahora se añade en SU (año, mes): con la clave completa ya no hay un mismo
+    # número de mes de dos años distintos compitiendo por las mismas columnas.
+    # No se inventa ninguna marca: el día agregado se llena solo con lo que
+    # haya en la base.
+    for clave, dias_dict in por_mes.items():
+        lista = fechas_esperadas_por_mes.setdefault(clave, [])
+        ya = {f.day for f in lista}
+        for dia in dias_dict:
+            if dia not in ya:
+                lista.append(date(clave[0], clave[1], dia))
 
     # S1 — LA FECHA JUSTIFICADA CONSERVA SU COLUMNA.
     #
@@ -263,27 +359,40 @@ def build_asistencia_registro(
     # No se inventa ninguna marca: la columna entra vacia y lo unico que lleva
     # es la etiqueta del motivo.
     for _fecha in no_impartidas:
-        _lista = fechas_esperadas_por_mes.setdefault(_fecha.month, [])
+        _clave = (_fecha.year, _fecha.month)
+        if secuencia and _clave not in en_ano:
+            continue   # una sesión fuera del año no abre un mes que no existe
+        _lista = fechas_esperadas_por_mes.setdefault(_clave, [])
         if _fecha.day not in {f.day for f in _lista}:
             _lista.append(_fecha)
 
-    meses_presentes = sorted(fechas_esperadas_por_mes.keys(), key=_orden_mes)
+    # REG-1 · con año escolar, TODOS sus meses entran y en su orden, tengan o no
+    # marcas: un mes vacío sigue ocupando su hueco. Sin fechas de año (legacy),
+    # los meses salen de las marcas, igualmente en orden cronológico real.
+    if secuencia:
+        meses_presentes = secuencia
+    else:
+        meses_presentes = sorted(fechas_esperadas_por_mes.keys())
     dias_trabajados_cfg = ano.get_dias_trabajados() if ano else {}
 
-    resultado = []
-    for mes_num in meses_presentes:
-        fechas_mes = fechas_esperadas_por_mes.get(mes_num, [])
-        # v2.19.7: se ordena por NÚMERO de día, no por fecha completa. Al poder
-        # convivir días de años distintos en un mismo mes (ver arriba), ordenar
-        # por fecha dejaría las columnas fuera de secuencia en la hoja MINERD.
+    resultado = MatrizAsistencia(
+        fuera_de_rango=fuera_de_rango, meses_del_ano=secuencia,
+        inicio=getattr(ano, 'fecha_inicio', None) if secuencia else None,
+        fin=getattr(ano, 'fecha_fin', None) if secuencia else None)
+    for posicion, clave in enumerate(meses_presentes):
+        anio_mes, mes_num = clave
+        fechas_mes = fechas_esperadas_por_mes.get(clave, [])
+        # Un (año, mes) tiene un solo calendario: ordenar por número de día es
+        # ordenar por fecha. Una marca digitada fuera de orden (25-sep, luego
+        # 8-sep) se imprime igual en su columna cronológica.
         dias_unicos = sorted({f.day for f in fechas_mes})
-        dias_con_registro = sorted(por_mes.get(mes_num, {}).keys())
+        dias_con_registro = sorted(por_mes.get(clave, {}).keys())
         cfg_mes = dias_trabajados_cfg.get(MES_CLAVE_CORTA.get(mes_num, ''), 0) if dias_trabajados_cfg else 0
 
         # S1 — los dias de este mes en que la clase no se impartio, por numero
         # de dia, que es como se indexan las columnas de la hoja.
         sesiones_mes = {f.day: sesion for f, sesion in no_impartidas.items()
-                        if f.month == mes_num and f.day in set(dias_unicos)}
+                        if (f.year, f.month) == clave and f.day in set(dias_unicos)}
         dias_no_impartidos = sorted(sesiones_mes)
         dias_computables = len(dias_unicos) - len(dias_no_impartidos)
 
@@ -310,7 +419,7 @@ def build_asistencia_registro(
             esperadas_est = 0
 
             for dia in dias_unicos:
-                codigo = por_mes.get(mes_num, {}).get(dia, {}).get(est.id, '')
+                codigo = por_mes.get(clave, {}).get(dia, {}).get(est.id, '')
                 _fecha_col = fecha_por_dia.get(dia)
                 # NO APLICA: antes de que el estudiante perteneciera al centro o
                 # después de su retiro. La celda se marca «-» y no cuenta para
@@ -369,6 +478,11 @@ def build_asistencia_registro(
         resultado.append({
             'mes': MES_NUM_A_NOMBRE.get(mes_num, str(mes_num)),
             'mes_num': mes_num,
+            # REG-1: identidad completa del mes y su hueco en la hoja oficial
+            # (0 = el mes de fecha_inicio). Los generadores colocan por esto.
+            'anio': anio_mes,
+            'clave': f'{anio_mes:04d}-{mes_num:02d}',
+            'posicion': posicion,
             'dias': dias_unicos,
             'total_dias': len(dias_unicos),
             # S1: `total_dias` sigue siendo el numero de COLUMNAS —la geometria
