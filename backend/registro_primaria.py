@@ -13,7 +13,7 @@ F1 (esta versión) rellena:
      efectivo = RP si existe, si no P) + Promedio del área con LINAJE ESTRICTO
      (solo si las 3 finales de competencia están completas)
 
-F2 (esta versión): ASISTENCIA MENSUAL — 12 formularios (agosto-julio),
+F2 (esta versión): ASISTENCIA MENSUAL — 12 formularios, el 1ro = mes de inicio del año (REG-1),
 números de día en la banda Fecha, códigos P/A/T/E por estudiante×día,
 mes y días trabajados. F3 (esta versión): ACTA DE RENDIMIENTO de fin de año — final por área
 con linaje estricto, recuperación final/especial, % asistencia del año y
@@ -182,8 +182,6 @@ ASIST_MES_X = 85          # tras la etiqueta "Mes:____" (x0=57)
 ASIST_DIAS_TRAB_X = 352   # tras "Días trabajados:____"
 ASIST_INFO_Y = 63.0
 ASIST_FILAS_MAX = 45      # un formulario por mes: 45 estudiantes
-# Orden del calendario escolar dominicano: agosto → julio
-MESES_ESCOLARES = [8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7]
 
 # ─────────────────────────── ÁREAS OFICIALES ───────────────────────────
 # nombre canónico → variantes con que puede venir la asignatura del colegio
@@ -553,15 +551,27 @@ def generar_registro_primaria(
                         c.drawCentredString(ASIST_DIA_X0 + j * ASIST_DIA_STEP, y, cod)
         return draw
 
-    # Cada mes del resultado va a SU formulario según el calendario escolar
-    # (formulario 0 = agosto … 11 = julio), no por orden de aparición.
+    # REG-1: cada mes va al formulario de SU POSICIÓN en el año escolar del
+    # colegio: el formulario 1 es el mes de `fecha_inicio`. Un centro que abre
+    # el 7 de septiembre usa septiembre…junio en los formularios 1-10 y deja
+    # los dos últimos vírgenes; uno que abre en agosto empieza en agosto. Un mes
+    # sin marcas conserva su formulario. Antes el formulario 1 era SIEMPRE
+    # agosto, fuera cual fuera el inicio del año.
+    #
+    # FAIL CLOSED: asistencia fuera del año, o más meses que formularios, NO
+    # producen un Registro: no se mueve una marca de mes ni se deja fuera.
+    from registro_asistencia import (verificar_dentro_del_ano, verificar_huecos,
+                                     meses_necesarios)
     paginas_asist = indice.get('asistencia') or []
-    for mes_data in (asistencia_data or []):
-        mes_num = mes_data.get('mes_num')
-        if mes_num in MESES_ESCOLARES:
-            slot = MESES_ESCOLARES.index(mes_num)
-            if slot < len(paginas_asist):
-                agendar(paginas_asist[slot], draw_asistencia_mes(mes_data))
+    if asistencia_data:
+        verificar_dentro_del_ano(asistencia_data, 'Asistencia de Primaria')
+        verificar_huecos(meses_necesarios(asistencia_data), len(paginas_asist),
+                         'Asistencia de Primaria')
+    for i, mes_data in enumerate(asistencia_data or []):
+        if not mes_data:
+            continue
+        slot = mes_data.get('posicion', i)
+        agendar(paginas_asist[slot], draw_asistencia_mes(mes_data))
 
     # ── F4: Estadísticas de matrícula — cuadro de edad y sexo ──
     def draw_estadisticas(c, w, h):

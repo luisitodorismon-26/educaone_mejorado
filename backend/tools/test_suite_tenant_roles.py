@@ -2685,13 +2685,15 @@ with client:
 
     print(f"{BOLD}\n=== X. v2.19.7 — DATOS EN VIVO EN EL REGISTRO ==={RESET}")
 
-    # Se siembra el MISMO escenario que tiene el colegio en producción:
-    # el año escolar declara un rango (2024-09-01 → 2025-06-30) que NO cubre
-    # las fechas en las que realmente se tomó asistencia. Con eso, la rejilla
-    # de días se construía solo con los días esperados del año escolar y las
-    # marcas reales caían fuera: la hoja salía vacía teniendo cientos de
-    # registros. Y las notas de secundaria viven en CalificacionSecundaria,
-    # que el Registro ni siquiera consultaba.
+    # v2.19.7 sembraba aquí un año 2024-09-01 → 2025-06-30 con asistencia de
+    # 2026, y aceptaba que esas marcas se imprimieran en el mes del MISMO
+    # NÚMERO de otro año. REG-1 lo prohíbe: un mes es (año, mes) y una marca
+    # fuera del año escolar es una inconsistencia que bloquea el Registro, no
+    # algo que se reacomoda (ver X2). Las fechas sembradas caen ahora DENTRO
+    # del año (2024-09-01 → 2025-06-30, el mismo en que las secciones previas
+    # registran asistencia) y X1 comprueba que cada código llega a su
+    # (año, mes), cruzando diciembre → enero. Las notas de secundaria viven en
+    # CalificacionSecundaria, que el Registro antes ni consultaba.
     from datetime import date as _date
     from database import SessionLocal as _SL
     from models import (Asistencia as _Asist, CalificacionSecundaria as _CS,
@@ -2699,10 +2701,10 @@ with client:
                         Usuario as _Usr)
 
     X_FECHAS = {  # fecha → estado, uno por cada código del registro
-        _date(2026, 7, 15): 'presente',
-        _date(2026, 8, 5): 'ausente',
-        _date(2026, 8, 12): 'tardanza',
-        _date(2026, 9, 2): 'excusa',
+        _date(2024, 10, 16): 'presente',
+        _date(2024, 12, 4): 'ausente',
+        _date(2025, 1, 8): 'tardanza',      # diciembre → enero: otro año
+        _date(2025, 3, 5): 'excusa',
     }
     X_COMPETENCIAS = [(1, 65, 60, 65, 60), (2, 67, 78, 68, 89),
                       (3, 56, 50, 71, 95), (4, 66, 63, 56, 94)]
@@ -2791,34 +2793,63 @@ with client:
                 continue
             for i, dia in enumerate(dias):
                 if fila['valores'][i]:
-                    encontrados[(mes['mes_num'], dia)] = fila['valores'][i]
+                    encontrados[(mes['anio'], mes['mes_num'], dia)] = fila['valores'][i]
 
-        esperado = {(f.month, f.day): {'presente': 'P', 'ausente': 'A',
-                                       'tardanza': 'T', 'excusa': 'E'}[e]
+        # REG-1: la marca llega a su (año, mes) real, no a un mes del mismo número.
+        esperado = {(f.year, f.month, f.day): {'presente': 'P', 'ausente': 'A',
+                                               'tardanza': 'T', 'excusa': 'E'}[e]
                     for f, e in X_FECHAS.items()}
         for clave_fecha, codigo in esperado.items():
             assert clave_fecha in encontrados, \
-                (f'la marca del {clave_fecha[1]}/{clave_fecha[0]} no llegó a la hoja. '
-                 f'Días con marca: {sorted(encontrados)}')
+                (f'la marca del {clave_fecha[2]}/{clave_fecha[1]}/{clave_fecha[0]} no llegó '
+                 f'a la hoja. Días con marca: {sorted(encontrados)}')
             assert encontrados[clave_fecha] == codigo, \
                 f'{clave_fecha}: se esperaba {codigo} y llegó {encontrados[clave_fecha]!r}'
         assert fila_idx >= 0
 
-    @test("X2. Las fechas fuera del rango del año escolar NO se pierden")
+    @test("X2. Una fecha fuera del año escolar NO se pierde ni se reacomoda: bloquea (REG-1)")
     def t():
-        # Es exactamente el caso de producción: el año escolar declara
-        # 2024-2025 y la asistencia se tomó en 2026. Antes de v2.19.7 la
-        # rejilla no tenía ni julio ni agosto y septiembre no tenía el día 2.
-        data, _ = _datos_asignatura()
-        clave = next(k for k in data if 'atem' in k)
-        matriz = data[clave]['asistencia_matriz']
-        meses_con_marca = {m['mes_num'] for m in matriz
-                           for f in m['filas'] for v in f['valores'] if v}
-        assert {7, 8, 9} <= meses_con_marca, \
-            f'faltan meses con marcas; llegaron {sorted(meses_con_marca)}'
-        sept = next(m for m in matriz if m['mes_num'] == 9)
-        assert 2 in sept['dias'], \
-            f"el día 2 de septiembre tiene registro y no está en la rejilla: {sept['dias']}"
+        # REG-1: una marca fuera de fecha_inicio..fecha_fin no se imprime en el
+        # mes del mismo número de otro año (lo que hacía v2.19.7) ni se oculta:
+        # queda anotada como inconsistencia y el Registro responde 422 con la
+        # fecha exacta. La fila sigue en la base con su fecha. Al terminar se
+        # retira para que X6 e Y generen el Registro normalmente.
+        _s = _SL()
+        try:
+            fuera = _Asist(colegio_id=A_COLEGIO_ID, estudiante_id=X_EST, curso_id=A['curso'],
+                           asignatura_id=A['asig'], fecha=_date(2026, 9, 3), estado='presente')
+            _s.add(fuera)
+            _s.commit()
+            fuera_id = fuera.id
+        finally:
+            _s.close()
+        try:
+            data, _ = _datos_asignatura()
+            clave = next(k for k in data if 'atem' in k)
+            matriz = data[clave]['asistencia_matriz']
+            assert [x['fecha'] for x in matriz.fuera_de_rango] == [_date(2026, 9, 3)], \
+                f'la marca fuera del año debe quedar anotada: {matriz.fuera_de_rango}'
+            sept = next(m for m in matriz if m['clave'] == '2024-09')
+            fila = next(f for f in sept['filas'] if f['estudiante_id'] == X_EST)
+            assert 3 not in sept['dias'] or fila['valores'][sept['dias'].index(3)] in ('', '-'), \
+                'la marca de 2026-09-03 no puede aparecer en septiembre 2024'
+            r = client.get(f'/api/registros/secundaria/{A["curso"]}/preview-pdf',
+                           headers=auth(DIR_A_TOKEN))
+            assert r.status_code == 422, f'{r.status_code} {r.text[:200]}'
+            assert r.json().get('motivo') == 'ASISTENCIA_FUERA_DEL_ANO_ESCOLAR', r.text[:200]
+            assert '2026-09-03' in r.json().get('fechas', []), r.text[:200]
+            _s = _SL()
+            try:
+                assert _s.get(_Asist, fuera_id).fecha == _date(2026, 9, 3), 'la fecha cambió'
+            finally:
+                _s.close()
+        finally:
+            _s = _SL()
+            try:
+                _s.delete(_s.get(_Asist, fuera_id))
+                _s.commit()
+            finally:
+                _s.close()
 
     @test("X3. Las notas de CalificacionSecundaria producen PC y CF en el Registro")
     def t():

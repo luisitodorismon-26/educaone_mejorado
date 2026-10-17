@@ -1988,6 +1988,17 @@ def generar_registro_escolar(
             entrada = ASISTENCIA_MAPA_SECUNDARIA[a_idx]
             meses = asig_data.get("meses", [])
 
+            # REG-1: `meses` está indexado por posición en el año escolar
+            # (hueco 0 = mes de fecha_inicio, con None en los meses sin filas).
+            # Si el año pide más huecos de los que tiene la hoja, NO se imprime
+            # un Registro recortado: antes los meses sobrantes se perdían con
+            # solo un aviso en el log.
+            from registro_asistencia import verificar_huecos
+            _por_pagina = (ASISTENCIA_TABLE_4MESES["bloques"]
+                           if entrada["layout"] == "4meses" else 2)
+            _ultimo = max((i for i, m in enumerate(meses) if m), default=-1)
+            verificar_huecos(_ultimo + 1, _por_pagina * len(entrada["paginas"]), asig)
+
             if entrada["layout"] in ASISTENCIA_LAYOUT_SIN_CALIBRAR:
                 # Barrera: una rejilla sin medir se deja EN BLANCO antes que
                 # estampar marcas en columnas que no le corresponden.
@@ -2024,13 +2035,6 @@ def generar_registro_escolar(
                     c_asist.save()
                     buf.seek(0)
                     overlays[pg_idx] = buf
-                if len(meses) > por_pagina * len(entrada["paginas"]):
-                    logger.warning(
-                        "Asistencia de '%s': %d meses capturados y la hoja oficial "
-                        "solo tiene %d huecos (páginas %s).",
-                        asig, len(meses), por_pagina * len(entrada["paginas"]),
-                        entrada["paginas"],
-                    )
                 continue
 
             # Cada asignatura tiene 5 páginas (10 meses, 2 por página)
@@ -2090,6 +2094,14 @@ def generar_registro_escolar(
                 continue
             datos_bloque = salida_optativa_asistencia[bloque_idx] or {}
             meses = datos_bloque.get("meses") or []
+            # REG-1: la matriz ya viene en orden cronológico con todos los meses
+            # del año (vacíos incluidos), así que su índice ES el hueco. Mismos
+            # dos cierres que una materia troncal.
+            from registro_asistencia import (verificar_dentro_del_ano,
+                                             verificar_huecos, meses_necesarios)
+            _ctx = f"Salida Optativa (bloque {bloque_idx + 1})"
+            verificar_dentro_del_ano(meses, _ctx)
+            verificar_huecos(meses_necesarios(meses), 2 * len(bloques[bloque_idx]), _ctx)
             # ROTULADO (R3.4.1 §4-§5). El template deja en blanco "SALIDA
             # OPTATIVA ____ ASIGNATURA ____", así que la rejilla sola no dice a
             # qué materia pertenece. Los nombres vienen del CATÁLOGO y del
@@ -2780,6 +2792,11 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         meses_list = []
 
         if matriz:
+            # REG-1: asistencia fuera del año escolar → no se emite (ni se mueve
+            # de mes ni se esconde). El control de huecos va en
+            # generar_registro_escolar, que es quien conoce la rejilla.
+            from registro_asistencia import verificar_dentro_del_ano
+            verificar_dentro_del_ano(matriz, asig_nombre)
             for mes_data in matriz:
                 dias_mes = list(mes_data.get('dias', []))[:21]
                 est_list = []
@@ -2806,35 +2823,25 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
                         etiquetas_ni[_idx] = _info.get("etiqueta") or "NO IMPARTIDA"
 
                 if est_list:
-                    meses_list.append({
+                    # REG-1: cada mes va al hueco de su POSICIÓN en el año
+                    # escolar (0 = mes de fecha_inicio), no al siguiente libre.
+                    # Antes se ponían delante los meses con marcas: una materia
+                    # sin asistencia en septiembre imprimía octubre en el hueco
+                    # de septiembre. Ahora septiembre vacío conserva su hueco.
+                    pos = mes_data.get("posicion", len(meses_list))
+                    while len(meses_list) <= pos:
+                        meses_list.append(None)
+                    meses_list[pos] = {
                         "nombre_mes": mes_data.get("mes", ""),
                         "docente": "",
                         "asistencias": est_list,
                         "dias_labels": dias_mes,
                         "etiquetas_no_impartidas": etiquetas_ni,
-                        # marca interna para priorizar los meses con captura real.
-                        # Un mes cuyo unico contenido es una justificacion TAMBIEN
-                        # necesita su hueco: si no, la unica pagina que explica por
-                        # que no hubo clase seria la que se cae de la hoja.
-                        "_tiene_marcas": (any(v for f in est_list for v in f["dias"])
-                                          or bool(etiquetas_ni)),
-                    })
-            # v2.19.7: la hoja MINERD tiene 10 huecos de mes por asignatura
-            # (5 páginas x 2). Cuando el año escolar y las fechas realmente
-            # capturadas no coinciden, la matriz puede traer más de 10 meses y
-            # los últimos se perderían — justo los que tienen asistencia. Se
-            # ponen delante los meses CON captura, conservando entre ellos el
-            # orden del año escolar (agosto→julio). No se altera ningún dato:
-            # solo se decide qué meses ocupan los huecos disponibles.
-            meses_list = (
-                [m for m in meses_list if m.get("_tiene_marcas")]
-                + [m for m in meses_list if not m.get("_tiene_marcas")]
-            )
-            for m in meses_list:
-                m.pop("_tiene_marcas", None)
-            if meses_list:
+                    }
+            primero = next((m for m in meses_list if m), None)
+            if primero:
                 # El template imprime el docente una sola vez, en el primer mes.
-                meses_list[0]["docente"] = data.get('docente', '')
+                primero["docente"] = data.get('docente', '')
         else:
             meses_legacy = sorted({mes_idx for est_raw in raw.values() for mes_idx in est_raw.keys()})
             for mes_idx in meses_legacy:
