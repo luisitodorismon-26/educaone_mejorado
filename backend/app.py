@@ -11365,13 +11365,10 @@ async def get_dashboard_alertas(request: Request, db: Session = Depends(get_db),
 
     # Comunicados no leídos
     query = tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True)
-    if current_user.role == 'profesor':
-        query = query.filter_by(para_profesores=True)
-    elif current_user.role == 'coordinador':
-        query = query.filter_by(para_coordinadores=True)
-    elif current_user.role == 'psicologia':
-        query = query.filter_by(para_psicologia=True)
-    
+    # COM1 · misma audiencia que el listado (flags por rol + nivel): sin esto
+    # quedaría un "sin leer" que el usuario no puede abrir.
+    query = _filtrar_comunicados_visibles(query, current_user)
+
     comunicados_ids = [c.id for c in query.all()]
     leidos_ids = [cl.comunicado_id for cl in tenant_filter(db.query(ComunicadoLeido), ComunicadoLeido, current_user).filter_by(usuario_id=current_user.id).all()]
     no_leidos = [cid for cid in comunicados_ids if cid not in leidos_ids]
@@ -11813,7 +11810,9 @@ async def get_actividad_reciente(db: Session = Depends(get_db), current_user: Us
     actividades = []
     
     # Últimos comunicados
-    comunicados = tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True).order_by(Comunicado.fecha.desc()).limit(3).all()
+    comunicados = _filtrar_comunicados_visibles(
+        tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True),
+        current_user).order_by(Comunicado.fecha.desc()).limit(3).all()
     for c in comunicados:
         actividades.append({
             'tipo': 'comunicado',
@@ -13476,19 +13475,97 @@ async def marcar_mensaje_leido(id, request: Request, db: Session = Depends(get_d
         db.commit()
     return {'message': 'Mensaje marcado como leído'}
 
+# ═══════════════ COM1 · ALCANCE DE LOS COMUNICADOS POR NIVEL ═══════════════
+#
+# Se REUTILIZA `Comunicado.tipo` (String(20), default 'general'), que hasta
+# ahora solo se escribía con su valor por defecto y se devolvía en el GET:
+#     'general'    = Todo el colegio
+#     'primaria'   = Primaria
+#     'secundaria' = Secundaria
+# Cualquier otro valor (NULL, vacío o legacy) se trata como 'general': ningún
+# comunicado existente desaparece. Sin migración ni columna nueva.
+#
+# La autoridad es el backend y el dato es `nivel_asignado`: Dirección y
+# Coordinación son globales en Comunicación (ven y publican los tres alcances,
+# aunque el coordinador tenga división fija); el resto con división fija ve
+# 'general' + la suya; sin división fija ve los tres. El filtro de nivel va
+# ENCIMA de los flags por rol (`para_profesores`, ...), que no cambian.
+ALCANCES_COMUNICADO = ('general', 'primaria', 'secundaria')
+
+
+def _alcance_comunicado(comunicado):
+    t = (getattr(comunicado, 'tipo', None) or '').strip().lower()
+    return t if t in NIVELES_DIVISION else 'general'
+
+
+def _nivel_fijo_comunicados(user):
+    """División fija que limita los comunicados de este usuario, o None."""
+    if getattr(user, 'role', None) in ('direccion', 'coordinador', 'superadmin'):
+        return None
+    nv = (getattr(user, 'nivel_asignado', None) or '').strip().lower()
+    return nv if nv in NIVELES_DIVISION else None
+
+
+def _filtrar_comunicados_por_nivel(query, user):
+    """Quita los comunicados de la división CONTRARIA. NULL/legacy = general.
+    `tipo` se compara normalizado (minúsculas, sin espacios), igual que
+    `_alcance_comunicado`; las filas no se reescriben."""
+    nv = _nivel_fijo_comunicados(user)
+    if nv is None:
+        return query
+    otro = 'secundaria' if nv == 'primaria' else 'primaria'
+    return query.filter(or_(Comunicado.tipo.is_(None),
+                            func.lower(func.trim(Comunicado.tipo)) != otro))
+
+
+def _comunicado_visible_por_nivel(comunicado, user):
+    nv = _nivel_fijo_comunicados(user)
+    return nv is None or _alcance_comunicado(comunicado) in ('general', nv)
+
+
+# Flags por rol de siempre: rol del usuario -> columna que lo habilita.
+_FLAG_COMUNICADO_POR_ROL = {
+    'profesor': 'para_profesores',
+    'coordinador': 'para_coordinadores',
+    'psicologia': 'para_psicologia',
+}
+
+
+def _filtrar_comunicados_visibles(query, user):
+    """Audiencia completa de un comunicado: flags por rol + nivel (COM1).
+    Una sola regla para el listado, las alertas, la actividad reciente y
+    marcar leído."""
+    flag = _FLAG_COMUNICADO_POR_ROL.get(getattr(user, 'role', None))
+    if flag:
+        query = query.filter(getattr(Comunicado, flag).is_(True))
+    return _filtrar_comunicados_por_nivel(query, user)
+
+
+def _comunicado_visible(comunicado, user):
+    flag = _FLAG_COMUNICADO_POR_ROL.get(getattr(user, 'role', None))
+    if flag and not getattr(comunicado, flag):
+        return False
+    return _comunicado_visible_por_nivel(comunicado, user)
+
+
+def _alcance_pedido(data, por_defecto='general'):
+    """('alcance', None) si es válido; (None, JSONResponse) si no."""
+    valor = data.get('tipo', por_defecto)
+    valor = (valor or por_defecto).strip().lower() if isinstance(valor, str) else valor
+    if valor not in ALCANCES_COMUNICADO:
+        return None, JSONResponse({'error': 'Alcance inválido: use general, primaria o secundaria.'},
+                                  status_code=400)
+    return valor, None
+
+
 @app.get("/api/comunicados")
 async def get_comunicados(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Obtener comunicados visibles para el usuario"""
     query = tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True)
     
-    # Filtrar según rol
-    if current_user.role == 'profesor':
-        query = query.filter_by(para_profesores=True)
-    elif current_user.role == 'coordinador':
-        query = query.filter_by(para_coordinadores=True)
-    elif current_user.role == 'psicologia':
-        query = query.filter_by(para_psicologia=True)
-    
+    # Filtrar según rol (flags de siempre) y, encima, el nivel (COM1).
+    query = _filtrar_comunicados_visibles(query, current_user)
+
     # Filtrar comunicados expirados
     query = query.filter(
         (Comunicado.fecha_expiracion.is_(None)) | 
@@ -13506,6 +13583,7 @@ async def get_comunicados(request: Request, db: Session = Depends(get_db), curre
         'contenido': c.contenido,
         'imagen': c.imagen,
         'tipo': c.tipo,
+        'alcance': _alcance_comunicado(c),
         'autor': c.autor.nombre_completo if c.autor else None,
         'autor_id': c.autor_id,
         'fecha': c.fecha.isoformat() if c.fecha else None,
@@ -13516,14 +13594,18 @@ async def get_comunicados(request: Request, db: Session = Depends(get_db), curre
 async def crear_comunicado(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
     """Crear un nuevo comunicado"""
     data = await request.json()
-    
+    # COM1 · alcance pedido (Dirección y Coordinación publican los tres).
+    alcance, _err = _alcance_pedido(data)
+    if _err is not None:
+        return _err
+
     comunicado = Comunicado(
         autor_id=current_user.id,
         colegio_id=current_user.colegio_id,
         titulo=data['titulo'],
         contenido=data['contenido'],
         imagen=data.get('imagen'),
-        tipo=data.get('tipo', 'general'),
+        tipo=alcance,
         para_profesores=data.get('para_profesores', True),
         para_coordinadores=data.get('para_coordinadores', True),
         para_psicologia=data.get('para_psicologia', True)
@@ -13536,8 +13618,13 @@ async def crear_comunicado(request: Request, db: Session = Depends(get_db), curr
     if comunicado.para_profesores: roles_dest.append('profesor')
     if comunicado.para_coordinadores: roles_dest.append('coordinador')
     if comunicado.para_psicologia: roles_dest.append('psicologia')
+    # COM1 · mismos roles de siempre, pero solo quien puede VER este alcance:
+    # un comunicado de Primaria no notifica a quien está fijo en Secundaria.
+    nivel = None if alcance == 'general' else alcance
     for role in roles_dest:
-        notificar_rol(db, current_user.colegio_id, role, f'📢 {comunicado.titulo}', comunicado.contenido[:100], 'comunicado', '/comunicacion')
+        for uid in usuarios_autorizados_para_nivel(db, current_user.colegio_id, role, nivel):
+            crear_notificacion(db, uid, f'📢 {comunicado.titulo}', comunicado.contenido[:100],
+                               'comunicado', '/comunicacion', current_user.colegio_id)
     db.commit()
     
     log_auditoria(db, 'CREAR_COMUNICADO', 'comunicados', comunicado.id, user=current_user, request=request)
@@ -13548,6 +13635,8 @@ async def crear_comunicado(request: Request, db: Session = Depends(get_db), curr
 async def eliminar_comunicado(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
     """Eliminar comunicado"""
     comunicado = get_tenant_or_404(db, Comunicado, id, current_user, name='comunicado')
+    if not _comunicado_visible_por_nivel(comunicado, current_user):
+        return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
     comunicado.activo = False
     db.commit()
     log_auditoria(db, 'ELIMINAR_COMUNICADO', 'comunicados', id, user=current_user, request=request)
@@ -13555,10 +13644,18 @@ async def eliminar_comunicado(id, request: Request, db: Session = Depends(get_db
 
 @app.put("/api/comunicados/{id}")
 async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
-    """Actualizar comunicado"""
+    """Actualizar comunicado. Editar NO es publicar: no se notifica de nuevo."""
     comunicado = get_tenant_or_404(db, Comunicado, id, current_user, name='comunicado')
+    if not _comunicado_visible_por_nivel(comunicado, current_user):
+        return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
     data = await request.json()
-    
+    # COM1 · el alcance se puede cambiar (sin volver a notificar).
+    if 'tipo' in data:
+        alcance, _err = _alcance_pedido(data)
+        if _err is not None:
+            return _err
+        comunicado.tipo = alcance
+
     if 'titulo' in data:
         comunicado.titulo = data['titulo']
     if 'contenido' in data:
@@ -13574,7 +13671,11 @@ async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_
 async def marcar_comunicado_leido(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Marcar comunicado como leído. Valida que el comunicado pertenezca al tenant."""
     comunicado = get_tenant_or_404(db, Comunicado, id, current_user, name='comunicado')
-    
+    # COM1 · lo que no se puede ver (flags por rol o nivel), no se puede
+    # marcar (fail closed).
+    if not _comunicado_visible(comunicado, current_user):
+        return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
+        
     existing = tenant_filter(db.query(ComunicadoLeido), ComunicadoLeido, current_user).filter_by(
         comunicado_id=comunicado.id, 
         usuario_id=current_user.id
