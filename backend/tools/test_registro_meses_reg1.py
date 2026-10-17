@@ -58,9 +58,15 @@ db = SessionLocal()
 _n = [0]
 
 
-def escenario(inicio, fin, nivel='secundaria', n_est=3, horario=('Lunes', 'Martes', 'Miércoles',
-                                                                    'Jueves', 'Viernes')):
-    """Colegio + año + curso + 3 estudiantes + Matemática con horario L-V."""
+# REG-2: la hoja de Secundaria tiene 21 columnas por mes y ya no recorta días;
+# con clase de lunes a viernes, octubre 2026 (22 días hábiles) no cabría. Cuatro
+# días por semana (como mucho 20 columnas al mes) conservan lo que este test
+# verifica: el 7-sep es lunes y el 25-jun-2027 es viernes.
+HORARIO_4_DIAS = ('Lunes', 'Martes', 'Miércoles', 'Viernes')
+
+
+def escenario(inicio, fin, nivel='secundaria', n_est=3, horario=HORARIO_4_DIAS):
+    """Colegio + año + curso + 3 estudiantes + Matemática con horario de 4 días."""
     _n[0] += 1
     k = _n[0]
     col = M.Colegio(nombre='REG1-%d' % k, codigo='reg1%d' % k, activo=True)
