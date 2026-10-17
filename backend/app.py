@@ -12566,6 +12566,57 @@ async def get_mensajes_no_leidos(request: Request, db: Session = Depends(get_db)
 
 # ============== REPORTES DE CONDUCTA ==============
 
+# REP1 · DIVISIÓN PRIMARIA/SECUNDARIA EN REPORTES
+#
+# El nivel de un reporte se DERIVA del estudiante reportado
+# (estudiante -> curso -> grado -> nivel), nunca de quién lo escribió; no se
+# guarda en `ReporteConducta` (sin migración ni reetiquetado).
+#   - Dirección: todo el colegio (no se limita por nivel_asignado).
+#   - Coordinación y Psicología con nivel_asignado fijo: solo su división.
+#     Sin división fija: comportamiento de siempre (todo el colegio).
+#   - Profesor: sin cambios (lo rige `reportado_por`).
+# Acceso directo al otro nivel = 404, sin revelar que el reporte existe.
+# Un estudiante sin curso/grado no tiene nivel determinable: para un usuario
+# con división fija queda fuera (fail closed).
+_ROLES_CON_DIVISION_EN_REPORTES = ('coordinador', 'psicologia')
+
+
+def _nivel_fijo_reportes(user):
+    """División fija que limita los reportes de este usuario, o None."""
+    if getattr(user, 'role', None) not in _ROLES_CON_DIVISION_EN_REPORTES:
+        return None
+    nv = (getattr(user, 'nivel_asignado', None) or '').strip().lower()
+    return nv if nv in NIVELES_DIVISION else None
+
+
+def _filtrar_reportes_por_nivel(q, db, user):
+    nv = _nivel_fijo_reportes(user)
+    if nv is None:
+        return q
+    _cids = cursos_ids_de_nivel(db, user, nv) or {0}
+    _est_ids = [e[0] for e in tenant_filter(
+        db.query(Estudiante.id), Estudiante, user
+    ).filter(Estudiante.curso_id.in_(_cids)).all()] or [0]
+    return q.filter(ReporteConducta.estudiante_id.in_(_est_ids))
+
+
+def _reporte_o_404(db, id, user):
+    """Reporte del colegio Y de la división del usuario; si no, 404."""
+    reporte = get_tenant_or_404(db, ReporteConducta, id, user, name='reporte')
+    nv = _nivel_fijo_reportes(user)
+    if nv is not None and nivel_de_estudiante(db, user, reporte.estudiante_id) != nv:
+        raise HTTPException(status_code=404, detail='reporte no encontrado')
+    return reporte
+
+
+def _coordinadores_para_reporte(db, colegio_id, nivel):
+    """Coordinadores que deben enterarse de un reporte del `nivel` dado.
+    Sin división fija: siempre. Con división fija: solo si coincide. Si el
+    nivel no se puede determinar, solo los que no tienen división fija (los
+    demás no podrían abrirlo)."""
+    return usuarios_autorizados_para_nivel(db, colegio_id, 'coordinador', nivel or 'sin_nivel')
+
+
 @app.get("/api/reportes")
 async def get_reportes(request: Request, db: Session = Depends(get_db),
                        current_user: Usuario = Depends(
@@ -12577,7 +12628,8 @@ async def get_reportes(request: Request, db: Session = Depends(get_db),
     -----------------------------------------------------------------
       profesor      -> SOLO los reportes que el mismo creo
       direccion     -> todos los del colegio
-      coordinacion  -> todos los del colegio
+      coordinacion  -> todos los del colegio; con nivel_asignado fijo, SOLO
+                       los de estudiantes de su división (REP1)
       secretaria    -> SIN listado general de reportes disciplinarios
       psicologia    -> SIN listado general; sus intervenciones llegan por los
                        flujos/casos de Psicologia, no por esta lista
@@ -12602,6 +12654,8 @@ async def get_reportes(request: Request, db: Session = Depends(get_db),
 
     if current_user.role == 'profesor':
         q = q.filter(ReporteConducta.reportado_por == current_user.id)
+    # REP1 · coordinación con división fija: solo su nivel.
+    q = _filtrar_reportes_por_nivel(q, db, current_user)
 
     q = q.order_by(ReporteConducta.fecha.desc())
     # v2.13.30: paginación opcional (sin ?page devuelve todo, retrocompatible)
@@ -12769,10 +12823,13 @@ async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db:
     # v2.19 Fase A — avisar a quienes deben atender el reporte.
     # Va DESPUÉS del commit: el reporte ya está persistido pase lo que pase acá.
     _grav = (reporte.gravedad or 'leve').lower()
+    # REP1 · Dirección siempre; coordinación según la división del ESTUDIANTE.
+    _niv_rep = nivel_de_estudiante(db, current_user, reporte.estudiante_id)
     _notifs = notify(
         db,
         colegio_id=current_user.colegio_id,
-        roles=['direccion', 'coordinador'],
+        roles=['direccion'],
+        usuario_ids=_coordinadores_para_reporte(db, current_user.colegio_id, _niv_rep),
         excluir_usuario_id=current_user.id,
         titulo=('🔴 URGENTE: nuevo reporte de conducta' if _grav == 'grave'
                 else '📋 Nuevo reporte de conducta'),
@@ -12803,9 +12860,9 @@ async def responder_reporte(id, request: Request, background_tasks: BackgroundTa
     - respuesta: comentario adicional libre (opcional, legacy)
     
     Permisos: dirección, coordinación, psicología (los tres roles que firman
-    reportes oficiales en colegios DR).
+    reportes oficiales en colegios DR). REP1: con división fija, solo su nivel.
     """
-    reporte = get_tenant_or_404(db, ReporteConducta, id, current_user, name='reporte')
+    reporte = _reporte_o_404(db, id, current_user)
     data = await request.json()
     
     import bleach
@@ -12862,7 +12919,7 @@ async def confirmar_reporte_padre(id, request: Request, db: Session = Depends(ge
     
     Idempotente: marcar 2 veces no rompe nada.
     """
-    reporte = get_tenant_or_404(db, ReporteConducta, id, current_user, name='reporte')
+    reporte = _reporte_o_404(db, id, current_user)
     
     if reporte.confirmado_padre:
         return {
@@ -12888,13 +12945,17 @@ async def confirmar_reporte_padre(id, request: Request, db: Session = Depends(ge
 
 @app.get("/api/reportes/{id}/pdf")
 async def imprimir_reporte_pdf(id, request: Request, db: Session = Depends(get_db),
-                                  current_user: Usuario = Depends(get_current_user)):
+                                  current_user: Usuario = Depends(
+                                      RolesRequired('direccion', 'coordinador', 'psicologia', 'profesor'))):
     """
     Genera el PDF profesional de un reporte de conducta.
 
-    Permisos (v2.11):
-    - Dirección, coordinación, psicología: cualquier reporte del colegio
+    Permisos (v2.11, REP1):
+    - Dirección: cualquier reporte del colegio
+    - Coordinación, psicología: cualquiera del colegio; con división fija,
+      solo los de su nivel (404 para el otro)
     - Profesor: solo los reportes que él creó
+    - Secretaría y demás roles: 403 (no imprimen reportes por ID)
 
     v2.13.22: TODO el cuerpo va dentro de try/except para que cualquier
     error devuelva el detalle real en vez de un 500 mudo.
@@ -12903,7 +12964,7 @@ async def imprimir_reporte_pdf(id, request: Request, db: Session = Depends(get_d
     from fastapi.responses import Response
     from pdf_helpers import safe_filename_ascii
 
-    reporte = get_tenant_or_404(db, ReporteConducta, id, current_user, name='reporte')
+    reporte = _reporte_o_404(db, id, current_user)
 
     # Profesor: solo sus propios reportes
     if current_user.role == 'profesor' and reporte.reportado_por != current_user.id:
@@ -12963,8 +13024,8 @@ async def imprimir_reporte_pdf(id, request: Request, db: Session = Depends(get_d
 @app.post("/api/reportes/{id}/enviar-padres")
 async def enviar_reporte_padres(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
     """Registrar envío de reporte a padres con historial"""
-    
-    reporte = get_tenant_or_404(db, ReporteConducta, id, current_user, name='reporte')
+
+    reporte = _reporte_o_404(db, id, current_user)  # REP1: tenant + división
     data = await request.json() or {}
     
     # Marcar como enviado
@@ -12997,7 +13058,9 @@ async def enviar_reporte_padres(id, request: Request, db: Session = Depends(get_
 @app.get("/api/reportes/{id}/historial-envios")
 async def get_historial_envios_reporte(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
     """Ver historial de envíos de un reporte a padres"""
-    
+    # REP1 · el reporte debe ser del colegio y de la división del usuario.
+    _reporte_o_404(db, id, current_user)
+
     historial = tenant_filter(db.query(HistorialReportePadres), HistorialReportePadres, current_user).filter_by(reporte_id=id).order_by(HistorialReportePadres.fecha_envio.desc()).all()
     
     return [{

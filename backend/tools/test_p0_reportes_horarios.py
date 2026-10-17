@@ -5,7 +5,8 @@ EducaOne P0 — HOTFIX: aislamiento de reportes + integridad de horarios.
 BLOQUE A — REPORTES
     profesor      -> SOLO los reportes que el mismo creo
     direccion     -> todos los del colegio
-    coordinacion  -> todos los del colegio
+    coordinacion  -> sin nivel fijo: todos los del colegio;
+                     con nivel_asignado fijo: solo su division (REP1)
     secretaria    -> SIN listado general
     psicologia    -> SIN listado general (opera desde sus casos)
     Se conservan: PDF propio del profesor, POST /api/reportes, acciones de
@@ -104,6 +105,7 @@ A_LENGUA, A_SOCIALES, A_INGLES, A_FRANCES = 1, 3, 5, 17
 U_P1, U_P2, U_P3, U_P4 = 31, 32, 33, 40
 U_DIR, U_COORD, U_PSI, U_SEC = 34, 35, 36, 37
 U_DIR_B, U_P_B = 38, 39
+U_COORD_P, U_COORD_S = 41, 42   # REP1: coordinadores con division fija
 EST_COMP, EST_OTRO, EST_B = 50, 51, 52
 CURSO_B_ASIG = 77
 
@@ -145,6 +147,14 @@ def _seed():
                                   (U_P_B, "p_b", "profesor", COL_B)):
             u = M.Usuario(id=uid, username=un, nombre=un.upper(), apellido="T",
                           role=rol, colegio_id=col, activo=True)
+            u.set_password(PWD)
+            d.add(u)
+        # REP1: el colegio A del fixture es solo de Secundaria.
+        for uid, un, nv in ((U_COORD_P, "coord_p", "primaria"),
+                            (U_COORD_S, "coord_s", "secundaria")):
+            u = M.Usuario(id=uid, username=un, nombre=un.upper(), apellido="T",
+                          role="coordinador", colegio_id=COL_A, activo=True,
+                          nivel_asignado=nv)
             u.set_password(PWD)
             d.add(u)
         for eid, col, cur, nom in ((EST_COMP, COL_A, C_COMP, "EstComp"),
@@ -198,7 +208,7 @@ def auth(t):
 
 _seed()
 TOK = {u: login(u) for u in ("p1", "p2", "p3", "p4", "dir", "coord", "psi",
-                             "sec", "dir_b", "p_b")}
+                             "sec", "dir_b", "p_b", "coord_p", "coord_s")}
 
 
 def listado(u):
@@ -237,12 +247,21 @@ def _():
     assert "SECRETO_DE_P1" in cuerpo, "debe seguir viendo el propio"
 
 
-@test("§A4 DIRECCION y COORDINACION: todos los reportes del colegio")
+@test("§A4 DIRECCION y COORDINACION sin nivel fijo: todos los reportes del colegio")
 def _():
     for u in ("dir", "coord"):
         cod, v = listado(u)
         assert cod == 200, (u, cod)
         assert v == {100, 101, 102}, (u, v)
+
+
+@test("§A4b REP1 COORDINACION con nivel fijo: solo su division")
+def _():
+    # Los tres reportes del colegio A son de estudiantes de Secundaria.
+    cod, v = listado("coord_s")
+    assert cod == 200 and v == {100, 101, 102}, ("coord_s", cod, v)
+    cod, v = listado("coord_p")
+    assert cod == 200 and v == set(), ("coord_p no debe ver Secundaria", cod, v)
 
 
 @test("§A5 SECRETARIA: sin listado general (403)")
