@@ -21457,6 +21457,65 @@ async def get_dias_trabajados(ano_id: int, db: Session = Depends(get_db),
 
 
 
+def _enriquecer_registro_primaria(db, current_user, curso, config, estudiantes_db,
+                                  estudiantes_raw, colegio_info, calificaciones_por_area):
+    """REG-3 · Completa lo que el Registro de Primaria ya debía recibir.
+
+    SOLO LECTURA y sin reglas nuevas:
+      · nacionalidad, dirección y condición de entrada: columnas del Estudiante;
+      · zona y sector: la configuración del colegio (círculos de la pág 7);
+      · `cf_oficial` de cada competencia y `_area.cf` del área: las MISMAS
+        funciones del motor (`calculo_primaria.cf_competencia` / `cf_area`),
+        para que el PDF no promedie nada por su cuenta. Una consulta para todo
+        el curso (sin N+1).
+    """
+    import calculo_primaria as _CP
+
+    colegio_info['zona'] = getattr(config, 'zona', '') or ''
+    colegio_info['sector'] = getattr(config, 'sector', '') or ''
+    for est, fila in zip(estudiantes_db, estudiantes_raw):
+        fila['nacionalidad'] = (getattr(est, 'nacionalidad', '') or '').strip()
+        fila['direccion'] = (est.direccion or '').strip()
+        fila['condicion_entrada'] = getattr(est, 'condicion_entrada', '') or ''
+
+    if not calificaciones_por_area or not estudiantes_db:
+        return
+    asig_id_por_nombre = {}
+    for ap in tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            curso_id=curso.id, activo=True).all():
+        a = db.query(Asignatura).filter_by(id=ap.asignatura_id,
+                                           colegio_id=current_user.colegio_id).first()
+        if a is not None:
+            asig_id_por_nombre.setdefault(a.nombre, a.id)
+    ids_est = [e.id for e in estudiantes_db]
+    califs = {}
+    # El cargador de arriba toma `.first()` por (estudiante, asignatura,
+    # competencia); ordenar por id y quedarse con la primera reproduce ese
+    # criterio de forma determinista.
+    for c in tenant_filter(db.query(CalificacionPrimaria), CalificacionPrimaria, current_user).filter(
+            CalificacionPrimaria.estudiante_id.in_(ids_est),
+            CalificacionPrimaria.asignatura_id.in_(list(asig_id_por_nombre.values()) or [0]),
+    ).order_by(CalificacionPrimaria.id).all():
+        califs.setdefault((c.estudiante_id, c.asignatura_id, c.competencia_numero), c)
+
+    for nombre, area_data in calificaciones_por_area.items():
+        asig_id = asig_id_por_nombre.get(nombre)
+        if asig_id is None:
+            continue
+        for idx, comps in area_data.items():
+            est = estudiantes_db[int(idx)]
+            objetos = []
+            for num in (1, 2, 3):
+                obj = califs.get((est.id, asig_id, num))
+                if obj is None:
+                    continue
+                objetos.append(obj)
+                if num in comps:
+                    comps[num]['cf_oficial'] = _CP.cf_competencia(obj)
+            _exacto, redondeado = _CP.cf_area(objetos)
+            comps['_area'] = {'cf': redondeado}
+
+
 def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_area):
     """v2.17 F3: arma los datos del ACTA de fin de año del registro de primaria.
 
@@ -21515,9 +21574,27 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
                 recuperaciones_por_asig={k: v[0] for k, v
                                          in (_recs.get(est.id) or {}).items() if v},
                 asistencias=_asist.get(est.id, []))
-            condiciones[idx] = ETIQUETA.get(
-                RAC.CONDICION_LEGACY_PRIMARIA.get(
-                    _paquete['situacion']['condicion']), '')
+            # REG-3: el Acta marca la casilla de la situación con el CÓDIGO
+            # canónico (PROMOVIDO / APLAZADO / REPROBADO; EN_PROCESO no marca)
+            # y llena "Presencia y ausencia" con la asistencia anual
+            # CANÓNICA del mismo paquete: % asistencia (P+T), % ausencia
+            # injustificada (la de A2) y % excusa, todos sobre los días
+            # lectivos y solo con cobertura completa. Nada se recalcula.
+            _cond = _paquete['situacion']['condicion']
+            _r = _paquete.get('asistencia') or {}
+            _lect = _r.get('dias_lectivos') or 0
+            _completa = bool(_r.get('cobertura_completa')) and _lect > 0
+            condiciones[idx] = {
+                'condicion': _cond,
+                'etiqueta': ETIQUETA.get(RAC.CONDICION_LEGACY_PRIMARIA.get(_cond), ''),
+                'asistencia': {
+                    'cobertura_completa': _completa,
+                    'pct_asistencia': _r.get('pct_asistencia') if _completa else None,
+                    'pct_ausencia': _r.get('porcentaje_a2') if _completa else None,
+                    'pct_excusa': (round(_r.get('excusas', 0) * 100.0 / _lect, 1)
+                                   if _completa else None),
+                },
+            }
     return recuperaciones, condiciones
 
 
@@ -21637,6 +21714,10 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
         if area_data:
             calificaciones_por_area[asignatura.nombre] = area_data
     
+    # REG-3: lo que el Registro de Primaria ya debía recibir (solo lectura).
+    _enriquecer_registro_primaria(db, current_user, curso, config, estudiantes_db[:90],
+                                  estudiantes_raw, colegio_info, calificaciones_por_area)
+
     # Asistencia
     from registro_asistencia import build_asistencia_registro
     asistencia = build_asistencia_registro(db, curso_id, estudiantes=estudiantes_db[:90])
@@ -21798,6 +21879,10 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
         if area_data:
             calificaciones_por_area[asignatura.nombre] = area_data
     
+    # REG-3: lo que el Registro de Primaria ya debía recibir (solo lectura).
+    _enriquecer_registro_primaria(db, current_user, curso, config, estudiantes_db[:90],
+                                  estudiantes_raw, colegio_info, calificaciones_por_area)
+
     from registro_asistencia import build_asistencia_registro
     asistencia_por_mes = build_asistencia_registro(db, curso_id, estudiantes=estudiantes_db[:90])
     
