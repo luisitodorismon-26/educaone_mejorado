@@ -40,6 +40,48 @@ from reglas_academicas import redondear_calificacion_final
 
 logger = logging.getLogger(__name__)
 
+
+class RegistroExcedePlantilla(Exception):
+    """REG-2: el dato real no cabe en la hoja oficial (más días que columnas,
+    más estudiantes que filas). FAIL CLOSED: no se emite un Registro recortado.
+    `detalle` es serializable; app.py lo devuelve como 422."""
+
+    def __init__(self, detalle: Dict):
+        self.detalle = detalle
+        super().__init__(detalle.get('mensaje', detalle.get('motivo', 'plantilla')))
+
+
+def _verificar_capacidad_mes(datos_mes: Dict, max_dias: int, contexto: str = '',
+                             max_filas: int = 40) -> None:
+    """Un mes de asistencia cabe entero en su rejilla o no se imprime."""
+    dias = list(datos_mes.get("dias_labels") or [])
+    # Columnas que de verdad se usan: los días rotulados y, por fila, hasta la
+    # última celda CON marca (un relleno con None no ocupa columnas).
+    n_marcas = 0
+    for e in (datos_mes.get("asistencias") or []):
+        valores = (e or {}).get("dias") or []
+        usados = [i for i, v in enumerate(valores) if v not in (None, "")]
+        if usados:
+            n_marcas = max(n_marcas, usados[-1] + 1)
+    n = max(len(dias), n_marcas)
+    if n > max_dias:
+        raise RegistroExcedePlantilla({
+            'motivo': 'DIAS_EXCEDEN_PLANTILLA',
+            'mensaje': (f"{contexto} — {datos_mes.get('nombre_mes', '')}: hay {n} días de "
+                        f"clase y la hoja oficial solo tiene {max_dias} columnas. No se "
+                        f"imprime un Registro que esconda días.").strip(' —'),
+            'contexto': contexto, 'mes': datos_mes.get('nombre_mes', ''),
+            'dias': dias, 'columnas': max_dias,
+        })
+    filas = len(datos_mes.get("asistencias") or [])
+    if filas > max_filas:
+        raise RegistroExcedePlantilla({
+            'motivo': 'ESTUDIANTES_EXCEDEN_PLANTILLA',
+            'mensaje': (f"{contexto}: {filas} estudiantes y la hoja oficial solo tiene "
+                        f"{max_filas} filas.").strip(': '),
+            'contexto': contexto, 'estudiantes': filas, 'filas': max_filas,
+        })
+
 # ============================================================================
 # CONSTANTES
 # ============================================================================
@@ -219,6 +261,9 @@ GRADO_CONFIG = {
         # Calificaciones de rendimiento (spreads de 2 páginas por asignatura)
         "calificaciones_inicio": 131,
         "calificaciones_pgs_por_asignatura": 2,
+        # REG-2: página IZQUIERDA del spread de cada asignatura, en el orden de
+        # ASIGNATURAS_CICLO_1 (verificado por el rótulo impreso en cada hoja).
+        "calificaciones_paginas": [131, 133, 135, 137, 139, 141, 143, 145, 147],
         # Completivas/extraordinarias (1 pg por asignatura)
         # Completivas: 9 asignaturas base, 1 pg cada una
         # Pg 150=Lengua, 151=Inglés, 152=Francés, 153=Matemática,
@@ -250,6 +295,9 @@ GRADO_CONFIG = {
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 131,
         "calificaciones_pgs_por_asignatura": 2,
+        # REG-2: página IZQUIERDA del spread de cada asignatura, en el orden de
+        # ASIGNATURAS_CICLO_1 (verificado por el rótulo impreso en cada hoja).
+        "calificaciones_paginas": [131, 133, 135, 137, 139, 141, 143, 145, 147],
         "completiva_inicio": 150,
         "completiva_paginas": [150, 151, 152, 153, 154, 155, 156, 157, 158],
         "promocion_inicio": 159,
@@ -274,6 +322,9 @@ GRADO_CONFIG = {
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 131,
         "calificaciones_pgs_por_asignatura": 2,
+        # REG-2: página IZQUIERDA del spread de cada asignatura, en el orden de
+        # ASIGNATURAS_CICLO_1 (verificado por el rótulo impreso en cada hoja).
+        "calificaciones_paginas": [131, 133, 135, 137, 139, 141, 143, 145, 147],
         "completiva_inicio": 150,
         "completiva_paginas": [150, 151, 152, 153, 154, 155, 156, 157, 158],
         "promocion_inicio": 159,
@@ -299,6 +350,17 @@ GRADO_CONFIG = {
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 179,
         "calificaciones_pgs_por_asignatura": 2,
+        # REG-2: NO es lineal. Entre las troncales van intercalados los spreads
+        # de Salida Optativa, así que `179 + a_idx*2` solo acertaba en Lengua
+        # (Inglés caía en 181, una hoja de Salida Optativa). Mapa verificado
+        # leyendo el rótulo de cada hoja en 4to, 5to y 6to (idéntico):
+        #   179 LE · 181 SO(slot0) · 183 SO(slot1) · 185 IN · 187 SO(slot2) ·
+        #   189 FR · 191 MA · 193 SO(slot3) · 195 CS · 197 SO(slot4) · 199 CN ·
+        #   201 SO(slot5) · 203 EA · 205 EF · 207 FIHR
+        "calificaciones_paginas": [179, 185, 189, 191, 195, 199, 203, 205, 207],
+        # Spread de cada componente de Salida Optativa, indexado por SLOT del
+        # catálogo (`salidas_optativas`), igual que `completiva_salida_optativa`.
+        "calificaciones_salida_optativa": [181, 183, 187, 193, 197, 201],
         # Completivas: incluye salida optativa intercalada
         # Pg 210=Lengua, 211-212=SalidaOpt(Lengua), 213=Inglés, 214=SalidaOpt(Inglés),
         # 215=Francés, 216=Matemática, 217=SalidaOpt(Mat), 218=C.Sociales, 219=SalidaOpt(CS),
@@ -328,6 +390,17 @@ GRADO_CONFIG = {
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 179,
         "calificaciones_pgs_por_asignatura": 2,
+        # REG-2: NO es lineal. Entre las troncales van intercalados los spreads
+        # de Salida Optativa, así que `179 + a_idx*2` solo acertaba en Lengua
+        # (Inglés caía en 181, una hoja de Salida Optativa). Mapa verificado
+        # leyendo el rótulo de cada hoja en 4to, 5to y 6to (idéntico):
+        #   179 LE · 181 SO(slot0) · 183 SO(slot1) · 185 IN · 187 SO(slot2) ·
+        #   189 FR · 191 MA · 193 SO(slot3) · 195 CS · 197 SO(slot4) · 199 CN ·
+        #   201 SO(slot5) · 203 EA · 205 EF · 207 FIHR
+        "calificaciones_paginas": [179, 185, 189, 191, 195, 199, 203, 205, 207],
+        # Spread de cada componente de Salida Optativa, indexado por SLOT del
+        # catálogo (`salidas_optativas`), igual que `completiva_salida_optativa`.
+        "calificaciones_salida_optativa": [181, 183, 187, 193, 197, 201],
         "completiva_inicio": 210,
         "completiva_paginas": [210, 213, 215, 216, 218, 220, 222, 223, 224],
         "completiva_salida_optativa": [211, 212, 214, 217, 219, 221],
@@ -353,6 +426,17 @@ GRADO_CONFIG = {
         "asistencia_pgs_por_asignatura": 5,
         "calificaciones_inicio": 179,
         "calificaciones_pgs_por_asignatura": 2,
+        # REG-2: NO es lineal. Entre las troncales van intercalados los spreads
+        # de Salida Optativa, así que `179 + a_idx*2` solo acertaba en Lengua
+        # (Inglés caía en 181, una hoja de Salida Optativa). Mapa verificado
+        # leyendo el rótulo de cada hoja en 4to, 5to y 6to (idéntico):
+        #   179 LE · 181 SO(slot0) · 183 SO(slot1) · 185 IN · 187 SO(slot2) ·
+        #   189 FR · 191 MA · 193 SO(slot3) · 195 CS · 197 SO(slot4) · 199 CN ·
+        #   201 SO(slot5) · 203 EA · 205 EF · 207 FIHR
+        "calificaciones_paginas": [179, 185, 189, 191, 195, 199, 203, 205, 207],
+        # Spread de cada componente de Salida Optativa, indexado por SLOT del
+        # catálogo (`salidas_optativas`), igual que `completiva_salida_optativa`.
+        "calificaciones_salida_optativa": [181, 183, 187, 193, 197, 201],
         "completiva_inicio": 210,
         "completiva_paginas": [210, 213, 215, 216, 218, 220, 222, 223, 224],
         "completiva_salida_optativa": [211, 212, 214, 217, 219, 221],
@@ -376,21 +460,34 @@ def _y(plumber_y: float) -> float:
     return PAGE_H - plumber_y
 
 
-# --- PORTADA (Pg 1) ---
-# Calibrado contra PDF MINERD oficial:
-#   "20______ 20______" en y_plumber=659.7
-#   Primer "20" empieza en x=181.3, sus "______" van hasta x≈225
-#   Segundo "20" empieza en x=243.1, sus "______" van hasta x≈287
-#   "SECCIÓN" en y_plumber=697.8, línea de sección de x=148 a x=275
-PORTADA_COORDS = {
-    "anio_inicio_x": 200,      # Sobre los guiones del primer "20" (181+19)
-    "anio_inicio_y": _y(670),  # Pegado a la línea de los guiones (más bajo)
-    "anio_fin_x": 261,         # Sobre los guiones del segundo "20" (243+18)
-    "anio_fin_y": _y(670),
-    "seccion_x": 165,          # Después del label "SECCIÓN" (start línea x=148 + margen)
-    "seccion_y": _y(710),      # Sobre la línea de la sección
-    "salida_optativa_x": 165,
-    "salida_optativa_y": _y(735),
+# --- PORTADA (Pgs 1-2) ---
+# REG-2 — PORTADA POR CICLO. La de 4to-6to NO es la de 1ro-3ro: el bloque sube
+# 25 pt y añade la línea de SALIDA OPTATIVA. Con las coordenadas de 1ro-3ro el
+# año caía en la banda de SECCIÓN y la sección sobre el rótulo SALIDA OPTATIVA.
+# Medido con pymupdf sobre los seis templates (idéntico dentro de cada ciclo):
+#   pág 1, ciclo 1: "20____ 20____" línea base 670.6, guiones x 196.3-240.0 y
+#                   258.1-301.9; SECCIÓN: línea y=715.7, x 147.6-275.3.
+#   pág 1, ciclo 2: línea base 645.7, guiones x 197.3-241.0 y 259.1-302.9;
+#                   SECCIÓN: línea y=690.7, x 148.6-276.3;
+#                   SALIDA OPTATIVA: línea y=730.6, x 208.1-360.8.
+#   pág 2 (los dos ciclos): "20____ 20____" tamaño 12, línea base 658.6, guiones
+#                   x 183.0-219.0 y 233.9-269.9; SECCIÓN: línea y=691.9 hasta
+#                   x=271.8 (rótulo hasta 137.7); SALIDA OPTATIVA (solo 4to-6to):
+#                   línea y=720.7 hasta x=540.0 (rótulo hasta 185.8).
+# Cada dato va DENTRO de su línea; los textos largos se achican hasta caber.
+PORTADA_GEOMETRIA = {
+    # (ciclo, página 1-based) -> campos
+    # 1ro-3ro: las coordenadas de siempre, sin mover un punto.
+    (1, 1): {"anio_inicio": (200, 670), "anio_fin": (261, 670), "anio_size": 14,
+             "seccion": (165, 710, 108), "seccion_size": 12},
+    (2, 1): {"anio_inicio": (201, 645.7), "anio_fin": (263, 645.7), "anio_size": 14,
+             "seccion": (165, 685, 108), "seccion_size": 12,
+             "salida": (212, 725, 146), "salida_size": 12},
+    (1, 2): {"anio_inicio": (189, 658.6), "anio_fin": (240, 658.6), "anio_size": 11,
+             "seccion": (146, 688, 123), "seccion_size": 10},
+    (2, 2): {"anio_inicio": (189, 658.6), "anio_fin": (240, 658.6), "anio_size": 11,
+             "seccion": (146, 688, 123), "seccion_size": 10,
+             "salida": (189, 717, 348), "salida_size": 10},
 }
 
 # --- CENTRO EDUCATIVO (Pg 8) ---
@@ -490,6 +587,28 @@ CONDICION_TABLE = {
         "promovido": {"x": 389.3, "w": 70},   # 351.5 - 427.0 (marcar X)
         "repitente": {"x": 464.9, "w": 70},   # 427.0 - 502.7 (marcar X)
         "reingreso": {"x": 540.6, "w": 70},   # 502.7 - 578.4 (marcar X)
+    },
+}
+
+# REG-2 — CONDICIÓN INICIAL DE 2do A 6to. Es OTRA tabla, no la de 1ro: la
+# condición ocupa cuatro columnas estrechas (Promovido, Repitente, Reingreso,
+# Aplazado) y a su derecha van las "Evaluaciones de las asignaturas pendientes"
+# del grado anterior. Con la tabla de 1ro las X caían justo en esas columnas de
+# asignaturas pendientes. Medido con pymupdf (idéntico en 2do..6to):
+#   verticales 35.6 | 241.2 | 262.4 | 283.7 | 304.9 | 326.2 | 353.2 | ... | 575.6
+#   primera fila: 180.0 → 194.2 (paso 14.17)
+# Las columnas de asignaturas pendientes quedan en blanco: EducaOne no guarda
+# hoy esas notas del grado anterior y no se inventan.
+CONDICION_TABLE_2A6 = {
+    "primera_fila_y_plumber": 180.0,
+    "row_height": 14.17,
+    "total_filas": 40,
+    "columnas": {
+        "correo": {"x": 38.6, "w": 200},       # 35.6 - 241.2 (texto a la izquierda)
+        "promovido": {"x": 251.8, "w": 21},    # 241.2 - 262.4
+        "repitente": {"x": 273.05, "w": 21},   # 262.4 - 283.7
+        "reingreso": {"x": 294.3, "w": 21},    # 283.7 - 304.9
+        "aplazado": {"x": 315.55, "w": 21},    # 304.9 - 326.2
     },
 }
 
@@ -823,26 +942,53 @@ def pagina_indicador(ciclo: int, asig_idx: int, periodo: int) -> Optional[int]:
 # Spread landscape - cada página muestra la mitad
 # V-lines pg 159: 36.8, 48.7, 190.7, 332.7, luego cada ~20.2
 # Columnas: No | Apellidos | Nombres | [por asignatura: Final, Completivo, Extraordinario, Especial] | Situación
-PROMOCION_TABLE = {
-    "primera_fila_y_plumber": 179.9,
-    "row_height": 14.15,
-    "total_filas": 40,
-    "columnas_pg_izq": {
-        "numero": {"x": 41, "w": 10},
-        "apellidos": {"x": 118, "w": 138},     # 48.7 - 190.7
-        "nombres": {"x": 260, "w": 138},       # 190.7 - 332.7
-        # Asignaturas empiezan en x=332.7, cada una tiene 4 sub-columnas de ~20.2
-        "asig_inicio_x": 332.7,
-        "asig_sub_width": 20.2,
-        "sub_cols": ["final", "completivo", "extraordinario", "especial"],
+# --- ACTA FINAL (spread "Promoción", REG-2) ---
+#
+# Medida con pymupdf sobre los templates; idéntica dentro de cada ciclo y
+# DISTINTA entre ciclos (4to-6to mete Matemática en la página izquierda y
+# añade Salida Optativa 1 y 2 en la derecha). Cada asignatura ocupa 4
+# subcolumnas iguales: Final | Completivo | Extraordinario | Especial.
+# Filas: la 1 empieza en 179.9 y el paso es 14.17 (40 filas hasta 746.0).
+# Bloques: (clave, x0, x1); la clave es el índice en ASIGNATURAS_CICLO_* o
+# "so1"/"so2" para los componentes de Salida Optativa.
+ACTA_GEOMETRIA = {
+    1: {
+        "izq": {"apellidos": (48.7, 190.7), "nombres": (190.7, 332.7),
+                "bloques": [(0, 332.7, 413.6), (1, 413.6, 494.6), (2, 494.6, 575.5)]},
+        "der": {"bloques": [(3, 49.2, 128.7), (4, 128.7, 208.2), (5, 208.2, 287.6),
+                            (6, 287.6, 367.1), (7, 367.1, 446.6), (8, 446.6, 526.0)],
+                "promovido": (526.0, 550.3), "reprobado": (550.3, 574.5)},
+        # Cabecera izquierda: (x, línea base, ancho). Año escolar en la 4ta fila.
+        "cab_izq": {"nombre_centro": (127, 50.5, 258), "codigo": (478, 50.5, 96),
+                    "regional": (127, 66.3, 258), "distrito": (478, 66.3, 96),
+                    "grado": (127, 81.8, 258), "seccion": (478, 81.8, 96),
+                    "anio": (127, 97.3, 248)},
     },
-    # Página derecha continúa las asignaturas y termina con situación final
-    "columnas_pg_der": {
-        # Continúa desde donde quedó la izquierda
-        # La posición X depende de cuántas asignaturas caben en la izq
-        "situacion_final_x": 555,
-        "situacion_final_w": 18,
+    2: {
+        "izq": {"apellidos": (48.7, 167.3), "nombres": (167.3, 303.8),
+                "bloques": [(0, 303.8, 371.7), (1, 371.7, 439.5), (2, 439.5, 507.4),
+                            (3, 507.4, 575.2)]},
+        "der": {"bloques": [(4, 48.9, 117.6), (5, 117.6, 186.2), (6, 186.2, 254.9),
+                            (7, 254.9, 323.6), (8, 323.6, 392.3),
+                            ("so1", 392.3, 461.0), ("so2", 461.0, 529.7)],
+                "promovido": (529.7, 553.9), "reprobado": (553.9, 574.8)},
+        "cab_izq": {"nombre_centro": (127, 50.5, 258), "codigo": (478, 50.5, 96),
+                    "regional": (127, 66.3, 258), "distrito": (478, 66.3, 96),
+                    "grado": (127, 81.8, 258), "seccion": (478, 81.8, 96),
+                    "salida": (127, 97.3, 258), "anio": (478, 97.3, 96)},
     },
+}
+ACTA_FILAS = {"primera_fila_y_plumber": 179.9, "row_height": 14.17, "total_filas": 40}
+ACTA_SUBCOLUMNAS = ("final", "completivo", "extraordinario", "especial")
+# Cabecera derecha (igual en los dos ciclos): director del centro y los
+# círculos de tanda/sector/zona (centros medidos de las curvas del template).
+ACTA_CAB_DER = {
+    "director": (153, 69.0, 196),
+    "tanda": {"jee": (427.85, 49.65), "matutina": (501.55, 49.65),
+              "vespertina": (562.85, 49.65)},
+    "sector": {"publico": (445.95, 70.15), "privado": (496.05, 70.15),
+               "semioficial": (564.6, 70.15)},
+    "zona": {"rural": (437.55, 90.65), "urbana": (494.75, 90.65), "otra": (540.95, 90.65)},
 }
 
 
@@ -909,10 +1055,13 @@ def _draw_sesion_no_impartida(c: canvas.Canvas, x_centro: float,
         c.restoreState()
 
 
-def _draw_x_mark(c: canvas.Canvas, x: float, y: float, size: float = 8):
-    """Dibuja una X como marca de checkbox."""
+def _draw_x_mark(c: canvas.Canvas, x: float, y: float, size: float = 8,
+                 center: bool = False):
+    """Dibuja una X como marca de checkbox (`center`: `x` es el centro)."""
     c.setFont(FONT_BOLD, size)
     c.setFillColorRGB(*AZUL)
+    if center:
+        x -= c.stringWidth("X", FONT_BOLD, size) / 2
     c.drawString(x, y, "X")
 
 
@@ -922,9 +1071,15 @@ def _create_overlay_page(draw_func, *args, **kwargs) -> io.BytesIO:
     c = canvas.Canvas(buf, pagesize=letter)
     try:
         draw_func(c, *args, **kwargs)
-    except Exception as e:
-        # Si la función de dibujo falla, generar página vacía
-        pass
+    except RegistroExcedePlantilla:
+        # REG-2: un rechazo deliberado (el dato no cabe) NO se convierte en
+        # una página en blanco silenciosa.
+        raise
+    except Exception:
+        # Si la función de dibujo falla, se genera la página vacía como
+        # siempre, pero ahora queda rastro en el log en vez de perderse.
+        logger.exception("Overlay del Registro falló en %s; la página queda como el template",
+                         getattr(draw_func, '__name__', draw_func))
     c.showPage()  # Asegurar que siempre hay al menos 1 página
     c.save()
     buf.seek(0)
@@ -945,23 +1100,39 @@ def draw_portada(c: canvas.Canvas, datos: Dict):
         "salida_optativa": "Informática"  # Solo 4to-6to
     }
     """
-    coords = PORTADA_COORDS
-    
-    if datos.get("anio_inicio"):
-        _draw_text(c, coords["anio_inicio_x"], coords["anio_inicio_y"],
-                   datos["anio_inicio"], size=FONT_SIZE_PORTADA_ANIO)
-    
-    if datos.get("anio_fin"):
-        _draw_text(c, coords["anio_fin_x"], coords["anio_fin_y"],
-                   datos["anio_fin"], size=FONT_SIZE_PORTADA_ANIO)
-    
+    # REG-2: la geometría depende del ciclo y de la página (1 o 2). Sin ciclo
+    # explícito se usa la de 1ro-3ro, que era la única que existía.
+    g = PORTADA_GEOMETRIA[(datos.get("_ciclo", 1), datos.get("_pagina", 1))]
+
+    for campo in ("anio_inicio", "anio_fin"):
+        if datos.get(campo):
+            x, y_pl = g[campo]
+            _draw_text(c, x, _y(y_pl), datos[campo], size=g["anio_size"])
+
     if datos.get("seccion"):
-        _draw_text(c, coords["seccion_x"], coords["seccion_y"],
-                   datos["seccion"], size=FONT_SIZE_PORTADA_SECCION)
-    
-    if datos.get("salida_optativa"):
-        _draw_text(c, coords["salida_optativa_x"], coords["salida_optativa_y"],
-                   datos["salida_optativa"], size=FONT_SIZE_PORTADA_SECCION)
+        x, y_pl, ancho = g["seccion"]
+        _draw_text_ajustado(c, x, _y(y_pl), datos["seccion"], g["seccion_size"], ancho)
+
+    # Solo 4to-6to tienen la línea SALIDA OPTATIVA; en 1ro-3ro no se escribe.
+    if datos.get("salida_optativa") and "salida" in g:
+        x, y_pl, ancho = g["salida"]
+        _draw_text_ajustado(c, x, _y(y_pl), datos["salida_optativa"], g["salida_size"], ancho)
+
+
+def _draw_text_ajustado(c: canvas.Canvas, x: float, y: float, text: str,
+                        size: float, ancho: float, minimo: float = 6.0):
+    """Texto que se achica hasta caber en `ancho`; nunca se corta.
+
+    Si ni al tamaño mínimo cabe, se imprime igual al mínimo y se avisa: un
+    nombre oficial (p. ej. la Salida Optativa) no se recorta en un documento.
+    """
+    text = str(text)
+    s = size
+    while s > minimo and c.stringWidth(text, FONT_NORMAL, s) > ancho:
+        s -= 0.5
+    if c.stringWidth(text, FONT_NORMAL, s) > ancho:
+        logger.warning("Texto %r no cabe en %.0f pt ni a %.1f pt", text, ancho, s)
+    _draw_text(c, x, y, text, size=s)
 
 
 def draw_centro_educativo(c: canvas.Canvas, datos: Dict):
@@ -1076,17 +1247,13 @@ def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
                 _draw_text(c, cols[col_name]["x"], y,
                            str(est[campo]), size=FONT_SIZE_TABLA, center=True)
         
-        # Cédula/Pasaporte
-        if est.get("cedula"):
-            _draw_text(c, cols["cedula"]["x"], y,
-                       est["cedula"], size=FONT_SIZE_TABLA_NOMBRE,
-                       max_width=cols["cedula"]["w"])
-        
-        # RNE
-        if est.get("rne"):
-            _draw_text(c, cols["rne"]["x"], y,
-                       est["rne"], size=FONT_SIZE_TABLA_NOMBRE,
-                       max_width=cols["rne"]["w"])
+        # Cédula/Pasaporte y RNE — REG-2: `x` es el CENTRO de la celda y antes
+        # se usaba como punto de partida, así que el texto empezaba a mitad de
+        # la casilla y se metía en la siguiente. Ahora se centra en la celda.
+        for campo in ("cedula", "rne"):
+            if est.get(campo):
+                _draw_text_en_celda(c, cols[campo], y, est[campo],
+                                    FONT_SIZE_TABLA_NOMBRE, centrado=True)
         
         # Lugar de residencia (con marca de RETIRADO si aplica)
         lugar = est.get("lugar_residencia", "") or ""
@@ -1101,12 +1268,36 @@ def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
         else:
             lugar_con_marca = lugar
         if lugar_con_marca:
-            _draw_text(c, cols["lugar_residencia"]["x"] - 40, y,
-                       lugar_con_marca, size=FONT_SIZE_TABLA_NOMBRE,
-                       max_width=cols["lugar_residencia"]["w"])
+            # REG-2: desde el borde IZQUIERDO real de la celda (398.3), no desde
+            # "centro - 40" (446.9), que con 172 pt de ancho salía de la tabla.
+            _draw_text_en_celda(c, cols["lugar_residencia"], y, lugar_con_marca,
+                                FONT_SIZE_TABLA_NOMBRE, centrado=False)
 
 
-def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict]):
+def _draw_text_en_celda(c: canvas.Canvas, col: Dict, y: float, text: str,
+                        size: float, centrado: bool, margen: float = 2.0):
+    """Texto dentro de la celda `col` ({"x": centro, "w": ancho}).
+
+    Nunca sale de la celda: si no cabe se achica (hasta 4.5 pt) y, solo si
+    aun así no cabe, se recorta con "…" para no invadir la casilla vecina.
+    """
+    text = str(text)
+    util = col["w"] - 2 * margen
+    s = size
+    while s > 4.5 and c.stringWidth(text, FONT_NORMAL, s) > util:
+        s -= 0.25
+    if c.stringWidth(text, FONT_NORMAL, s) > util:
+        while len(text) > 1 and c.stringWidth(text + "…", FONT_NORMAL, s) > util:
+            text = text[:-1]
+        text += "…"
+    if centrado:
+        _draw_text(c, col["x"], y, text, size=s, center=True)
+    else:
+        _draw_text(c, col["x"] - col["w"] / 2 + margen, y, text, size=s)
+
+
+def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict],
+                           grado: int = 1):
     """
     Dibuja la tabla de condición inicial (Pg 12).
     estudiantes: lista de dicts con:
@@ -1122,8 +1313,13 @@ def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict]):
       - NO se marca columna de promovido/repitente/reingreso (no aplica).
       - Se imprime una marca textual "RET DD/MM" al lado del correo para
         que quien revise el registro sepa por qué quedó sin marca.
+
+    REG-2: 1ro usa CONDICION_TABLE; 2do-6to, CONDICION_TABLE_2A6.
     """
-    table = CONDICION_TABLE
+    table = CONDICION_TABLE if grado == 1 else CONDICION_TABLE_2A6
+    # En 2do-6to las casillas miden 21 pt: la X se centra. En 1ro se conserva
+    # exactamente el trazo de siempre.
+    centrar = grado != 1
     
     for i, est in enumerate(estudiantes[:40]):
         if not est:
@@ -1156,14 +1352,17 @@ def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict]):
             # Aceptar tanto "condicion" como "condicion_entrada" (el endpoint manda esta última)
             condicion = str(est.get("condicion") or est.get("condicion_entrada") or "").lower()
             if condicion in ("nuevo", "promovido", ""):
-                _draw_x_mark(c, cols["promovido"]["x"], y, size=FONT_SIZE_TABLA)
+                _draw_x_mark(c, cols["promovido"]["x"], y, size=FONT_SIZE_TABLA, center=centrar)
             elif condicion == "repitente":
-                _draw_x_mark(c, cols["repitente"]["x"], y, size=FONT_SIZE_TABLA)
+                _draw_x_mark(c, cols["repitente"]["x"], y, size=FONT_SIZE_TABLA, center=centrar)
             elif condicion in ("reingreso", "transferido"):
-                _draw_x_mark(c, cols["reingreso"]["x"], y, size=FONT_SIZE_TABLA)
+                _draw_x_mark(c, cols["reingreso"]["x"], y, size=FONT_SIZE_TABLA, center=centrar)
+            elif condicion == "aplazado" and "aplazado" in cols:
+                _draw_x_mark(c, cols["aplazado"]["x"], y, size=FONT_SIZE_TABLA, center=centrar)
 
 
-def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = False):
+def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = False,
+                    contexto: str = ''):
     """
     Dibuja asistencia de un mes en media página.
     datos_mes: {
@@ -1180,6 +1379,8 @@ def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = Fa
     """
     table = ASISTENCIA_TABLE
     prefix = "mes_der" if es_mes_derecho else "mes_izq"
+    # REG-2: 21 columnas por mes. Si hay más días, NO se recorta: se rechaza.
+    _verificar_capacidad_mes(datos_mes, 21, contexto)
     
     # Centros exactos de las columnas de días
     dia_centers = table.get(f"{prefix}_dia_centers")
@@ -1304,13 +1505,9 @@ def draw_asistencia_4meses(c: canvas.Canvas, meses_pagina: List[Optional[Dict]],
         # 10 huecos por mes en esta rejilla; si se capturaron más, se avisa en
         # vez de desbordar la celda o de escribir fuera de la tabla.
         dias_labels = datos_mes.get("dias_labels", []) or []
-        if len(dias_labels) > max_dias:
-            logger.warning(
-                "Asistencia compacta (pg %s, %s, mes %r): %d días capturados y la hoja "
-                "oficial solo tiene %d columnas; se imprimen los primeros %d.",
-                pagina, asignatura or "?", datos_mes.get("nombre_mes", ""),
-                len(dias_labels), max_dias, max_dias,
-            )
+        # REG-2: la hoja compacta tiene 10 columnas por mes. Antes se imprimían
+        # los 10 primeros días y el resto se perdía con un aviso en el log.
+        _verificar_capacidad_mes(datos_mes, max_dias, asignatura or f"pág {pagina}")
         header_y = _y(t["dias_header_y_plumber"] + 2.2)
         for d, valor_dia in enumerate(dias_labels[:max_dias]):
             _draw_text(c, blk["dias"][d], header_y, str(valor_dia), size=7, center=True)
@@ -1729,136 +1926,90 @@ def draw_especificacion_curricular(c: canvas.Canvas, datos: Dict):
             _draw_text(c, x_ce, y_ce_top - (indice * lh), ce_codigo, size=size)
 
 
-def draw_promocion_izq(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: List[str]):
-    """
-    Dibuja la página izquierda del spread de promoción.
-    estudiantes: lista de dicts con:
-    {
-        "numero": int,
-        "apellidos": str,
-        "nombres": str,
-        "notas": {
-            "asignatura_key": {
-                "final": float,
-                "completivo": float,
-                "extraordinario": float,
-                "especial": str,
-            }
-        }
-    }
-    """
-    table = PROMOCION_TABLE
-    cols = table["columnas_pg_izq"]
-    
-    for i, est in enumerate(estudiantes[:40]):
-        if not est:
-            continue
-        
-        row_y_plumber = table["primera_fila_y_plumber"] + (i * table["row_height"])
-        y = _y(row_y_plumber + table["row_height"] - 3)
-        
-        # Número - NO dibujar, ya está impreso en el template
-        
-        # Apellidos
-        if est.get("apellidos"):
-            _draw_text(c, cols["apellidos"]["x"] - 65, y,
-                       est["apellidos"], size=FONT_SIZE_PROMOCION,
-                       max_width=cols["apellidos"]["w"])
-        
-        # Nombres
-        if est.get("nombres"):
-            _draw_text(c, cols["nombres"]["x"] - 65, y,
-                       est["nombres"], size=FONT_SIZE_PROMOCION,
-                       max_width=cols["nombres"]["w"])
-        
-        # Notas por asignatura (las que caben en esta página)
-        notas = est.get("notas", {})
-        asig_x = cols["asig_inicio_x"]
-        sub_w = cols["asig_sub_width"]
-        
-        # Calculamos cuántas asignaturas caben en la página izquierda
-        # Desde x=332.7 hasta x=575.5 (borde derecho) = ~243 pts
-        # Cada asignatura = 4 sub-cols × 20.2 = 80.8 pts
-        # Caben ~3 asignaturas en la izquierda
-        max_asig_izq = int((575.5 - asig_x) / (sub_w * 4))
-        
-        for a_idx, asig in enumerate(asignaturas[:max_asig_izq]):
-            asig_key = asig.lower().replace(" ", "_").replace("-", "_")
-            nota_asig = notas.get(asig_key, {})
-            
-            base_x = asig_x + (a_idx * sub_w * 4)
-            
-            for s_idx, sub_col in enumerate(cols["sub_cols"]):
-                valor = nota_asig.get(sub_col)
-                if valor is not None and valor != "":
-                    text = str(valor)
-                    if isinstance(valor, float):
-                        text = f"{valor:.0f}" if valor == int(valor) else f"{valor:.1f}"
-                    sx = base_x + (s_idx * sub_w) + sub_w / 2
-                    _draw_text(c, sx, y, text,
-                               size=FONT_SIZE_PROMOCION, center=True)
+def _acta_y(i: int) -> float:
+    t = ACTA_FILAS
+    return _y(t["primera_fila_y_plumber"] + i * t["row_height"] + t["row_height"] - 4)
 
 
-def draw_promocion_der(c: canvas.Canvas, estudiantes: List[Dict],
-                        asignaturas: List[str], offset_asig: int = 3):
+def _acta_notas(c: canvas.Canvas, y: float, notas: Optional[Dict], x0: float, x1: float):
+    """Las 4 subcolumnas de una asignatura del Acta, centradas en su celda."""
+    sub = (x1 - x0) / 4
+    for s_idx, campo in enumerate(ACTA_SUBCOLUMNAS):
+        texto = _fmt_nota((notas or {}).get(campo))
+        if texto:
+            _draw_text(c, x0 + sub * s_idx + sub / 2, y, texto,
+                       size=FONT_SIZE_PROMOCION, center=True)
+
+
+def _acta_clave_asig(asignaturas: List[str], clave) -> str:
+    if clave in ("so1", "so2"):
+        return "salida_optativa_" + clave[-1]
+    return asignaturas[clave].lower().replace(" ", "_").replace("-", "_")
+
+
+def draw_promocion_izq(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: List[str],
+                       ciclo: int = 1, cabecera: Optional[Dict] = None):
+    """Página IZQUIERDA del Acta final (REG-2: geometría por ciclo).
+
+    estudiantes: lista (índice = fila) de dicts:
+      {"apellidos": str, "nombres": str,
+       "notas": {asig_key: {"final", "completivo", "extraordinario", "especial"}}}
+    El número de fila ya viene impreso en el template.
     """
-    Dibuja la página derecha del spread de promoción.
-    offset_asig: cuántas asignaturas ya se dibujaron en la izquierda.
-    """
-    table = PROMOCION_TABLE
-    cols_der = table["columnas_pg_der"]
-    cols_izq = table["columnas_pg_izq"]
-    sub_w = cols_izq["asig_sub_width"]
-    
-    for i, est in enumerate(estudiantes[:40]):
+    g = ACTA_GEOMETRIA[ciclo]
+    cab = cabecera or {}
+    for campo, (x, y_pl, ancho) in g["cab_izq"].items():
+        if cab.get(campo):
+            _draw_text_ajustado(c, x, _y(y_pl), cab[campo], 8, ancho)
+
+    for i, est in enumerate(estudiantes[:ACTA_FILAS["total_filas"]]):
         if not est:
             continue
-        
-        row_y_plumber = table["primera_fila_y_plumber"] + (i * table["row_height"])
-        y = _y(row_y_plumber + table["row_height"] - 3)
-        
-        notas = est.get("notas", {})
-        
-        # Continuar asignaturas desde offset
-        # En la página derecha, X empieza desde el borde izquierdo (~36)
-        # pero el contenido del spread continúa desde donde quedó
-        # Como es un spread, las coordenadas reales del contenido son las mismas
-        # pero la página derecha muestra la segunda mitad
-        # Sin embargo, al escribir el overlay, escribimos en coords de 0-612
-        # Para la página derecha, hay que calcular el offset:
-        # En el spread completo, la derecha empieza en X=612
-        # Pero nosotros escribimos en X de 0-612 en esta página
-        # Entonces: X_overlay = X_spread - 612
-        
-        asig_x_spread = cols_izq["asig_inicio_x"] + (offset_asig * sub_w * 4)
-        
-        remaining_asigs = asignaturas[offset_asig:]
-        for a_idx, asig in enumerate(remaining_asigs):
-            asig_key = asig.lower().replace(" ", "_").replace("-", "_")
-            nota_asig = notas.get(asig_key, {})
-            
-            base_x_spread = asig_x_spread + (a_idx * sub_w * 4)
-            base_x = base_x_spread - 612  # Convertir a coords de página derecha
-            
-            if base_x > 575:  # Fuera de página
-                break
-            
-            for s_idx, sub_col in enumerate(cols_izq["sub_cols"]):
-                valor = nota_asig.get(sub_col)
-                if valor is not None and valor != "":
-                    text = str(valor)
-                    if isinstance(valor, float):
-                        text = f"{valor:.0f}" if valor == int(valor) else f"{valor:.1f}"
-                    sx = base_x + (s_idx * sub_w) + sub_w / 2
-                    if 0 < sx < 612:
-                        _draw_text(c, sx, y, text,
-                                   size=FONT_SIZE_PROMOCION, center=True)
-        
-        # Situación final
-        sit = est.get("situacion_final", "")
-        if sit:
-            _draw_text(c, cols_der["situacion_final_x"], y,
-                       sit, size=FONT_SIZE_PROMOCION, center=True)
+        y = _acta_y(i)
+        for campo in ("apellidos", "nombres"):
+            if est.get(campo):
+                x0, x1 = g["izq"][campo]
+                _draw_text_en_celda(c, {"x": (x0 + x1) / 2, "w": x1 - x0}, y,
+                                    est[campo], FONT_SIZE_PROMOCION, centrado=False)
+        for clave, x0, x1 in g["izq"]["bloques"]:
+            _acta_notas(c, y, (est.get("notas") or {}).get(_acta_clave_asig(asignaturas, clave)),
+                        x0, x1)
+
+
+def draw_promocion_der(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: List[str],
+                       offset_asig: int = 3, ciclo: int = 1,
+                       cabecera: Optional[Dict] = None):
+    """Página DERECHA del Acta final: resto de asignaturas, Salida Optativa
+    1 y 2 (4to-6to) y la situación final en el grado (X en Promovido o
+    Reprobado). `offset_asig` se conserva por compatibilidad; las columnas
+    salen de ACTA_GEOMETRIA."""
+    g = ACTA_GEOMETRIA[ciclo]
+    cd = ACTA_CAB_DER
+    cab = cabecera or {}
+    if cab.get("director"):
+        x, y_pl, ancho = cd["director"]
+        _draw_text_ajustado(c, x, _y(y_pl), cab["director"], 8, ancho)
+    for grupo in ("tanda", "sector", "zona"):
+        opcion = cab.get(grupo)
+        if opcion in cd[grupo]:
+            cx, cy = cd[grupo][opcion]
+            _draw_x_mark(c, cx, _y(cy) - 2.6, size=8, center=True)
+
+    for i, est in enumerate(estudiantes[:ACTA_FILAS["total_filas"]]):
+        if not est:
+            continue
+        y = _acta_y(i)
+        for clave, x0, x1 in g["der"]["bloques"]:
+            _acta_notas(c, y, (est.get("notas") or {}).get(_acta_clave_asig(asignaturas, clave)),
+                        x0, x1)
+        sit = est.get("situacion_final")
+        if isinstance(sit, str):
+            sit = {"promovido": sit.lower() in ("promovido", "promovida"),
+                   "reprobado": sit.lower() in ("reprobado", "reprobada", "repitente")}
+        for campo in ("promovido", "reprobado"):
+            if (sit or {}).get(campo):
+                x0, x1 = g["der"][campo]
+                _draw_x_mark(c, (x0 + x1) / 2, y, size=FONT_SIZE_TABLA, center=True)
 
 
 def draw_estadisticas(c: canvas.Canvas, datos: Dict):
@@ -1891,7 +2042,9 @@ def generar_registro_escolar(
     completiva_data: Optional[Dict] = None,
     salida_optativa_data: Optional[Dict] = None,
     salida_optativa_asistencia: Optional[Dict] = None,
+    salida_optativa_spread: Optional[Dict] = None,
     promocion_data: Optional[List[Dict]] = None,
+    acta_cabecera: Optional[Dict] = None,
     estadisticas_data: Optional[Dict] = None,
     template_dir: Optional[str] = None,
     marca_borrador: bool = False,
@@ -1929,6 +2082,17 @@ def generar_registro_escolar(
     config = GRADO_CONFIG[grado]
     ciclo = config["ciclo"]
     asignaturas = ASIGNATURAS_CICLO_2 if ciclo == 2 else ASIGNATURAS_CICLO_1
+
+    # REG-2: la hoja oficial tiene 40 filas. Antes se imprimían los 40 primeros
+    # y el resto del curso desaparecía del Registro sin aviso.
+    if estudiantes and len(estudiantes) > 40:
+        raise RegistroExcedePlantilla({
+            'motivo': 'ESTUDIANTES_EXCEDEN_PLANTILLA',
+            'mensaje': (f'El curso tiene {len(estudiantes)} estudiantes y el Registro '
+                        f'oficial solo tiene 40 filas. No se emite un Registro que deje '
+                        f'estudiantes fuera.'),
+            'estudiantes': len(estudiantes), 'filas': 40,
+        })
     
     # Cargar template
     tpl_dir = template_dir or TEMPLATE_DIR
@@ -1945,8 +2109,12 @@ def generar_registro_escolar(
     
     # --- PORTADA (Pg 1) ---
     if datos_portada:
-        buf = _create_overlay_page(draw_portada, datos_portada)
-        overlays[0] = buf  # Pg 1 = index 0
+        # REG-2: portada (pág 1) y portadilla (pág 2) llevan los mismos datos,
+        # cada una con la geometría de SU ciclo.
+        for _pag in config["portada"]:
+            buf = _create_overlay_page(
+                draw_portada, dict(datos_portada, _ciclo=ciclo, _pagina=_pag))
+            overlays[_pag - 1] = buf
     
     # --- CENTRO EDUCATIVO ---
     if datos_centro:
@@ -1963,7 +2131,7 @@ def generar_registro_escolar(
     # --- CONDICIÓN INICIAL (Pg 12) ---
     if estudiantes:
         pg_idx = config["condicion_inicial"] - 1
-        buf = _create_overlay_page(draw_condicion_inicial, estudiantes)
+        buf = _create_overlay_page(draw_condicion_inicial, estudiantes, grado)
         overlays[pg_idx] = buf
     
     # --- ASISTENCIA ---
@@ -2053,11 +2221,13 @@ def generar_registro_escolar(
                 c_asist = canvas.Canvas(buf, pagesize=letter)
                 
                 if mes_izq_idx < len(meses) and meses[mes_izq_idx]:
-                    draw_asistencia(c_asist, meses[mes_izq_idx], es_mes_derecho=False)
+                    draw_asistencia(c_asist, meses[mes_izq_idx], es_mes_derecho=False,
+                                    contexto=asig)
                     has_data = True
                 
                 if mes_der_idx < len(meses) and meses[mes_der_idx]:
-                    draw_asistencia(c_asist, meses[mes_der_idx], es_mes_derecho=True)
+                    draw_asistencia(c_asist, meses[mes_der_idx], es_mes_derecho=True,
+                                    contexto=asig)
                     has_data = True
                 
                 if has_data:
@@ -2094,13 +2264,19 @@ def generar_registro_escolar(
                 continue
             datos_bloque = salida_optativa_asistencia[bloque_idx] or {}
             meses = datos_bloque.get("meses") or []
-            # REG-1: la matriz ya viene en orden cronológico con todos los meses
-            # del año (vacíos incluidos), así que su índice ES el hueco. Mismos
-            # dos cierres que una materia troncal.
-            from registro_asistencia import (verificar_dentro_del_ano,
-                                             verificar_huecos, meses_necesarios)
-            _ctx = f"Salida Optativa (bloque {bloque_idx + 1})"
-            verificar_dentro_del_ano(meses, _ctx)
+            from registro_asistencia import verificar_huecos, meses_necesarios
+            _ctx = (f"Salida Optativa — {datos_bloque.get('componente_nombre')}"
+                    if datos_bloque.get('componente_nombre')
+                    else f"Salida Optativa (bloque {bloque_idx + 1})")
+            # REG-2: llega la matriz CRUDA de `build_asistencia_registro`
+            # (`mes`/`filas`/`valores`), pero `draw_asistencia` lee
+            # `nombre_mes`/`asistencias`/`dias`: sin traducir, la rejilla salía
+            # siempre vacía. Se traduce con la MISMA función que las troncales
+            # (que además aplica el cierre de REG-1 de fuera del año).
+            if any(m and "filas" in m for m in meses):
+                meses = _meses_desde_matriz(meses, len(estudiantes or []),
+                                            datos_bloque.get("docente", ""), _ctx)
+            # REG-1: el índice ES el hueco (meses vacíos incluidos).
             verificar_huecos(meses_necesarios(meses), 2 * len(bloques[bloque_idx]), _ctx)
             # ROTULADO (R3.4.1 §4-§5). El template deja en blanco "SALIDA
             # OPTATIVA ____ ASIGNATURA ____", así que la rejilla sola no dice a
@@ -2136,10 +2312,12 @@ def generar_registro_escolar(
                                rotulo_asig, size=FONT_SIZE_NOTA,
                                max_width=_hdr["asignatura_max_width"])
                 if mes_izq_idx < len(meses) and meses[mes_izq_idx]:
-                    draw_asistencia(c_asist, meses[mes_izq_idx], es_mes_derecho=False)
+                    draw_asistencia(c_asist, meses[mes_izq_idx], es_mes_derecho=False,
+                                    contexto=_ctx)
                     has_data = True
                 if mes_der_idx < len(meses) and meses[mes_der_idx]:
-                    draw_asistencia(c_asist, meses[mes_der_idx], es_mes_derecho=True)
+                    draw_asistencia(c_asist, meses[mes_der_idx], es_mes_derecho=True,
+                                    contexto=_ctx)
                     has_data = True
                 if has_data or rotulo_salida or rotulo_asig:
                     c_asist.showPage()
@@ -2148,22 +2326,28 @@ def generar_registro_escolar(
                     overlays[pg_idx] = buf
 
     # --- CALIFICACIONES DE RENDIMIENTO (P1-P4, PC por período) ---
-    if calificaciones_data:
-        calif_inicio = config.get("calificaciones_inicio", 131) - 1  # 0-indexed
-        calif_pgs = config.get("calificaciones_pgs_por_asignatura", 2)
-        
-        for a_idx, asig in enumerate(asignaturas):
-            asig_califs = calificaciones_data.get(a_idx, {})
-            if not asig_califs:
-                continue
-            
-            # Cada asignatura tiene 2 páginas (spread landscape)
-            # Página izquierda: P1, P2 | Página derecha: P3, P4, CF
-            pg_izq = calif_inicio + (a_idx * calif_pgs)
-            pg_der = pg_izq + 1 if calif_pgs >= 2 else None
-            
+    # REG-2: cada spread sale de un MAPA explícito de páginas (ver GRADO_CONFIG):
+    # las troncales por su índice en ASIGNATURAS_CICLO_*, y en 4to-6to también
+    # los componentes de Salida Optativa por su SLOT. Una asignatura sin página
+    # en el mapa (la "Salida Optativa" genérica, a_idx 9) NO se estampa en la
+    # hoja de otra: antes la fórmula la mandaba a la 197, que es de HCS/C.Soc.
+    _spreads = []
+    for a_idx, asig in enumerate(asignaturas):
+        if (calificaciones_data or {}).get(a_idx) and a_idx < len(config["calificaciones_paginas"]):
+            _spreads.append((calificaciones_data[a_idx], config["calificaciones_paginas"][a_idx]))
+    _paginas_so = config.get("calificaciones_salida_optativa", [])
+    for _slot, _califs in sorted((salida_optativa_spread or {}).items()):
+        if _califs and 0 <= int(_slot) < len(_paginas_so):
+            _spreads.append((_califs, _paginas_so[int(_slot)]))
+
+    if _spreads:
+        for asig_califs, _pagina_izq in _spreads:
+            # Spread de 2 páginas: izquierda competencias 1-2, derecha 3-4 + resumen.
+            pg_izq = _pagina_izq - 1   # 0-indexed
+            pg_der = pg_izq + 1
+
             if pg_izq >= total_pages:
-                break
+                continue
             
             # === SPREAD DE CALIFICACIONES (v2.19.7) ===
             #
@@ -2421,12 +2605,14 @@ def generar_registro_escolar(
         prom_inicio = config["promocion_inicio"] - 1
         
         # Página izquierda
-        buf = _create_overlay_page(draw_promocion_izq, promocion_data, asignaturas)
+        buf = _create_overlay_page(draw_promocion_izq, promocion_data, asignaturas,
+                                   ciclo=ciclo, cabecera=acta_cabecera)
         overlays[prom_inicio] = buf
         
         # Página derecha
         if prom_inicio + 1 < total_pages:
-            buf = _create_overlay_page(draw_promocion_der, promocion_data, asignaturas, offset_asig=3)
+            buf = _create_overlay_page(draw_promocion_der, promocion_data, asignaturas,
+                                       offset_asig=3, ciclo=ciclo, cabecera=acta_cabecera)
             overlays[prom_inicio + 1] = buf
     
     # ========================================
@@ -2697,6 +2883,58 @@ def _calcular_edad(fecha_nacimiento) -> int:
 # TEST: Generar un registro de prueba
 # ============================================================================
 
+def _meses_desde_matriz(matriz, num_est: int, docente: str, contexto: str) -> List[Optional[Dict]]:
+    """Traduce la matriz de `build_asistencia_registro` al formato de la hoja.
+
+    · Cada mes va al hueco de su POSICIÓN en el año escolar (REG-1); un mes
+      sin filas deja su hueco en None.
+    · NO se recorta ningún día (REG-2): si un mes trae más días de los que
+      caben, lo rechaza `draw_asistencia` / `draw_asistencia_4meses`, que son
+      las que conocen la rejilla.
+    · El docente va en todos los meses: cada hoja del template tiene su campo
+      DOCENTE y se imprime una vez por hoja (lo pone el mes izquierdo).
+    · Asistencia fuera del año escolar → no se emite (REG-1).
+    """
+    from registro_asistencia import verificar_dentro_del_ano
+    verificar_dentro_del_ano(matriz, contexto)
+    meses_list: List[Optional[Dict]] = []
+    for mes_data in matriz or []:
+        if not mes_data:
+            continue
+        dias_mes = list(mes_data.get('dias', []))
+        est_list = []
+        for fila in (mes_data.get('filas') or [])[:num_est]:
+            est_list.append({
+                "dias": [v or None for v in (fila.get('valores') or [])],
+                "total": fila.get("presentes", 0),
+                "porcentaje": fila.get("porcentaje", 0),
+            })
+
+        # S1 — las columnas se dibujan por INDICE, y `no_impartidas` viene
+        # indexado por numero de dia. Aqui se traduce una cosa en la otra usando
+        # las mismas columnas que ya se van a imprimir, asi que una etiqueta no
+        # puede acabar sobre la fecha vecina.
+        _no_imp = mes_data.get("no_impartidas") or {}
+        etiquetas_ni = {}
+        for _idx, _dia in enumerate(dias_mes):
+            _info = _no_imp.get(_dia) or _no_imp.get(str(_dia))
+            if _info:
+                etiquetas_ni[_idx] = _info.get("etiqueta") or "NO IMPARTIDA"
+
+        if est_list:
+            pos = mes_data.get("posicion", len(meses_list))
+            while len(meses_list) <= pos:
+                meses_list.append(None)
+            meses_list[pos] = {
+                "nombre_mes": mes_data.get("mes", ""),
+                "docente": docente or "",
+                "asistencias": est_list,
+                "dias_labels": dias_mes,
+                "etiquetas_no_impartidas": etiquetas_ni,
+            }
+    return meses_list
+
+
 def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudiantes,
                                    asignaturas_data, grado_numero, marca_borrador=False,
                                    especificacion_data=None, salida_optativa_data=None,
@@ -2721,6 +2959,9 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         "anio_inicio": anio_inicio,
         "anio_fin": anio_fin,
         "seccion": curso_info.get('seccion', 'A'),
+        # REG-2: nombre oficial de la Salida Optativa del curso (catálogo).
+        # Solo la portada de 4to-6to tiene esa línea.
+        "salida_optativa": curso_info.get('salida_optativa', '') or '',
     }
     
     datos_centro = {
@@ -2743,6 +2984,16 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         "distrito": colegio_info.get('distrito', ''),
     }
     
+    # REG-2: 40 filas en la hoja oficial; un curso más grande NO se recorta.
+    if len(estudiantes) > 40:
+        raise RegistroExcedePlantilla({
+            'motivo': 'ESTUDIANTES_EXCEDEN_PLANTILLA',
+            'mensaje': (f'El curso tiene {len(estudiantes)} estudiantes y el Registro '
+                        f'oficial solo tiene 40 filas. No se emite un Registro que deje '
+                        f'estudiantes fuera.'),
+            'estudiantes': len(estudiantes), 'filas': 40,
+        })
+
     estudiantes_nuevo = []
     for idx, est in enumerate(estudiantes[:40]):
         fn = est.get('fecha_nacimiento')
@@ -2763,6 +3014,10 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
             # `rne`, este `est.get('rne')` lo toma solo; mientras tanto la
             # casilla va vacía, que es la verdad.
             "rne": est.get('rne', '') or '',
+            # REG-2: el Acta final separa APELLIDO(S) y NOMBRE(S).
+            "apellidos": est.get('apellidos', '') or '',
+            "nombres": est.get('nombres', '') or '',
+            "situacion_final": est.get('situacion_final'),
             "lugar_residencia": est.get('direccion', ''),
             "correo": est.get('email', '') or '',
             "condicion": est.get('condicion_entrada', 'nuevo'),
@@ -2792,56 +3047,10 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         meses_list = []
 
         if matriz:
-            # REG-1: asistencia fuera del año escolar → no se emite (ni se mueve
-            # de mes ni se esconde). El control de huecos va en
-            # generar_registro_escolar, que es quien conoce la rejilla.
-            from registro_asistencia import verificar_dentro_del_ano
-            verificar_dentro_del_ano(matriz, asig_nombre)
-            for mes_data in matriz:
-                dias_mes = list(mes_data.get('dias', []))[:21]
-                est_list = []
-                for fila in mes_data.get('filas', [])[:num_est]:
-                    valores = list(fila.get('valores', []))[:21]
-                    dias = [None] * 21
-                    for idx_dia, valor in enumerate(valores):
-                        dias[idx_dia] = valor or None
-                    est_list.append({
-                        "dias": dias,
-                        "total": fila.get("presentes", 0),
-                        "porcentaje": fila.get("porcentaje", 0),
-                    })
-
-                # S1 — las columnas se dibujan por INDICE, y `no_impartidas`
-                # viene indexado por numero de dia. Aqui se traduce una cosa en
-                # la otra usando las mismas columnas que ya se van a imprimir,
-                # asi que una etiqueta no puede acabar sobre la fecha vecina.
-                _no_imp = mes_data.get("no_impartidas") or {}
-                etiquetas_ni = {}
-                for _idx, _dia in enumerate(dias_mes):
-                    _info = _no_imp.get(_dia) or _no_imp.get(str(_dia))
-                    if _info:
-                        etiquetas_ni[_idx] = _info.get("etiqueta") or "NO IMPARTIDA"
-
-                if est_list:
-                    # REG-1: cada mes va al hueco de su POSICIÓN en el año
-                    # escolar (0 = mes de fecha_inicio), no al siguiente libre.
-                    # Antes se ponían delante los meses con marcas: una materia
-                    # sin asistencia en septiembre imprimía octubre en el hueco
-                    # de septiembre. Ahora septiembre vacío conserva su hueco.
-                    pos = mes_data.get("posicion", len(meses_list))
-                    while len(meses_list) <= pos:
-                        meses_list.append(None)
-                    meses_list[pos] = {
-                        "nombre_mes": mes_data.get("mes", ""),
-                        "docente": "",
-                        "asistencias": est_list,
-                        "dias_labels": dias_mes,
-                        "etiquetas_no_impartidas": etiquetas_ni,
-                    }
-            primero = next((m for m in meses_list if m), None)
-            if primero:
-                # El template imprime el docente una sola vez, en el primer mes.
-                primero["docente"] = data.get('docente', '')
+            # REG-1: fuera del año → no se emite. REG-2: la traducción vive en
+            # `_meses_desde_matriz`, la MISMA que usa la Salida Optativa.
+            meses_list = _meses_desde_matriz(matriz, num_est, data.get('docente', ''),
+                                             asig_nombre)
         else:
             meses_legacy = sorted({mes_idx for est_raw in raw.values() for mes_idx in est_raw.keys()})
             for mes_idx in meses_legacy:
@@ -2963,19 +3172,100 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
                 'calificaciones': filas,
             }
 
-    # === TRADUCIR PROMOCION ===
+    # === TRADUCIR ACTA FINAL (REG-2) ===
+    # Antes se mandaba {"notas_finales": {asig_idx: cf}} y el dibujo leía
+    # "notas"/"apellidos"/"nombres": el Acta salía SIEMPRE vacía. Aquí solo se
+    # TRADUCE lo que EducaOne ya calcula, sin ninguna fórmula nueva:
+    #   Final          = CF oficial (redondeo académico, igual que la completiva)
+    #   Completivo     = EvaluacionExtraSecundaria.completiva_final
+    #   Extraordinario = EvaluacionExtraSecundaria.extraordinaria_final
+    #   Especial       = EvaluacionExtraSecundaria.especial_final
+    #   Situación      = la del motor canónico (A2), que llega de app.py en
+    #                    `situacion_final` — la MISMA que imprime el boletín.
+    def _notas_acta(cd):
+        if not cd:
+            return None
+        cf = cd.get('cf')
+        ev = cd.get('evaluacion_extra') or {}
+        fila = {
+            'final': redondear_calificacion_final(cf) if cf is not None else None,
+            'completivo': ev.get('completiva_final'),
+            'extraordinario': ev.get('extraordinaria_final'),
+            'especial': ev.get('especial_final'),
+        }
+        return fila if any(v is not None for v in fila.values()) else None
+
+    # Salida Optativa 1 / 2 = el componente en la 1ra / 2da posición de los que
+    # define la salida del curso (orden de slot del catálogo), NO el orden de
+    # los que traen notas: un componente conserva su columna aunque el otro
+    # esté vacío. Es el mismo criterio que la asistencia de Salida Optativa.
+    _so_columna = {}
+    _cod_salida = curso_info.get('salida_optativa_codigo')
+    if _cod_salida and grado_numero >= 4:
+        import salidas_optativas as _cat
+        for _pos, _comp in enumerate(_cat.componentes_de(_cod_salida, grado_numero)[:2]):
+            _so_columna[_comp.slot] = _pos + 1
+
     promocion_data = []
+    hay_dato_final = False
     for idx in range(num_est):
-        est_promo = {"notas_finales": {}}
+        est = estudiantes_nuevo[idx]
+        notas = {}
         for asig_idx, asig_nombre in enumerate(asigs_minerd):
-            if asig_nombre in asignaturas_data:
-                califs = asignaturas_data[asig_nombre].get('calificaciones', {})
-                if idx in califs:
-                    cf = califs[idx].get('cf')
-                    if cf is not None:
-                        est_promo["notas_finales"][asig_idx] = cf
-        promocion_data.append(est_promo if est_promo["notas_finales"] else None)
-    
+            if asig_nombre == "Salida Optativa" or asig_nombre not in asignaturas_data:
+                continue
+            fila = _notas_acta((asignaturas_data[asig_nombre].get('calificaciones') or {}).get(idx))
+            if fila:
+                notas[asig_nombre.lower().replace(" ", "_").replace("-", "_")] = fila
+        for slot, data_comp in (salida_optativa_data or {}).items():
+            col = _so_columna.get(int(slot))
+            if not col:
+                continue
+            fila = _notas_acta(((data_comp or {}).get('calificaciones') or {}).get(idx))
+            if fila:
+                notas['salida_optativa_%d' % col] = fila
+        sit = est.get("situacion_final") or {}
+        if notas or sit.get('promovido') or sit.get('reprobado'):
+            hay_dato_final = True
+        promocion_data.append({
+            "numero": est.get("numero"),
+            "apellidos": est.get("apellidos") or '',
+            # Sin apellido separado (datos antiguos), el nombre completo va en
+            # NOMBRE(S): nunca se parte un nombre adivinando dónde empieza.
+            "nombres": est.get("nombres") or (est.get("nombre") if not est.get("apellidos") else ''),
+            "notas": notas,
+            "situacion_final": sit,
+        })
+
+    # Cabecera del Acta: solo lo que el sistema TIENE (el resto, a mano).
+    _zona = str(colegio_info.get('zona', '') or '').lower()
+    acta_cabecera = {
+        "nombre_centro": datos_centro.get("nombre_centro", ''),
+        "codigo": datos_centro.get("codigo_sigerd", ''),
+        "regional": datos_centro.get("regional", ''),
+        "distrito": datos_centro.get("distrito", ''),
+        "grado": curso_info.get('grado', '') or '',
+        "seccion": curso_info.get('seccion', '') or '',
+        "anio": str(ano_escolar or ''),
+        "salida": curso_info.get('salida_optativa', '') or '',
+        "director": datos_centro.get("director", ''),
+        "tanda": str(datos_centro.get("jornada", '') or '').lower(),
+        "sector": str(datos_centro.get("sector", '') or '').lower(),
+        # El Acta solo distingue RURAL / URBANA / OTRA: una zona "urbana
+        # marginal" o "rural aislada" sigue siendo urbana / rural.
+        "zona": ('urbana' if _zona.startswith('urbana') else
+                 'rural' if _zona.startswith('rural') else
+                 'otra' if _zona else ''),
+    }
+
+    # Spreads de calificaciones de los componentes de Salida Optativa, por SLOT
+    # (las MISMAS notas crudas que la página completiva de cada componente).
+    salida_optativa_spread = {
+        int(slot): (data_comp or {}).get('calificaciones')
+        for slot, data_comp in (salida_optativa_data or {}).items()
+        if (data_comp or {}).get('calificaciones')
+    }
+
     return generar_registro_escolar(
         grado=grado_numero,
         datos_centro=datos_centro,
@@ -2994,7 +3284,11 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         # construida con `build_asistencia_registro`, el mismo constructor de las
         # materias normales, así que no hay una segunda forma de contar faltas.
         salida_optativa_asistencia=salida_optativa_asistencia or None,
-        promocion_data=promocion_data if any(p for p in promocion_data) else None,
+        salida_optativa_spread=salida_optativa_spread or None,
+        # REG-2: el Acta solo se estampa si hay algún dato final; sin ninguno
+        # queda virgen, como antes.
+        promocion_data=promocion_data if hay_dato_final else None,
+        acta_cabecera=acta_cabecera,
         marca_borrador=marca_borrador,
     )
 

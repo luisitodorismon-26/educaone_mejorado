@@ -21942,6 +21942,10 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
         'direccion': e.direccion or '',
         'condicion_entrada': getattr(e, 'condicion_entrada', 'nuevo') or 'nuevo',
     } for idx, e in enumerate(estudiantes_db[:90])]
+    # REG-2: datos que el Registro de Secundaria ya tenía en la base y no
+    # recibía (apellidos/nombres, correo, Salida Optativa, situación final).
+    _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
+                                    estudiantes_db[:90], estudiantes_raw)
     
     asignaturas_data = _cargar_datos_asignaturas_secundaria(
         db, current_user, curso_id, grado_numero, estudiantes_db[:90]
@@ -21956,7 +21960,15 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
             db, current_user, curso, grado_numero)
     except EspecificacionCurricularConflicto as _exc:
         return _respuesta_conflicto_espec(_exc)
-    
+
+    # REG-2: el BORRADOR lleva la MISMA Salida Optativa que el oficial (notas,
+    # Completiva, asistencia y Acta). Mismos helpers, mismos argumentos; se
+    # resuelven aquí, con la sesión, antes de pasar al threadpool.
+    salida_optativa_data = _cargar_salida_optativa_registro(
+        db, current_user, curso, estudiantes_db[:90])
+    salida_optativa_asistencia = _cargar_salida_optativa_asistencia(
+        db, current_user, curso, estudiantes_db[:90])
+
     try:
         # v2.19.6: el sello BORRADOR se estampa DENTRO de la generación.
         # Antes se armaba el PDF, se serializaba entero, se volvía a parsear y
@@ -21979,6 +21991,8 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
             estudiantes_raw, asignaturas_data, grado_numero,
             marca_borrador=True,
             especificacion_data=especificacion_data,
+            salida_optativa_data=salida_optativa_data or None,
+            salida_optativa_asistencia=salida_optativa_asistencia or None,
         )
         
         filename = f"BORRADOR_Registro_Secundaria_{curso.nombre_completo.replace(' ', '_')}.pdf"
@@ -22110,6 +22124,10 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
         'direccion': e.direccion or '',
         'condicion_entrada': getattr(e, 'condicion_entrada', 'nuevo') or 'nuevo',
     } for idx, e in enumerate(estudiantes_db[:90])]
+    # REG-2: datos que el Registro de Secundaria ya tenía en la base y no
+    # recibía (apellidos/nombres, correo, Salida Optativa, situación final).
+    _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
+                                    estudiantes_db[:90], estudiantes_raw)
     
     # Cargar asignaturas, profesores, calificaciones, asistencias
     asignaturas_data = _cargar_datos_asignaturas_secundaria(
@@ -22345,6 +22363,46 @@ def _cargar_especificacion_curricular(db: Session, current_user, curso, grado_nu
     return salida
 
 
+def _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
+                                    estudiantes_db, estudiantes_raw):
+    """REG-2 · Completa lo que el Registro de Secundaria ya debía recibir.
+
+    SOLO LECTURA y sin reglas nuevas:
+      · apellidos / nombres / correo: columnas del propio Estudiante;
+      · Salida Optativa: nombre oficial del catálogo según
+        `Curso.salida_optativa_codigo`;
+      · situación final en el grado: la del motor canónico (A2) a través de
+        `_situaciones_por_estudiante` —una precarga por curso, sin N+1— y
+        `RAC.situacion_boletin_secundaria`, EXACTAMENTE lo que imprime el
+        boletín. Mientras A2 no decide (EN_PROCESO, APLAZADO) no se marca
+        ninguna casilla.
+    """
+    import salidas_optativas as _cat_sal
+    codigo = getattr(curso, 'salida_optativa_codigo', None) or ''
+    curso_info['salida_optativa_codigo'] = codigo
+    curso_info['salida_optativa'] = _cat_sal.nombre_salida(codigo) or '' if codigo else ''
+
+    situaciones = {}
+    if ano is not None and estudiantes_db:
+        try:
+            paquetes = _situaciones_por_estudiante(db, current_user, estudiantes_db, ano)
+            for est_id, paq in paquetes.items():
+                sit = RAC.situacion_boletin_secundaria(paq['situacion'], paq.get('diagnosticos', ()))
+                situaciones[est_id] = {'promovido': bool(sit.get('promovido')),
+                                       'reprobado': bool(sit.get('repitente'))}
+        except Exception:
+            # La situación es un dato más del Acta; si el motor no puede
+            # resolverla, las casillas quedan sin marcar (nunca se adivina).
+            logger.exception("REG-2: situación final no disponible para el curso %s",
+                             getattr(curso, 'id', None))
+
+    for est, fila in zip(estudiantes_db, estudiantes_raw):
+        fila['apellidos'] = est.apellido or ''
+        fila['nombres'] = est.nombre or ''
+        fila['email'] = (est.email or '').strip()
+        fila['situacion_final'] = situaciones.get(est.id)
+
+
 def _respuesta_conflicto_espec(exc):
     """Traduce las anomalías de la especificación curricular a HTTP."""
     from registro_escolar import EspecificacionCurricularOverflow
@@ -22354,6 +22412,11 @@ def _respuesta_conflicto_espec(exc):
     # REG-1: asistencia fuera del año escolar o más meses que huecos. Es un
     # dato que el centro debe corregir, no un fallo del servidor.
     if isinstance(exc, RegistroAsistenciaError):
+        return JSONResponse(exc.detalle, status_code=422)
+    # REG-2: más días que columnas o más estudiantes que filas: el Registro
+    # no se emite recortado.
+    from registro_escolar import RegistroExcedePlantilla
+    if isinstance(exc, RegistroExcedePlantilla):
         return JSONResponse(exc.detalle, status_code=422)
     if isinstance(exc, EspecificacionCurricularConflicto):
         return JSONResponse(exc.detalle, status_code=409)

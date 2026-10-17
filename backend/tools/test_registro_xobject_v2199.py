@@ -101,17 +101,20 @@ def _asig_data(studs, grado, solo_n=None):
     meses = ["septiembre", "octubre", "noviembre", "diciembre", "enero",
              "febrero", "marzo", "abril", "mayo", "junio"]
     data = {}
-    for a in asigs:
+    for a_idx, a in enumerate(asigs):
+        # REG-2: la hoja compacta (Ed. Artística, Ed. Física, FIHR; a_idx >= 6)
+        # tiene 10 columnas por mes y ya no recorta: el dato sintético cabe.
+        n_d = 10 if a_idx >= 6 else 20
         matriz = []
         for m in meses:
             filas = []
             for idx, e in enumerate(studs):
-                vals = [("P", "A", "T", "E", "P")[(idx + d) % 5] for d in range(20)]
+                vals = [("P", "A", "T", "E", "P")[(idx + d) % 5] for d in range(n_d)]
                 filas.append({"no": idx + 1, "estudiante_id": idx, "nombre": e["nombre"],
                               "valores": vals, "presentes": vals.count("P"),
                               "ausentes": vals.count("A"), "porcentaje": 75.0})
-            matriz.append({"mes": m, "mes_num": 9, "dias": list(range(1, 21)),
-                           "total_dias": 20, "filas": filas, "fuente_dias": "horario"})
+            matriz.append({"mes": m, "mes_num": 9, "dias": list(range(1, n_d + 1)),
+                           "total_dias": n_d, "filas": filas, "fuente_dias": "horario"})
         cal = {}
         for idx in range(len(studs)):
             cal[idx] = {
