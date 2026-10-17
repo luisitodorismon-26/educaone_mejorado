@@ -82,7 +82,12 @@ LEG_GEN = M.Comunicado(colegio_id=COL.id, autor_id=DIR.id, titulo='Legacy genera
                        tipo='general')
 LEG_NULL = M.Comunicado(colegio_id=COL.id, autor_id=DIR.id, titulo='Legacy nulo', contenido='x', tipo=None)
 LEG_RARO = M.Comunicado(colegio_id=COL.id, autor_id=DIR.id, titulo='Legacy raro', contenido='x', tipo='urgente')
-db.add_all([LEG_GEN, LEG_NULL, LEG_RARO])
+# `tipo` con mayúsculas/espacios: se compara normalizado, sin reescribir la fila.
+LEG_SEC_MAY = M.Comunicado(colegio_id=COL.id, autor_id=DIR.id, titulo='Legacy Secundaria mayus', contenido='x',
+                           tipo='Secundaria')
+LEG_SEC_ESP = M.Comunicado(colegio_id=COL.id, autor_id=DIR.id, titulo='Legacy secundaria espacios', contenido='x',
+                           tipo=' secundaria ')
+db.add_all([LEG_GEN, LEG_NULL, LEG_RARO, LEG_SEC_MAY, LEG_SEC_ESP])
 db.commit()
 
 
@@ -211,6 +216,43 @@ check('CO-15b ...y esas ediciones tampoco notifican',
 check('CO-12b otro colegio no edita ni borra (404)',
       client.put('/api/comunicados/%d' % ID_GEN, json={'titulo': 'x'}, headers=h(DIR2)).status_code == 404
       and client.delete('/api/comunicados/%d' % ID_GEN, headers=h(DIR2)).status_code == 404, '')
+
+print("\n=== AUDIENCIA COMPLETA (flags + nivel) Y tipo NORMALIZADO ===")
+r_np = crear(DIR, 'general', titulo='Solo sin profesores', para_profesores=False)
+ID_NP = r_np.json()['id']
+check('CO-19 para_profesores=False: el profesor no lo lista', 'Solo sin profesores' not in titulos(PP)
+      and 'Solo sin profesores' in titulos(DIR), '')
+r19 = client.post('/api/comunicados/%d/marcar-leido' % ID_NP, headers=h(PP))
+db.expire_all()
+check('CO-19b ...ni lo marca leído por ID (404) y no queda fila',
+      r19.status_code == 404
+      and db.query(M.ComunicadoLeido).filter_by(usuario_id=PP.id, comunicado_id=ID_NP).count() == 0, r19.text)
+def _act(u):
+    return [a.get('titulo') for a in client.get('/api/dashboard/actividad-reciente', headers=h(u)).json()
+            if a.get('tipo') == 'comunicado']
+check('CO-19c actividad reciente del profesor no contiene su título (Dirección sí: control)',
+      'Solo sin profesores' not in _act(PP) and 'Solo sin profesores' in _act(DIR), (_act(PP), _act(DIR)))
+check('CO-19d marcar leído sigue funcionando para quien sí está en la audiencia',
+      client.post('/api/comunicados/%d/marcar-leido' % ID_NP, headers=h(CP)).status_code == 200, '')
+_sec_legacy = {'Legacy Secundaria mayus', 'Legacy secundaria espacios'}
+check("CO-20 tipo='Secundaria' y ' secundaria ' no aparecen a usuarios fijos de Primaria",
+      all(not (_sec_legacy & titulos(u)) for u in (PP, SECP)), '')
+check('CO-20b ...siguen visibles para usuarios de Secundaria y sin nivel',
+      all(_sec_legacy <= titulos(u) for u in (PS, PSIS, PN)), '')
+check("CO-20c ...y el GET los informa como 'secundaria'",
+      all(c['alcance'] == 'secundaria' for c in client.get('/api/comunicados', headers=h(DIR)).json()
+          if c['titulo'] in _sec_legacy), '')
+check('CO-20d ...y Primaria no los marca leídos por ID (404)',
+      client.post('/api/comunicados/%d/marcar-leido' % LEG_SEC_MAY.id, headers=h(PP)).status_code == 404, '')
+db.expire_all()
+check('CO-20e las filas NO se reescriben',
+      db.get(M.Comunicado, LEG_SEC_MAY.id).tipo == 'Secundaria'
+      and db.get(M.Comunicado, LEG_SEC_ESP.id).tipo == ' secundaria '
+      and db.get(M.Comunicado, LEG_RARO.id).tipo == 'urgente', '')
+check("CO-21 legacy 'urgente' sigue siendo general (visible a ambos niveles y marcable)",
+      all('Legacy raro' in titulos(u) for u in (PP, PS))
+      and client.post('/api/comunicados/%d/marcar-leido' % LEG_RARO.id, headers=h(PP)).status_code == 200
+      and client.post('/api/comunicados/%d/marcar-leido' % LEG_RARO.id, headers=h(PS)).status_code == 200, '')
 
 print("\n=== MENSAJES (sin cambios) ===")
 r = client.post('/api/mensajes', json={'destinatario_id': PS.id, 'asunto': 'Hola', 'contenido': 'Mensaje'},

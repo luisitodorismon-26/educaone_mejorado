@@ -11365,14 +11365,9 @@ async def get_dashboard_alertas(request: Request, db: Session = Depends(get_db),
 
     # Comunicados no leídos
     query = tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True)
-    if current_user.role == 'profesor':
-        query = query.filter_by(para_profesores=True)
-    elif current_user.role == 'coordinador':
-        query = query.filter_by(para_coordinadores=True)
-    elif current_user.role == 'psicologia':
-        query = query.filter_by(para_psicologia=True)
-    # COM1 · sin esto quedaría un "sin leer" que el usuario no puede abrir.
-    query = _filtrar_comunicados_por_nivel(query, current_user)
+    # COM1 · misma audiencia que el listado (flags por rol + nivel): sin esto
+    # quedaría un "sin leer" que el usuario no puede abrir.
+    query = _filtrar_comunicados_visibles(query, current_user)
 
     comunicados_ids = [c.id for c in query.all()]
     leidos_ids = [cl.comunicado_id for cl in tenant_filter(db.query(ComunicadoLeido), ComunicadoLeido, current_user).filter_by(usuario_id=current_user.id).all()]
@@ -11815,7 +11810,7 @@ async def get_actividad_reciente(db: Session = Depends(get_db), current_user: Us
     actividades = []
     
     # Últimos comunicados
-    comunicados = _filtrar_comunicados_por_nivel(
+    comunicados = _filtrar_comunicados_visibles(
         tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True),
         current_user).order_by(Comunicado.fecha.desc()).limit(3).all()
     for c in comunicados:
@@ -13512,17 +13507,45 @@ def _nivel_fijo_comunicados(user):
 
 
 def _filtrar_comunicados_por_nivel(query, user):
-    """Quita los comunicados de la división CONTRARIA. NULL/legacy = general."""
+    """Quita los comunicados de la división CONTRARIA. NULL/legacy = general.
+    `tipo` se compara normalizado (minúsculas, sin espacios), igual que
+    `_alcance_comunicado`; las filas no se reescriben."""
     nv = _nivel_fijo_comunicados(user)
     if nv is None:
         return query
     otro = 'secundaria' if nv == 'primaria' else 'primaria'
-    return query.filter(or_(Comunicado.tipo.is_(None), Comunicado.tipo != otro))
+    return query.filter(or_(Comunicado.tipo.is_(None),
+                            func.lower(func.trim(Comunicado.tipo)) != otro))
 
 
 def _comunicado_visible_por_nivel(comunicado, user):
     nv = _nivel_fijo_comunicados(user)
     return nv is None or _alcance_comunicado(comunicado) in ('general', nv)
+
+
+# Flags por rol de siempre: rol del usuario -> columna que lo habilita.
+_FLAG_COMUNICADO_POR_ROL = {
+    'profesor': 'para_profesores',
+    'coordinador': 'para_coordinadores',
+    'psicologia': 'para_psicologia',
+}
+
+
+def _filtrar_comunicados_visibles(query, user):
+    """Audiencia completa de un comunicado: flags por rol + nivel (COM1).
+    Una sola regla para el listado, las alertas, la actividad reciente y
+    marcar leído."""
+    flag = _FLAG_COMUNICADO_POR_ROL.get(getattr(user, 'role', None))
+    if flag:
+        query = query.filter(getattr(Comunicado, flag).is_(True))
+    return _filtrar_comunicados_por_nivel(query, user)
+
+
+def _comunicado_visible(comunicado, user):
+    flag = _FLAG_COMUNICADO_POR_ROL.get(getattr(user, 'role', None))
+    if flag and not getattr(comunicado, flag):
+        return False
+    return _comunicado_visible_por_nivel(comunicado, user)
 
 
 def _alcance_pedido(data, por_defecto='general'):
@@ -13540,15 +13563,8 @@ async def get_comunicados(request: Request, db: Session = Depends(get_db), curre
     """Obtener comunicados visibles para el usuario"""
     query = tenant_filter(db.query(Comunicado), Comunicado, current_user).filter_by(activo=True)
     
-    # Filtrar según rol
-    if current_user.role == 'profesor':
-        query = query.filter_by(para_profesores=True)
-    elif current_user.role == 'coordinador':
-        query = query.filter_by(para_coordinadores=True)
-    elif current_user.role == 'psicologia':
-        query = query.filter_by(para_psicologia=True)
-    # COM1 · y encima, el nivel (la división contraria no se ve).
-    query = _filtrar_comunicados_por_nivel(query, current_user)
+    # Filtrar según rol (flags de siempre) y, encima, el nivel (COM1).
+    query = _filtrar_comunicados_visibles(query, current_user)
 
     # Filtrar comunicados expirados
     query = query.filter(
@@ -13655,8 +13671,9 @@ async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_
 async def marcar_comunicado_leido(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Marcar comunicado como leído. Valida que el comunicado pertenezca al tenant."""
     comunicado = get_tenant_or_404(db, Comunicado, id, current_user, name='comunicado')
-    # COM1 · lo que no se puede ver, no se puede marcar (fail closed).
-    if not _comunicado_visible_por_nivel(comunicado, current_user):
+    # COM1 · lo que no se puede ver (flags por rol o nivel), no se puede
+    # marcar (fail closed).
+    if not _comunicado_visible(comunicado, current_user):
         return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
         
     existing = tenant_filter(db.query(ComunicadoLeido), ComunicadoLeido, current_user).filter_by(
