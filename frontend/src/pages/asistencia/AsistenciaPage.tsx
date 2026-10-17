@@ -6,6 +6,7 @@ import { useNivelesActivos, Nivel } from '../../hooks/useNivelesActivos';
 import { labelCurso } from '../../utils/labelCurso';
 import { SesionNoImpartidaPanel, SesionNI } from './SesionNoImpartida';
 import { textoSoloLectura } from './permisoAsistencia';
+import { VistaRapidaAsistencia } from './VistaRapidaAsistencia';
 
 interface Estudiante {
   id: number;
@@ -57,6 +58,8 @@ export const AsistenciaPage = () => {
 
   // Solo profesores pueden marcar asistencia
   const esProfesor = user?.role === 'profesor';
+  // ASIS-DASH-1: Dirección y Coordinación ven el resumen del día al elegir curso.
+  const veVistaRapida = user?.role === 'direccion' || user?.role === 'coordinador';
   // P3.1 — en Primaria la asistencia diaria la registra el TITULAR del curso.
   // Quién lo es lo decide el servidor y llega en la respuesta: el frontend no
   // lo deduce, y menos aún mirando el horario. `null` = Secundaria, donde esta
@@ -430,6 +433,15 @@ export const AsistenciaPage = () => {
           </div>
         )}
       </div>
+
+      {/* ASIS-DASH-1 · Vista rápida del día (solo lectura) */}
+      {veVistaRapida && cursoId > 0 && (
+        <VistaRapidaAsistencia
+          cursoId={cursoId}
+          fecha={fecha}
+          onAbrirMateria={esPrimaria ? undefined : (id) => setAsignaturaId(id)}
+        />
+      )}
 
       {/* Resumen */}
       {cursoId > 0 && (esPrimaria || asignaturaId > 0) && asistencias.length > 0 && (
