@@ -13490,10 +13490,11 @@ async def marcar_mensaje_leido(id, request: Request, db: Session = Depends(get_d
 # Cualquier otro valor (NULL, vacío o legacy) se trata como 'general': ningún
 # comunicado existente desaparece. Sin migración ni columna nueva.
 #
-# La autoridad es el backend y el dato es `nivel_asignado`: Dirección es
-# global; un usuario con división fija ve 'general' + la suya; sin división
-# fija ve los tres. El filtro de nivel va ENCIMA de los flags por rol
-# (`para_profesores`, ...), que no cambian.
+# La autoridad es el backend y el dato es `nivel_asignado`: Dirección y
+# Coordinación son globales en Comunicación (ven y publican los tres alcances,
+# aunque el coordinador tenga división fija); el resto con división fija ve
+# 'general' + la suya; sin división fija ve los tres. El filtro de nivel va
+# ENCIMA de los flags por rol (`para_profesores`, ...), que no cambian.
 ALCANCES_COMUNICADO = ('general', 'primaria', 'secundaria')
 
 
@@ -13504,7 +13505,7 @@ def _alcance_comunicado(comunicado):
 
 def _nivel_fijo_comunicados(user):
     """División fija que limita los comunicados de este usuario, o None."""
-    if getattr(user, 'role', None) in ('direccion', 'superadmin'):
+    if getattr(user, 'role', None) in ('direccion', 'coordinador', 'superadmin'):
         return None
     nv = (getattr(user, 'nivel_asignado', None) or '').strip().lower()
     return nv if nv in NIVELES_DIVISION else None
@@ -13522,16 +13523,6 @@ def _filtrar_comunicados_por_nivel(query, user):
 def _comunicado_visible_por_nivel(comunicado, user):
     nv = _nivel_fijo_comunicados(user)
     return nv is None or _alcance_comunicado(comunicado) in ('general', nv)
-
-
-def _alcances_que_puede_publicar(user):
-    """Dirección y coordinación sin división fija: los tres alcances.
-    Coordinación con división fija: solo la suya (no 'Todo el colegio')."""
-    if getattr(user, 'role', None) == 'coordinador':
-        nv = _nivel_fijo_comunicados(user)
-        if nv:
-            return (nv,)
-    return ALCANCES_COMUNICADO
 
 
 def _alcance_pedido(data, por_defecto='general'):
@@ -13587,13 +13578,10 @@ async def get_comunicados(request: Request, db: Session = Depends(get_db), curre
 async def crear_comunicado(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
     """Crear un nuevo comunicado"""
     data = await request.json()
-    # COM1 · alcance pedido y permitido (la API directa no salta la regla).
+    # COM1 · alcance pedido (Dirección y Coordinación publican los tres).
     alcance, _err = _alcance_pedido(data)
     if _err is not None:
         return _err
-    if alcance not in _alcances_que_puede_publicar(current_user):
-        return JSONResponse({'error': 'No puede publicar comunicados para ese alcance.'},
-                            status_code=403)
 
     comunicado = Comunicado(
         autor_id=current_user.id,
@@ -13645,15 +13633,11 @@ async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_
     if not _comunicado_visible_por_nivel(comunicado, current_user):
         return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
     data = await request.json()
-    # COM1 · el alcance se puede cambiar, solo a uno que pueda publicar.
+    # COM1 · el alcance se puede cambiar (sin volver a notificar).
     if 'tipo' in data:
         alcance, _err = _alcance_pedido(data)
         if _err is not None:
             return _err
-        if (alcance != _alcance_comunicado(comunicado)
-                and alcance not in _alcances_que_puede_publicar(current_user)):
-            return JSONResponse({'error': 'No puede asignar ese alcance al comunicado.'},
-                                status_code=403)
         comunicado.tipo = alcance
 
     if 'titulo' in data:

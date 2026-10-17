@@ -63,12 +63,9 @@ export const ComunicacionPage = () => {
   const [contenido, setContenido] = useState('');
   const [titulo, setTitulo] = useState('');
   const [imagen, setImagen] = useState('');
-  // COM1: alcance del comunicado. El backend decide quién puede publicar qué;
-  // aquí solo se ofrecen las opciones que le van a ser aceptadas.
-  const nivelFijo = (user as any)?.nivel_asignado;
-  const alcancesPermitidos: Alcance[] =
-    user?.role === 'coordinador' && (nivelFijo === 'primaria' || nivelFijo === 'secundaria')
-      ? [nivelFijo] : ['general', 'primaria', 'secundaria'];
+  // COM1: alcance del comunicado. Dirección y Coordinación publican los tres
+  // (el backend lo valida); para una persona concreta sigue "Nuevo Mensaje".
+  const alcancesPermitidos: Alcance[] = ['general', 'primaria', 'secundaria'];
   const [alcance, setAlcance] = useState<Alcance>(alcancesPermitidos[0]);
 
   // v2.19.3-A: la difusión masiva quedó reservada a Dirección y Coordinación
@@ -750,14 +747,7 @@ export const ComunicacionPage = () => {
                       onChange={e => setAlcance(e.target.value as Alcance)}
                       className="w-full px-3 py-2 border rounded-lg"
                     >
-                      {/* Al editar se muestra también el alcance actual, aunque
-                          este usuario no pueda publicarlo: editar el texto no
-                          obliga a cambiarlo. */}
-                      {Array.from(new Set<Alcance>([
-                        ...alcancesPermitidos,
-                        ...(modalType === 'editarComunicado' && selectedItem
-                          ? [(selectedItem.alcance || 'general') as Alcance] : []),
-                      ])).map(a => (
+                      {alcancesPermitidos.map(a => (
                         <option key={a} value={a}>{ETIQUETA_ALCANCE[a]}</option>
                       ))}
                     </select>

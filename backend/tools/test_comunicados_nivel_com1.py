@@ -4,7 +4,8 @@ EducaOne — COM1: comunicados por nivel (Todo el colegio / Primaria / Secundari
 
 Reutiliza `Comunicado.tipo`: 'general' | 'primaria' | 'secundaria'; NULL o un
 valor legacy desconocido = 'general'. La autoridad es el backend con
-`nivel_asignado`; Dirección es global. El filtro de nivel va ENCIMA de los
+`nivel_asignado`; Dirección y Coordinación son globales en Comunicación
+(ven y publican los tres alcances aunque el coordinador tenga división fija). El filtro de nivel va ENCIMA de los
 flags por rol (para_profesores, ...). Editar no vuelve a notificar.
 
 Base temporal aislada. Nunca producción.
@@ -114,11 +115,15 @@ check('CO-00 Dirección publica en los tres alcances',
       (r_gen.text, r_pri.text, r_sec.text))
 ID_GEN, ID_PRI, ID_SEC = r_gen.json()['id'], r_pri.json()['id'], r_sec.json()['id']
 T_GEN, T_PRI, T_SEC = 'C-c1_dir-general', 'C-c1_dir-primaria', 'C-c1_dir-secundaria'
-check('CO-07 coordinador Primaria puede crear Primaria', crear(CP, 'primaria').status_code == 201, '')
-check('CO-08 coordinador Primaria NO puede crear Secundaria (API directa)',
-      crear(CP, 'secundaria').status_code == 403, '')
-check('CO-09 coordinador Primaria NO puede crear "Todo el colegio"',
-      crear(CP, 'general').status_code == 403 and crear(CP, None).status_code == 403, '')
+r_cp = {t: crear(CP, t) for t in ('general', 'primaria', 'secundaria')}
+check('CO-07 coordinador Primaria publica general, Primaria y Secundaria',
+      all(r.status_code == 201 for r in r_cp.values()), {t: r.text for t, r in r_cp.items()})
+r_cs = {t: crear(CS, t) for t in ('general', 'primaria', 'secundaria')}
+check('CO-08 coordinador Secundaria publica general, Primaria y Secundaria',
+      all(r.status_code == 201 for r in r_cs.values()), {t: r.text for t, r in r_cs.items()})
+r_def = crear(CP, None)
+check('CO-09 sin "tipo" se publica como Todo el colegio',
+      r_def.status_code == 201 and db.get(M.Comunicado, r_def.json()['id']).tipo == 'general', r_def.text)
 check('CO-10 coordinador sin división crea cualquiera',
       all(crear(CN, t).status_code == 201 for t in ('general', 'primaria', 'secundaria')), '')
 check('CO-10b alcance inválido → 400', crear(DIR, 'todos').status_code == 400, '')
@@ -132,6 +137,8 @@ check('CO-03 Primaria invisible para usuario fijo Secundaria', T_PRI not in ts, 
 check('CO-04 Secundaria invisible para usuario fijo Primaria', T_SEC not in tp, tp)
 check('CO-05 usuario sin nivel ve los tres', {T_GEN, T_PRI, T_SEC} <= tn, tn)
 check('CO-06 Dirección ve los tres', {T_GEN, T_PRI, T_SEC} <= td, td)
+check('CO-06c Coordinación ve los tres aunque tenga división fija',
+      all({T_GEN, T_PRI, T_SEC} <= titulos(u) for u in (CP, CS, CN)), '')
 check('CO-06b secretaría y psicología fijas respetan su nivel',
       T_SEC not in titulos(SECP) and T_PRI in titulos(SECP)
       and T_PRI not in titulos(PSIS) and T_SEC in titulos(PSIS), '')
@@ -173,6 +180,13 @@ check('CO-N1 Secundaria no notifica a quien está fijo en Primaria (y viceversa)
       n_sec_pp == 0 and n_pri_ps == 0, (n_sec_pp, n_pri_ps))
 check('CO-N2 Primaria notifica a Primaria; sin nivel recibe ambos', n_pri_pp == 1 and n_pri_pn == 2,
       (n_pri_pp, n_pri_pn))
+# El autor no cambia los destinatarios: un coordinador de SECUNDARIA que
+# publica para Primaria notifica a Primaria, no a Secundaria.
+db.expire_all()
+_t = '📢 C-c1_cs-primaria'
+check('CO-N3 el alcance (no el autor) decide los destinatarios',
+      db.query(M.Notificacion).filter_by(usuario_id=PP.id, titulo=_t).count() == 1
+      and db.query(M.Notificacion).filter_by(usuario_id=PS.id, titulo=_t).count() == 0, '')
 
 print("\n=== EDITAR ===")
 antes = (notifs(PP), notifs(PS), notifs(PN))
@@ -182,22 +196,30 @@ check('CO-14 Dirección cambia el alcance Primaria → Secundaria', r.status_cod
 check('CO-15 editar NO crea notificaciones nuevas (ni duplicadas)',
       (notifs(PP), notifs(PS), notifs(PN)) == antes, (antes, (notifs(PP), notifs(PS), notifs(PN))))
 id_cp = crear(CP, 'primaria', titulo='De coord P').json()['id']
-check('CO-14b coordinador Primaria NO puede pasar su comunicado a Secundaria',
-      client.put('/api/comunicados/%d' % id_cp, json={'tipo': 'secundaria'}, headers=h(CP)).status_code == 403, '')
-check('CO-14c ...ni a "Todo el colegio"',
-      client.put('/api/comunicados/%d' % id_cp, json={'tipo': 'general'}, headers=h(CP)).status_code == 403, '')
-check('CO-14d coordinador Primaria NO edita ni borra uno de Secundaria por ID (404)',
-      client.put('/api/comunicados/%d' % ID_SEC, json={'titulo': 'x'}, headers=h(CP)).status_code == 404
-      and client.delete('/api/comunicados/%d' % ID_SEC, headers=h(CP)).status_code == 404, '')
-check('CO-14e editar el texto sin cambiar el alcance sigue funcionando',
-      client.put('/api/comunicados/%d' % id_cp, json={'titulo': 'De coord P v2', 'tipo': 'primaria'},
-                 headers=h(CP)).status_code == 200, '')
+antes = (notifs(PP), notifs(PS), notifs(PN))
+check('CO-14b coordinador Primaria puede cambiar el alcance a Secundaria y a Todo el colegio',
+      client.put('/api/comunicados/%d' % id_cp, json={'tipo': 'secundaria'}, headers=h(CP)).status_code == 200
+      and client.put('/api/comunicados/%d' % id_cp, json={'tipo': 'general'}, headers=h(CP)).status_code == 200, '')
+check('CO-14c coordinador Primaria edita uno de Secundaria',
+      client.put('/api/comunicados/%d' % ID_SEC, json={'titulo': T_SEC}, headers=h(CP)).status_code == 200, '')
+check('CO-14d cambio de alcance inválido → 400',
+      client.put('/api/comunicados/%d' % id_cp, json={'tipo': 'todos'}, headers=h(CP)).status_code == 400, '')
+check('CO-14e profesor sigue sin poder editar (403)',
+      client.put('/api/comunicados/%d' % id_cp, json={'titulo': 'x'}, headers=h(PP)).status_code == 403, '')
+check('CO-15b ...y esas ediciones tampoco notifican',
+      (notifs(PP), notifs(PS), notifs(PN)) == antes, '')
+check('CO-12b otro colegio no edita ni borra (404)',
+      client.put('/api/comunicados/%d' % ID_GEN, json={'titulo': 'x'}, headers=h(DIR2)).status_code == 404
+      and client.delete('/api/comunicados/%d' % ID_GEN, headers=h(DIR2)).status_code == 404, '')
 
 print("\n=== MENSAJES (sin cambios) ===")
 r = client.post('/api/mensajes', json={'destinatario_id': PS.id, 'asunto': 'Hola', 'contenido': 'Mensaje'},
                 headers=h(PP))
 check('CO-18 mensajes individuales siguen funcionando igual (cruzan niveles como antes)',
       r.status_code in (200, 201), r.text)
+_m = [client.post('/api/mensajes', json={'destinatario_id': d.id, 'asunto': 'A', 'contenido': 'B'},
+                  headers=h(u)).status_code for u, d in ((DIR, PS), (CP, PS), (CS, PP))]
+check('CO-18b Dirección y ambos coordinadores envían mensaje individual', all(c in (200, 201) for c in _m), _m)
 db.close()
 
 ok = sum(1 for _, r in RES if r)
