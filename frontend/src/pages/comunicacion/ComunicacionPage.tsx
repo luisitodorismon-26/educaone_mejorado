@@ -30,7 +30,14 @@ interface Comunicado {
   autor_id: number;
   fecha: string;
   leido_por_mi?: boolean;
+  // COM1: 'general' (Todo el colegio) | 'primaria' | 'secundaria'
+  alcance?: Alcance;
 }
+
+type Alcance = 'general' | 'primaria' | 'secundaria';
+const ETIQUETA_ALCANCE: Record<Alcance, string> = {
+  general: 'Todo el colegio', primaria: 'Primaria', secundaria: 'Secundaria',
+};
 
 export const ComunicacionPage = () => {
   const { user } = useAuth();
@@ -56,6 +63,13 @@ export const ComunicacionPage = () => {
   const [contenido, setContenido] = useState('');
   const [titulo, setTitulo] = useState('');
   const [imagen, setImagen] = useState('');
+  // COM1: alcance del comunicado. El backend decide quién puede publicar qué;
+  // aquí solo se ofrecen las opciones que le van a ser aceptadas.
+  const nivelFijo = (user as any)?.nivel_asignado;
+  const alcancesPermitidos: Alcance[] =
+    user?.role === 'coordinador' && (nivelFijo === 'primaria' || nivelFijo === 'secundaria')
+      ? [nivelFijo] : ['general', 'primaria', 'secundaria'];
+  const [alcance, setAlcance] = useState<Alcance>(alcancesPermitidos[0]);
 
   // v2.19.3-A: la difusión masiva quedó reservada a Dirección y Coordinación
   // en el backend. Se oculta también acá para que el resto de los roles no vea
@@ -107,6 +121,7 @@ export const ComunicacionPage = () => {
     setContenido('');
     setTitulo('');
     setImagen('');
+    setAlcance(alcancesPermitidos[0]);
     setSelectedItem(null);
   };
 
@@ -205,10 +220,10 @@ export const ComunicacionPage = () => {
 
     try {
       if (modalType === 'editarComunicado' && selectedItem) {
-        await api.put(`/comunicados/${selectedItem.id}`, { titulo, contenido, imagen });
+        await api.put(`/comunicados/${selectedItem.id}`, { titulo, contenido, imagen, tipo: alcance });
         setSuccess('Comunicado actualizado');
       } else {
-        await api.post('/comunicados', { titulo, contenido, imagen });
+        await api.post('/comunicados', { titulo, contenido, imagen, tipo: alcance });
         setSuccess('Comunicado publicado');
       }
       
@@ -254,6 +269,7 @@ export const ComunicacionPage = () => {
     setTitulo(c.titulo);
     setContenido(c.contenido);
     setImagen(c.imagen || '');
+    setAlcance(c.alcance || 'general');
     setModalType('editarComunicado');
     setShowModal(true);
   };
@@ -531,6 +547,7 @@ export const ComunicacionPage = () => {
                       <h3 className="font-bold text-lg text-gray-800">{c.titulo}</h3>
                       <p className="text-xs text-gray-500">
                         Por {c.autor} • {formatFecha(c.fecha)}
+                        {' • '}<span className="text-gray-600">{ETIQUETA_ALCANCE[c.alcance || 'general']}</span>
                       </p>
                     </div>
                     {canComunicado && c.autor_id === user?.id && (
@@ -726,6 +743,25 @@ export const ComunicacionPage = () => {
                     placeholder="Título del comunicado"
                     className="w-full px-3 py-2 border rounded-lg"
                   />
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Dirigido a</label>
+                    <select
+                      value={alcance}
+                      onChange={e => setAlcance(e.target.value as Alcance)}
+                      className="w-full px-3 py-2 border rounded-lg"
+                    >
+                      {/* Al editar se muestra también el alcance actual, aunque
+                          este usuario no pueda publicarlo: editar el texto no
+                          obliga a cambiarlo. */}
+                      {Array.from(new Set<Alcance>([
+                        ...alcancesPermitidos,
+                        ...(modalType === 'editarComunicado' && selectedItem
+                          ? [(selectedItem.alcance || 'general') as Alcance] : []),
+                      ])).map(a => (
+                        <option key={a} value={a}>{ETIQUETA_ALCANCE[a]}</option>
+                      ))}
+                    </select>
+                  </div>
                   <textarea
                     value={contenido}
                     onChange={e => setContenido(e.target.value)}
