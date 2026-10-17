@@ -136,9 +136,8 @@ check('R-06 Secretaría y Psicología siguen sin listado general (403)',
       listado(SEC)[0] == 403 and listado(PSN)[0] == 403 and listado(PSP)[0] == 403, '')
 check('R-07 otro colegio: no ve los reportes del C1', R_O.id not in listado(DIR)[1]
       and listado(DIR_O) == (200, {R_O.id}), '')
-check('R-08 X-Nivel no limita a Dirección ni amplía al coordinador fijo',
-      {x['id'] for x in client.get('/api/reportes', headers={**h(DIR), 'X-Nivel': 'primaria'}).json()} == TODOS
-      and {x['id'] for x in client.get('/api/reportes', headers={**h(CP), 'X-Nivel': 'secundaria'}).json()} == {R_P.id},
+check('R-08 X-Nivel no amplía al coordinador fijo',
+      {x['id'] for x in client.get('/api/reportes', headers={**h(CP), 'X-Nivel': 'secundaria'}).json()} == {R_P.id},
       '')
 
 print("\n=== ACCESO DIRECTO AL OTRO NIVEL (coordinador Primaria -> reporte Secundaria) ===")
@@ -277,6 +276,83 @@ for nombre, fn in (('dashboard/alertas', n_dash_alertas), ('dashboard/all', n_da
           v['coord_pri'] == N_P and v['coord_sec'] == N_S, (v, N_P, N_S))
     check('R-41 %s: coordinador sin nivel y Dirección cuentan ambos' % nombre,
           v['coord_null'] == N_P + N_S and v['dir'] == N_P + N_S, (v, N_P, N_S))
+
+print("\n=== SELECTOR GLOBAL (X-Nivel): LENTE DE VISTA, NO AUTORIZACIÓN ===")
+db.expire_all()
+_todos = db.query(M.ReporteConducta).filter_by(colegio_id=COL.id).all()
+IDS_P = {r.id for r in _todos if r.estudiante_id == EST_P.id}
+IDS_S = {r.id for r in _todos if r.estudiante_id == EST_S.id}
+
+
+def lista(u, nivel=None):
+    hd = dict(h(u), **({'X-Nivel': nivel} if nivel else {}))
+    r = client.get('/api/reportes', headers=hd)
+    return {x['id'] for x in r.json()} if r.status_code == 200 else r.status_code
+
+
+for u, quien in ((CN, 'coordinador sin nivel'), (DIR, 'Dirección')):
+    check('L-01 %s: Todos / Primaria / Secundaria' % quien,
+          (lista(u), lista(u, 'primaria'), lista(u, 'secundaria')) == (IDS_P | IDS_S, IDS_P, IDS_S),
+          (lista(u), lista(u, 'primaria'), lista(u, 'secundaria')))
+check('L-02 coordinador Primaria: X-Nivel secundaria no salta su nivel',
+      lista(CP) == IDS_P and lista(CP, 'secundaria') == IDS_P, (lista(CP), lista(CP, 'secundaria')))
+check('L-03 coordinador Secundaria: X-Nivel primaria no salta su nivel',
+      lista(CS) == IDS_S and lista(CS, 'primaria') == IDS_S, (lista(CS), lista(CS, 'primaria')))
+
+
+def hx(u, nivel):
+    return dict(h(u), **({'X-Nivel': nivel} if nivel else {}))
+
+
+def act(u, nivel=None):
+    return {a['titulo'] for a in client.get('/api/dashboard/actividad-reciente', headers=hx(u, nivel)).json()
+            if a.get('tipo') == 'reporte'}
+
+
+def cuentas(u, nivel=None):
+    hd = hx(u, nivel)
+    a1 = [a for a in client.get('/api/dashboard/alertas', headers=hd).json() if a.get('tipo') == 'reporte']
+    a2 = client.get('/api/dashboard/all', headers=hd).json()['stats']['reportes_pendientes']
+    a3 = [a for a in client.get('/api/alertas', headers=hd).json() if a.get('tipo') == 'reporte']
+    return (a1[0]['count'] if a1 else 0, a2, int(a3[0]['titulo'].split()[0]) if a3 else 0)
+
+
+for u, quien in ((CN, 'coordinador sin nivel'), (DIR, 'Dirección')):
+    ap_, as2 = act(u, 'primaria'), act(u, 'secundaria')
+    check('L-04 %s: actividad reciente sigue el lente' % quien,
+          ap_ and not (ap_ & T_SEC) and as2 and not (as2 & T_PRI), (ap_, as2))
+    c = (cuentas(u), cuentas(u, 'primaria'), cuentas(u, 'secundaria'))
+    check('L-05 %s: alertas, dashboard/all y /api/alertas siguen el lente' % quien,
+          c == ((N_P + N_S,) * 3, (N_P,) * 3, (N_S,) * 3), (c, N_P, N_S))
+check('L-06 coordinador fijo: el lente no cambia sus conteos ni su actividad',
+      cuentas(CP, 'secundaria') == (N_P,) * 3 and cuentas(CS, 'primaria') == (N_S,) * 3
+      and not (act(CP, 'secundaria') & T_SEC) and not (act(CS, 'primaria') & T_PRI), '')
+
+# Acciones por ID: manda la AUTORIZACIÓN (nivel_asignado), no la vista elegida.
+check('L-07 coordinador sin nivel con vista Primaria sigue pudiendo operar uno de Secundaria',
+      client.get('/api/reportes/%d/pdf' % R_S.id, headers=hx(CN, 'primaria')).status_code == 200
+      and client.get('/api/reportes/%d/historial-envios' % R_S.id, headers=hx(CN, 'primaria')).status_code == 200, '')
+check('L-08 Dirección con vista Primaria sigue pudiendo operar uno de Secundaria',
+      client.get('/api/reportes/%d/pdf' % R_S.id, headers=hx(DIR, 'primaria')).status_code == 200, '')
+antes = huella(R_S.id)
+check('L-09 coordinador Primaria con X-Nivel secundaria sigue en 404 por ID y sin escribir',
+      [client.post('/api/reportes/%d/responder' % R_S.id, json={'acciones_centro': 'x'}, headers=hx(CP, 'secundaria')).status_code,
+       client.post('/api/reportes/%d/confirmar-padre' % R_S.id, headers=hx(CP, 'secundaria')).status_code,
+       client.post('/api/reportes/%d/enviar-padres' % R_S.id, json={}, headers=hx(CP, 'secundaria')).status_code,
+       client.get('/api/reportes/%d/historial-envios' % R_S.id, headers=hx(CP, 'secundaria')).status_code,
+       client.get('/api/reportes/%d/pdf' % R_S.id, headers=hx(CP, 'secundaria')).status_code] == [404] * 5
+      and huella(R_S.id) == antes, '')
+check('L-10 Psicología Primaria con X-Nivel secundaria sigue en 404',
+      client.get('/api/reportes/%d/pdf' % R_S.id, headers=hx(PSP, 'secundaria')).status_code == 404, '')
+check('L-11 Secretaría con X-Nivel: sigue sin listado ni PDF',
+      client.get('/api/reportes', headers=hx(SEC, 'primaria')).status_code == 403
+      and client.get('/api/reportes/%d/pdf' % R_P.id, headers=hx(SEC, 'primaria')).status_code == 403, '')
+
+# Avisos: los decide la autorización, no la vista del autor ni del receptor.
+rv = client.post('/api/reportes', json={'estudiante_id': EST_S.id, 'titulo': 'Con vista P'}, headers=hx(DIR, 'primaria'))
+av = avisados(rv.json()['id'])
+check('L-12 la vista elegida no filtra avisos: coordinador sin nivel y Secundaria lo reciben; Primaria no',
+      rv.status_code == 201 and CN.id in av and CS.id in av and CP.id not in av and DIR2.id in av, av)
 db.close()
 
 ok = sum(1 for _, r in RES if r)

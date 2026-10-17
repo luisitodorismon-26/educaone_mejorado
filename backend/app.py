@@ -11397,10 +11397,10 @@ async def get_dashboard_alertas(request: Request, db: Session = Depends(get_db),
                 'link': '/reportes'
             })
     elif current_user.role in ['direccion', 'coordinador']:
-        # REP1 · coordinación con división fija: solo su nivel.
+        # REP1 · división fija, o el selector global si no la tiene.
         reportes_count = _filtrar_reportes_por_nivel(
             tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente'),
-            db, current_user).count()
+            db, current_user, request).count()
         if reportes_count > 0:
             alertas.append({
                 'tipo': 'reporte',
@@ -11809,7 +11809,7 @@ async def atender_alerta(
 
 
 @app.get("/api/dashboard/actividad-reciente")
-async def get_actividad_reciente(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_actividad_reciente(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     actividades = []
     
     # Últimos comunicados
@@ -11832,7 +11832,7 @@ async def get_actividad_reciente(db: Session = Depends(get_db), current_user: Us
     if current_user.role == 'profesor':
         q_rep = q_rep.filter(ReporteConducta.reportado_por == current_user.id)
     elif current_user.role in ('direccion', 'coordinador', 'superadmin'):
-        q_rep = _filtrar_reportes_por_nivel(q_rep, db, current_user)
+        q_rep = _filtrar_reportes_por_nivel(q_rep, db, current_user, request)
     else:
         q_rep = None
     reportes = q_rep.order_by(ReporteConducta.fecha.desc()).limit(3).all() if q_rep is not None else []
@@ -12276,7 +12276,10 @@ async def get_dashboard_direccion(db: Session = Depends(get_db), current_user: U
 @app.get("/api/dashboard/all")
 async def get_dashboard_all(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Endpoint unificado — 1 request en vez de 4. Cache 15s."""
-    ck = f'dash_all:{current_user.id}'
+    # REP1 · el lente de reportes entra en la clave: sin esto, la vista
+    # "Primaria" se serviría 15 s a quien acaba de elegir "Secundaria".
+    _lente_rep = _nivel_lente_reportes(current_user, request)
+    ck = f'dash_all:{current_user.id}:{_lente_rep or "todos"}'
     cached = cache_get(ck)
     if cached: return cached
     
@@ -12290,7 +12293,7 @@ async def get_dashboard_all(request: Request, db: Session = Depends(get_db), cur
         # REP1 · con división fija, solo los pendientes de su nivel.
         'reportes_pendientes': _filtrar_reportes_por_nivel(
             tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente'),
-            db, current_user).count(),
+            db, current_user, request).count(),
         'colegio': {'nombre': config.nombre if config else 'Educa One', 'logo': config.logo if config else None}
     }
     
@@ -12343,7 +12346,7 @@ async def get_accesos(db: Session = Depends(get_db), current_user: Usuario = Dep
 # ============== ENDPOINTS ADICIONALES ==============
 
 @app.get("/api/alertas")
-async def get_alertas(db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+async def get_alertas(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Endpoint de alertas dinámicas basadas en datos reales"""
     alertas = []
     hoy = today_rd()
@@ -12427,10 +12430,10 @@ async def get_alertas(db: Session = Depends(get_db), current_user: Usuario = Dep
                         'prioridad': 'urgent' if (dias_restantes and dias_restantes <= 3) else 'warning'
                     })
     
-    # 2. Reportes pendientes (REP1 · con división fija, solo su nivel)
+    # 2. Reportes pendientes (REP1 · división fija, o el selector global)
     reportes_pendientes = _filtrar_reportes_por_nivel(
         tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente'),
-        db, current_user).count()
+        db, current_user, request).count()
     if reportes_pendientes > 0:
         alertas.append({
             'id': 2,
@@ -12607,8 +12610,30 @@ def _nivel_fijo_reportes(user):
     return nv if nv in NIVELES_DIVISION else None
 
 
-def _filtrar_reportes_por_nivel(q, db, user):
-    nv = _nivel_fijo_reportes(user)
+def _nivel_lente_reportes(user, request=None):
+    """Nivel con el que se FILTRA la vista (listado y dashboard), o None.
+
+    - División fija (coordinación/psicología): manda siempre; X-Nivel no la
+      puede quitar ni cambiar.
+    - Dirección y coordinación/psicología sin división fija: el selector
+      global (X-Nivel) es solo un lente de vista. NO es autorización: las
+      acciones por ID y los avisos se rigen por `_nivel_fijo_reportes`.
+    - Resto de roles: sin lente.
+    """
+    if getattr(user, 'role', None) not in ('direccion',) + _ROLES_CON_DIVISION_EN_REPORTES:
+        return None
+    fijo = _nivel_fijo_reportes(user)
+    if fijo:
+        return fijo
+    if request is not None:
+        h = (request.headers.get('X-Nivel') or '').strip().lower()
+        if h in NIVELES_DIVISION:
+            return h
+    return None
+
+
+def _filtrar_reportes_por_nivel(q, db, user, request=None):
+    nv = _nivel_lente_reportes(user, request)
     if nv is None:
         return q
     _cids = cursos_ids_de_nivel(db, user, nv) or {0}
@@ -12672,8 +12697,9 @@ async def get_reportes(request: Request, db: Session = Depends(get_db),
 
     if current_user.role == 'profesor':
         q = q.filter(ReporteConducta.reportado_por == current_user.id)
-    # REP1 · coordinación con división fija: solo su nivel.
-    q = _filtrar_reportes_por_nivel(q, db, current_user)
+    # REP1 · división fija: solo su nivel; sin división fija, el selector
+    # global (X-Nivel) filtra la vista.
+    q = _filtrar_reportes_por_nivel(q, db, current_user, request)
 
     q = q.order_by(ReporteConducta.fecha.desc())
     # v2.13.30: paginación opcional (sin ?page devuelve todo, retrocompatible)
