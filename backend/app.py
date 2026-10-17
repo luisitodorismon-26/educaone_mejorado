@@ -11397,7 +11397,10 @@ async def get_dashboard_alertas(request: Request, db: Session = Depends(get_db),
                 'link': '/reportes'
             })
     elif current_user.role in ['direccion', 'coordinador']:
-        reportes_count = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente').count()
+        # REP1 · coordinación con división fija: solo su nivel.
+        reportes_count = _filtrar_reportes_por_nivel(
+            tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente'),
+            db, current_user).count()
         if reportes_count > 0:
             alertas.append({
                 'tipo': 'reporte',
@@ -11821,8 +11824,18 @@ async def get_actividad_reciente(db: Session = Depends(get_db), current_user: Us
             'autor': c.autor.nombre_completo if c.autor else None
         })
     
-    # Últimos reportes
-    reportes = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).order_by(ReporteConducta.fecha.desc()).limit(3).all()
+    # Últimos reportes — REP1: misma visibilidad que GET /api/reportes.
+    # Profesor: solo los suyos. Dirección/coordinación: el colegio (o su
+    # división fija). Secretaría, psicología y demás: sin listado general,
+    # así que tampoco reciben títulos aquí.
+    q_rep = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user)
+    if current_user.role == 'profesor':
+        q_rep = q_rep.filter(ReporteConducta.reportado_por == current_user.id)
+    elif current_user.role in ('direccion', 'coordinador', 'superadmin'):
+        q_rep = _filtrar_reportes_por_nivel(q_rep, db, current_user)
+    else:
+        q_rep = None
+    reportes = q_rep.order_by(ReporteConducta.fecha.desc()).limit(3).all() if q_rep is not None else []
     for r in reportes:
         actividades.append({
             'tipo': 'reporte',
@@ -12274,7 +12287,10 @@ async def get_dashboard_all(request: Request, db: Session = Depends(get_db), cur
         'estudiantes': tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(activo=True).count(),
         'profesores': tenant_filter(db.query(Usuario), Usuario, current_user).filter_by(role='profesor', activo=True).count(),
         'cursos': tenant_filter(db.query(Curso), Curso, current_user).filter_by(activo=True).count(),
-        'reportes_pendientes': tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente').count(),
+        # REP1 · con división fija, solo los pendientes de su nivel.
+        'reportes_pendientes': _filtrar_reportes_por_nivel(
+            tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente'),
+            db, current_user).count(),
         'colegio': {'nombre': config.nombre if config else 'Educa One', 'logo': config.logo if config else None}
     }
     
@@ -12411,8 +12427,10 @@ async def get_alertas(db: Session = Depends(get_db), current_user: Usuario = Dep
                         'prioridad': 'urgent' if (dias_restantes and dias_restantes <= 3) else 'warning'
                     })
     
-    # 2. Reportes pendientes
-    reportes_pendientes = tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente').count()
+    # 2. Reportes pendientes (REP1 · con división fija, solo su nivel)
+    reportes_pendientes = _filtrar_reportes_por_nivel(
+        tenant_filter(db.query(ReporteConducta), ReporteConducta, current_user).filter_by(estado='pendiente'),
+        db, current_user).count()
     if reportes_pendientes > 0:
         alertas.append({
             'id': 2,

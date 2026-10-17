@@ -230,6 +230,53 @@ check('R-32 coordinador Secundaria crea en su nivel; no se auto-notifica',
       and {DIR.id, DIR2.id, CN.id} <= avisados(rcs.json()['id']), rcs.text)
 check('R-33 coordinador Primaria no crea un reporte de Secundaria (candado existente)',
       client.post('/api/reportes', json={'estudiante_id': EST_S.id, 'titulo': 'X'}, headers=h(CP)).status_code == 403, '')
+
+print("\n=== DASHBOARD: ACTIVIDAD RECIENTE Y CONTEOS ===")
+
+
+def titulos_actividad(u):
+    r = client.get('/api/dashboard/actividad-reciente', headers=h(u))
+    return {a['titulo'] for a in r.json() if a.get('tipo') == 'reporte'}
+
+
+T_PRI = {'REP_PRIMARIA', 'Nuevo P'}
+T_SEC = {'REP_SECUNDARIA', 'REP_SECUNDARIA_2', 'Nuevo S', 'De CS'}
+a_pp, a_sec, a_psi = titulos_actividad(PROF_P), titulos_actividad(SEC), titulos_actividad(PSN)
+a_cp, a_cs, a_dir = titulos_actividad(CP), titulos_actividad(CS), titulos_actividad(DIR)
+check('R-34 actividad: profesor solo ve títulos de sus reportes', a_pp == {'REP_PRIMARIA'}, a_pp)
+check('R-35 actividad: Secretaría y Psicología no reciben títulos de reportes', a_sec == set() and a_psi == set(),
+      (a_sec, a_psi))
+check('R-36 actividad: coordinador Primaria no ve títulos de Secundaria', a_cp and not (a_cp & T_SEC), a_cp)
+check('R-37 actividad: coordinador Secundaria no ve títulos de Primaria', a_cs and not (a_cs & T_PRI), a_cs)
+check('R-38 actividad: Dirección ve ambos niveles', (a_dir & T_PRI) and (a_dir & T_SEC), a_dir)
+
+db.expire_all()
+_pend = db.query(M.ReporteConducta).filter_by(colegio_id=COL.id, estado='pendiente').all()
+N_P = sum(1 for r in _pend if r.estudiante_id == EST_P.id)
+N_S = sum(1 for r in _pend if r.estudiante_id == EST_S.id)
+check('R-39 precondición: pendientes distintos por nivel', N_P > 0 and N_S > 0 and N_P != N_S, (N_P, N_S))
+
+
+def n_dash_alertas(u):
+    al = [a for a in client.get('/api/dashboard/alertas', headers=h(u)).json() if a.get('tipo') == 'reporte']
+    return al[0]['count'] if al else 0
+
+
+def n_dash_all(u):
+    return client.get('/api/dashboard/all', headers=h(u)).json()['stats']['reportes_pendientes']
+
+
+def n_alertas(u):
+    al = [a for a in client.get('/api/alertas', headers=h(u)).json() if a.get('tipo') == 'reporte']
+    return int(al[0]['titulo'].split()[0]) if al else 0
+
+
+for nombre, fn in (('dashboard/alertas', n_dash_alertas), ('dashboard/all', n_dash_all), ('/api/alertas', n_alertas)):
+    v = {u.username: fn(u) for u in (CP, CS, CN, DIR)}
+    check('R-40 %s: coordinador fijo cuenta solo su nivel' % nombre,
+          v['coord_pri'] == N_P and v['coord_sec'] == N_S, (v, N_P, N_S))
+    check('R-41 %s: coordinador sin nivel y Dirección cuentan ambos' % nombre,
+          v['coord_null'] == N_P + N_S and v['dir'] == N_P + N_S, (v, N_P, N_S))
 db.close()
 
 ok = sum(1 for _, r in RES if r)
