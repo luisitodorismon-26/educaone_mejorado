@@ -14301,6 +14301,146 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
 
     return _respuesta_asistencia_curso(db, curso, resultado, current_user)
 
+_DIAS_HORARIO = ('Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo')
+_ESTADOS_VISTA = ('presente', 'ausente', 'tardanza', 'excusa')
+
+
+def _resumen_marcas(estudiantes, marcas):
+    """Conteo y listas de UNA toma de asistencia. Sin marca = sin marcar:
+    nunca se asume presente. Estado: registrada (todos marcados), parcial o
+    sin_asistencia."""
+    conteo = {e: 0 for e in _ESTADOS_VISTA}
+    listas = {'ausente': [], 'tardanza': [], 'excusa': []}
+    sin_marcar = 0
+    for est in estudiantes:
+        estado = (marcas.get(est.id) or '').lower()
+        if estado in conteo:
+            conteo[estado] += 1
+            if estado in listas:
+                listas[estado].append({'id': est.id, 'no_lista': est.no_lista,
+                                       'nombre': est.nombre_completo})
+        else:
+            sin_marcar += 1
+    marcados = len(estudiantes) - sin_marcar
+    estado = ('sin_asistencia' if marcados == 0 else
+              'registrada' if sin_marcar == 0 else 'parcial')
+    return {'estado': estado, 'total_estudiantes': len(estudiantes),
+            'presentes': conteo['presente'], 'ausentes': conteo['ausente'],
+            'tardanzas': conteo['tardanza'], 'excusas': conteo['excusa'],
+            'sin_marcar': sin_marcar, 'lista_ausentes': listas['ausente'],
+            'lista_tardanzas': listas['tardanza'], 'lista_excusas': listas['excusa']}
+
+
+@app.get("/api/asistencia/vista-rapida/{curso_id}")
+async def vista_rapida_asistencia(curso_id: int, request: Request, db: Session = Depends(get_db),
+                                  current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+    """ASIS-DASH-1 · Vista rápida de la asistencia de UN curso en UNA fecha.
+
+    SOLO LECTURA: no escribe, no corrige ni completa nada. Para Dirección y
+    Coordinación; el resto de roles no gana ningún permiso.
+
+    · Primaria: la asistencia es del curso y del día (asignatura NULL), el
+      mismo flujo que registra el titular.
+    · Secundaria: una entrada por asignatura con clase ese día según el
+      HORARIO real del curso (profesor y horas incluidos), con su propia toma.
+      No existe un "ausente del día": faltar a una materia no se extiende a
+      las demás. Si hay asistencia de una materia sin clase en el horario de
+      ese día, también aparece (marcada "fuera de horario"): no se esconde.
+    · Una sesión declarada NO impartida (S1) se muestra como tal.
+
+    Alcance: tenant (`get_tenant_or_404`) y división fija del coordinador
+    (`_guardia_nivel_lectura_curso`, la misma que Horarios).
+    """
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    _g = _guardia_nivel_lectura_curso(db, current_user, curso.id)
+    if _g is not None:
+        return _g
+    fecha_str = request.query_params.get('fecha') or today_rd().isoformat()
+    try:
+        fecha = datetime.strptime(fecha_str, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return JSONResponse({'error': f'fecha inválida: {fecha_str!r}. Formato YYYY-MM-DD'},
+                            status_code=400)
+
+    grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
+    nivel = _canon_nivel(grado.nivel if grado else None)
+    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
+        Estudiante.curso_id == curso.id, Estudiante.activo.is_(True),
+    ).order_by(Estudiante.no_lista).all()
+    est_ids = [e.id for e in estudiantes] or [0]
+    # Día no laborable: el de esa fecha exacta, o uno recurrente (mismo día y mes).
+    no_laborable = next((d for d in tenant_filter(db.query(DiaNoLaborable), DiaNoLaborable, current_user)
+                         .filter(DiaNoLaborable.activo.is_(True)).all()
+                         if d.fecha == fecha or (d.recurrente and d.fecha
+                                                 and (d.fecha.month, d.fecha.day) == (fecha.month, fecha.day))),
+                        None)
+    base = {
+        'curso_id': curso.id, 'curso': curso.nombre_completo, 'nivel': nivel,
+        'fecha': fecha.isoformat(), 'dia': _DIAS_HORARIO[fecha.weekday()],
+        'dia_no_laborable': (no_laborable.nombre or 'Día no laborable') if no_laborable else None,
+    }
+
+    marcas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+        Asistencia.estudiante_id.in_(est_ids), Asistencia.fecha == fecha).all()
+
+    if nivel == 'primaria':
+        diarias = {a.estudiante_id: a.estado for a in marcas if a.asignatura_id is None}
+        titular = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            curso_id=curso.id, activo=True, es_titular=True).first()
+        base['primaria'] = dict(_resumen_marcas(estudiantes, diarias),
+                                titular=(titular.profesor.nombre_completo
+                                         if titular and titular.profesor else None))
+        return base
+
+    # Secundaria: las clases de ESE día según el horario activo del curso.
+    bloques = tenant_filter(db.query(Horario), Horario, current_user).filter(
+        Horario.curso_id == curso.id, Horario.activo.is_(True),
+        Horario.dia == _DIAS_HORARIO[fecha.weekday()],
+        Horario.asignatura_id.isnot(None),
+    ).order_by(Horario.hora_inicio).all()
+    no_imp = {s.asignatura_id: s for s in tenant_filter(
+        db.query(SesionNoImpartida), SesionNoImpartida, current_user).filter(
+        SesionNoImpartida.curso_id == curso.id, SesionNoImpartida.fecha == fecha,
+        SesionNoImpartida.activo.is_(True))}
+    por_asig = {}
+    for a in marcas:
+        if a.asignatura_id is not None:
+            por_asig.setdefault(a.asignatura_id, {})[a.estudiante_id] = a.estado
+    asigs = {a.id: a for a in tenant_filter(db.query(Asignatura), Asignatura, current_user).filter(
+        Asignatura.id.in_({b.asignatura_id for b in bloques} | set(por_asig) or {0}))}
+
+    sesiones, vistas = [], set()
+    for b in bloques:
+        if b.asignatura_id in vistas:
+            # Misma materia dos veces el mismo día: la asistencia se guarda por
+            # (estudiante, fecha, asignatura), así que es UNA toma; se agrega el
+            # bloque horario a la misma entrada para que siga siendo trazable.
+            s = next(x for x in sesiones if x['asignatura_id'] == b.asignatura_id)
+            s['bloques'].append({'hora_inicio': b.hora_inicio, 'hora_fin': b.hora_fin,
+                                 'profesor': b.profesor.nombre_completo if b.profesor else None})
+            continue
+        vistas.add(b.asignatura_id)
+        ses = no_imp.get(b.asignatura_id)
+        sesiones.append(dict(
+            _resumen_marcas(estudiantes, por_asig.get(b.asignatura_id, {})),
+            asignatura_id=b.asignatura_id,
+            asignatura=asigs[b.asignatura_id].nombre if b.asignatura_id in asigs else None,
+            profesor=b.profesor.nombre_completo if b.profesor else None,
+            bloques=[{'hora_inicio': b.hora_inicio, 'hora_fin': b.hora_fin,
+                      'profesor': b.profesor.nombre_completo if b.profesor else None}],
+            no_impartida=({'motivo': ses.motivo_nombre, 'detalle': ses.motivo_detalle}
+                          if ses else None),
+            fuera_de_horario=False))
+    for asig_id, m in por_asig.items():
+        if asig_id not in vistas:
+            sesiones.append(dict(
+                _resumen_marcas(estudiantes, m), asignatura_id=asig_id,
+                asignatura=asigs[asig_id].nombre if asig_id in asigs else None,
+                profesor=None, bloques=[], no_impartida=None, fuera_de_horario=True))
+    base['secundaria'] = {'sesiones': sesiones, 'sin_clases_programadas': not bloques}
+    return base
+
+
 @app.post("/api/asistencia/masivo")
 async def registrar_asistencia_masivo(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """Registrar asistencia de múltiples estudiantes por materia.
