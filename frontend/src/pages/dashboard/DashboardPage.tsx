@@ -40,6 +40,10 @@ interface GraficoData {
     curso_id: number; curso: string; total: number;
     presentes: number; ausentes: number; tardanzas: number; excusas: number;
     sin_marca: number; registrado: boolean; porcentaje: number;
+    // ASIS-TANDA-1: datos estructurados para agrupar (opcionales: un backend
+    // anterior no los envía y el panel se muestra como antes).
+    tanda_id?: number | null; tanda?: string | null; tanda_hora_inicio?: string | null;
+    grado_nivel?: string | null; grado_orden?: number | null; seccion?: string | null;
   }>;
   ranking_mejor?: Array<{ nombre: string; curso: string; promedio: number; corte?: number }>;
   ranking_peligro?: Array<{ nombre: string; curso: string; promedio: number; corte?: number }>;
@@ -47,6 +51,41 @@ interface GraficoData {
 }
 // v2.14: clave+atendible ⇒ la alerta puede marcarse como atendida (con nota) y desaparece
 interface Alerta { tipo: string; prioridad: string; mensaje: string; count?: number; link?: string; clave?: string; atendible?: boolean; }
+
+type FilaAsistenciaHoy = NonNullable<GraficoData['asistencia_hoy_por_curso']>[number];
+
+// ASIS-TANDA-1 — "Asistencia hoy" agrupada por tanda (por hora de inicio:
+// Matutina antes que Vespertina) y, dentro de cada tanda, por nivel (Primaria
+// antes que Secundaria), orden del grado y sección. Solo presentación: las
+// filas y sus valores son exactamente los que envía el backend. Los cursos
+// sin tanda van al final, en su propio grupo.
+const RANGO_NIVEL: Record<string, number> = { inicial: 0, primaria: 1, secundaria: 2 };
+
+function agruparAsistenciaHoy(filas: FilaAsistenciaHoy[]): Array<{ clave: string; nombre: string | null; filas: FilaAsistenciaHoy[] }> {
+  // Backend anterior sin datos de tanda: un solo grupo, en el orden recibido.
+  if (!filas.some(f => f.tanda_id !== undefined)) {
+    return [{ clave: 'todos', nombre: null, filas }];
+  }
+  const grupos = new Map<string, { clave: string; nombre: string | null; hora: string; filas: FilaAsistenciaHoy[] }>();
+  for (const f of filas) {
+    const clave = f.tanda_id ? String(f.tanda_id) : 'sin-tanda';
+    if (!grupos.has(clave)) {
+      grupos.set(clave, { clave, nombre: f.tanda_id ? (f.tanda || 'Tanda') : 'Sin tanda', hora: f.tanda_hora_inicio || '', filas: [] });
+    }
+    grupos.get(clave)!.filas.push(f);
+  }
+  const ordenFila = (a: FilaAsistenciaHoy, b: FilaAsistenciaHoy) =>
+    (RANGO_NIVEL[a.grado_nivel || ''] ?? 9) - (RANGO_NIVEL[b.grado_nivel || ''] ?? 9)
+    || (a.grado_orden ?? 999) - (b.grado_orden ?? 999)
+    || (a.seccion || '').localeCompare(b.seccion || '', 'es')
+    || a.curso.localeCompare(b.curso, 'es');
+  return Array.from(grupos.values())
+    .sort((a, b) => {
+      if (a.clave === 'sin-tanda' || b.clave === 'sin-tanda') return a.clave === 'sin-tanda' ? 1 : -1;
+      return (a.hora || '99:99').localeCompare(b.hora || '99:99') || (a.nombre || '').localeCompare(b.nombre || '', 'es');
+    })
+    .map(g => ({ clave: g.clave, nombre: g.nombre, filas: [...g.filas].sort(ordenFila) }));
+}
 
 // Labels amigables para los tipos de alerta. Si el tipo no está aquí,
 // se usa el fallback `tipo.replace('_', ' ')` (que es lo que había antes).
@@ -708,8 +747,16 @@ export const DashboardPage = () => {
                         <th className="text-right font-semibold pb-2">Asistencia</th>
                       </tr>
                     </thead>
-                    <tbody>
-                      {graficos.asistencia_hoy_por_curso.map((c) => (
+                    {agruparAsistenciaHoy(graficos.asistencia_hoy_por_curso).map((grupo) => (
+                    <tbody key={grupo.clave}>
+                      {grupo.nombre && (
+                        <tr>
+                          <td colSpan={6} className="pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                            {grupo.nombre}
+                          </td>
+                        </tr>
+                      )}
+                      {grupo.filas.map((c) => (
                         <tr key={c.curso_id} className="border-t border-gray-100">
                           <td className="py-2 pr-2 text-xs font-medium text-gray-800">{c.curso}</td>
                           {c.registrado ? (
@@ -740,6 +787,7 @@ export const DashboardPage = () => {
                         </tr>
                       ))}
                     </tbody>
+                    ))}
                   </table>
                 </div>
               ) : graficos.asistencia_hoy && graficos.asistencia_hoy.total_estudiantes > 0 ? (

@@ -454,6 +454,14 @@ def get_graficos(db: Session, user, nivel: str = None) -> dict:
             'sin_marca': max(0, total_curso - d['marcados']),
             'registrado': registrado,
             'porcentaje': round(d['presentes'] / total_curso * 100, 1) if registrado else 0,
+            # ASIS-TANDA-1 · datos estructurados SOLO para agrupar y ordenar en
+            # el panel (tanda -> grado -> sección). No cambian ningún valor.
+            'tanda_id': c.tanda_id,
+            'tanda': c.tanda.nombre if c.tanda else None,
+            'tanda_hora_inicio': c.tanda.hora_inicio if c.tanda else None,
+            'grado_nivel': (c.grado.nivel or '').strip().lower() if c.grado else None,
+            'grado_orden': c.grado.orden if c.grado else None,
+            'seccion': c.nombre,
         })
     asistencia_hoy_por_curso.sort(key=lambda x: x['curso'])
 
