@@ -65,14 +65,23 @@ export const ComunicacionPage = () => {
   const [imagen, setImagen] = useState('');
   // COM1: alcance del comunicado. Dirección y Coordinación publican los tres
   // (el backend lo valida); para una persona concreta sigue "Nuevo Mensaje".
-  const alcancesPermitidos: Alcance[] = ['general', 'primaria', 'secundaria'];
+  // PSI-COM-1: Psicología con división fija solo ve su división; con "Ambos
+  // niveles", los tres. La autoridad sigue siendo el backend.
+  const esPsicologia = user?.role === 'psicologia';
+  const nivelPsicologia = (user as any)?.nivel_asignado;
+  const alcancesPermitidos: Alcance[] =
+    esPsicologia && (nivelPsicologia === 'primaria' || nivelPsicologia === 'secundaria')
+      ? [nivelPsicologia]
+      : ['general', 'primaria', 'secundaria'];
   const [alcance, setAlcance] = useState<Alcance>(alcancesPermitidos[0]);
 
   // v2.19.3-A: la difusión masiva quedó reservada a Dirección y Coordinación
   // en el backend. Se oculta también acá para que el resto de los roles no vea
   // una opción que la API va a rechazar con 403. La mensajería individual
   // sigue disponible para todos, vía /usuarios/directorio.
-  const canMasivo = user?.role === 'direccion' || user?.role === 'coordinador';
+  // PSI-COM-1: Psicología usa el mismo envío "Por rol"; el backend lo acota a
+  // su división.
+  const canMasivo = user?.role === 'direccion' || user?.role === 'coordinador' || esPsicologia;
 
   useEffect(() => {
     cargarDatos();
@@ -326,7 +335,7 @@ export const ComunicacionPage = () => {
     }
   };
 
-  const canComunicado = user?.role === 'direccion' || user?.role === 'coordinador';
+  const canComunicado = user?.role === 'direccion' || user?.role === 'coordinador' || esPsicologia;
 
   // Filtrar mensajes
   const mensajesRecibidos = mensajes.filter(m => m.tipo === 'recibido');
