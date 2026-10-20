@@ -48,6 +48,8 @@ export interface EstudianteData {
   estudiante: {
     id: number;
     nombre_completo: string;
+    // CAL-NL-1: número de lista guardado; null/ausente = "—" (no se inventa).
+    no_lista?: number | null;
     retirado?: boolean;
     fecha_retiro?: string | null;
     motivo_retiro?: string | null;

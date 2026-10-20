@@ -9846,6 +9846,12 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
     estudiantes = db.query(Estudiante).filter_by(
         curso_id=curso_id, colegio_id=current_user.colegio_id, activo=True
     ).order_by(Estudiante.apellido, Estudiante.nombre).all()
+    # CAL-NL-1 · orden del NÚMERO DE LISTA guardado (no_lista), no alfabético:
+    # la tabla mostraba la posición (idx + 1) y no coincidía con el número
+    # real del estudiante. Sin número van al final, por apellido y nombre.
+    # Solo cambia el ORDEN: cada nota sigue indexada por estudiante_id.
+    estudiantes.sort(key=lambda e: (e.no_lista is None, e.no_lista or 0,
+                                    (e.apellido or '').lower(), (e.nombre or '').lower(), e.id))
     
     # Calificaciones de la asignatura
     califs = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter_by(
@@ -9905,6 +9911,7 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
             'estudiante': {
                 'id': est.id,
                 'nombre_completo': f"{est.apellido or ''}, {est.nombre or ''}".strip(', '),
+                'no_lista': est.no_lista,  # CAL-NL-1: número guardado, o None
             },
             'competencias': competencias_data,
             'pc_por_periodo': pcs,            # PC1, PC2, PC3, PC4

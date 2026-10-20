@@ -150,7 +150,7 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
                   const aprobado = tieneCF && est.cf! >= 70;
                   return (
                     <tr key={est.estudiante.id} className={`border-b ${esRetirado ? 'bg-gray-50' : 'hover:bg-gray-50'}`}>
-                      <td className={`px-3 py-2 ${esRetirado ? 'text-gray-400 line-through' : 'text-gray-500'}`}>{idx + 1}</td>
+                      <td className={`px-3 py-2 ${esRetirado ? 'text-gray-400 line-through' : 'text-gray-500'}`}>{est.estudiante.no_lista ?? '—'}</td>
                       <td className="px-3 py-2">
                         <span className={`font-medium ${esRetirado ? 'text-gray-400 line-through' : ''}`}>
                           {est.estudiante.nombre_completo}

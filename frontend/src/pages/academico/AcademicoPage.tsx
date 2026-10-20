@@ -541,7 +541,7 @@ export const AcademicoPage = () => {
                   return (
                     <tr key={cal.estudiante_id} className={`border-b ${cal.retirado ? 'bg-gray-50' : 'hover:bg-gray-50'}`}>
                       <td className={`px-2 py-1 sticky left-0 bg-white ${cal.retirado ? 'text-gray-400 line-through' : 'text-gray-500'}`}>
-                        {cal.no_lista || idx + 1}
+                        {cal.no_lista ?? '—'}
                       </td>
                       <td className={`px-2 py-1 sticky left-8 bg-white ${cal.retirado ? 'bg-gray-50' : ''}`}>
                         <div className="flex items-center gap-2 flex-wrap">
@@ -790,7 +790,7 @@ export const AcademicoPage = () => {
                       return (
                         <tr key={cal.estudiante_id} className={`border-b ${cal.retirado ? 'bg-gray-50' : ''}`}>
                           <td className={`px-3 py-2 ${cal.retirado ? 'text-gray-400 line-through' : ''}`}>
-                            {cal.no_lista || idx + 1}
+                            {cal.no_lista ?? '—'}
                           </td>
                           <td className="px-3 py-2">
                             <div className="flex items-center gap-2 flex-wrap">
