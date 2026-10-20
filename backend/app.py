@@ -13482,8 +13482,18 @@ async def enviar_mensaje(request: Request, background_tasks: BackgroundTasks, db
 ROLES_DESTINO_MASIVO = {'direccion', 'coordinador', 'profesor', 'psicologia', 'secretaria'}
 
 
+# PSI-COM-1 · Psicología usa los MISMOS flujos que Coordinación (comunicado y
+# mensaje "Por rol"), pero sin su excepción global: el alcance es la división
+# configurada en la cuenta (`nivel_asignado`; vacío = ambos niveles). Nunca
+# sale del formulario ni de X-Nivel. Sin restricción por tanda (pendiente).
+def _nivel_psicologia(user):
+    """División fija de una cuenta de Psicología, o None (= ambos niveles)."""
+    nv = (getattr(user, 'nivel_asignado', None) or '').strip().lower()
+    return nv if nv in NIVELES_DIVISION else None
+
+
 @app.post("/api/mensajes/masivo")
-async def enviar_mensaje_masivo(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def enviar_mensaje_masivo(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
     """Enviar mensaje a todos los usuarios de un rol.
 
     v2.19.3-A — Restringido a Dirección y Coordinación.
@@ -13522,6 +13532,19 @@ async def enviar_mensaje_masivo(request: Request, background_tasks: BackgroundTa
     contenido_limpio = bleach.clean(data['contenido'], tags=['b','i','u','br','p'], strip=True)[:5000]
 
     usuarios_destino = tenant_filter(db.query(Usuario), Usuario, current_user).filter_by(role=rol, activo=True).all()
+
+    # PSI-COM-1 · Psicología con división fija: solo destinatarios autorizados
+    # para esa división, con la MISMA regla que ya usan las notificaciones de
+    # Comunicación (nivel_asignado igual o vacío). Dirección y Coordinación no
+    # pasan por aquí.
+    if current_user.role == 'psicologia':
+        _nv = _nivel_psicologia(current_user)
+        if _nv is not None:
+            _ids = set(usuarios_autorizados_para_nivel(db, current_user.colegio_id, rol, _nv))
+            usuarios_destino = [u for u in usuarios_destino if u.id in _ids]
+        if not [u for u in usuarios_destino if u.id != current_user.id]:
+            return JSONResponse({'error': f'No hay destinatarios del rol {rol} dentro de su división.'},
+                                status_code=404)
 
     if not usuarios_destino:
         return JSONResponse({'error': f'No hay usuarios con el rol {rol}'}, status_code=404)
@@ -13662,6 +13685,29 @@ def _comunicado_visible(comunicado, user):
     return _comunicado_visible_por_nivel(comunicado, user)
 
 
+def _alcances_psicologia(user):
+    """Alcances que Psicología puede publicar: su división fija, o los tres
+    con "Ambos niveles"."""
+    nv = _nivel_psicologia(user)
+    return (nv,) if nv else ALCANCES_COMUNICADO
+
+
+def _guardia_comunicado_psicologia(comunicado, user, editar):
+    """Psicología solo administra comunicados PROPIOS.
+    - Ajeno: 404, sin revelar nada.
+    - Propio: puede retirarlo siempre (reduce la exposición). Editarlo solo si
+      su alcance cabe en la división ACTUAL; si no, 403 con el motivo.
+    Para otros roles devuelve None (sus reglas no cambian)."""
+    if getattr(user, 'role', None) != 'psicologia':
+        return None
+    if comunicado.autor_id != user.id:
+        return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
+    if editar and _alcance_comunicado(comunicado) not in _alcances_psicologia(user):
+        return JSONResponse({'error': 'Este comunicado es de un alcance que ya no corresponde a su '
+                                      'división: puede retirarlo, pero no editarlo.'}, status_code=403)
+    return None
+
+
 def _alcance_pedido(data, por_defecto='general'):
     """('alcance', None) si es válido; (None, JSONResponse) si no."""
     valor = data.get('tipo', por_defecto)
@@ -13705,13 +13751,16 @@ async def get_comunicados(request: Request, db: Session = Depends(get_db), curre
     } for c in comunicados]
 
 @app.post("/api/comunicados")
-async def crear_comunicado(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def crear_comunicado(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
     """Crear un nuevo comunicado"""
     data = await request.json()
     # COM1 · alcance pedido (Dirección y Coordinación publican los tres).
     alcance, _err = _alcance_pedido(data)
     if _err is not None:
         return _err
+    # PSI-COM-1 · Psicología: solo dentro de su división.
+    if current_user.role == 'psicologia' and alcance not in _alcances_psicologia(current_user):
+        return JSONResponse({'error': 'No puede publicar comunicados para ese alcance.'}, status_code=403)
 
     comunicado = Comunicado(
         autor_id=current_user.id,
@@ -13746,10 +13795,14 @@ async def crear_comunicado(request: Request, db: Session = Depends(get_db), curr
     return JSONResponse({'message': 'Comunicado creado', 'id': comunicado.id}, status_code=201)
 
 @app.delete("/api/comunicados/{id}")
-async def eliminar_comunicado(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def eliminar_comunicado(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
     """Eliminar comunicado"""
     comunicado = get_tenant_or_404(db, Comunicado, id, current_user, name='comunicado')
-    if not _comunicado_visible_por_nivel(comunicado, current_user):
+    if current_user.role == 'psicologia':
+        _err = _guardia_comunicado_psicologia(comunicado, current_user, editar=False)
+        if _err is not None:
+            return _err
+    elif not _comunicado_visible_por_nivel(comunicado, current_user):
         return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
     comunicado.activo = False
     db.commit()
@@ -13757,10 +13810,14 @@ async def eliminar_comunicado(id, request: Request, db: Session = Depends(get_db
     return {'message': 'Comunicado eliminado'}
 
 @app.put("/api/comunicados/{id}")
-async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador'))):
+async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
     """Actualizar comunicado. Editar NO es publicar: no se notifica de nuevo."""
     comunicado = get_tenant_or_404(db, Comunicado, id, current_user, name='comunicado')
-    if not _comunicado_visible_por_nivel(comunicado, current_user):
+    if current_user.role == 'psicologia':
+        _err = _guardia_comunicado_psicologia(comunicado, current_user, editar=True)
+        if _err is not None:
+            return _err
+    elif not _comunicado_visible_por_nivel(comunicado, current_user):
         return JSONResponse({'error': 'comunicado no encontrado'}, status_code=404)
     data = await request.json()
     # COM1 · el alcance se puede cambiar (sin volver a notificar).
@@ -13768,6 +13825,8 @@ async def actualizar_comunicado(id, request: Request, db: Session = Depends(get_
         alcance, _err = _alcance_pedido(data)
         if _err is not None:
             return _err
+        if current_user.role == 'psicologia' and alcance not in _alcances_psicologia(current_user):
+            return JSONResponse({'error': 'No puede asignar ese alcance al comunicado.'}, status_code=403)
         comunicado.tipo = alcance
 
     if 'titulo' in data:
