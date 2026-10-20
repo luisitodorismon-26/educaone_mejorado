@@ -250,7 +250,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                   const esRetirado = !!est.estudiante.retirado;
                   return (
                     <tr key={est.estudiante.id} className={`border-b ${esRetirado ? 'bg-gray-50' : 'hover:bg-gray-50'}`}>
-                      <td className="px-2 py-1 text-center text-gray-500">{idx + 1}</td>
+                      <td className="px-2 py-1 text-center text-gray-500">{est.estudiante.no_lista ?? '—'}</td>
                       <td className="px-2 py-1">
                         {est.estudiante.nombre_completo}
                         {esRetirado && <span className="ml-1 text-xs text-red-500">(retirado)</span>}
