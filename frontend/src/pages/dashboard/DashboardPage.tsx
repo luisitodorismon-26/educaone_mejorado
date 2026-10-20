@@ -54,12 +54,17 @@ interface Alerta { tipo: string; prioridad: string; mensaje: string; count?: num
 
 type FilaAsistenciaHoy = NonNullable<GraficoData['asistencia_hoy_por_curso']>[number];
 
-// ASIS-TANDA-1 — "Asistencia hoy" agrupada por tanda (por hora de inicio:
-// Matutina antes que Vespertina) y, dentro de cada tanda, por nivel (Primaria
-// antes que Secundaria), orden del grado y sección. Solo presentación: las
-// filas y sus valores son exactamente los que envía el backend. Los cursos
-// sin tanda van al final, en su propio grupo.
+// ASIS-TANDA-1 — "Asistencia hoy" agrupada por tanda: Matutina primero,
+// Vespertina después, luego las demás tandas (por hora de inicio y nombre) y
+// "Sin tanda" al final. Dentro de cada tanda, por nivel (Primaria antes que
+// Secundaria), orden del grado y sección. Solo presentación: las filas y sus
+// valores son exactamente los que envía el backend.
 const RANGO_NIVEL: Record<string, number> = { inicial: 0, primaria: 1, secundaria: 2 };
+// `Tanda` no tiene otro campo que identifique Matutina/Vespertina: se usa su
+// nombre normalizado. Cualquier otra tanda va después, sin perderse.
+const RANGO_TANDA: Record<string, number> = { matutina: 0, vespertina: 1 };
+const rangoTanda = (nombre: string | null) =>
+  RANGO_TANDA[(nombre || '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')] ?? 2;
 
 function agruparAsistenciaHoy(filas: FilaAsistenciaHoy[]): Array<{ clave: string; nombre: string | null; filas: FilaAsistenciaHoy[] }> {
   // Backend anterior sin datos de tanda: un solo grupo, en el orden recibido.
@@ -82,7 +87,9 @@ function agruparAsistenciaHoy(filas: FilaAsistenciaHoy[]): Array<{ clave: string
   return Array.from(grupos.values())
     .sort((a, b) => {
       if (a.clave === 'sin-tanda' || b.clave === 'sin-tanda') return a.clave === 'sin-tanda' ? 1 : -1;
-      return (a.hora || '99:99').localeCompare(b.hora || '99:99') || (a.nombre || '').localeCompare(b.nombre || '', 'es');
+      return rangoTanda(a.nombre) - rangoTanda(b.nombre)
+        || (a.hora || '99:99').localeCompare(b.hora || '99:99')
+        || (a.nombre || '').localeCompare(b.nombre || '', 'es');
     })
     .map(g => ({ clave: g.clave, nombre: g.nombre, filas: [...g.filas].sort(ordenFila) }));
 }
