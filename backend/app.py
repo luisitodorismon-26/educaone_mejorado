@@ -43,6 +43,7 @@ from security import validate_password
 load_dotenv()
 
 from database import engine, SessionLocal, get_db, Base
+from sqlalchemy.exc import IntegrityError
 from reglas_academicas import redondear_calificacion_final
 # R4-A3: el puente a los motores canonicos A1/A2. No decide nada por su
 # cuenta; traduce filas ORM a lo que A1 y A2 esperan.
@@ -469,6 +470,23 @@ async def lifespan(app):
                             logger.warning(f"No se pudo copiar {old} → {new}: {e}")
                             raise
         
+        # === 6a. REP-DUP-1: idempotencia del envío de reportes ===
+        # Aditivo: dos columnas NULL, sin DEFAULT ni backfill. Los reportes
+        # existentes quedan intactos (NULL = sin clave). La verificación
+        # post-migración exige que existan, así que el ALTER no es opcional.
+        if 'reportes_conducta' in inspector.get_table_names():
+            rep_cols = {c['name'] for c in inspector.get_columns('reportes_conducta')}
+            for col_name in ('client_request_id', 'client_request_hash'):
+                if col_name not in rep_cols:
+                    with engine.connect() as conn:
+                        try:
+                            conn.execute(text(f'ALTER TABLE reportes_conducta ADD COLUMN {col_name} VARCHAR(64)'))
+                            conn.commit()
+                            logger.info(f"✅ Migración: columna {col_name} agregada a reportes_conducta")
+                        except Exception as e:
+                            logger.warning(f"No se pudo agregar reportes_conducta.{col_name}: {e}")
+                            raise
+
         # === 6b. Notificaciones: campos de Fase A (v2.19) ===
         # OBLIGATORIO: la verificación post-migración de más abajo compara cada
         # columna de cada modelo contra el esquema físico y aborta el arranque si
@@ -1066,6 +1084,17 @@ async def lifespan(app):
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_push_subscription_endpoint "
                 "ON push_subscriptions (endpoint)"
             ),
+            (
+                'uq_reporte_autor_client_request',
+                # REP-DUP-1: un solo reporte por envío (colegio + autor + clave).
+                # Es la barrera que hace correcta la concurrencia: de dos
+                # peticiones simultáneas con la misma clave solo una inserta.
+                # Los reportes existentes tienen la clave NULL y quedan fuera
+                # del predicado, así que el índice no puede fallar por ellos.
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_reporte_autor_client_request "
+                "ON reportes_conducta (colegio_id, reportado_por, client_request_id) "
+                "WHERE client_request_id IS NOT NULL"
+            ),
         ]
         # Si alguno falla por datos duplicados, NO ocultamos el error: es más
         # seguro abortar el nuevo deploy y sanear los datos que seguir operando
@@ -1134,6 +1163,7 @@ async def lifespan(app):
             'notificaciones': {'uq_notificacion_usuario_evento'},
             'push_subscriptions': {'uq_push_subscription_endpoint'},
             'eval_interna_estudiante': {'uq_eval_interna_identidad'},
+            'reportes_conducta': {'uq_reporte_autor_client_request'},
         }
         for tabla_nombre, requeridos in indices_requeridos.items():
             existentes = {idx.get('name') for idx in inspector_final.get_indexes(tabla_nombre)}
@@ -12799,6 +12829,33 @@ def _generar_numero_reporte(db: Session, colegio_id: int) -> str:
     return f"{prefijo}{count + 1:04d}"
 
 
+# REP-DUP-1 · formato aceptado para la clave del envío (UUID o similar).
+_RE_CLAVE_ENVIO = re.compile(r'[A-Za-z0-9-]{8,64}')
+
+
+def _huella_reporte(estudiante_id, titulo, descripcion, tipo, gravedad):
+    """SHA-256 del contenido YA saneado: distingue un reintento del mismo
+    envío de una clave reutilizada con otro contenido."""
+    import hashlib
+    import json as _j
+    base = _j.dumps([int(estudiante_id), titulo, descripcion, tipo, gravedad], ensure_ascii=False)
+    return hashlib.sha256(base.encode('utf-8')).hexdigest()
+
+
+def _respuesta_reporte_existente(existente, huella):
+    """Reintento de un envío ya guardado: mismo reporte, sin notificar otra
+    vez. Si la clave llegó con OTRO contenido, 409 y no se crea nada."""
+    if existente.client_request_hash != huella:
+        return JSONResponse({'error': 'Esta clave de envío ya se usó con otro contenido. '
+                                      'Vuelva a abrir el formulario y envíe de nuevo.'}, status_code=409)
+    return JSONResponse({
+        'message': 'Reporte ya creado',
+        'id': existente.id,
+        'numero_reporte': existente.numero_reporte,
+        'reintento': True,
+    }, status_code=200)
+
+
 @app.post("/api/reportes")
 async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
     """
@@ -12856,20 +12913,53 @@ async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db:
     import bleach
     titulo = bleach.clean(data['titulo'], tags=[], strip=True)[:200]
     descripcion = bleach.clean(data.get('descripcion', ''), tags=[], strip=True)[:5000]
-    
+    tipo = data.get('tipo', 'conducta')
+    gravedad = data.get('gravedad', 'leve')
+
+    # REP-DUP-1 · idempotencia del envío. Sin clave: comportamiento de siempre
+    # (dos reportes con el mismo texto son dos incidentes distintos). Con
+    # clave: un solo reporte por colegio + autor + clave.
+    clave = data.get('client_request_id')
+    huella = None
+    if clave is not None:
+        clave = str(clave).strip()
+        if not _RE_CLAVE_ENVIO.fullmatch(clave):
+            return JSONResponse({'error': 'client_request_id inválido'}, status_code=400)
+        huella = _huella_reporte(estudiante.id, titulo, descripcion, tipo, gravedad)
+        existente = db.query(ReporteConducta).filter_by(
+            colegio_id=current_user.colegio_id, reportado_por=current_user.id,
+            client_request_id=clave).first()
+        if existente is not None:
+            return _respuesta_reporte_existente(existente, huella)
+
     reporte = ReporteConducta(
         estudiante_id=data['estudiante_id'],
         colegio_id=current_user.colegio_id,
         reportado_por=current_user.id,
         titulo=titulo,
         descripcion=descripcion,
-        tipo=data.get('tipo', 'conducta'),
-        gravedad=data.get('gravedad', 'leve'),
+        tipo=tipo,
+        gravedad=gravedad,
         estado='pendiente',
         numero_reporte=_generar_numero_reporte(db, current_user.colegio_id),
+        client_request_id=clave,
+        client_request_hash=huella,
     )
     db.add(reporte)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Dos peticiones simultáneas con la misma clave: el índice único deja
+        # pasar solo una. La otra devuelve el reporte ganador y NO notifica.
+        db.rollback()
+        if clave is None:
+            raise
+        existente = db.query(ReporteConducta).filter_by(
+            colegio_id=current_user.colegio_id, reportado_por=current_user.id,
+            client_request_id=clave).first()
+        if existente is None:
+            raise
+        return _respuesta_reporte_existente(existente, huella)
 
     # v2.19 Fase A — avisar a quienes deben atender el reporte.
     # Va DESPUÉS del commit: el reporte ya está persistido pase lo que pase acá.

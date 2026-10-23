@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { 
@@ -91,7 +91,7 @@ export const ReportesPage = () => {
   const [respuesta, setRespuesta] = useState('');
 
   // Form
-  const [form, setForm] = useState({
+  const [form, setFormEstado] = useState({
     estudiante_id: 0,
     tipo: 'conducta',
     gravedad: 'leve',
@@ -150,19 +150,50 @@ export const ReportesPage = () => {
     }
   };
 
+  // REP-DUP-1 — un solo envío a la vez. El ref se marca en el MISMO tick del
+  // clic (el estado de React tarda un render), así que un doble clic o un
+  // toque repetido no llega a lanzar un segundo POST mientras el primero sigue
+  // en vuelo. El botón muestra "Enviando…" y el formulario se conserva si
+  // falla, para reintentar sin volver a escribir.
+  const enviandoRef = useRef(false);
+  const [enviando, setEnviando] = useState(false);
+  // Con un envío en vuelo, el formulario no acepta cambios (ni siquiera
+  // programáticos): el contenido y la clave del reintento no se alteran.
+  const setForm: typeof setFormEstado = (v) => { if (!enviandoRef.current) setFormEstado(v); };
+  // Identifica ESTE envío. Se conserva al reintentar el mismo contenido y se
+  // renueva al cambiar el formulario o tras crear el reporte. El backend la
+  // usa para la idempotencia: un reintento con la misma clave (p. ej. tras
+  // perder la respuesta) devuelve el reporte ya creado sin crear otro ni
+  // volver a notificar; la misma clave con otro contenido responde 409.
+  const claveEnvioRef = useRef<string | null>(null);
+  useEffect(() => { claveEnvioRef.current = null; }, [form]);
+  const nuevaClaveEnvio = () =>
+    (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+
   const handleCreate = async () => {
+    if (enviandoRef.current) return;
     if (!form.estudiante_id || !form.titulo) {
       setMessage({ type: 'error', text: 'Complete los campos requeridos' });
       return;
     }
+    enviandoRef.current = true;
+    setEnviando(true);
+    if (!claveEnvioRef.current) claveEnvioRef.current = nuevaClaveEnvio();
     try {
-      await api.post('/reportes', form);
+      await api.post('/reportes', { ...form, client_request_id: claveEnvioRef.current });
       setMessage({ type: 'success', text: 'Reporte creado correctamente' });
       loadData();
       setShowModal(false);
-      setForm({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '' });
+      // setFormEstado: el reset es parte de ESTE envío (la guarda de setForm lo bloquearía).
+      setFormEstado({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '' });
     } catch (e: any) {
+      // El formulario NO se limpia: el usuario puede reintentar tal cual.
       setMessage({ type: 'error', text: e.response?.data?.error || 'Error al crear' });
+    } finally {
+      enviandoRef.current = false;
+      setEnviando(false);
     }
   };
 
@@ -625,17 +656,20 @@ export const ReportesPage = () => {
       {/* Modal Crear Reporte */}
       <Modal
         isOpen={showModal}
-        onClose={() => setShowModal(false)}
+        onClose={() => { if (!enviandoRef.current) setShowModal(false); }}
         title="Nuevo Reporte"
         size="lg"
         footer={
           <>
-            <Button variant="secondary" onClick={() => setShowModal(false)}>Cancelar</Button>
-            <Button onClick={handleCreate}>Crear Reporte</Button>
+            <Button variant="secondary" onClick={() => setShowModal(false)} disabled={enviando}>Cancelar</Button>
+            <Button onClick={handleCreate} loading={enviando}>{enviando ? 'Enviando…' : 'Crear Reporte'}</Button>
           </>
         }
       >
-        <div className="space-y-4">
+        {/* REP-DUP-1: mientras se envía, los campos quedan bloqueados (fieldset
+            deshabilita todos los controles): el contenido —y con él la clave
+            del reintento— no puede cambiar con el envío en vuelo. */}
+        <fieldset disabled={enviando} className="space-y-4 min-w-0 border-0 p-0 m-0">
           <Select
             label="Curso"
             value={form.curso_filter || ''}
@@ -693,7 +727,7 @@ export const ReportesPage = () => {
           <p className="text-xs text-slate-400">
             * El reporte será enviado a la dirección para su revisión y seguimiento.
           </p>
-        </div>
+        </fieldset>
       </Modal>
 
       {/* Modal Detalle */}

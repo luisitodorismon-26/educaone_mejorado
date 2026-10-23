@@ -1675,6 +1675,23 @@ class ReporteConducta(Base):
     # Formato: "YYYY-NNNN" autogenerado por colegio (ej: "2026-0023")
     numero_reporte = Column(String(20), index=True)
 
+    # === REP-DUP-1 · IDEMPOTENCIA DEL ENVÍO ===
+    # Clave que el formulario genera para UN envío y conserva al reintentarlo
+    # (p. ej. si se perdió la respuesta). El índice único parcial
+    # uq_reporte_autor_client_request (colegio + autor + clave) hace que la
+    # base de datos admita UN solo reporte por clave, aunque lleguen dos
+    # peticiones a la vez. La huella (SHA-256 del contenido) distingue un
+    # reintento legítimo de una clave reutilizada con otro contenido.
+    # NULL en todos los reportes anteriores y en clientes que no la envían.
+    client_request_id = Column(String(64), nullable=True)
+    client_request_hash = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index('uq_reporte_autor_client_request', 'colegio_id', 'reportado_por', 'client_request_id',
+              unique=True, postgresql_where=text('client_request_id IS NOT NULL'),
+              sqlite_where=text('client_request_id IS NOT NULL')),
+    )
+
     estudiante = relationship('Estudiante', backref='reportes')
     reportador = relationship('Usuario', foreign_keys=[reportado_por], backref='reportes_creados')
     respondedor = relationship('Usuario', foreign_keys=[respondido_por], backref='reportes_respondidos')
