@@ -91,7 +91,7 @@ export const ReportesPage = () => {
   const [respuesta, setRespuesta] = useState('');
 
   // Form
-  const [form, setForm] = useState({
+  const [form, setFormEstado] = useState({
     estudiante_id: 0,
     tipo: 'conducta',
     gravedad: 'leve',
@@ -157,10 +157,14 @@ export const ReportesPage = () => {
   // falla, para reintentar sin volver a escribir.
   const enviandoRef = useRef(false);
   const [enviando, setEnviando] = useState(false);
-  // Identifica ESTE envío. Se conserva al reintentar el mismo contenido (si la
-  // respuesta se perdió, el backend podrá reconocer el reintento) y se
-  // renueva al cambiar el formulario o tras crear el reporte. Hoy el backend
-  // lo ignora: queda listo para la protección del servidor.
+  // Con un envío en vuelo, el formulario no acepta cambios (ni siquiera
+  // programáticos): el contenido y la clave del reintento no se alteran.
+  const setForm: typeof setFormEstado = (v) => { if (!enviandoRef.current) setFormEstado(v); };
+  // Identifica ESTE envío. Se conserva al reintentar el mismo contenido y se
+  // renueva al cambiar el formulario o tras crear el reporte. El backend la
+  // usa para la idempotencia: un reintento con la misma clave (p. ej. tras
+  // perder la respuesta) devuelve el reporte ya creado sin crear otro ni
+  // volver a notificar; la misma clave con otro contenido responde 409.
   const claveEnvioRef = useRef<string | null>(null);
   useEffect(() => { claveEnvioRef.current = null; }, [form]);
   const nuevaClaveEnvio = () =>
@@ -182,7 +186,8 @@ export const ReportesPage = () => {
       setMessage({ type: 'success', text: 'Reporte creado correctamente' });
       loadData();
       setShowModal(false);
-      setForm({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '' });
+      // setFormEstado: el reset es parte de ESTE envío (la guarda de setForm lo bloquearía).
+      setFormEstado({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '' });
     } catch (e: any) {
       // El formulario NO se limpia: el usuario puede reintentar tal cual.
       setMessage({ type: 'error', text: e.response?.data?.error || 'Error al crear' });
@@ -661,7 +666,10 @@ export const ReportesPage = () => {
           </>
         }
       >
-        <div className="space-y-4">
+        {/* REP-DUP-1: mientras se envía, los campos quedan bloqueados (fieldset
+            deshabilita todos los controles): el contenido —y con él la clave
+            del reintento— no puede cambiar con el envío en vuelo. */}
+        <fieldset disabled={enviando} className="space-y-4 min-w-0 border-0 p-0 m-0">
           <Select
             label="Curso"
             value={form.curso_filter || ''}
@@ -719,7 +727,7 @@ export const ReportesPage = () => {
           <p className="text-xs text-slate-400">
             * El reporte será enviado a la dirección para su revisión y seguimiento.
           </p>
-        </div>
+        </fieldset>
       </Modal>
 
       {/* Modal Detalle */}
