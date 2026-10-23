@@ -17,7 +17,12 @@ Base temporal aislada. Nunca producción.
 
 Uso:
     cd backend
-    python tools/test_reportes_idempotencia.py
+    python tools/test_reportes_idempotencia.py                 # SQLite temporal
+    EO_TEST_PG_URL=postgresql://eo_test@127.0.0.1:55432/eo_test_repdup \\
+        python tools/test_reportes_idempotencia.py             # PostgreSQL LOCAL y vacío
+
+Con EO_TEST_PG_URL solo se acepta un PostgreSQL en localhost cuya base empiece
+por `eo_test` (vacía; la suite crea y altera tablas).
 """
 import json
 import os
@@ -35,12 +40,27 @@ sys.path.insert(0, os.path.join(BK, "tools"))
 
 from test_utils import aislar_base_de_datos  # noqa: E402
 
-TMP = aislar_base_de_datos('rep_dup1')
+PG_URL = os.environ.get('EO_TEST_PG_URL')
+if PG_URL:
+    from urllib.parse import urlparse
+    _u = urlparse(PG_URL)
+    if _u.hostname not in ('127.0.0.1', 'localhost') or not _u.path.lstrip('/').startswith('eo_test'):
+        raise SystemExit('EO_TEST_PG_URL debe ser un PostgreSQL LOCAL con base eo_test*: %s' % _u.hostname)
+    os.environ['DATABASE_URL'] = PG_URL
+    TMP = None
+else:
+    TMP = aislar_base_de_datos('rep_dup1')
 
 from database import engine, SessionLocal  # noqa: E402
 from test_utils import verificar_engine_aislado  # noqa: E402
 
-verificar_engine_aislado(engine, TMP)
+if PG_URL:
+    assert engine.dialect.name == 'postgresql' and engine.url.host in ('127.0.0.1', 'localhost') \
+        and str(engine.url.database).startswith('eo_test'), engine.url
+    print('Motor: PostgreSQL local aislado (%s:%s/%s)' % (engine.url.host, engine.url.port, engine.url.database))
+else:
+    verificar_engine_aislado(engine, TMP)
+    print('Motor: SQLite temporal')
 
 from sqlalchemy import inspect, text  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
