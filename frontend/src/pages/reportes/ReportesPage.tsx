@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { 
@@ -150,19 +150,45 @@ export const ReportesPage = () => {
     }
   };
 
+  // REP-DUP-1 — un solo envío a la vez. El ref se marca en el MISMO tick del
+  // clic (el estado de React tarda un render), así que un doble clic o un
+  // toque repetido no llega a lanzar un segundo POST mientras el primero sigue
+  // en vuelo. El botón muestra "Enviando…" y el formulario se conserva si
+  // falla, para reintentar sin volver a escribir.
+  const enviandoRef = useRef(false);
+  const [enviando, setEnviando] = useState(false);
+  // Identifica ESTE envío. Se conserva al reintentar el mismo contenido (si la
+  // respuesta se perdió, el backend podrá reconocer el reintento) y se
+  // renueva al cambiar el formulario o tras crear el reporte. Hoy el backend
+  // lo ignora: queda listo para la protección del servidor.
+  const claveEnvioRef = useRef<string | null>(null);
+  useEffect(() => { claveEnvioRef.current = null; }, [form]);
+  const nuevaClaveEnvio = () =>
+    (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+
   const handleCreate = async () => {
+    if (enviandoRef.current) return;
     if (!form.estudiante_id || !form.titulo) {
       setMessage({ type: 'error', text: 'Complete los campos requeridos' });
       return;
     }
+    enviandoRef.current = true;
+    setEnviando(true);
+    if (!claveEnvioRef.current) claveEnvioRef.current = nuevaClaveEnvio();
     try {
-      await api.post('/reportes', form);
+      await api.post('/reportes', { ...form, client_request_id: claveEnvioRef.current });
       setMessage({ type: 'success', text: 'Reporte creado correctamente' });
       loadData();
       setShowModal(false);
       setForm({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '' });
     } catch (e: any) {
+      // El formulario NO se limpia: el usuario puede reintentar tal cual.
       setMessage({ type: 'error', text: e.response?.data?.error || 'Error al crear' });
+    } finally {
+      enviandoRef.current = false;
+      setEnviando(false);
     }
   };
 
@@ -625,13 +651,13 @@ export const ReportesPage = () => {
       {/* Modal Crear Reporte */}
       <Modal
         isOpen={showModal}
-        onClose={() => setShowModal(false)}
+        onClose={() => { if (!enviandoRef.current) setShowModal(false); }}
         title="Nuevo Reporte"
         size="lg"
         footer={
           <>
-            <Button variant="secondary" onClick={() => setShowModal(false)}>Cancelar</Button>
-            <Button onClick={handleCreate}>Crear Reporte</Button>
+            <Button variant="secondary" onClick={() => setShowModal(false)} disabled={enviando}>Cancelar</Button>
+            <Button onClick={handleCreate} loading={enviando}>{enviando ? 'Enviando…' : 'Crear Reporte'}</Button>
           </>
         }
       >
