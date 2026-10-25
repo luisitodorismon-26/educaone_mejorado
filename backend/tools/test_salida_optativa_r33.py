@@ -153,7 +153,9 @@ def _():
 @test("§A2 las 6 páginas son PÁGINA HUMANA (1-based): el código resta 1")
 def _():
     # Evidencia en el código: `completiva_paginas` se convierte con `- 1`.
-    src = _inspect.getsource(RE.generar_registro_escolar)
+    # REG-43: el cuerpo vive en `_generar_registro_escolar`; la función pública
+    # solo elige la plantilla y lo llama.
+    src = _inspect.getsource(RE._generar_registro_escolar)
     assert "comp_paginas[a_idx] - 1" in src, "cambió la convención de completiva_paginas"
     assert "salida_opt_paginas[slot_int] - 1" in src, \
         "la Salida Optativa debe usar la MISMA convención 1-based"
@@ -349,7 +351,7 @@ def _():
                 and isinstance(n.func, _ast.Attribute)
                 and n.func.attr == "merge_page"]
     assert not llamadas, "R3.3 no debe reintroducir llamadas a merge_page"
-    src_gen = _inspect.getsource(RE.generar_registro_escolar)
+    src_gen = _inspect.getsource(RE._generar_registro_escolar)   # REG-43: ver §A2
     assert "_create_overlay_page(draw_completiva, datos_comp)" in src_gen, \
         "la Salida Optativa debe usar el pipeline de overlay existente"
     pdf = _generar(4, {5: {"docente": "D", "calificaciones": [_fila(cf=88)] * 3}})
