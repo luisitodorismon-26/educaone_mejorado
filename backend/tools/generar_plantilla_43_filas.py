@@ -18,6 +18,7 @@ equiespaciadas):
 Lo que está fuera de la franja (encabezados, TOTALES, pie, firmas) no se toca.
 
 Uso: python tools/generar_plantilla_43_filas.py <plantilla.pdf> <salida.pdf> <informe.json> [filas=43]
+"""
 import collections
 import json
 import sys

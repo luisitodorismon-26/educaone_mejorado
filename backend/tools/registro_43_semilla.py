@@ -13,7 +13,11 @@ Cada estudiante es reconocible en el PDF por datos derivados de SU número de
 lista, que además NO es consecutivo (hay huecos) y no coincide con el orden de
 alta:
     cédula      001-<curso>-<no_lista con 4 cifras>-1
-    nota        45 + no_lista        (la misma en las 4 competencias y períodos)
+    nota        100 - no_lista       (la misma en las 4 competencias y períodos)
+    completiva  con nota < 70 (no_lista > 30, es decir, las últimas filas):
+                CEC = 131 - no_lista; si la completiva no llega a 70, también
+                extraordinaria con CEEX = 30 + no_lista. Valores propios de
+                cada estudiante, para verlos en Completivas y en el Acta.
     asistencia  A, T o P según un hash de (no_lista, fecha): cada estudiante tiene
                 su propia secuencia de marcas, distinta de la de sus vecinos
 """
@@ -38,7 +42,34 @@ def no_listas(n):
 
 
 def nota(no_lista):
-    return 45 + no_lista
+    return 100 - no_lista
+
+
+def _redondeo(x):
+    return int(x + 0.5)
+
+
+def evaluacion_extra(no_lista):
+    """Completiva (y, si hace falta, extraordinaria) de un estudiante con nota < 70."""
+    v = nota(no_lista)
+    if v >= 70:
+        return None
+    cec = 131 - no_lista
+    comp = _redondeo(0.5 * v + 0.5 * cec)
+    ev = {'cf_original': v, 'cec': cec, 'completiva_final': comp}
+    if comp >= 70:
+        ev.update(condicion_final='aprobado_completiva', nota_final=comp)
+    else:
+        ceex = 30 + no_lista
+        ext = _redondeo(0.3 * v + 0.7 * ceex)
+        ev.update(ceex=ceex, extraordinaria_final=ext, nota_final=ext,
+                  condicion_final='aprobado_extraordinaria' if ext >= 70 else 'reprobado')
+    return ev
+
+
+def nota_final(no_lista):
+    ev = evaluacion_extra(no_lista)
+    return ev['nota_final'] if ev else nota(no_lista)
 
 
 def estado(no_lista, fecha):
@@ -115,11 +146,15 @@ def sembrar(db, M, cursos, password_hash='x', codigo='REG43'):
         filas_cal, filas_as = [], []
         for e in ests:
             v = nota(e.no_lista)
+            ev = evaluacion_extra(e.no_lista)
             for a in asigs:
                 for comp in (1, 2, 3, 4):
                     filas_cal.append(M.CalificacionSecundaria(
                         colegio_id=col.id, estudiante_id=e.id, asignatura_id=a.id, ano_escolar_id=ano.id,
                         competencia_numero=comp, p1=v, p2=v, p3=v, p4=v))
+                if ev:
+                    filas_cal.append(M.EvaluacionExtraSecundaria(
+                        colegio_id=col.id, estudiante_id=e.id, asignatura_id=a.id, ano_escolar_id=ano.id, **ev))
         for i, a in enumerate(asigs):
             for f in fechas_asignatura(i):
                 for e in ests:

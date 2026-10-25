@@ -81,6 +81,16 @@ datos de ese estudiante: cédula, notas, asistencia, apellidos y nombre.
 la posición de la fila, como en la plantilla oficial, y no el `no_lista`.
 Este comportamiento es el mismo que con 40 filas.
 
+Consecuencias, que REG-43 no cambia:
+- **El PDF no muestra el número de lista real.** Una fila se identifica por su
+  posición, cruzándola con el apellido y nombre del acta (págs. 159–160) o con
+  la cédula de la pág. 11.
+- **El orden no tiene desempate.** `order_by(Estudiante.no_lista)` no usa un
+  segundo criterio. La unicidad del número de lista la comprueba solo la
+  aplicación, al crear o editar un estudiante activo; la base de datos no la
+  impone. Con números repetidos o vacíos, el orden entre esos estudiantes no
+  está garantizado: SQLite pone los vacíos al principio y PostgreSQL, al final.
+
 ## Recorridos de descarga
 
 | Botón de la interfaz (`RegistroEscolarPage`) | Endpoint | Probado |
@@ -100,12 +110,41 @@ cd backend
 python tools/test_registro_43_1ro.py [carpeta_pdfs]
 ```
 
-Base SQLite aislada y datos sintéticos (`tools/registro_43_semilla.py`):
-números de lista con huecos y altas en otro orden. Comprueba lo siguiente:
+Base SQLite aislada con datos sintéticos (`tools/registro_43_semilla.py`):
+- números de lista con huecos y altas en otro orden;
+- nota `100 − no_lista`;
+- completiva (y a veces extraordinaria) con valores propios de cada estudiante
+  para los que tienen nota < 70, que son las últimas filas;
+- asistencia con una secuencia de marcas propia de cada estudiante.
 
-- en cada página, todos los estudiantes, una sola vez y en orden;
-- en cada fila, los datos de su estudiante;
-- las filas sobrantes, vacías;
-- la plantilla elegida;
-- los rechazos con su motivo;
-- las generaciones simultáneas.
+Para los cursos de 1ro con 40, 41, 42 y 43, por la descarga oficial y por el
+borrador, se comprueba fila a fila contra la semilla (no contra el generador).
+«Su estudiante» es el i-ésimo por número de lista:
+
+| Página | Qué se comprueba en cada fila |
+|---|---|
+| 11, datos generales | Cédula: todos, en orden, una vez |
+| 17, asistencia de Lengua (sep–oct) | Secuencia de marcas; además, 40 o 43 números de fila impresos |
+| 47, 50 y 53, asistencia compacta (Ed. Artística, Ed. Física y FIHR, sep–dic) | Secuencia completa de marcas |
+| 131, calificaciones de Lengua | Todas las notas |
+| 150–158, completivas de las 9 asignaturas | Secuencia exacta de columnas con dato |
+| 159 y 160, acta | Apellido y nombre; final, completivo y extraordinario de cada asignatura |
+
+En esas páginas se comprueba además:
+- que las filas sobrantes queden vacías y no haya nada fuera de la tabla;
+- con 41–43, las filas 41 a n por separado: que tengan contenido y sean de sus estudiantes.
+
+**Rechazos.** Para 44 en 1ro y 41 en 2do se comprueban el validador, los dos
+endpoints y la vista previa de la interfaz.
+
+**Contexto de la plantilla.**
+- **Generaciones simultáneas:** 43, 40 y 41 en hilos distintos usan cada una su plantilla.
+- **Tras una excepción** durante la generación (un error real del dibujo, una excepción arbitraria, y en un hilo reutilizado) no queda plantilla activa, y la siguiente generación de 40 usa la de 40.
+
+**Sin comprobación fila a fila:**
+- condición inicial (pág. 12);
+- emergencias y parentesco (13–14);
+- asistencia a evaluaciones (56–61), que la plantilla deja en blanco;
+- el resto de páginas de asistencia (18–46, 48–49, 51–52, 54–55) y de calificaciones (132–148).
+
+La plantilla de esas páginas sí se verificó píxel a píxel al fabricarla.
