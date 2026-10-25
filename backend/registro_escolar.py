@@ -15,6 +15,7 @@ Autor: EducaOne
 """
 
 import io
+from contextvars import ContextVar
 import os
 import logging
 from datetime import date
@@ -52,8 +53,10 @@ class RegistroExcedePlantilla(Exception):
 
 
 def _verificar_capacidad_mes(datos_mes: Dict, max_dias: int, contexto: str = '',
-                             max_filas: int = 40) -> None:
+                             max_filas: Optional[int] = None) -> None:
     """Un mes de asistencia cabe entero en su rejilla o no se imprime."""
+    if max_filas is None:
+        max_filas = _filas_max()   # REG-43: 40, o 43 con la plantilla ampliada de 1ro
     dias = list(datos_mes.get("dias_labels") or [])
     # Columnas que de verdad se usan: los días rotulados y, por fila, hasta la
     # última celda CON marca (un relleno con None no ocupa columnas).
@@ -1195,6 +1198,100 @@ def draw_centro_educativo(c: canvas.Canvas, datos: Dict):
             _draw_x_mark(c, coords[key]["x"], coords[key]["y"])
 
 
+# ============================================================================
+# REG-43 · PLANTILLA AMPLIADA DE 1RO DE SECUNDARIA (43 FILAS)
+# ============================================================================
+# Excepción acotada: un curso de 1ro de Secundaria con 41 a 43 estudiantes se
+# imprime sobre una versión de la plantilla oficial con 43 filas en el MISMO
+# alto que las 40 originales (14,17 -> 13,18 pt por fila). Mismas páginas,
+# mismas columnas, mismos tamaños de letra; solo cambia la rejilla del cuerpo
+# de cada tabla. La fabrica una vez `tools/generar_plantilla_43_filas.py`.
+#
+# CUÁNDO SE USA CADA PLANTILLA (`seleccionar_plantilla`)
+#   · hasta 40 estudiantes, cualquier grado -> plantilla oficial, sin cambios;
+#   · 1ro con 41-43                         -> plantilla ampliada;
+#   · cualquier otro caso con más de 40     -> RegistroExcedePlantilla (422):
+#     no se emite un Registro que deje estudiantes fuera.
+# No se extiende sola a otros grados: hay que medir y añadir su plantilla aquí.
+#
+# La geometría ampliada vive en una ContextVar que solo se activa durante la
+# generación que la usa: dos registros generados a la vez (el borrador corre en
+# un threadpool) no se pisan, y sin ella todo lee las tablas de siempre.
+FILAS_PLANTILLA = 40
+
+PLANTILLAS_AMPLIADAS = {
+    1: {
+        'archivo': 'Registro-1er-Grado-Sec-General-43-filas.pdf',
+        'filas': 43,
+        # (tabla, y de la primera línea de fila, y de la última) medidas en la
+        # plantilla: el alto nuevo de fila es (y1 - y0) / 43.
+        'franjas': [
+            (ESTUDIANTES_TABLE, 180.2, 746.7),        # pág 11
+            (CONDICION_TABLE, 177.2, 744.0),          # pág 12 (TOTALES queda debajo)
+            (ASISTENCIA_TABLE, 180.1, 747.0),         # págs 17-46
+            (ASISTENCIA_TABLE_4MESES, 180.5, 747.4),  # págs 47-55
+            (CALIF_SPREAD, 180.7, 747.5),             # págs 131-148
+            (COMPLETIVA_TABLE, 179.6, 746.5),         # págs 150-158
+            (ACTA_FILAS, 179.9, 746.5),               # págs 159-160
+        ],
+    },
+}
+
+_PLANTILLA_ACTIVA: ContextVar = ContextVar('registro_plantilla_activa', default=None)
+
+
+def seleccionar_plantilla(grado: int, n_estudiantes: int) -> Optional[Dict]:
+    """None = plantilla oficial de 40 filas; dict = plantilla ampliada del grado.
+
+    Si el curso no cabe en ninguna, RegistroExcedePlantilla con el motivo: no se
+    recorta a nadie. `error` repite el mensaje para que la interfaz lo muestre.
+    """
+    if n_estudiantes <= FILAS_PLANTILLA:
+        return None
+    ampliada = PLANTILLAS_AMPLIADAS.get(grado)
+    if ampliada and n_estudiantes <= ampliada['filas']:
+        return ampliada
+    if ampliada:
+        mensaje = (f"El curso tiene {n_estudiantes} estudiantes y el Registro de {grado}° de "
+                   f"Secundaria admite como máximo {ampliada['filas']}, con su plantilla ampliada. "
+                   f"No se emite un Registro que deje estudiantes fuera.")
+        filas = ampliada['filas']
+    else:
+        mensaje = (f"El curso tiene {n_estudiantes} estudiantes y el Registro oficial de {grado}° "
+                   f"de Secundaria solo tiene {FILAS_PLANTILLA} filas. No se emite un Registro que "
+                   f"deje estudiantes fuera.")
+        filas = FILAS_PLANTILLA
+    raise RegistroExcedePlantilla({
+        'motivo': 'ESTUDIANTES_EXCEDEN_PLANTILLA',
+        'mensaje': mensaje, 'error': mensaje,
+        'estudiantes': n_estudiantes, 'filas': filas, 'grado': grado,
+    })
+
+
+def _activar_plantilla(ampliada: Dict) -> Dict:
+    """Geometría de la plantilla ampliada: mismas tablas con el alto de fila nuevo."""
+    n = ampliada['filas']
+    tablas = {}
+    for tabla, y0, y1 in ampliada['franjas']:
+        alto = (y1 - y0) / n
+        nueva = dict(tabla, row_height=alto, total_filas=n)
+        if 'centro_fila1_plumber' in tabla:
+            nueva['centro_fila1_plumber'] = y0 + alto / 2
+        tablas[id(tabla)] = nueva
+    return {'archivo': ampliada['archivo'], 'filas': n, 'tablas': tablas}
+
+
+def _geo(tabla: Dict) -> Dict:
+    """La tabla de filas a usar: la ampliada si hay una plantilla activa."""
+    activa = _PLANTILLA_ACTIVA.get()
+    return activa['tablas'].get(id(tabla), tabla) if activa else tabla
+
+
+def _filas_max() -> int:
+    activa = _PLANTILLA_ACTIVA.get()
+    return activa['filas'] if activa else FILAS_PLANTILLA
+
+
 def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
     """
     Dibuja la tabla de datos generales del estudiante (Pg 11).
@@ -1211,9 +1308,9 @@ def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
         "fecha_retiro": str (ISO YYYY-MM-DD),
     }
     """
-    table = ESTUDIANTES_TABLE
+    table = _geo(ESTUDIANTES_TABLE)
     
-    for i, est in enumerate(estudiantes[:40]):
+    for i, est in enumerate(estudiantes[:_filas_max()]):
         if not est:
             continue
         
@@ -1316,12 +1413,12 @@ def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict],
 
     REG-2: 1ro usa CONDICION_TABLE; 2do-6to, CONDICION_TABLE_2A6.
     """
-    table = CONDICION_TABLE if grado == 1 else CONDICION_TABLE_2A6
+    table = _geo(CONDICION_TABLE if grado == 1 else CONDICION_TABLE_2A6)
     # En 2do-6to las casillas miden 21 pt: la X se centra. En 1ro se conserva
     # exactamente el trazo de siempre.
     centrar = grado != 1
     
-    for i, est in enumerate(estudiantes[:40]):
+    for i, est in enumerate(estudiantes[:_filas_max()]):
         if not est:
             continue
         
@@ -1377,7 +1474,7 @@ def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = Fa
         ]
     }
     """
-    table = ASISTENCIA_TABLE
+    table = _geo(ASISTENCIA_TABLE)
     prefix = "mes_der" if es_mes_derecho else "mes_izq"
     # REG-2: 21 columnas por mes. Si hay más días, NO se recorta: se rechaza.
     _verificar_capacidad_mes(datos_mes, 21, contexto)
@@ -1411,7 +1508,7 @@ def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = Fa
         _draw_text(c, table["docente_x"], _y(table["docente_y_plumber"]),
                    datos_mes["docente"], size=FONT_SIZE_NOTA, max_width=200)
     
-    for i, est in enumerate(datos_mes.get("asistencias", [])[:40]):
+    for i, est in enumerate(datos_mes.get("asistencias", [])[:_filas_max()]):
         if not est:
             continue
         
@@ -1482,7 +1579,7 @@ def draw_asistencia_4meses(c: canvas.Canvas, meses_pagina: List[Optional[Dict]],
     los mismos que en `draw_asistencia`. Un valor None o "" se deja en blanco:
     nunca se inventa una asistencia.
     """
-    t = ASISTENCIA_TABLE_4MESES
+    t = _geo(ASISTENCIA_TABLE_4MESES)
     bloques = _asistencia_4meses_bloques(pagina)
     max_dias = t["dias_por_bloque"]
 
@@ -1671,14 +1768,14 @@ def draw_completiva(c: canvas.Canvas, datos: Dict):
       espec_cf, espec_ce, situacion_a, situacion_r
     Un valor 0 es válido y SE dibuja (se usa `is not None`, nunca `if valor`).
     """
-    table = COMPLETIVA_TABLE
+    table = _geo(COMPLETIVA_TABLE)
 
     # Docente
     if datos.get("docente"):
         _draw_text(c, table["docente_x"], _y(table["docente_y_plumber"]),
                    datos["docente"], size=FONT_SIZE_NOTA, max_width=250)
 
-    for i, est in enumerate(datos.get("calificaciones", [])[:40]):
+    for i, est in enumerate(datos.get("calificaciones", [])[:_filas_max()]):
         if not est:
             continue
 
@@ -1927,7 +2024,7 @@ def draw_especificacion_curricular(c: canvas.Canvas, datos: Dict):
 
 
 def _acta_y(i: int) -> float:
-    t = ACTA_FILAS
+    t = _geo(ACTA_FILAS)
     return _y(t["primera_fila_y_plumber"] + i * t["row_height"] + t["row_height"] - 4)
 
 
@@ -1962,7 +2059,7 @@ def draw_promocion_izq(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: L
         if cab.get(campo):
             _draw_text_ajustado(c, x, _y(y_pl), cab[campo], 8, ancho)
 
-    for i, est in enumerate(estudiantes[:ACTA_FILAS["total_filas"]]):
+    for i, est in enumerate(estudiantes[:_geo(ACTA_FILAS)["total_filas"]]):
         if not est:
             continue
         y = _acta_y(i)
@@ -1995,7 +2092,7 @@ def draw_promocion_der(c: canvas.Canvas, estudiantes: List[Dict], asignaturas: L
             cx, cy = cd[grupo][opcion]
             _draw_x_mark(c, cx, _y(cy) - 2.6, size=8, center=True)
 
-    for i, est in enumerate(estudiantes[:ACTA_FILAS["total_filas"]]):
+    for i, est in enumerate(estudiantes[:_geo(ACTA_FILAS)["total_filas"]]):
         if not est:
             continue
         y = _acta_y(i)
@@ -2030,7 +2127,26 @@ def draw_estadisticas(c: canvas.Canvas, datos: Dict):
 # GENERADOR PRINCIPAL
 # ============================================================================
 
-def generar_registro_escolar(
+def generar_registro_escolar(grado: int, datos_centro: Dict, datos_portada: Dict,
+                             estudiantes: List[Dict], *args, **kwargs) -> bytes:
+    """REG-43: elige la plantilla por grado y tamaño del curso y genera con ella.
+
+    Hasta 40 estudiantes no se activa nada: plantilla y geometría oficiales,
+    exactamente como antes. 1ro con 41-43 activa la plantilla ampliada solo
+    durante esta generación. Más de lo admitido -> RegistroExcedePlantilla.
+    El trabajo lo hace `_generar_registro_escolar` (ver su docstring).
+    """
+    ampliada = seleccionar_plantilla(grado, len(estudiantes or []))
+    token = _PLANTILLA_ACTIVA.set(_activar_plantilla(ampliada)) if ampliada else None
+    try:
+        return _generar_registro_escolar(grado, datos_centro, datos_portada, estudiantes,
+                                         *args, **kwargs)
+    finally:
+        if token is not None:
+            _PLANTILLA_ACTIVA.reset(token)
+
+
+def _generar_registro_escolar(
     grado: int,
     datos_centro: Dict,
     datos_portada: Dict,
@@ -2084,19 +2200,13 @@ def generar_registro_escolar(
     asignaturas = ASIGNATURAS_CICLO_2 if ciclo == 2 else ASIGNATURAS_CICLO_1
 
     # REG-2: la hoja oficial tiene 40 filas. Antes se imprimían los 40 primeros
-    # y el resto del curso desaparecía del Registro sin aviso.
-    if estudiantes and len(estudiantes) > 40:
-        raise RegistroExcedePlantilla({
-            'motivo': 'ESTUDIANTES_EXCEDEN_PLANTILLA',
-            'mensaje': (f'El curso tiene {len(estudiantes)} estudiantes y el Registro '
-                        f'oficial solo tiene 40 filas. No se emite un Registro que deje '
-                        f'estudiantes fuera.'),
-            'estudiantes': len(estudiantes), 'filas': 40,
-        })
+    # y el resto del curso desaparecía del Registro sin aviso. REG-43: el límite
+    # y la plantilla los decide `seleccionar_plantilla` en `generar_registro_escolar`.
     
-    # Cargar template
+    # Cargar template (REG-43: la ampliada si la generación la activó)
     tpl_dir = template_dir or TEMPLATE_DIR
-    tpl_path = os.path.join(tpl_dir, TEMPLATE_FILES[grado])
+    _activa = _PLANTILLA_ACTIVA.get()
+    tpl_path = os.path.join(tpl_dir, _activa['archivo'] if _activa else TEMPLATE_FILES[grado])
     
     if not os.path.exists(tpl_path):
         raise FileNotFoundError(f"Template no encontrado: {tpl_path}")
@@ -2358,8 +2468,9 @@ def generar_registro_escolar(
             # competencia 1: los cuatro bloques quedaban vacíos o con el número
             # equivocado. La nota de cada competencia y período ya viene en
             # est_data['competencias'][n], sin colapsar.
-            row_start_y = _y(CALIF_SPREAD['centro_fila1_plumber'] + FONT_SIZE_NOTA * 0.35)
-            row_spacing = CALIF_SPREAD['row_height']
+            _cs = _geo(CALIF_SPREAD)
+            row_start_y = _y(_cs['centro_fila1_plumber'] + FONT_SIZE_NOTA * 0.35)
+            row_spacing = _cs['row_height']
 
             def _dibujar_detalle(lienzo, columnas_por_competencia):
                 """Dibuja los bloques de detalle de una página del spread.
@@ -2372,7 +2483,7 @@ def generar_registro_escolar(
                     if not isinstance(est_data, dict):
                         continue
                     ei = int(est_idx) if isinstance(est_idx, str) else est_idx
-                    if ei >= 40:
+                    if ei >= _filas_max():
                         continue
                     detalle = est_data.get('competencias') or {}
                     if not detalle:
@@ -2423,7 +2534,7 @@ def generar_registro_escolar(
                     if not isinstance(est_data, dict):
                         continue
                     ei = int(est_idx) if isinstance(est_idx, str) else est_idx
-                    if ei >= 40:
+                    if ei >= _filas_max():
                         continue
 
                     y = row_start_y - (ei * row_spacing)
@@ -2985,17 +3096,12 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
     }
     
     # REG-2: 40 filas en la hoja oficial; un curso más grande NO se recorta.
-    if len(estudiantes) > 40:
-        raise RegistroExcedePlantilla({
-            'motivo': 'ESTUDIANTES_EXCEDEN_PLANTILLA',
-            'mensaje': (f'El curso tiene {len(estudiantes)} estudiantes y el Registro '
-                        f'oficial solo tiene 40 filas. No se emite un Registro que deje '
-                        f'estudiantes fuera.'),
-            'estudiantes': len(estudiantes), 'filas': 40,
-        })
+    # REG-43: 1ro admite 43 con la plantilla ampliada; fuera de eso, 422.
+    _ampliada = seleccionar_plantilla(grado_numero, len(estudiantes))
+    n_filas = _ampliada['filas'] if _ampliada else FILAS_PLANTILLA
 
     estudiantes_nuevo = []
-    for idx, est in enumerate(estudiantes[:40]):
+    for idx, est in enumerate(estudiantes[:n_filas]):
         fn = est.get('fecha_nacimiento')
         estudiantes_nuevo.append({
             "numero": est.get('no_lista', idx + 1),
@@ -3029,7 +3135,7 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         })
     
     asigs_minerd = ASIGNATURAS_CICLO_2 if grado_numero >= 4 else ASIGNATURAS_CICLO_1
-    num_est = len(estudiantes[:40])
+    num_est = len(estudiantes[:n_filas])
     
     # === TRADUCIR ASISTENCIA ===
     # Prioriza la matriz real construida desde horario + días no laborables + captura diaria.

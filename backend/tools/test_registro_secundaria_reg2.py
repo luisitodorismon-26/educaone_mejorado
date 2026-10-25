@@ -257,7 +257,9 @@ for g in (4, 5, 6):
 print("\n=== 6 · CAPACIDAD: FAIL CLOSED ===")
 for etiqueta, kw, motivo in (('22 días en hoja de 21', {'n_dias': 22}, 'DIAS_EXCEDEN_PLANTILLA'),
                              ('11 días en hoja compacta de 10', {'dias_4m': 11}, 'DIAS_EXCEDEN_PLANTILLA'),
-                             ('41 estudiantes en 40 filas', {'n_est': 41}, 'ESTUDIANTES_EXCEDEN_PLANTILLA')):
+                             # REG-43: 1ro admite 41-43 con su plantilla ampliada; el
+                             # límite que no se puede pasar sin recortar es 44.
+                             ('44 estudiantes en 1ro (máximo 43)', {'n_est': 44}, 'ESTUDIANTES_EXCEDEN_PLANTILLA')):
     try:
         generar(1, **kw)
         check('REG2-17 %s → error explícito' % etiqueta, False, 'generó el PDF')

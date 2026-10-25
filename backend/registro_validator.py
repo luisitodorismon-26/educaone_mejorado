@@ -226,11 +226,18 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
         r.add_error(f"El curso '{curso.nombre_completo}' no tiene estudiantes activos")
         return r
     
-    if len(estudiantes) > 40:
-        r.add_warning(
-            f"El curso tiene {len(estudiantes)} estudiantes. "
-            f"El registro MINERD solo soporta 40. Se tomarán los primeros 40 por número de lista."
-        )
+    # REG-43: la plantilla y su capacidad las decide el generador
+    # (`seleccionar_plantilla`); aquí se adelanta su respuesta con el MISMO
+    # mensaje. Antes se avisaba de que "se tomarán los primeros 40", pero el
+    # generador no recorta: rechaza. 1ro con 41-43 usa la plantilla ampliada.
+    from registro_escolar import seleccionar_plantilla, RegistroExcedePlantilla
+    try:
+        _ampliada = seleccionar_plantilla(grado_numero, len(estudiantes))
+    except RegistroExcedePlantilla as exc:
+        r.add_error(exc.detalle['mensaje'])
+    else:
+        if _ampliada:
+            r.info['plantilla_ampliada'] = _ampliada['archivo']
     
     r.info['total_estudiantes'] = len(estudiantes)
     r.info['estudiante_ids'] = [e.id for e in estudiantes]
