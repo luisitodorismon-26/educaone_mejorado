@@ -35,7 +35,7 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<TabId>('notas');
   // Modo de carga de notas: 'competencia' (por competencia) o 'periodo' (por período)
-  const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('competencia');
+  const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('periodo');
   // Estado de cierre de períodos (para bloquear casillas de períodos cerrados)
   const [periodosCerrados, setPeriodosCerrados] = useState<Record<string, boolean>>({ p1: false, p2: false, p3: false, p4: false });
 
@@ -152,18 +152,8 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
       <div>
         {tab === 'notas' && (
           <div className="space-y-4">
-            {/* Selector de modo de carga: Por Competencia / Por Período */}
+            {/* Selector de modo de carga: Por Período (predeterminado) / Por Competencia */}
             <div className="flex gap-2 bg-gray-100 p-1 rounded-lg w-fit">
-              <button
-                onClick={() => setModoNotas('competencia')}
-                className={`px-4 py-2 rounded-md text-sm font-medium transition ${
-                  modoNotas === 'competencia'
-                    ? 'bg-white text-blue-700 shadow-sm'
-                    : 'text-gray-600 hover:text-gray-800'
-                }`}
-              >
-                Por Competencia
-              </button>
               <button
                 onClick={() => setModoNotas('periodo')}
                 className={`px-4 py-2 rounded-md text-sm font-medium transition ${
@@ -173,6 +163,16 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
                 }`}
               >
                 Por Período
+              </button>
+              <button
+                onClick={() => setModoNotas('competencia')}
+                className={`px-4 py-2 rounded-md text-sm font-medium transition ${
+                  modoNotas === 'competencia'
+                    ? 'bg-white text-blue-700 shadow-sm'
+                    : 'text-gray-600 hover:text-gray-800'
+                }`}
+              >
+                Por Competencia
               </button>
             </div>
 
