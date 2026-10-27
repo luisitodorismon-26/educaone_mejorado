@@ -29,7 +29,7 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
   // Modalidad de recuperacion del periodo: la resuelve el servidor por grado.
   const [modalidadRecuperacion, setModalidadRecuperacion] = useState<ModalidadRecuperacion | null>(null);
   const [loading, setLoading] = useState(false);
-  const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('competencia');
+  const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('periodo');
   const [descargando, setDescargando] = useState(false);
   const [mensaje, setMensaje] = useState<string | null>(null);
 
@@ -136,16 +136,8 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
 
       {mensaje && <Alert variant="error" onClose={() => setMensaje(null)}>{mensaje}</Alert>}
 
-      {/* Selector de modo de carga: Por Competencia / Por Período */}
+      {/* Selector de modo de carga: Por Período (predeterminado) / Por Competencia */}
       <div className="flex gap-2 bg-gray-100 p-1 rounded-lg w-fit">
-        <button
-          onClick={() => setModoNotas('competencia')}
-          className={`px-4 py-2 rounded-md text-sm font-medium transition ${
-            modoNotas === 'competencia' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'
-          }`}
-        >
-          Por Competencia
-        </button>
         <button
           onClick={() => setModoNotas('periodo')}
           className={`px-4 py-2 rounded-md text-sm font-medium transition ${
@@ -153,6 +145,14 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
           }`}
         >
           Por Período
+        </button>
+        <button
+          onClick={() => setModoNotas('competencia')}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition ${
+            modoNotas === 'competencia' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'
+          }`}
+        >
+          Por Competencia
         </button>
       </div>
 
