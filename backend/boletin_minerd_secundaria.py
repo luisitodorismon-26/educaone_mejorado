@@ -206,6 +206,15 @@ ROW_Y_SEGUNDO = {
     'SALIDA OPTATIVA 2': 410,
 }
 ASIST_Y_SEGUNDO    = {'p1': 492, 'p2': 517, 'p3': 542, 'p4': 567}
+
+# SALIDAS-MIXTAS — celda del nombre en las dos filas de Salida Optativa, medida
+# sobre las plantillas de 4to-6to (iguales): columna x 63.4-163.4 y filas
+# 366.3-391.6 y 391.6-416.9 (coordenadas desde arriba). El nombre del
+# componente se escribe COMPLETO dentro de la celda, en una a tres líneas como
+# el "Formación Integral / Humana y Religiosa" impreso de la plantilla.
+SO_NOMBRE_X = 67
+SO_NOMBRE_ANCHO = 93
+SO_CELDA_Y = {'SALIDA OPTATIVA 1': (366.3, 391.6), 'SALIDA OPTATIVA 2': (391.6, 416.9)}
 SITUACION_Y_SEGUNDO = 446
 CONDICION_FINAL_Y_SEGUNDO = 504
 
@@ -247,6 +256,85 @@ FRANJA_VERDE_X = (36.4, 63.0)
 FRANJA_VERDE_COLOR = (0.834, 0.895, 0.684)
 CELDAS_VERDES_X = [(661.0, 685.0), (757.1, 781.1), (853.1, 877.1), (905.8, 934.6)]
 CELDA_VERDE_COLOR = (0.919, 0.948, 0.847)
+
+
+def _lineas_nombre_optativa(nombre: str):
+    """(tamaño, [líneas]) para que `nombre` quepa ENTERO en la celda.
+
+    Prueba de 7.5 pt hacia abajo, partiendo solo por espacios, y se queda con
+    el mayor tamaño cuyas líneas caben en el ancho y en el alto de la celda.
+    Nunca recorta: si nada cabe (no ocurre con el catálogo oficial), devuelve
+    el reparto a 5 pt aunque alguna línea se pase del ancho.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    palabras = (nombre or '').split()
+    alto = SO_CELDA_Y['SALIDA OPTATIVA 1'][1] - SO_CELDA_Y['SALIDA OPTATIVA 1'][0] - 2
+    tam = 7.5
+    while True:
+        lineas, actual = [], ''
+        for w in palabras:
+            prueba = (actual + ' ' + w).strip()
+            if actual and stringWidth(prueba, 'Helvetica-Bold', tam) > SO_NOMBRE_ANCHO:
+                lineas.append(actual)
+                actual = w
+            else:
+                actual = prueba
+        if actual:
+            lineas.append(actual)
+        cabe_ancho = all(stringWidth(l, 'Helvetica-Bold', tam) <= SO_NOMBRE_ANCHO
+                         for l in lineas)
+        if (cabe_ancho and len(lineas) * (tam + 1.2) <= alto) or tam <= 5:
+            return tam, lineas
+        tam -= 0.5
+
+
+def _dibujar_nombre_optativa(c, etiqueta: str, nombre: str) -> None:
+    """Nombre completo del componente, centrado en vertical en su celda."""
+    y0, y1 = SO_CELDA_Y[etiqueta]
+    tam, lineas = _lineas_nombre_optativa(nombre)
+    interlineado = tam + 1.2
+    alto_bloque = interlineado * (len(lineas) - 1) + tam * 0.72
+    base = (y0 + y1) / 2 - alto_bloque / 2 + tam * 0.72
+    c.setFont("Helvetica-Bold", tam)
+    for i, linea in enumerate(lineas):
+        c.drawString(SO_NOMBRE_X, _y(base + i * interlineado), linea)
+    c.setFont("Helvetica", 8)
+
+
+def _filas_salida_optativa(calificaciones_por_asig: dict, row_y_map: dict) -> dict:
+    """{asig_id: 'SALIDA OPTATIVA n'} para las dos filas de Salida Optativa.
+
+    SALIDAS-MIXTAS: primero los componentes optativos del curso
+    (`es_salida_optativa`), cada uno en la fila de su `so_orden` —el mismo
+    orden que la asistencia y el acta del Registro—; después, en las filas que
+    queden libres, las materias extra del colegio en el orden de siempre. Una
+    materia extra ya no puede quitarle la fila a una optativa.
+    """
+    candidatas = ['SALIDA OPTATIVA 1', 'SALIDA OPTATIVA 2']
+    filas = {}
+    libres = list(candidatas)
+    fuera = [k for k, d in calificaciones_por_asig.items()
+             if _normalizar_nombre_asignatura(d.get('asignatura_nombre', '')) not in row_y_map]
+    optativas = sorted((k for k in fuera if calificaciones_por_asig[k].get('es_salida_optativa')),
+                       key=lambda k: calificaciones_por_asig[k].get('so_orden', len(candidatas)))
+    for k in optativas:
+        orden = calificaciones_por_asig[k].get('so_orden')
+        if isinstance(orden, int) and 0 <= orden < len(candidatas) and candidatas[orden] in libres:
+            etiqueta = candidatas[orden]
+        elif libres:
+            etiqueta = libres[0]
+        else:
+            continue
+        filas[k] = etiqueta
+        libres.remove(etiqueta)
+    for k in fuera:
+        if k in filas or calificaciones_por_asig[k].get('es_salida_optativa'):
+            continue
+        if not libres:
+            break
+        filas[k] = libres.pop(0)
+    return filas
 
 
 def _dibujar_fila_extra(c, indice: int) -> float:
@@ -716,36 +804,40 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
     c.setFont("Helvetica", 8)
     
     extras_usadas = 0  # v2.13.42: contador de materias extra del colegio
+    # SALIDAS-MIXTAS: en el segundo ciclo las dos filas de Salida Optativa se
+    # reparten ANTES del bucle (optativas primero, en su orden; extras después).
+    filas_so = (_filas_salida_optativa(calificaciones_por_asig, row_y_map)
+                if 'SALIDA OPTATIVA 1' in row_y_map else None)
     for asig_id, asig_data in calificaciones_por_asig.items():
         nombre_asig = _normalizar_nombre_asignatura(asig_data.get('asignatura_nombre', ''))
-        
+
         # Determinar fila correcta
         if nombre_asig in row_y_map:
             y_row = _y(row_y_map[nombre_asig])
-        elif asig_data.get('es_salida_optativa') and 'SALIDA OPTATIVA 1' in row_y_map:
-            # Solo segundo ciclo tiene SALIDA OPTATIVA
-            y_row = _y(row_y_map['SALIDA OPTATIVA 1'])
+        elif filas_so is not None:
+            etiqueta = filas_so.get(asig_id)
+            if etiqueta is None:
+                continue        # sin fila libre (máximo 2, límite físico de la hoja)
+            y_row = _y(row_y_map[etiqueta])
+            if asig_data.get('es_salida_optativa'):
+                _dibujar_nombre_optativa(c, etiqueta, str(asig_data.get('asignatura_nombre', '')))
+            else:
+                # Materia extra del colegio: igual que siempre.
+                c.setFont("Helvetica-Bold", 7.5)
+                c.drawString(67, y_row - 3, str(asig_data.get('asignatura_nombre', ''))[:26])
+                c.setFont("Helvetica", 8)
         else:
             # v2.13.42: asignatura EXTRA del colegio (ej. Música) — no existe en
-            # la plantilla oficial MINERD. Se le dibuja su propia casilla:
-            #  - Segundo ciclo: usa las filas SALIDA OPTATIVA (nombre en blanco).
-            #  - Primer ciclo: fila dibujada debajo de Formación Integral.
-            # Máximo 2 extras por boletín (límite físico de la hoja).
-            if 'SALIDA OPTATIVA 1' in row_y_map:
-                candidatas = ['SALIDA OPTATIVA 1', 'SALIDA OPTATIVA 2']
-                if extras_usadas >= len(candidatas):
-                    continue
-                y_top_extra = row_y_map[candidatas[extras_usadas]]
-                dibujar_linea = False
-            else:
-                # Primer ciclo: solo cabe 1 fila extra a tamaño completo antes
-                # del bloque impreso "RESUMEN DE ASISTENCIA" de la plantilla.
-                if extras_usadas >= 1:
-                    continue
-                # v2.13.43: fila calibrada — extiende la tabla con las líneas
-                # y fondos REALES extraídos de la plantilla oficial.
-                y_top_extra = _dibujar_fila_extra(c, extras_usadas)
-                dibujar_linea = True
+            # la plantilla oficial MINERD. Se le dibuja su propia casilla. El
+            # segundo ciclo la resuelve arriba con `filas_so`; aquí solo llega
+            # el primer ciclo: fila dibujada debajo de Formación Integral.
+            # Primer ciclo: solo cabe 1 fila extra a tamaño completo antes
+            # del bloque impreso "RESUMEN DE ASISTENCIA" de la plantilla.
+            if extras_usadas >= 1:
+                continue
+            # v2.13.43: fila calibrada — extiende la tabla con las líneas
+            # y fondos REALES extraídos de la plantilla oficial.
+            y_top_extra = _dibujar_fila_extra(c, extras_usadas)
             extras_usadas += 1
             y_row = _y(y_top_extra)
             # Nombre de la materia: misma tipografía que las áreas oficiales

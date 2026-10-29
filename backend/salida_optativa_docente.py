@@ -89,6 +89,78 @@ class RepunteBloqueado(Exception):
         self.detalle = detalle or {}
 
 
+class IdentidadPorElegir(Exception):
+    """
+    SALIDAS-MIXTAS. El componente no tiene mapeo, pero el curso ya tiene
+    asignaturas dedicadas a él. Crear otra sería el duplicado que se veía en
+    producción (dos HLM-LE-4 en el mismo curso); elegir una sola sería decidir
+    por Dirección. Se devuelve 409 con las candidatas y sus datos.
+    """
+
+    def __init__(self, componente, candidatas):
+        super().__init__(componente.codigo)
+        self.componente = componente
+        self.candidatas = candidatas
+
+
+def candidatas_identidad(db, curso, componente) -> list:
+    """
+    Asignaturas dedicadas que ESTE curso ya usó para `componente` y que hoy no
+    representan a nadie. Devuelve `[{asignatura_id, nombre, activo, historia,
+    asignaciones}]`, ordenada por id.
+
+    Por qué existen: cambiar de salida o quitar un componente retira el mapeo
+    pero conserva la asignatura (R3.2 §8). Al volver a configurar el componente,
+    `crear_asignatura_dedicada` creaba OTRA, y la primera quedaba suelta con su
+    profesor inactivo.
+
+    Cómo se reconocen, sin resolver por nombre: una identidad independiente
+    (`area_curricular_codigo` NULL) del colegio, con el código del componente
+    como metadato —el que le puso `crear_asignatura_dedicada`—, que además está
+    ligada A ESTE CURSO por una asignación docente (activa o no) o por historia
+    académica. El código solo PROPONE candidatas: nunca se elige una sin que
+    Dirección lo indique.
+
+    Se excluyen las que ya representan un componente en algún curso del colegio.
+    No escribe nada.
+    """
+    from models import AsignacionProfesor, Asignatura, CursoComponenteOptativo
+    from salida_optativa_historia import historia_academica, resumen_historia
+
+    ocupadas = {r[0] for r in db.query(CursoComponenteOptativo.asignatura_id).filter(
+        CursoComponenteOptativo.colegio_id == curso.colegio_id).all()}
+    asigs = db.query(Asignatura).filter(
+        Asignatura.colegio_id == curso.colegio_id,
+        Asignatura.codigo == componente.codigo,
+        Asignatura.area_curricular_codigo.is_(None),
+    ).order_by(Asignatura.id).all()
+    salida = []
+    for a in asigs:
+        if a.id in ocupadas:
+            continue
+        aps = db.query(AsignacionProfesor).filter(
+            AsignacionProfesor.curso_id == curso.id,
+            AsignacionProfesor.asignatura_id == a.id,
+            AsignacionProfesor.colegio_id == curso.colegio_id,
+        ).order_by(AsignacionProfesor.id).all()
+        ev = historia_academica(db, curso, a.id)
+        if not aps and not ev:
+            continue
+        salida.append({
+            'asignatura_id': a.id,
+            'nombre': a.nombre,
+            'activo': a.activo is not False,
+            'historia': ev,
+            'historia_resumen': resumen_historia(ev) if ev else '',
+            'asignaciones': [{
+                'profesor_id': ap.profesor_id,
+                'profesor_nombre': (ap.profesor.nombre_completo if ap.profesor else None),
+                'activo': bool(ap.activo),
+            } for ap in aps],
+        })
+    return salida
+
+
 def resolver_identidad_calificable(db, curso, componente, mapeo_actual
                                    ) -> Tuple[object, bool, Optional[dict]]:
     """
@@ -96,7 +168,9 @@ def resolver_identidad_calificable(db, curso, componente, mapeo_actual
 
     Cuatro casos, y ninguno toca una sola nota:
 
-      1. No hay mapeo -> se crea la asignatura dedicada.
+      1. No hay mapeo -> se crea la asignatura dedicada, salvo que el curso ya
+         tenga candidatas para el componente (`candidatas_identidad`): entonces
+         se levanta `IdentidadPorElegir` -> 409 y no se crea nada.
       2. El mapeo ya apunta a una identidad INDEPENDIENTE y activa -> se
          REUTILIZA tal cual (R3.4 §8), aunque la haya elegido Dirección a mano.
       3. El mapeo apunta a una identidad INDEPENDIENTE pero INACTIVA:
@@ -162,6 +236,13 @@ def resolver_identidad_calificable(db, curso, componente, mapeo_actual
                 actual.area_curricular_codigo, nueva.id)
             return nueva, True, correccion
 
+    # SALIDAS-MIXTAS: sin mapeo, una asignatura que el curso ya usó para este
+    # componente impide crear otra. No se reutiliza sola —ni aunque haya una
+    # sola—: reutilizarla reactivaría la asignación de su antiguo profesor, y
+    # esa decisión es de Dirección.
+    candidatas = candidatas_identidad(db, curso, componente)
+    if candidatas:
+        raise IdentidadPorElegir(componente, candidatas)
     return crear_asignatura_dedicada(db, curso, componente), True, None
 
 
