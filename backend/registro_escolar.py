@@ -2413,14 +2413,17 @@ def _generar_registro_escolar(
                 c_asist = canvas.Canvas(buf, pagesize=letter)
                 # El rótulo va en TODAS las páginas del bloque: cada hoja del
                 # Registro tiene que poder leerse por separado.
+                # SALIDAS-MIXTAS: el nombre oficial se achica hasta caber, nunca
+                # se corta. Antes `max_width` lo truncaba ("Filosofía Social y
+                # Pensamiento Domin"); los que ya cabían salen idénticos.
                 if rotulo_salida:
-                    _draw_text(c_asist, _hdr["salida_x"], _y(_hdr["y_plumber"]),
-                               rotulo_salida, size=FONT_SIZE_NOTA,
-                               max_width=_hdr["salida_max_width"])
+                    _draw_text_ajustado(c_asist, _hdr["salida_x"], _y(_hdr["y_plumber"]),
+                                        rotulo_salida, FONT_SIZE_NOTA,
+                                        _hdr["salida_max_width"], minimo=5.0)
                 if rotulo_asig:
-                    _draw_text(c_asist, _hdr["asignatura_x"], _y(_hdr["y_plumber"]),
-                               rotulo_asig, size=FONT_SIZE_NOTA,
-                               max_width=_hdr["asignatura_max_width"])
+                    _draw_text_ajustado(c_asist, _hdr["asignatura_x"], _y(_hdr["y_plumber"]),
+                                        rotulo_asig, FONT_SIZE_NOTA,
+                                        _hdr["asignatura_max_width"], minimo=5.0)
                 if mes_izq_idx < len(meses) and meses[mes_izq_idx]:
                     draw_asistencia(c_asist, meses[mes_izq_idx], es_mes_derecho=False,
                                     contexto=_ctx)
@@ -3305,9 +3308,19 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
     # define la salida del curso (orden de slot del catálogo), NO el orden de
     # los que traen notas: un componente conserva su columna aunque el otro
     # esté vacío. Es el mismo criterio que la asistencia de Salida Optativa.
+    #
+    # SALIDAS-MIXTAS: si app.py manda `salida_optativa_slots` (los componentes
+    # que imparte el curso, en orden de slot), manda esa lista: es la misma de
+    # la asistencia y del boletín, y un componente de otra salida tiene su
+    # columna. Sin ella, la de siempre. Más de 2 nunca llega aquí: app.py
+    # rechaza el documento antes con un mensaje que nombra los que sobran.
     _so_columna = {}
     _cod_salida = curso_info.get('salida_optativa_codigo')
-    if _cod_salida and grado_numero >= 4:
+    _slots_curso = curso_info.get('salida_optativa_slots')
+    if _cod_salida and grado_numero >= 4 and _slots_curso is not None:
+        for _pos, _slot in enumerate(list(_slots_curso)[:2]):
+            _so_columna[int(_slot)] = _pos + 1
+    elif _cod_salida and grado_numero >= 4:
         import salidas_optativas as _cat
         for _pos, _comp in enumerate(_cat.componentes_de(_cod_salida, grado_numero)[:2]):
             _so_columna[_comp.slot] = _pos + 1

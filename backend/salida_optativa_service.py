@@ -29,6 +29,7 @@ from salidas_optativas import (
     componente_pertenece,
     componentes_de,
     grado_admite_salida,
+    nombre_salida,
     salida_valida,
 )
 
@@ -184,7 +185,8 @@ def validar_coherencia_mapeo(mapeo, curso) -> Resultado:
 def validar_mapeo_componente(db, curso, componente_codigo: str,
                              asignatura_id: Optional[int],
                              ano_escolar_id: Optional[int] = None,
-                             colegio_id: Optional[int] = None) -> Resultado:
+                             colegio_id: Optional[int] = None,
+                             cualquier_salida: bool = False) -> Resultado:
     """
     ¿Puede `asignatura_id` representar a `componente_codigo` en este curso?
 
@@ -195,6 +197,11 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
       4. el curso tiene colegio y año escolar, ese año existe, es del mismo
          colegio y ambos coinciden con los valores pedidos (si se pasaron);
       5. la asignatura existe y es DEL MISMO COLEGIO que el curso (tenant-safe).
+
+    `cualquier_salida` (SALIDAS-MIXTAS) relaja el punto 3 a "pertenece A ESE
+    grado": es la vía de `POST .../componentes`, que añade al curso un
+    componente de otra salida sin cambiar la suya. El grado sigue siendo
+    obligatorio: un 'CYT-CN-4' nunca entra en un 5to.
 
     `ano_escolar_id` y `colegio_id` son OPCIONALES y solo sirven de verificación
     cruzada cuando el llamador cree saberlos. Lo correcto es no pasarlos: el
@@ -226,7 +233,9 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
     if comp is None:
         return False, f"Componente optativo desconocido: {componente_codigo!r}."
 
-    if not componente_pertenece(componente_codigo, salida, grado_numero):
+    if cualquier_salida and comp.grado == grado_numero:
+        pass
+    elif not componente_pertenece(componente_codigo, salida, grado_numero):
         return False, (
             f"El componente {componente_codigo!r} ({comp.nombre_oficial}) pertenece a la "
             f"salida {comp.salida} de {comp.grado}to y no puede usarse en un curso "
@@ -253,7 +262,8 @@ def validar_mapeo_componente(db, curso, componente_codigo: str,
     return True, None
 
 
-def construir_mapeo(db, curso, componente_codigo: str, asignatura_id: Optional[int]):
+def construir_mapeo(db, curso, componente_codigo: str, asignatura_id: Optional[int],
+                    cualquier_salida: bool = False):
     """
     Única vía admitida para CREAR un `CursoComponenteOptativo`.
 
@@ -272,7 +282,8 @@ def construir_mapeo(db, curso, componente_codigo: str, asignatura_id: Optional[i
     """
     from models import CursoComponenteOptativo
 
-    ok, err = validar_mapeo_componente(db, curso, componente_codigo, asignatura_id)
+    ok, err = validar_mapeo_componente(db, curso, componente_codigo, asignatura_id,
+                                       cualquier_salida=cualquier_salida)
     if not ok:
         return None, err
 
@@ -318,6 +329,11 @@ def resolver_componentes(db, curso, ano_escolar_id: Optional[int] = None) -> Lis
 
     R3.3 usará `slot` para saber a qué página del template va cada nota:
     slot == índice en `GRADO_CONFIG[g]['completiva_salida_optativa']`.
+
+    SALIDAS-MIXTAS: la lista es la de `_componentes_de_curso`. En un curso cuyos
+    mapeos son todos de su salida es exactamente la de antes (los de la salida,
+    vinculados o pendientes); si Dirección añadió un componente de otra salida,
+    pasan a ser los componentes vinculados, sin huecos pendientes inventados.
     """
     from models import CursoComponenteOptativo
 
@@ -379,7 +395,7 @@ def resolver_componentes(db, curso, ano_escolar_id: Optional[int] = None) -> Lis
     from models import Asignatura
 
     salida = []
-    for comp in esperados:
+    for comp in _componentes_de_curso(esperados, por_codigo, grado_numero_de_curso(curso)):
         fila = por_codigo.get(comp.codigo)
         asignatura_id = fila.asignatura_id if fila else None
         legacy_troncal_id = None
@@ -410,3 +426,99 @@ def resolver_componentes(db, curso, ano_escolar_id: Optional[int] = None) -> Lis
             'asignatura_troncal_id': legacy_troncal_id,
         })
     return salida
+
+
+# ---------------------------------------------------------------------------
+# SALIDAS-MIXTAS — COMPONENTES QUE IMPARTE EL CURSO
+# ---------------------------------------------------------------------------
+# El centro decide qué componentes imparte cada curso. `salida_optativa_codigo`
+# sigue siendo uno solo (es el rótulo de la portada y del acta), pero ya no
+# limita los componentes: Dirección puede añadir uno de otra salida del mismo
+# grado (`POST /api/cursos/{id}/salida-optativa/componentes`).
+#
+# Regla, sin columnas nuevas ni migración:
+#   * si todos los mapeos activos son de la salida del curso, los componentes
+#     del curso son los de esa salida —vinculados o pendientes—, igual que
+#     antes de este cambio. Ningún curso existente cambia;
+#   * si alguno es de otra salida, los componentes del curso son exactamente
+#     los VINCULADOS. Un componente de la salida que nadie vinculó deja de
+#     figurar como pendiente: no se le reserva un espacio que el curso no usa.
+#
+# El orden es SIEMPRE el slot del catálogo. Es el que fija la plantilla para
+# calificaciones y completivas, y es el que usan los espacios genéricos —los dos
+# bloques de asistencia, las columnas SO1/SO2 del acta y las dos filas del
+# boletín—, de modo que un componente ocupa la misma posición en todos.
+
+# Espacios genéricos que traen las plantillas oficiales de 4to-6to para la
+# Salida Optativa: 2 bloques de asistencia (pgs 56-65), 2 columnas en el acta
+# (pg 226) y 2 filas en el boletín. Las páginas propias de cada componente
+# (calificaciones, completivas) sí existen para los seis.
+CAPACIDAD_REGISTRO = 2
+
+
+def _componentes_de_curso(esperados, por_codigo, grado_numero):
+    if not grado_admite_salida(grado_numero):
+        return []
+    vinculados = [c for c in (_componente(cod) for cod in por_codigo)
+                  if c is not None and c.grado == grado_numero]
+    codigos_salida = {c.codigo for c in esperados}
+    if all(c.codigo in codigos_salida for c in vinculados):
+        return list(esperados)
+    return sorted(vinculados, key=lambda c: c.slot)
+
+
+def componentes_del_curso(db, curso) -> List:
+    """Componentes del curso en orden de impresión (slot). Lista vacía si no aplica."""
+    try:
+        return [i['componente'] for i in resolver_componentes(db, curso)]
+    except ValueError as e:
+        logger.error("Componentes optativos no resueltos para el curso %s: %s",
+                     getattr(curso, 'id', '?'), e)
+        return []
+
+
+def rotulo_salida_optativa(salida_curso: Optional[str], componentes) -> str:
+    """
+    Texto de «SALIDA OPTATIVA» en la portada y en la cabecera del acta.
+
+    Se decide por los COMPONENTES configurados del curso (`componentes_del_curso`),
+    no por nombres de profesores ni de asignaturas:
+      * si todos son de una misma salida —o el curso aún no tiene ninguno—, el
+        nombre oficial de la salida del curso, como siempre;
+      * si son de dos salidas, sus códigos en el orden de impresión de los
+        componentes (el de las columnas SO1/SO2 del acta): «HLM / HCS».
+        Autorizado por Dirección; el nombre completo de ambas no cabe en la
+        línea de la portada (146 pt).
+    """
+    salidas = []
+    for c in componentes:
+        if c.salida not in salidas:
+            salidas.append(c.salida)
+    if len(salidas) > 1:
+        return ' / '.join(salidas)
+    return nombre_salida(salida_curso) or '' if salida_curso else ''
+
+
+def mensaje_capacidad(componentes, al_guardar: bool = False) -> Optional[str]:
+    """
+    Texto del rechazo cuando el curso tiene más componentes que espacios.
+    None si caben. `al_guardar` cambia solo la última frase: al configurar se
+    rechaza el guardado; al imprimir, el documento.
+
+    No se recorta nada y no se elige cuál sobra: se NOMBRAN todos, porque
+    cualquiera de ellos quedaría fuera de la asistencia, el acta o el boletín.
+    """
+    if len(componentes) <= CAPACIDAD_REGISTRO:
+        return None
+    verbo = "quedaría con" if al_guardar else "tiene"
+    return (
+        f"Este curso {verbo} {len(componentes)} componentes optativos: "
+        + ", ".join(f"{c.nombre_oficial} ({c.codigo})" for c in componentes)
+        + f". Las plantillas oficiales solo tienen {CAPACIDAD_REGISTRO} espacios para la "
+          "Salida Optativa en la asistencia, el acta y el boletín, así que alguno "
+          "tendría que omitirse. "
+        + ("No se guarda esta configuración. Su soporte queda pendiente de una "
+           "solución para los documentos."
+           if al_guardar else
+           "No se emite el documento para no omitir ninguno.")
+    )

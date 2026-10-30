@@ -206,6 +206,60 @@ ROW_Y_SEGUNDO = {
     'SALIDA OPTATIVA 2': 410,
 }
 ASIST_Y_SEGUNDO    = {'p1': 492, 'p2': 517, 'p3': 542, 'p4': 567}
+
+# SALIDAS-MIXTAS — celda del nombre en las dos filas de Salida Optativa, medida
+# sobre las plantillas de 4to-6to (iguales): columna x 63.4-163.4 y filas
+# 366.3-391.6 y 391.6-416.9 (coordenadas desde arriba). El nombre del
+# componente se escribe COMPLETO dentro de la celda, en una a tres líneas como
+# el "Formación Integral / Humana y Religiosa" impreso de la plantilla.
+SO_NOMBRE_X = 67
+SO_NOMBRE_ANCHO = 93
+SO_CELDA_Y = {'SALIDA OPTATIVA 1': (366.3, 391.6), 'SALIDA OPTATIVA 2': (391.6, 416.9)}
+
+# SALIDAS-MIXTAS — FILA COMPACTA bajo la tabla (4to-6to). Solo se usa cuando las
+# dos filas de Salida Optativa están ocupadas por los componentes optativos y
+# queda UNA materia del colegio con notas (p. ej. Música). Medido sobre las tres
+# plantillas: la tabla termina en y≈416.8-416.9 y lo siguiente —los recuadros
+# de RESUMEN DE ASISTENCIA, LEYENDA y SITUACIÓN— empieza en y=434.2. La fila
+# ocupa 416.9-432.4 (15.5 pt) y deja 1.8 pt libres: no tapa ni desplaza nada.
+# Las columnas y el color NO son idénticos entre plantillas (5to va ~3.6 pt a
+# la derecha y es rosa), así que la cuadrícula se guarda por archivo, con las
+# verticales, los fondos y el color reales de la fila SO2 de cada uno. Esas
+# verticales son las de toda la tabla: también dan el centro de cada casilla
+# para TODAS las filas (`_centros_columnas_segundo_ciclo`).
+FILA_COMPACTA = 'FILA COMPACTA'
+FILA_COMPACTA_Y1 = 432.4
+SO_CELDA_Y[FILA_COMPACTA] = (416.9, FILA_COMPACTA_Y1)
+FILA_COMPACTA_GEOMETRIA = {
+    'Boletin-4to-grado-NS.pdf': {
+        'y0': 416.9,
+        'color': (0.819, 0.918, 0.934),     # azul de la plantilla de 4to
+        'verticales': [36.4, 63.0, 163.4, 188.7, 214.0, 239.3, 264.6, 289.9, 315.2, 340.5, 365.8, 391.1,
+                       416.4, 441.7, 467.0, 492.4, 517.7, 543.0, 568.3, 592.3, 616.3, 640.3, 664.3, 688.3,
+                       712.3, 736.3, 760.3, 784.3, 808.3, 832.3, 856.3, 880.3, 904.3, 931.7, 959.9, 988.2],
+        'fondos': [(36.4, 63.0), (664.3, 688.3), (760.3, 784.3), (856.3, 880.3), (904.3, 931.7)],
+    },
+    'Boletin-5to-grado-NS.pdf': {
+        'y0': 416.8,
+        'color': (0.982, 0.852, 0.881),     # rosa de la plantilla de 5to
+        'verticales': [36.4, 63.0, 167.0, 192.3, 217.6, 242.9, 268.2, 293.5, 318.8, 344.1, 369.4, 394.7,
+                       420.0, 445.3, 470.6, 496.0, 521.3, 546.6, 571.9, 595.9, 619.9, 643.9, 667.9, 691.9,
+                       715.9, 739.9, 763.9, 787.9, 811.9, 835.9, 859.9, 883.9, 907.9, 934.6, 962.8, 991.1],
+        'fondos': [(36.4, 63.0), (667.9, 691.9), (763.9, 787.9), (859.9, 883.9), (907.9, 934.6)],
+    },
+    'Boletin-6to-grado-NS.pdf': {
+        'y0': 416.8,
+        'color': (0.918, 0.966, 0.997),     # celeste de la plantilla de 6to
+        'verticales': [36.4, 63.0, 164.2, 189.5, 214.8, 240.1, 265.4, 290.7, 316.0, 341.3, 366.6, 391.9,
+                       417.2, 442.5, 467.8, 493.1, 518.4, 543.7, 569.0, 593.0, 617.0, 641.0, 665.0, 689.0,
+                       713.0, 737.0, 761.0, 785.0, 809.0, 833.0, 857.0, 881.0, 905.0, 934.9, 963.2, 991.4],
+        'fondos': [(36.4, 63.0), (665.0, 689.0), (761.0, 785.0), (857.0, 881.0), (905.0, 934.9)],
+    },
+}
+# Línea base de las notas: el generador escribe en `row_y + 3` (desde arriba).
+# Con row_y = centro + 0.2 la línea base queda en centro + 3.2, igual que en
+# las filas oficiales respecto a su celda.
+ROW_Y_FILA_COMPACTA = (416.9 + FILA_COMPACTA_Y1) / 2 + 0.2
 SITUACION_Y_SEGUNDO = 446
 CONDICION_FINAL_Y_SEGUNDO = 504
 
@@ -247,6 +301,171 @@ FRANJA_VERDE_X = (36.4, 63.0)
 FRANJA_VERDE_COLOR = (0.834, 0.895, 0.684)
 CELDAS_VERDES_X = [(661.0, 685.0), (757.1, 781.1), (853.1, 877.1), (905.8, 934.6)]
 CELDA_VERDE_COLOR = (0.919, 0.948, 0.847)
+
+
+def _lineas_nombre_optativa(nombre: str, etiqueta: str = 'SALIDA OPTATIVA 1'):
+    """(tamaño, [líneas]) para que `nombre` quepa ENTERO en la celda.
+
+    Prueba de 7.5 pt hacia abajo, partiendo solo por espacios, y se queda con
+    el mayor tamaño cuyas líneas caben en el ancho y en el alto de la celda.
+    Nunca recorta: si nada cabe (no ocurre con el catálogo oficial), devuelve
+    el reparto a 5 pt aunque alguna línea se pase del ancho.
+    """
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    palabras = (nombre or '').split()
+    alto = SO_CELDA_Y[etiqueta][1] - SO_CELDA_Y[etiqueta][0] - 2
+    tam = 7.5
+    while True:
+        lineas, actual = [], ''
+        for w in palabras:
+            prueba = (actual + ' ' + w).strip()
+            if actual and stringWidth(prueba, 'Helvetica-Bold', tam) > SO_NOMBRE_ANCHO:
+                lineas.append(actual)
+                actual = w
+            else:
+                actual = prueba
+        if actual:
+            lineas.append(actual)
+        cabe_ancho = all(stringWidth(l, 'Helvetica-Bold', tam) <= SO_NOMBRE_ANCHO
+                         for l in lineas)
+        if (cabe_ancho and len(lineas) * (tam + 1.2) <= alto) or tam <= 5:
+            return tam, lineas
+        tam -= 0.5
+
+
+def _dibujar_nombre_optativa(c, etiqueta: str, nombre: str) -> None:
+    """Nombre completo del componente, centrado en vertical en su celda."""
+    y0, y1 = SO_CELDA_Y[etiqueta]
+    tam, lineas = _lineas_nombre_optativa(nombre, etiqueta)
+    interlineado = tam + 1.2
+    alto_bloque = interlineado * (len(lineas) - 1) + tam * 0.72
+    base = (y0 + y1) / 2 - alto_bloque / 2 + tam * 0.72
+    c.setFont("Helvetica-Bold", tam)
+    for i, linea in enumerate(lineas):
+        c.drawString(SO_NOMBRE_X, _y(base + i * interlineado), linea)
+    c.setFont("Helvetica", 8)
+
+
+def _filas_salida_optativa(calificaciones_por_asig: dict, row_y_map: dict) -> dict:
+    """{asig_id: 'SALIDA OPTATIVA n'} para las dos filas de Salida Optativa.
+
+    SALIDAS-MIXTAS: primero los componentes optativos del curso
+    (`es_salida_optativa`), cada uno en la fila de su `so_orden` —el mismo
+    orden que la asistencia y el acta del Registro—; después, en las filas que
+    queden libres, las materias extra del colegio en el orden de siempre. Una
+    materia extra ya no puede quitarle la fila a una optativa.
+    """
+    candidatas = ['SALIDA OPTATIVA 1', 'SALIDA OPTATIVA 2']
+    filas = {}
+    libres = list(candidatas)
+    fuera = [k for k, d in calificaciones_por_asig.items()
+             if _fila_oficial(d) not in row_y_map]
+    optativas = sorted((k for k in fuera if calificaciones_por_asig[k].get('es_salida_optativa')),
+                       key=lambda k: calificaciones_por_asig[k].get('so_orden', len(candidatas)))
+    for k in optativas:
+        orden = calificaciones_por_asig[k].get('so_orden')
+        if isinstance(orden, int) and 0 <= orden < len(candidatas) and candidatas[orden] in libres:
+            etiqueta = candidatas[orden]
+        elif libres:
+            etiqueta = libres[0]
+        else:
+            continue
+        filas[k] = etiqueta
+        libres.remove(etiqueta)
+    for k in fuera:
+        if k in filas or calificaciones_por_asig[k].get('es_salida_optativa'):
+            continue
+        if not libres:
+            break
+        filas[k] = libres.pop(0)
+    # FILA COMPACTA: solo si las DOS filas son de componentes optativos y queda
+    # exactamente UNA materia del colegio. Con más de una no se coloca ninguna:
+    # `materias_sin_fila` las nombra todas y el boletín no se emite.
+    sin_fila = [k for k in fuera if k not in filas]
+    if (len(sin_fila) == 1 and not libres
+            and all(calificaciones_por_asig[k].get('es_salida_optativa') for k in filas)):
+        filas[sin_fila[0]] = FILA_COMPACTA
+    return filas
+
+
+_ORDEN_COLUMNAS_DERECHA = ('p_cf_50', 'cec', 'p_cec_50', 'ccf', 'p_cf_30', 'ceex', 'p_ceex_70',
+                           'cexf', 'esp_cf', 'esp_ce', 'A', 'R')
+
+
+def _centros_columnas_segundo_ciclo(curso):
+    """(COMP_X, PC_X, RIGHT_X) con el CENTRO real de cada casilla en 4to-6to.
+
+    Salen de las verticales de la plantilla del curso —las mismas en todas las
+    filas de la tabla, comprobado en las tres—: tras la celda del rótulo y la
+    del nombre vienen 16 casillas de períodos (4 competencias x P1-P4), PC1-PC4,
+    CF y las 12 de la derecha en el orden de `_ORDEN_COLUMNAS_DERECHA` (35
+    casillas entre 36 verticales).
+
+    Las constantes comunes COMP_X/PC_X/RIGHT_X están calibradas sobre la
+    plantilla de 1ro-3ro y en 4to-6to quedaban entre 2.7 y 10.9 pt a la
+    izquierda del centro (en 5to, varios números cruzaban la línea vecina).
+    1ro-3ro las sigue usando sin cambios.
+    """
+    geo = FILA_COMPACTA_GEOMETRIA.get(os.path.basename(_get_plantilla_path(curso)),
+                                      FILA_COMPACTA_GEOMETRIA['Boletin-6to-grado-NS.pdf'])
+    v = geo['verticales']
+    centros = [(v[i] + v[i + 1]) / 2 for i in range(len(v) - 1)]
+    cx = {n: {'p%d' % p: centros[2 + (n - 1) * 4 + (p - 1)] for p in (1, 2, 3, 4)} for n in (1, 2, 3, 4)}
+    px = {'pc%d' % p: centros[18 + p - 1] for p in (1, 2, 3, 4)}
+    rx = {'cf': centros[22]}
+    rx.update({k: centros[23 + i] for i, k in enumerate(_ORDEN_COLUMNAS_DERECHA)})
+    return cx, px, rx
+
+
+def _dibujar_fila_compacta(c, curso) -> None:
+    """Cuadrícula de la FILA COMPACTA con la geometría de la plantilla del curso."""
+    geo = FILA_COMPACTA_GEOMETRIA.get(os.path.basename(_get_plantilla_path(curso)),
+                                      FILA_COMPACTA_GEOMETRIA['Boletin-6to-grado-NS.pdf'])
+    y0, y1 = geo['y0'], FILA_COMPACTA_Y1
+    c.saveState()
+    c.setFillColorRGB(*geo['color'])
+    for x0, x1 in geo['fondos']:
+        c.rect(x0, _y(y1), x1 - x0, y1 - y0, fill=1, stroke=0)
+    c.setLineWidth(0.5)
+    c.setStrokeColorRGB(0.2, 0.2, 0.2)
+    c.line(geo['verticales'][0], _y(y1), geo['verticales'][-1], _y(y1))
+    for x in geo['verticales']:
+        if x == 63.0:
+            continue        # la celda del nombre va unida, de 36.4 a la primera columna de notas
+        c.line(x, _y(y0), x, _y(y1))
+    c.restoreState()
+
+
+class MateriasSinFila(Exception):
+    """Hay materias con notas que la plantilla oficial no tiene dónde imprimir."""
+
+    def __init__(self, nombres):
+        super().__init__(', '.join(nombres))
+        self.nombres = list(nombres)
+
+
+def materias_sin_fila(curso, calificaciones_por_asig: dict) -> list:
+    """Nombres de las materias con notas que NO tendrían fila en el boletín.
+
+    SALIDAS-MIXTAS. La plantilla oficial no tiene filas para materias propias
+    del colegio (Música, etc.):
+      * 4to-6to: las dos de "SALIDA OPTATIVA", que se reparten primero entre
+        los componentes optativos y después entre las materias extra, más la
+        FILA COMPACTA cuando ambas son de optativas y queda una sola materia
+        (`_filas_salida_optativa`);
+      * 1ro-3ro: una fila calibrada bajo Formación Integral (`_dibujar_fila_extra`).
+    Lo que no cabe antes se descartaba sin aviso. Ahora se nombra, y el
+    boletín no se emite hasta resolverlo: imprimirlo sería omitir notas.
+    """
+    if _es_segundo_ciclo(curso):
+        filas = _filas_salida_optativa(calificaciones_por_asig, ROW_Y_SEGUNDO)
+        return [d.get('asignatura_nombre', '') for k, d in calificaciones_por_asig.items()
+                if _fila_oficial(d) not in ROW_Y_SEGUNDO
+                and k not in filas]
+    extras = [d.get('asignatura_nombre', '') for d in calificaciones_por_asig.values()
+              if _fila_oficial(d) not in ROW_Y_PRIMERO]
+    return extras[1:]
 
 
 def _dibujar_fila_extra(c, indice: int) -> float:
@@ -361,6 +580,33 @@ def _normalizar_nombre_asignatura(nombre: str) -> str:
         'humana y religiosa': 'Formación Integral Humana y Religiosa',
     }
     return mapeo.get(n, nombre)  # si no encuentra, mantiene el original
+
+
+# SALIDAS-MIXTAS — fila oficial por IDENTIDAD curricular (R2.1C), no por nombre.
+# `Asignatura.area_curricular_codigo` dice qué bloque troncal es una asignatura;
+# antes el boletín solo miraba el nombre, y una troncal con un nombre que
+# `_normalizar_nombre_asignatura` no conoce ("Lenguas Extranjeras - Inglés")
+# se trataba como materia extra: ocupaba una fila de Salida Optativa o se
+# perdía. Ahora, con la detección de materias sin fila, eso sería un 409.
+AREA_CURRICULAR_A_FILA = {
+    'LE': 'Lengua Española',
+    'LEI': 'Lenguas Extranjeras (Inglés)',
+    'LEF': 'Lenguas Extranjeras (Francés)',
+    'MAT': 'Matemática',
+    'CS': 'Ciencias Sociales',
+    'CN': 'Ciencias de la Naturaleza',
+    'EA': 'Educación Artística',
+    'EF': 'Educación Física',
+    'FIHR': 'Formación Integral Humana y Religiosa',
+}
+
+
+def _fila_oficial(asig_data: dict) -> str:
+    """Nombre de fila del boletín: por `area_curricular_codigo` si lo hay; si no, por nombre."""
+    area = asig_data.get('area_curricular_codigo')
+    if area in AREA_CURRICULAR_A_FILA:
+        return AREA_CURRICULAR_A_FILA[area]
+    return _normalizar_nombre_asignatura(asig_data.get('asignatura_nombre', ''))
 
 
 def _texto_de(valor, attr='nombre') -> str:
@@ -715,37 +961,56 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
     # Tabla de notas
     c.setFont("Helvetica", 8)
     
+    # SALIDAS-MIXTAS: ninguna materia con notas se descarta en silencio. Los
+    # endpoints lo comprueban antes con `materias_sin_fila` y responden 409;
+    # esto es la última línea para cualquier otro llamador.
+    _sin_fila = materias_sin_fila(curso, calificaciones_por_asig)
+    if _sin_fila:
+        raise MateriasSinFila(_sin_fila)
+
     extras_usadas = 0  # v2.13.42: contador de materias extra del colegio
+    # SALIDAS-MIXTAS: en el segundo ciclo las dos filas de Salida Optativa se
+    # reparten ANTES del bucle (optativas primero, en su orden; extras después).
+    filas_so = (_filas_salida_optativa(calificaciones_por_asig, row_y_map)
+                if 'SALIDA OPTATIVA 1' in row_y_map else None)
+    _columnas = (_centros_columnas_segundo_ciclo(curso) if _es_segundo_ciclo(curso)
+                 else (COMP_X, PC_X, RIGHT_X))
     for asig_id, asig_data in calificaciones_por_asig.items():
-        nombre_asig = _normalizar_nombre_asignatura(asig_data.get('asignatura_nombre', ''))
-        
+        nombre_asig = _fila_oficial(asig_data)
+
         # Determinar fila correcta
         if nombre_asig in row_y_map:
             y_row = _y(row_y_map[nombre_asig])
-        elif asig_data.get('es_salida_optativa') and 'SALIDA OPTATIVA 1' in row_y_map:
-            # Solo segundo ciclo tiene SALIDA OPTATIVA
-            y_row = _y(row_y_map['SALIDA OPTATIVA 1'])
+        elif filas_so is not None:
+            etiqueta = filas_so.get(asig_id)
+            if etiqueta is None:
+                continue        # sin fila libre (máximo 2, límite físico de la hoja)
+            if etiqueta == FILA_COMPACTA:
+                _dibujar_fila_compacta(c, curso)
+                c.setFillColor(COLOR_DATOS)
+                y_row = _y(ROW_Y_FILA_COMPACTA)
+                _dibujar_nombre_optativa(c, etiqueta, str(asig_data.get('asignatura_nombre', '')))
+            elif asig_data.get('es_salida_optativa'):
+                y_row = _y(row_y_map[etiqueta])
+                _dibujar_nombre_optativa(c, etiqueta, str(asig_data.get('asignatura_nombre', '')))
+            else:
+                y_row = _y(row_y_map[etiqueta])
+                # Materia extra del colegio: igual que siempre.
+                c.setFont("Helvetica-Bold", 7.5)
+                c.drawString(67, y_row - 3, str(asig_data.get('asignatura_nombre', ''))[:26])
+                c.setFont("Helvetica", 8)
         else:
             # v2.13.42: asignatura EXTRA del colegio (ej. Música) — no existe en
-            # la plantilla oficial MINERD. Se le dibuja su propia casilla:
-            #  - Segundo ciclo: usa las filas SALIDA OPTATIVA (nombre en blanco).
-            #  - Primer ciclo: fila dibujada debajo de Formación Integral.
-            # Máximo 2 extras por boletín (límite físico de la hoja).
-            if 'SALIDA OPTATIVA 1' in row_y_map:
-                candidatas = ['SALIDA OPTATIVA 1', 'SALIDA OPTATIVA 2']
-                if extras_usadas >= len(candidatas):
-                    continue
-                y_top_extra = row_y_map[candidatas[extras_usadas]]
-                dibujar_linea = False
-            else:
-                # Primer ciclo: solo cabe 1 fila extra a tamaño completo antes
-                # del bloque impreso "RESUMEN DE ASISTENCIA" de la plantilla.
-                if extras_usadas >= 1:
-                    continue
-                # v2.13.43: fila calibrada — extiende la tabla con las líneas
-                # y fondos REALES extraídos de la plantilla oficial.
-                y_top_extra = _dibujar_fila_extra(c, extras_usadas)
-                dibujar_linea = True
+            # la plantilla oficial MINERD. Se le dibuja su propia casilla. El
+            # segundo ciclo la resuelve arriba con `filas_so`; aquí solo llega
+            # el primer ciclo: fila dibujada debajo de Formación Integral.
+            # Primer ciclo: solo cabe 1 fila extra a tamaño completo antes
+            # del bloque impreso "RESUMEN DE ASISTENCIA" de la plantilla.
+            if extras_usadas >= 1:
+                continue
+            # v2.13.43: fila calibrada — extiende la tabla con las líneas
+            # y fondos REALES extraídos de la plantilla oficial.
+            y_top_extra = _dibujar_fila_extra(c, extras_usadas)
             extras_usadas += 1
             y_row = _y(y_top_extra)
             # Nombre de la materia: misma tipografía que las áreas oficiales
@@ -753,6 +1018,9 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             c.drawString(67, y_row - 3, str(asig_data.get('asignatura_nombre', ''))[:26])
             c.setFont("Helvetica", 8)
         
+        # Columnas: en 4to-6to, el centro real de cada casilla de la plantilla
+        # del curso, en TODAS las filas; en 1ro-3ro, las de siempre.
+        _cx, _px, _rx = _columnas
         competencias = asig_data.get('competencias', [])
         if not competencias:
             continue
@@ -760,12 +1028,12 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
         # 4 competencias × 4 períodos (notas P1-P4 — usando valor_efectivo = max(P,RP))
         for comp in competencias:
             comp_n = getattr(comp, 'competencia_numero', None)
-            if not comp_n or comp_n not in COMP_X:
+            if not comp_n or comp_n not in _cx:
                 continue
             for p in range(1, 5):
                 valor = comp.valor_periodo(p) if hasattr(comp, 'valor_periodo') else None
                 if valor is not None:
-                    x = COMP_X[comp_n][f'p{p}']
+                    x = _cx[comp_n][f'p{p}']
                     c.drawCentredString(x, y_row - 3, _fmt_nota(valor))
         
         # PC1-PC4
@@ -773,13 +1041,13 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
         for p in range(1, 5):
             v = pcs.get(f'pc{p}')
             if v is not None:
-                c.drawCentredString(PC_X[f'pc{p}'], y_row - 3, _fmt_nota(v))
+                c.drawCentredString(_px[f'pc{p}'], y_row - 3, _fmt_nota(v))
         
         # CF — entero, negrita
         cf = asig_data.get('cf')
         if cf is not None:
             c.setFont("Helvetica-Bold", 8)
-            c.drawCentredString(RIGHT_X['cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
+            c.drawCentredString(_rx['cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
             c.setFont("Helvetica", 8)
         
         # Evaluación extra (si existe)
@@ -799,31 +1067,31 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             
             if cec is not None or ccf is not None:
                 if cf_pct is not None:
-                    c.drawCentredString(RIGHT_X['p_cf_50'], y_row - 3, _fmt_nota(round(cf_pct * 0.5, 1)))
+                    c.drawCentredString(_rx['p_cf_50'], y_row - 3, _fmt_nota(round(cf_pct * 0.5, 1)))
                 if cec is not None:
-                    c.drawCentredString(RIGHT_X['cec'], y_row - 3, _fmt_nota(cec, ints_only=True))
-                    c.drawCentredString(RIGHT_X['p_cec_50'], y_row - 3, _fmt_nota(round(cec * 0.5, 1)))
+                    c.drawCentredString(_rx['cec'], y_row - 3, _fmt_nota(cec, ints_only=True))
+                    c.drawCentredString(_rx['p_cec_50'], y_row - 3, _fmt_nota(round(cec * 0.5, 1)))
                 if ccf is not None:
                     c.setFont("Helvetica-Bold", 8)
-                    c.drawCentredString(RIGHT_X['ccf'], y_row - 3, _fmt_nota(ccf, ints_only=True))
+                    c.drawCentredString(_rx['ccf'], y_row - 3, _fmt_nota(ccf, ints_only=True))
                     c.setFont("Helvetica", 8)
             
             if ceex is not None or cexf is not None:
                 if cf_pct is not None:
-                    c.drawCentredString(RIGHT_X['p_cf_30'], y_row - 3, _fmt_nota(round(cf_pct * 0.3, 1)))
+                    c.drawCentredString(_rx['p_cf_30'], y_row - 3, _fmt_nota(round(cf_pct * 0.3, 1)))
                 if ceex is not None:
-                    c.drawCentredString(RIGHT_X['ceex'], y_row - 3, _fmt_nota(ceex, ints_only=True))
-                    c.drawCentredString(RIGHT_X['p_ceex_70'], y_row - 3, _fmt_nota(round(ceex * 0.7, 1)))
+                    c.drawCentredString(_rx['ceex'], y_row - 3, _fmt_nota(ceex, ints_only=True))
+                    c.drawCentredString(_rx['p_ceex_70'], y_row - 3, _fmt_nota(round(ceex * 0.7, 1)))
                 if cexf is not None:
                     c.setFont("Helvetica-Bold", 8)
-                    c.drawCentredString(RIGHT_X['cexf'], y_row - 3, _fmt_nota(cexf, ints_only=True))
+                    c.drawCentredString(_rx['cexf'], y_row - 3, _fmt_nota(cexf, ints_only=True))
                     c.setFont("Helvetica", 8)
             
             if ce is not None or esp_final is not None:
                 if cf is not None:
-                    c.drawCentredString(RIGHT_X['esp_cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
+                    c.drawCentredString(_rx['esp_cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
                 if ce is not None:
-                    c.drawCentredString(RIGHT_X['esp_ce'], y_row - 3, _fmt_nota(ce, ints_only=True))
+                    c.drawCentredString(_rx['esp_ce'], y_row - 3, _fmt_nota(ce, ints_only=True))
         
         # A/R por asignatura
         nota_final = None
@@ -839,9 +1107,9 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             # La tabla oficial MINERD muestra la NOTA FINAL en la columna A o R
             # (ej: A=76, A=74, R=69), no una marca.
             if nota_final >= 70:
-                c.drawCentredString(RIGHT_X['A'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
+                c.drawCentredString(_rx['A'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
             else:
-                c.drawCentredString(RIGHT_X['R'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
+                c.drawCentredString(_rx['R'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
     
     # ── Resumen de asistencia ──────────────────────────────────────────
     #

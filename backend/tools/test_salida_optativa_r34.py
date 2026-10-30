@@ -806,6 +806,16 @@ def _():
 @test("§D3 §3-B: DELETE de un componente retira la responsabilidad docente")
 def _():
     r = put(C4_A, DIR_A, profesores={HLM_IN_4: U_PROF2})
+    # SALIDAS-MIXTAS: a estas alturas el curso ya tiene una asignatura de
+    # HLM-IN-4 sin vincular (de un paso anterior). Antes se creaba OTRA —el
+    # duplicado visto en producción—; ahora se responde 409 con la candidata
+    # y Dirección la elige explícitamente.
+    if r.status_code == 409 and r.json().get("motivo") == "identidad_por_elegir":
+        cand = r.json()["candidatas"]
+        assert len(cand) == 1, cand
+        r = client.post(f"/api/cursos/{C4_A}/salida-optativa/componentes", headers=auth(DIR_A),
+                        json={"componente_codigo": HLM_IN_4, "profesor_id": U_PROF2,
+                              "asignatura_id": cand[0]["asignatura_id"]})
     assert r.status_code == 200, r.text[:250]
     m = mapeo_de(C4_A, HLM_IN_4)
     assert _aps_activas(C4_A, m.asignatura_id), "debe haber responsable"
