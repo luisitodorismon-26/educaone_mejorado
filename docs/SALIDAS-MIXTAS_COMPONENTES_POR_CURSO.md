@@ -19,7 +19,7 @@ distintas: Apreciación y Producción Literarias (HLM-LE-4) y Filosofía Social 
   - si todos los vinculados son de la salida del curso, los de esa salida, vinculados o pendientes, igual
     que antes;
   - si alguno es de otra salida, exactamente los vinculados.
-- **`Curso.salida_optativa_codigo`** se conserva como rótulo de la portada y de la cabecera del acta.
+- **`Curso.salida_optativa_codigo`** se conserva como la salida del curso.
 - **Sin duplicados.** Si el curso ya tiene asignaturas dedicadas sin vincular para ese componente
   (`candidatas_identidad`), el `POST` y el `PUT` responden **409 `identidad_por_elegir`** con la lista y
   sus datos. Dirección elige con `asignatura_id` o pide expresamente `crear_identidad_nueva`. Nunca se
@@ -42,6 +42,7 @@ El orden es el **slot del catálogo** en todos los espacios:
 |---|---|
 | Calificaciones y completivas | Página propia de cada componente (sin cambios) |
 | Asistencia, bloques 1 y 2 (págs. 56–65) | Mismo orden; el rótulo «SALIDA OPTATIVA» es la salida **del componente**; los nombres largos se achican, ya no se cortan |
+| Rótulo «SALIDA OPTATIVA» de la portada y de la cabecera del acta | Si los componentes configurados son de dos salidas, sus códigos en el orden de SO1/SO2: **«HLM / HCS»** (autorizado por Dirección; el nombre completo de ambas no cabe en la portada). Con una sola salida, el título de siempre. Se decide por los componentes, no por profesores ni asignaturas (`rotulo_salida_optativa`) |
 | Acta, págs. 225–226 | SO1/SO2 en el mismo orden (`curso_info['salida_optativa_slots']`); antes un componente de otra salida no aparecía |
 | Boletín, filas SO1/SO2 | Mismo orden, con el nombre completo ajustado a la celda; las optativas van antes que las materias extra del colegio, que solo ocupan filas libres |
 | Boletín, Música (u otra materia del colegio) con las dos optativas | **Fila compacta propia** bajo la tabla (416.9–432.4, 15.5 pt), con sus 16 notas, PC1–PC4, CF y la condición A/R de siempre. Las dos filas optativas no cambian y el boletín sigue teniendo dos páginas. Se dibuja con la cuadrícula y el color de la plantilla de cada grado, porque las columnas de 5to van ~3.6 pt a la derecha y su plantilla es rosa. No tapa ni desplaza asistencia, leyenda, situación ni firmas, que empiezan en 434.2. Solo se usa en ese caso: los boletines que ya cabían no cambian |
@@ -58,19 +59,6 @@ pendiente de una solución para los documentos.
   fila compacta. Para más haría falta otra solución (por ejemplo, la hoja adicional que se presentó como
   alternativa B); mientras tanto se rechaza con un mensaje que nombra las materias.
 
-- El rótulo «SALIDA OPTATIVA» de la portada y de la cabecera del acta sigue siendo la salida del curso.
-  Cuando hay dos salidas, Dirección debe decidir qué figura ahí. Opciones, generadas con el código real
-  para HLM + HCS:
-
-  | Opción | Portada (146 pt) | Acta (258 pt) |
-  |---|---|---|
-  | A · salida del curso, «Humanidades y Lenguas Modernas» (actual) | Cabe | Cabe |
-  | B · ambas completas, «Humanidades y Lenguas Modernas / Humanidades y Ciencias Sociales» | **No cabe** ni a 6 pt: se sale de la línea | Cabe |
-  | C · códigos, «HLM / HCS» | Cabe | Cabe |
-  | D · en blanco, a mano | — | — |
-
-  La B en la portada necesitaría escribirse en dos líneas, lo que exige un cambio de código que no está
-  hecho.
 - Las págs. 69 y 73 (asistencia a evaluaciones completivas y extraordinarias) no se rellenan para
   ninguna asignatura: el sistema no guarda ese dato.
 - La identidad de HLM-LE-4 del curso 29 de producción (asignaturas 25 y 27) se resolverá por separado,

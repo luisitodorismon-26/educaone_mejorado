@@ -23368,8 +23368,11 @@ def _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
     # El acta asigna SO1/SO2 con esta lista, la misma de la asistencia y del
     # boletín; sin ella el generador seguiría usando solo la salida del curso.
     if codigo:
-        curso_info['salida_optativa_slots'] = [
-            c.slot for c in _svc_sal.componentes_del_curso(db, curso)]
+        _comps_curso = _svc_sal.componentes_del_curso(db, curso)
+        curso_info['salida_optativa_slots'] = [c.slot for c in _comps_curso]
+        # Rótulo de portada y acta: «HLM / HCS» si los componentes configurados
+        # son de dos salidas; si no, el nombre de la salida del curso.
+        curso_info['salida_optativa'] = _svc_sal.rotulo_salida_optativa(codigo, _comps_curso)
 
     situaciones = {}
     if ano is not None and estudiantes_db:

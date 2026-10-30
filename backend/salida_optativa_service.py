@@ -29,6 +29,7 @@ from salidas_optativas import (
     componente_pertenece,
     componentes_de,
     grado_admite_salida,
+    nombre_salida,
     salida_valida,
 )
 
@@ -474,6 +475,28 @@ def componentes_del_curso(db, curso) -> List:
         logger.error("Componentes optativos no resueltos para el curso %s: %s",
                      getattr(curso, 'id', '?'), e)
         return []
+
+
+def rotulo_salida_optativa(salida_curso: Optional[str], componentes) -> str:
+    """
+    Texto de «SALIDA OPTATIVA» en la portada y en la cabecera del acta.
+
+    Se decide por los COMPONENTES configurados del curso (`componentes_del_curso`),
+    no por nombres de profesores ni de asignaturas:
+      * si todos son de una misma salida —o el curso aún no tiene ninguno—, el
+        nombre oficial de la salida del curso, como siempre;
+      * si son de dos salidas, sus códigos en el orden de impresión de los
+        componentes (el de las columnas SO1/SO2 del acta): «HLM / HCS».
+        Autorizado por Dirección; el nombre completo de ambas no cabe en la
+        línea de la portada (146 pt).
+    """
+    salidas = []
+    for c in componentes:
+        if c.salida not in salidas:
+            salidas.append(c.salida)
+    if len(salidas) > 1:
+        return ' / '.join(salidas)
+    return nombre_salida(salida_curso) or '' if salida_curso else ''
 
 
 def mensaje_capacidad(componentes, al_guardar: bool = False) -> Optional[str]:

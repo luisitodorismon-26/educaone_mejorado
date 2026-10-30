@@ -400,6 +400,18 @@ def guardar(nombre, data):
         open(os.path.join(OUT, nombre), 'wb').write(data)
 
 
+def rotulo_salida(pdf, etiqueta, esperado):
+    """Rótulo «SALIDA OPTATIVA» en portada (pág. 1) y acta (pág. 225): texto y que quepa."""
+    doc = pymupdf.open(stream=pdf, filetype='pdf')
+    for pag, x, ancho, y0, y1, sitio in ((0, 212, 146, 700, 730, 'portada'), (224, 127, 258, 85, 102, 'acta')):
+        sp = [(t, bb) for t, bb in spans(doc[pag]) if y0 <= (bb[1] + bb[3]) / 2 <= y1 and bb[0] >= x - 2
+              and bb[0] < x + ancho]
+        texto = ' '.join(t for t, _ in sp if not t.startswith('20'))       # sin el año escolar del acta
+        cabe = all(bb[2] <= x + ancho + 0.5 for t, bb in sp if not t.startswith('20'))
+        check('%s rótulo de %s = %r y cabe en su campo (%d pt)' % (etiqueta, sitio, esperado, ancho),
+              texto == esperado and cabe, (texto, [(t, round(bb[0]), round(bb[2])) for t, bb in sp]))
+
+
 def revisar_registro(pdf, etiqueta, ests, so_esperado):
     """so_esperado: [(componente, base, salida_nombre, nombre_componente), ...] en orden."""
     doc = pymupdf.open(stream=pdf, filetype='pdf')
@@ -448,6 +460,7 @@ check('D1 Registro oficial de 4to A: 200 PDF', r.status_code == 200 and r.conten
 if r.status_code == 200:
     guardar('registro_4toA_HLM-LE_HCS-CS_oficial.pdf', r.content)
     doc = revisar_registro(r.content, 'D2 oficial:', EA, SO_A)
+    rotulo_salida(r.content, 'D2b oficial 4to A (HLM + HCS):', 'HLM / HCS')
     troncal = doc[G['calificaciones_paginas'][0] - 1]
     check('D3 la troncal Lengua Española conserva sus notas (81) en su página',
           '81' in {t for t, _ in spans(troncal)}, spans(troncal)[:8])
@@ -456,6 +469,7 @@ check('D4 Borrador de 4to A: 200 PDF', r.status_code == 200 and r.content[:4] ==
 if r.status_code == 200:
     guardar('registro_4toA_HLM-LE_HCS-CS_borrador.pdf', r.content)
     revisar_registro(r.content, 'D5 borrador:', EA, SO_A)
+    rotulo_salida(r.content, 'D5b borrador 4to A (HLM + HCS):', 'HLM / HCS')
 
 
 def filas_boletin(pdf_bytes, pagina=1):
@@ -709,6 +723,7 @@ if r.status_code == 200:
     revisar_registro(r.content, 'E2 4to B:', EB, [
         ('HLM-LE-4', 61, 'Humanidades y Lenguas Modernas', 'Apreciación y Producción Literarias'),
         ('HLM-IN-4', 71, 'Humanidades y Lenguas Modernas', 'Manejo de la Información en Inglés')])
+    rotulo_salida(r.content, 'E3 4to B (solo HLM):', 'Humanidades y Lenguas Modernas')
 
 db.close()
 engine.dispose()
