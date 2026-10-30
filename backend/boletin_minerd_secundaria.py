@@ -387,6 +387,30 @@ def _filas_salida_optativa(calificaciones_por_asig: dict, row_y_map: dict) -> di
     return filas
 
 
+_ORDEN_COLUMNAS_DERECHA = ('p_cf_50', 'cec', 'p_cec_50', 'ccf', 'p_cf_30', 'ceex', 'p_ceex_70',
+                           'cexf', 'esp_cf', 'esp_ce', 'A', 'R')
+
+
+def _centros_fila_compacta(curso):
+    """(COMP_X, PC_X, RIGHT_X) con el CENTRO real de cada casilla de la FILA COMPACTA.
+
+    Salen de las verticales de la plantilla del curso: tras la celda del rótulo
+    y la del nombre vienen 16 casillas de períodos (4 competencias x P1-P4),
+    PC1-PC4, CF y las 12 de la derecha en el orden de `_ORDEN_COLUMNAS_DERECHA`
+    (35 casillas entre 36 verticales). Las constantes comunes COMP_X/PC_X/RIGHT_X
+    no sirven aquí: no coinciden con las casillas de 4to-6to.
+    """
+    geo = FILA_COMPACTA_GEOMETRIA.get(os.path.basename(_get_plantilla_path(curso)),
+                                      FILA_COMPACTA_GEOMETRIA['Boletin-6to-grado-NS.pdf'])
+    v = geo['verticales']
+    centros = [(v[i] + v[i + 1]) / 2 for i in range(len(v) - 1)]
+    cx = {n: {'p%d' % p: centros[2 + (n - 1) * 4 + (p - 1)] for p in (1, 2, 3, 4)} for n in (1, 2, 3, 4)}
+    px = {'pc%d' % p: centros[18 + p - 1] for p in (1, 2, 3, 4)}
+    rx = {'cf': centros[22]}
+    rx.update({k: centros[23 + i] for i, k in enumerate(_ORDEN_COLUMNAS_DERECHA)})
+    return cx, px, rx
+
+
 def _dibujar_fila_compacta(c, curso) -> None:
     """Cuadrícula de la FILA COMPACTA con la geometría de la plantilla del curso."""
     geo = FILA_COMPACTA_GEOMETRIA.get(os.path.basename(_get_plantilla_path(curso)),
@@ -944,6 +968,7 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
                 if 'SALIDA OPTATIVA 1' in row_y_map else None)
     for asig_id, asig_data in calificaciones_por_asig.items():
         nombre_asig = _fila_oficial(asig_data)
+        _es_compacta = False
 
         # Determinar fila correcta
         if nombre_asig in row_y_map:
@@ -953,6 +978,7 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             if etiqueta is None:
                 continue        # sin fila libre (máximo 2, límite físico de la hoja)
             if etiqueta == FILA_COMPACTA:
+                _es_compacta = True
                 _dibujar_fila_compacta(c, curso)
                 c.setFillColor(COLOR_DATOS)
                 y_row = _y(ROW_Y_FILA_COMPACTA)
@@ -985,6 +1011,10 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             c.drawString(67, y_row - 3, str(asig_data.get('asignatura_nombre', ''))[:26])
             c.setFont("Helvetica", 8)
         
+        # Columnas: las de siempre; en la FILA COMPACTA, el centro real de cada
+        # casilla de la plantilla del curso (`_centros_fila_compacta`).
+        _cx, _px, _rx = (_centros_fila_compacta(curso) if _es_compacta
+                         else (COMP_X, PC_X, RIGHT_X))
         competencias = asig_data.get('competencias', [])
         if not competencias:
             continue
@@ -992,12 +1022,12 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
         # 4 competencias × 4 períodos (notas P1-P4 — usando valor_efectivo = max(P,RP))
         for comp in competencias:
             comp_n = getattr(comp, 'competencia_numero', None)
-            if not comp_n or comp_n not in COMP_X:
+            if not comp_n or comp_n not in _cx:
                 continue
             for p in range(1, 5):
                 valor = comp.valor_periodo(p) if hasattr(comp, 'valor_periodo') else None
                 if valor is not None:
-                    x = COMP_X[comp_n][f'p{p}']
+                    x = _cx[comp_n][f'p{p}']
                     c.drawCentredString(x, y_row - 3, _fmt_nota(valor))
         
         # PC1-PC4
@@ -1005,13 +1035,13 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
         for p in range(1, 5):
             v = pcs.get(f'pc{p}')
             if v is not None:
-                c.drawCentredString(PC_X[f'pc{p}'], y_row - 3, _fmt_nota(v))
+                c.drawCentredString(_px[f'pc{p}'], y_row - 3, _fmt_nota(v))
         
         # CF — entero, negrita
         cf = asig_data.get('cf')
         if cf is not None:
             c.setFont("Helvetica-Bold", 8)
-            c.drawCentredString(RIGHT_X['cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
+            c.drawCentredString(_rx['cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
             c.setFont("Helvetica", 8)
         
         # Evaluación extra (si existe)
@@ -1031,31 +1061,31 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             
             if cec is not None or ccf is not None:
                 if cf_pct is not None:
-                    c.drawCentredString(RIGHT_X['p_cf_50'], y_row - 3, _fmt_nota(round(cf_pct * 0.5, 1)))
+                    c.drawCentredString(_rx['p_cf_50'], y_row - 3, _fmt_nota(round(cf_pct * 0.5, 1)))
                 if cec is not None:
-                    c.drawCentredString(RIGHT_X['cec'], y_row - 3, _fmt_nota(cec, ints_only=True))
-                    c.drawCentredString(RIGHT_X['p_cec_50'], y_row - 3, _fmt_nota(round(cec * 0.5, 1)))
+                    c.drawCentredString(_rx['cec'], y_row - 3, _fmt_nota(cec, ints_only=True))
+                    c.drawCentredString(_rx['p_cec_50'], y_row - 3, _fmt_nota(round(cec * 0.5, 1)))
                 if ccf is not None:
                     c.setFont("Helvetica-Bold", 8)
-                    c.drawCentredString(RIGHT_X['ccf'], y_row - 3, _fmt_nota(ccf, ints_only=True))
+                    c.drawCentredString(_rx['ccf'], y_row - 3, _fmt_nota(ccf, ints_only=True))
                     c.setFont("Helvetica", 8)
             
             if ceex is not None or cexf is not None:
                 if cf_pct is not None:
-                    c.drawCentredString(RIGHT_X['p_cf_30'], y_row - 3, _fmt_nota(round(cf_pct * 0.3, 1)))
+                    c.drawCentredString(_rx['p_cf_30'], y_row - 3, _fmt_nota(round(cf_pct * 0.3, 1)))
                 if ceex is not None:
-                    c.drawCentredString(RIGHT_X['ceex'], y_row - 3, _fmt_nota(ceex, ints_only=True))
-                    c.drawCentredString(RIGHT_X['p_ceex_70'], y_row - 3, _fmt_nota(round(ceex * 0.7, 1)))
+                    c.drawCentredString(_rx['ceex'], y_row - 3, _fmt_nota(ceex, ints_only=True))
+                    c.drawCentredString(_rx['p_ceex_70'], y_row - 3, _fmt_nota(round(ceex * 0.7, 1)))
                 if cexf is not None:
                     c.setFont("Helvetica-Bold", 8)
-                    c.drawCentredString(RIGHT_X['cexf'], y_row - 3, _fmt_nota(cexf, ints_only=True))
+                    c.drawCentredString(_rx['cexf'], y_row - 3, _fmt_nota(cexf, ints_only=True))
                     c.setFont("Helvetica", 8)
             
             if ce is not None or esp_final is not None:
                 if cf is not None:
-                    c.drawCentredString(RIGHT_X['esp_cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
+                    c.drawCentredString(_rx['esp_cf'], y_row - 3, _fmt_nota(cf, ints_only=True))
                 if ce is not None:
-                    c.drawCentredString(RIGHT_X['esp_ce'], y_row - 3, _fmt_nota(ce, ints_only=True))
+                    c.drawCentredString(_rx['esp_ce'], y_row - 3, _fmt_nota(ce, ints_only=True))
         
         # A/R por asignatura
         nota_final = None
@@ -1071,9 +1101,9 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             # La tabla oficial MINERD muestra la NOTA FINAL en la columna A o R
             # (ej: A=76, A=74, R=69), no una marca.
             if nota_final >= 70:
-                c.drawCentredString(RIGHT_X['A'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
+                c.drawCentredString(_rx['A'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
             else:
-                c.drawCentredString(RIGHT_X['R'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
+                c.drawCentredString(_rx['R'], y_row - 3, _fmt_nota(nota_final, ints_only=True))
     
     # ── Resumen de asistencia ──────────────────────────────────────────
     #

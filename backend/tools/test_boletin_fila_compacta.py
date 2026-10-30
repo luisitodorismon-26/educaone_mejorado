@@ -115,4 +115,52 @@ for g, gn in ((4, '4to'), (5, '5to'), (6, '6to')):
        all(abs(a - b) < 0.02 for a, b in zip(rgb, geo['color'])), (rgb, geo['color']))
     pc.get_pixmap(dpi=72, clip=pymupdf.Rect(30, 300, W - 10, 470)).save(os.path.join(OUT, '%s_100pct.png' % gn))
     pc.get_pixmap(dpi=300, clip=pymupdf.Rect(30, 395, 520, 445)).save(os.path.join(OUT, '%s_300dpi_detalle.png' % gn))
+# Centrado de Música en las casillas REALES de cada plantilla, con valores que
+# detectan cruces y columnas intercambiadas: 0, 9, 70, 99, 100 y decimales.
+PER = [0, 9, 70, 99, 100, 85.5, 72.3, 64.8, 55, 81, 92.5, 66, 77, 88, 33.3, 44]
+PCS = [98.5, 90.3, 61.5, 50.8]
+COLS = (['P%d-C%d' % (p_, c_) for c_ in (1, 2, 3, 4) for p_ in (1, 2, 3, 4)] + ['PC1', 'PC2', 'PC3', 'PC4', 'CF']
+        + ['50%CF', 'CEC', '50%CEC', 'CCF', '30%CF', 'CEEX', '70%CEEX', 'CEXF', 'ESP-CF', 'ESP-CE', 'A', 'R'])
+for gn in ('4to', '5to', '6to'):
+    curso = Obj(grado=Obj(nombre='%s Secundaria' % gn), seccion='A', nombre='A', tanda=None, tutor=None,
+                nivel='secundaria')
+    for nf in (100, 9):
+        mus = materia('Música', 0)
+        mus['competencias'] = [Comp(c_, PER[(c_ - 1) * 4:(c_ - 1) * 4 + 4]) for c_ in (1, 2, 3, 4)]
+        mus['pc_por_periodo'] = {'pc%d' % (i + 1): v_ for i, v_ in enumerate(PCS)}
+        mus['cf'] = mus['cf_exacto'] = 97
+        mus['evaluacion_extra'] = Obj(cec=65, completiva_final=71, ceex=74, extraordinaria_final=76, ce=79,
+                                      especial_final=None, nota_final=nf)
+        d_ = califs()
+        d_[201] = mus
+        pdf = B.generar_boletin_secundaria_minerd(Obj(nombre='E', apellido='S', sigerd='', numero_orden=1),
+                                                  curso, d_).getvalue()
+        if nf == 100:
+            open(os.path.join(OUT, 'musica_centrada_%s.pdf' % gn), 'wb').write(pdf)
+        pag = pymupdf.open(stream=pdf, filetype='pdf')[1]
+        v = B.FILA_COMPACTA_GEOMETRIA['Boletin-%s-grado-NS.pdf' % gn]['verticales']
+        cas = [(v[i], v[i + 1]) for i in range(2, len(v) - 1)]
+        esp = [(COLS[(c_ - 1) * 4 + p_ - 1], B._fmt_nota(PER[(c_ - 1) * 4 + p_ - 1]))
+               for c_ in (1, 2, 3, 4) for p_ in (1, 2, 3, 4)]
+        esp += [('PC%d' % (i + 1), B._fmt_nota(v_)) for i, v_ in enumerate(PCS)]
+        esp += [('CF', '97'), ('50%CF', '48.5'), ('CEC', '65'), ('50%CEC', '32.5'), ('CCF', '71'), ('30%CF', '29.1'),
+                ('CEEX', '74'), ('70%CEEX', '51.8'), ('CEXF', '76'), ('ESP-CF', '97'), ('ESP-CE', '79'),
+                (('A', str(nf)) if nf >= 70 else ('R', str(nf)))]
+        fila_w = [w for w in pag.get_text('words') if 416.9 <= (w[1] + w[3]) / 2 <= 432.4 and w[0] > 163]
+        malos = []
+        for col, txt in esp:
+            x0c, x1c = cas[COLS.index(col)]
+            cand = [w for w in fila_w if w[4] == txt and x0c <= (w[0] + w[2]) / 2 < x1c]
+            if len(cand) != 1:
+                malos.append('%s=%s no está en su casilla' % (col, txt))
+                continue
+            w = cand[0]
+            if abs((w[0] + w[2]) / 2 - (x0c + x1c) / 2) > 0.3 or min(w[0] - x0c, x1c - w[2]) < 1.0:
+                malos.append('%s=%s desvío %.2f margen %.2f' % (col, txt, (w[0] + w[2]) / 2 - (x0c + x1c) / 2,
+                                                                min(w[0] - x0c, x1c - w[2])))
+        ck('%s (condición %d): los %d valores de Música centrados en su casilla, sin cruces' % (gn, nf, len(esp)),
+           not malos and len(fila_w) == len(esp), (malos, len(fila_w)))
+        nom = [w for w in pag.get_text('words') if 416.9 <= (w[1] + w[3]) / 2 <= 432.4 and w[0] < 163]
+        ck('%s (condición %d): el nombre Música sigue alineado a la izquierda' % (gn, nf),
+           len(nom) == 1 and nom[0][4] == 'Música' and abs(nom[0][0] - B.SO_NOMBRE_X) < 0.5, nom)
 print('\n%d PASARON / %d FALLARON' % (OKS, len(MAL)))
