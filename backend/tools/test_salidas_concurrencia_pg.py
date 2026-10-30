@@ -1,7 +1,8 @@
 """SALIDAS-MIXTAS — concurrencia REAL en PostgreSQL al configurar componentes.
 
 Peticiones simultáneas (hilos con su propio TestClient, cada uno con su sesión
-y su bucle de eventos) contra una base PostgreSQL AISLADA y desechable:
+y su bucle de eventos) contra una base PostgreSQL TEMPORAL creada por la propia
+prueba:
 
   1. el mismo componente varias veces a la vez  -> 1 vínculo y 1 asignatura;
   2. componentes distintos que juntos superan la capacidad -> nunca más de 2
@@ -15,44 +16,189 @@ test). Se ejecuta dos veces:
     lo que demuestra que el test detecta la carrera;
   * con el bloqueo (el código real): ninguna violación.
 
+SEGURIDAD DE LA BASE
+--------------------
+Que el servidor sea local no basta: en local también hay bases con datos. Por
+eso la prueba NUNCA trabaja sobre una base que no haya creado ella misma:
+
+  * `EO_PG_TEST_SERVER` es solo la conexión de administración a un servidor
+    local (127.0.0.1/localhost). En esa base no se crea ni se borra nada.
+  * La prueba crea su propia base con un nombre único (`eo_tmp_salidas_<hex>`)
+    y la marca con un comentario que lleva un token aleatorio de esta ejecución.
+  * Antes de crear una sola tabla, `verificar_base_temporal` exige que la base
+    conectada sea exactamente esa, que lleve ese token y que esté vacía. Si no,
+    se aborta sin tocar nada. No hay `drop_all`.
+  * La misma comprobación se ejecuta primero contra una base ordinaria (la de
+    administración, o la de `EO_PG_TEST_ORDINARIA` si se indica) y debe
+    rechazarla sin modificarla.
+  * Al terminar se elimina ÚNICAMENTE la base temporal, tras volver a verificar
+    su nombre y su token.
+
 Uso (desde backend/):
-    EO_PG_TEST_URL=postgresql://usuario@127.0.0.1:PUERTO/base \\
+    EO_PG_TEST_SERVER=postgresql://usuario@127.0.0.1:PUERTO/postgres \\
         python tools/test_salidas_concurrencia_pg.py
-Se niega a ejecutarse si la URL no es de 127.0.0.1/localhost.
 """
+import atexit
 import datetime as dt
 import os
 import sys
 import threading
 import time
-from urllib.parse import urlparse
+import uuid
+from urllib.parse import urlparse, urlunparse
 
-URL = os.environ.get('EO_PG_TEST_URL', '')
-_u = urlparse(URL)
-if not URL.startswith('postgresql') or _u.hostname not in ('127.0.0.1', 'localhost'):
-    print('EO_PG_TEST_URL debe ser un PostgreSQL local y aislado (127.0.0.1/localhost).')
+import psycopg2
+from psycopg2 import sql
+
+SERVIDOR = os.environ.get('EO_PG_TEST_SERVER', '')
+_u = urlparse(SERVIDOR)
+if not SERVIDOR.startswith('postgresql') or _u.hostname not in ('127.0.0.1', 'localhost'):
+    print('EO_PG_TEST_SERVER debe ser la conexión de administración a un PostgreSQL local '
+          '(127.0.0.1/localhost).')
     sys.exit(2)
-os.environ['DATABASE_URL'] = URL
 
-BK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, BK)
-from database import engine, SessionLocal
-assert engine.url.host in ('127.0.0.1', 'localhost'), engine.url
-import models as M
-import app as APP
-import salida_optativa_docente as DOC
-from fastapi.testclient import TestClient
-from auth import create_token
-
-M.Base.metadata.drop_all(bind=engine)
-M.Base.metadata.create_all(bind=engine)
-
+PREFIJO = 'eo_tmp_salidas_'
+NOMBRE = PREFIJO + uuid.uuid4().hex[:16]
+TOKEN = 'eo-test-temporal:' + uuid.uuid4().hex
 OK, MAL = [], []
 
 
 def check(nombre, cond, detalle=''):
     (OK if cond else MAL).append(nombre)
     print('  %s %s %s' % ('PASA ' if cond else 'FALLA', nombre, '' if cond else str(detalle)[:400]))
+
+
+def _admin():
+    cn = psycopg2.connect(SERVIDOR)
+    cn.autocommit = True
+    return cn
+
+
+def _url_de(base):
+    return urlunparse(_u._replace(path='/' + base))
+
+
+class BaseNoTemporal(RuntimeError):
+    pass
+
+
+def verificar_base_temporal(cn, nombre, token):
+    """Aborta si la conexión `cn` no es la base temporal vacía de ESTA ejecución.
+
+    Solo lee: current_database(), el comentario de la base y si hay tablas.
+    """
+    cur = cn.cursor()
+    cur.execute("SELECT current_database()")
+    actual = cur.fetchone()[0]
+    if actual != nombre or not actual.startswith(PREFIJO):
+        raise BaseNoTemporal('la base conectada es %r, no la temporal %r' % (actual, nombre))
+    cur.execute("SELECT shobj_description(oid, 'pg_database') FROM pg_database "
+                "WHERE datname = current_database()")
+    marca = cur.fetchone()[0]
+    if marca != token:
+        raise BaseNoTemporal('la base %r no lleva el token de esta ejecución' % actual)
+    cur.execute("SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')")
+    if cur.fetchone()[0]:
+        raise BaseNoTemporal('la base %r no está vacía' % actual)
+
+
+def _resumen(cn):
+    """Huella de una base para comprobar que no cambió: tablas y filas por tabla."""
+    cur = cn.cursor()
+    cur.execute("SELECT table_schema, table_name FROM information_schema.tables "
+                "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY 1, 2")
+    tablas = cur.fetchall()
+    filas = []
+    for esq, tab in tablas:
+        cur.execute(sql.SQL('SELECT count(*) FROM {}.{}').format(sql.Identifier(esq), sql.Identifier(tab)))
+        filas.append(cur.fetchone()[0])
+    return list(zip(tablas, filas))
+
+
+print('\n=== SEGURIDAD: una base ordinaria se rechaza antes de modificarla ===')
+ORDINARIA = os.environ.get('EO_PG_TEST_ORDINARIA') or SERVIDOR
+_uo = urlparse(ORDINARIA)
+if _uo.hostname not in ('127.0.0.1', 'localhost'):
+    print('EO_PG_TEST_ORDINARIA debe ser local.')
+    sys.exit(2)
+cn_ord = psycopg2.connect(ORDINARIA)
+antes = _resumen(cn_ord)
+try:
+    verificar_base_temporal(cn_ord, NOMBRE, TOKEN)
+    rechazada = False
+except BaseNoTemporal as e:
+    rechazada = True
+    print('    rechazo:', e)
+despues = _resumen(cn_ord)
+cn_ord.close()
+check('una base ordinaria (%s) se rechaza' % _uo.path.lstrip('/'), rechazada)
+check('la base ordinaria queda idéntica (%d tablas, mismas filas)' % len(antes), antes == despues,
+      (antes, despues))
+
+print('\n=== Base temporal de esta ejecución ===')
+_cn = _admin()
+_cur = _cn.cursor()
+_cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", [NOMBRE])
+if _cur.fetchone():
+    print('Ya existe una base %r: no se toca.' % NOMBRE)
+    sys.exit(2)
+_cur.execute(sql.SQL('CREATE DATABASE {}').format(sql.Identifier(NOMBRE)))
+_cur.execute(sql.SQL('COMMENT ON DATABASE {} IS {}').format(sql.Identifier(NOMBRE), sql.Literal(TOKEN)))
+_cn.close()
+print('    creada %s' % NOMBRE)
+
+
+def _eliminar_temporal():
+    """Borra SOLO la base temporal, tras comprobar de nuevo nombre y token."""
+    try:
+        engine.dispose()
+    except Exception:
+        pass
+    cn = _admin()
+    cur = cn.cursor()
+    cur.execute("SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s", [NOMBRE])
+    fila = cur.fetchone()
+    if fila is None:
+        cn.close()
+        return
+    if not NOMBRE.startswith(PREFIJO) or fila[0] != TOKEN:
+        print('NO se elimina %r: su marca no coincide.' % NOMBRE)
+        cn.close()
+        return
+    cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()", [NOMBRE])
+    cur.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(NOMBRE)))
+    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", [NOMBRE])
+    print('    base temporal %s %s' % (NOMBRE, 'ELIMINADA' if cur.fetchone() is None else 'NO SE PUDO ELIMINAR'))
+    cn.close()
+
+
+engine = None
+atexit.register(_eliminar_temporal)
+
+_cn = psycopg2.connect(_url_de(NOMBRE))
+try:
+    verificar_base_temporal(_cn, NOMBRE, TOKEN)
+except BaseNoTemporal as e:
+    print('ABORTADO antes de crear tablas:', e)
+    sys.exit(2)
+finally:
+    _cn.close()
+check('la base temporal es la creada por esta ejecución, con su token y vacía', True)
+
+os.environ['DATABASE_URL'] = _url_de(NOMBRE)
+BK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BK)
+from database import engine, SessionLocal  # noqa: E402
+assert engine.url.database == NOMBRE and engine.url.host in ('127.0.0.1', 'localhost'), engine.url
+import models as M  # noqa: E402
+import app as APP  # noqa: E402
+import salida_optativa_docente as DOC  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from auth import create_token  # noqa: E402
+
+M.Base.metadata.create_all(bind=engine)
 
 
 db = SessionLocal()

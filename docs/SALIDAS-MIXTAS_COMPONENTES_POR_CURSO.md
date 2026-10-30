@@ -82,7 +82,11 @@ pendiente de una solución para los documentos.
 
 - `tools/test_salidas_mixtas_4to.py`: configuración, duplicados, mismo maestro, documentos completos,
   3 componentes y un curso de una sola salida.
-- `tools/test_salidas_concurrencia_pg.py`: concurrencia real en PostgreSQL aislado (`EO_PG_TEST_URL`).
-  Se ejecuta primero sin bloqueo, como control que debe mostrar la carrera, y después con el código real.
+- `tools/test_salidas_concurrencia_pg.py`: concurrencia real en PostgreSQL. Recibe solo la conexión de
+  administración a un servidor local (`EO_PG_TEST_SERVER`) y trabaja en una base temporal que crea ella
+  misma, con nombre único y un token propio. Antes de crear tablas verifica que la base conectada es esa
+  y que está vacía; además comprueba que una base ordinaria se rechaza sin modificarla. Al terminar
+  elimina solo esa base. Se ejecuta primero sin bloqueo, como control que debe mostrar la carrera, y
+  después con el código real.
 - `tools/test_salida_optativa_r34.py` §D3: ahora elige explícitamente la asignatura existente en vez de
   crear otra.
