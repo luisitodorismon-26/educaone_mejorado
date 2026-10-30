@@ -44,7 +44,8 @@ El orden es el **slot del catálogo** en todos los espacios:
 | Asistencia, bloques 1 y 2 (págs. 56–65) | Mismo orden; el rótulo «SALIDA OPTATIVA» es la salida **del componente**; los nombres largos se achican, ya no se cortan |
 | Acta, págs. 225–226 | SO1/SO2 en el mismo orden (`curso_info['salida_optativa_slots']`); antes un componente de otra salida no aparecía |
 | Boletín, filas SO1/SO2 | Mismo orden, con el nombre completo ajustado a la celda; las optativas van antes que las materias extra del colegio, que solo ocupan filas libres |
-| Boletín, materia con notas sin fila | Ya no se descarta: el boletín individual y el lote responden **409 `boletin_sin_fila`** con la materia y los estudiantes afectados. Pasa en 4to–6to cuando las dos filas están ocupadas, y en 1ro–3ro con una segunda materia extra |
+| Boletín, Música (u otra materia del colegio) con las dos optativas | **Fila compacta propia** bajo la tabla (416.9–432.4, 15.5 pt), con sus 16 notas, PC1–PC4, CF y la condición A/R de siempre. Las dos filas optativas no cambian y el boletín sigue teniendo dos páginas. Se dibuja con la cuadrícula y el color de la plantilla de cada grado, porque las columnas de 5to van ~3.6 pt a la derecha y su plantilla es rosa. No tapa ni desplaza asistencia, leyenda, situación ni firmas, que empiezan en 434.2. Solo se usa en ese caso: los boletines que ya cabían no cambian |
+| Boletín, materias con notas que aun así no caben | Ya no se descartan: el boletín individual y el lote responden **409 `boletin_sin_fila`** con las materias y los estudiantes afectados. Pasa en 4to–6to con dos o más materias del colegio y las dos optativas, y en 1ro–3ro con una segunda materia extra. No se recortan datos ni se añaden páginas |
 
 **Más de 2 componentes:** el registro oficial, el borrador, el boletín individual y el lote responden
 409 y nombran los componentes. Ningún documento los omite en silencio. Su soporte completo queda
@@ -52,13 +53,9 @@ pendiente de una solución para los documentos.
 
 ## Pendiente (fuera de este cambio)
 
-- **Materias del colegio sin fila en el boletín.** La plantilla oficial de 4to–6to solo tiene dos filas
-  propias del colegio, y la de 1ro–3ro una. Darles sitio requiere decidir una de estas soluciones:
-  - añadir filas calibradas bajo la tabla, como ya se hace en 1ro–3ro con `_dibujar_fila_extra`;
-  - emitir una hoja anexa;
-  - no imprimirlas en el boletín oficial.
-
-  Ninguna se ha aplicado: mientras tanto se rechaza con un mensaje que nombra la materia.
+- **Dos o más materias del colegio junto a las dos optativas** en 4to–6to. Bajo la tabla solo cabe una
+  fila compacta. Para más haría falta otra solución (por ejemplo, la hoja adicional que se presentó como
+  alternativa B); mientras tanto se rechaza con un mensaje que nombra las materias.
 
 - El rótulo «SALIDA OPTATIVA» de la portada y de la cabecera del acta sigue siendo la salida del curso.
   Cuando hay dos salidas, Dirección debe decidir qué figura ahí. Opciones, generadas con el código real
@@ -82,6 +79,9 @@ pendiente de una solución para los documentos.
 
 - `tools/test_salidas_mixtas_4to.py`: configuración, duplicados, mismo maestro, documentos completos,
   3 componentes y un curso de una sola salida.
+- `tools/test_boletin_fila_compacta.py`: fila compacta en 4to, 5to y 6to con el generador real. Fuera de
+  la fila, el boletín es idéntico píxel a píxel al mismo sin Música. Comprueba las notas, PC, CF y A/R,
+  la cuadrícula y el color de cada plantilla.
 - `tools/test_salidas_concurrencia_pg.py`: concurrencia real en PostgreSQL. Recibe solo la conexión de
   administración a un servidor local (`EO_PG_TEST_SERVER`) y trabaja en una base temporal que crea ella
   misma, con nombre único y un token propio. Antes de crear tablas verifica que la base conectada es esa

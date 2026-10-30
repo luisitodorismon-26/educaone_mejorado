@@ -215,6 +215,49 @@ ASIST_Y_SEGUNDO    = {'p1': 492, 'p2': 517, 'p3': 542, 'p4': 567}
 SO_NOMBRE_X = 67
 SO_NOMBRE_ANCHO = 93
 SO_CELDA_Y = {'SALIDA OPTATIVA 1': (366.3, 391.6), 'SALIDA OPTATIVA 2': (391.6, 416.9)}
+
+# SALIDAS-MIXTAS — FILA COMPACTA bajo la tabla (4to-6to). Solo se usa cuando las
+# dos filas de Salida Optativa están ocupadas por los componentes optativos y
+# queda UNA materia del colegio con notas (p. ej. Música). Medido sobre las tres
+# plantillas: la tabla termina en y≈416.8-416.9 y lo siguiente —los recuadros
+# de RESUMEN DE ASISTENCIA, LEYENDA y SITUACIÓN— empieza en y=434.2. La fila
+# ocupa 416.9-432.4 (15.5 pt) y deja 1.8 pt libres: no tapa ni desplaza nada.
+# Las columnas y el color NO son idénticos entre plantillas (5to va ~3.6 pt a
+# la derecha y es rosa), así que la cuadrícula se guarda por archivo, con las
+# verticales, los fondos y el color reales de la fila SO2 de cada uno.
+FILA_COMPACTA = 'FILA COMPACTA'
+FILA_COMPACTA_Y1 = 432.4
+SO_CELDA_Y[FILA_COMPACTA] = (416.9, FILA_COMPACTA_Y1)
+FILA_COMPACTA_GEOMETRIA = {
+    'Boletin-4to-grado-NS.pdf': {
+        'y0': 416.9,
+        'color': (0.819, 0.918, 0.934),     # azul de la plantilla de 4to
+        'verticales': [36.4, 63.0, 163.4, 188.7, 214.0, 239.3, 264.6, 289.9, 315.2, 340.5, 365.8, 391.1,
+                       416.4, 441.7, 467.0, 492.4, 517.7, 543.0, 568.3, 592.3, 616.3, 640.3, 664.3, 688.3,
+                       712.3, 736.3, 760.3, 784.3, 808.3, 832.3, 856.3, 880.3, 904.3, 931.7, 959.9, 988.2],
+        'fondos': [(36.4, 63.0), (664.3, 688.3), (760.3, 784.3), (856.3, 880.3), (904.3, 931.7)],
+    },
+    'Boletin-5to-grado-NS.pdf': {
+        'y0': 416.8,
+        'color': (0.982, 0.852, 0.881),     # rosa de la plantilla de 5to
+        'verticales': [36.4, 63.0, 167.0, 192.3, 217.6, 242.9, 268.2, 293.5, 318.8, 344.1, 369.4, 394.7,
+                       420.0, 445.3, 470.6, 496.0, 521.3, 546.6, 571.9, 595.9, 619.9, 643.9, 667.9, 691.9,
+                       715.9, 739.9, 763.9, 787.9, 811.9, 835.9, 859.9, 883.9, 907.9, 934.6, 962.8, 991.1],
+        'fondos': [(36.4, 63.0), (667.9, 691.9), (763.9, 787.9), (859.9, 883.9), (907.9, 934.6)],
+    },
+    'Boletin-6to-grado-NS.pdf': {
+        'y0': 416.8,
+        'color': (0.918, 0.966, 0.997),     # celeste de la plantilla de 6to
+        'verticales': [36.4, 63.0, 164.2, 189.5, 214.8, 240.1, 265.4, 290.7, 316.0, 341.3, 366.6, 391.9,
+                       417.2, 442.5, 467.8, 493.1, 518.4, 543.7, 569.0, 593.0, 617.0, 641.0, 665.0, 689.0,
+                       713.0, 737.0, 761.0, 785.0, 809.0, 833.0, 857.0, 881.0, 905.0, 934.9, 963.2, 991.4],
+        'fondos': [(36.4, 63.0), (665.0, 689.0), (761.0, 785.0), (857.0, 881.0), (905.0, 934.9)],
+    },
+}
+# Línea base de las notas: el generador escribe en `row_y + 3` (desde arriba).
+# Con row_y = centro + 0.2 la línea base queda en centro + 3.2, igual que en
+# las filas oficiales respecto a su celda.
+ROW_Y_FILA_COMPACTA = (416.9 + FILA_COMPACTA_Y1) / 2 + 0.2
 SITUACION_Y_SEGUNDO = 446
 CONDICION_FINAL_Y_SEGUNDO = 504
 
@@ -258,7 +301,7 @@ CELDAS_VERDES_X = [(661.0, 685.0), (757.1, 781.1), (853.1, 877.1), (905.8, 934.6
 CELDA_VERDE_COLOR = (0.919, 0.948, 0.847)
 
 
-def _lineas_nombre_optativa(nombre: str):
+def _lineas_nombre_optativa(nombre: str, etiqueta: str = 'SALIDA OPTATIVA 1'):
     """(tamaño, [líneas]) para que `nombre` quepa ENTERO en la celda.
 
     Prueba de 7.5 pt hacia abajo, partiendo solo por espacios, y se queda con
@@ -269,7 +312,7 @@ def _lineas_nombre_optativa(nombre: str):
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
     palabras = (nombre or '').split()
-    alto = SO_CELDA_Y['SALIDA OPTATIVA 1'][1] - SO_CELDA_Y['SALIDA OPTATIVA 1'][0] - 2
+    alto = SO_CELDA_Y[etiqueta][1] - SO_CELDA_Y[etiqueta][0] - 2
     tam = 7.5
     while True:
         lineas, actual = [], ''
@@ -292,7 +335,7 @@ def _lineas_nombre_optativa(nombre: str):
 def _dibujar_nombre_optativa(c, etiqueta: str, nombre: str) -> None:
     """Nombre completo del componente, centrado en vertical en su celda."""
     y0, y1 = SO_CELDA_Y[etiqueta]
-    tam, lineas = _lineas_nombre_optativa(nombre)
+    tam, lineas = _lineas_nombre_optativa(nombre, etiqueta)
     interlineado = tam + 1.2
     alto_bloque = interlineado * (len(lineas) - 1) + tam * 0.72
     base = (y0 + y1) / 2 - alto_bloque / 2 + tam * 0.72
@@ -334,7 +377,33 @@ def _filas_salida_optativa(calificaciones_por_asig: dict, row_y_map: dict) -> di
         if not libres:
             break
         filas[k] = libres.pop(0)
+    # FILA COMPACTA: solo si las DOS filas son de componentes optativos y queda
+    # exactamente UNA materia del colegio. Con más de una no se coloca ninguna:
+    # `materias_sin_fila` las nombra todas y el boletín no se emite.
+    sin_fila = [k for k in fuera if k not in filas]
+    if (len(sin_fila) == 1 and not libres
+            and all(calificaciones_por_asig[k].get('es_salida_optativa') for k in filas)):
+        filas[sin_fila[0]] = FILA_COMPACTA
     return filas
+
+
+def _dibujar_fila_compacta(c, curso) -> None:
+    """Cuadrícula de la FILA COMPACTA con la geometría de la plantilla del curso."""
+    geo = FILA_COMPACTA_GEOMETRIA.get(os.path.basename(_get_plantilla_path(curso)),
+                                      FILA_COMPACTA_GEOMETRIA['Boletin-6to-grado-NS.pdf'])
+    y0, y1 = geo['y0'], FILA_COMPACTA_Y1
+    c.saveState()
+    c.setFillColorRGB(*geo['color'])
+    for x0, x1 in geo['fondos']:
+        c.rect(x0, _y(y1), x1 - x0, y1 - y0, fill=1, stroke=0)
+    c.setLineWidth(0.5)
+    c.setStrokeColorRGB(0.2, 0.2, 0.2)
+    c.line(geo['verticales'][0], _y(y1), geo['verticales'][-1], _y(y1))
+    for x in geo['verticales']:
+        if x == 63.0:
+            continue        # la celda del nombre va unida, de 36.4 a la primera columna de notas
+        c.line(x, _y(y0), x, _y(y1))
+    c.restoreState()
 
 
 class MateriasSinFila(Exception):
@@ -350,8 +419,9 @@ def materias_sin_fila(curso, calificaciones_por_asig: dict) -> list:
 
     SALIDAS-MIXTAS. La plantilla oficial no tiene filas para materias propias
     del colegio (Música, etc.):
-      * 4to-6to: solo las dos de "SALIDA OPTATIVA", que se reparten primero
-        entre los componentes optativos y después entre las materias extra
+      * 4to-6to: las dos de "SALIDA OPTATIVA", que se reparten primero entre
+        los componentes optativos y después entre las materias extra, más la
+        FILA COMPACTA cuando ambas son de optativas y queda una sola materia
         (`_filas_salida_optativa`);
       * 1ro-3ro: una fila calibrada bajo Formación Integral (`_dibujar_fila_extra`).
     Lo que no cabe antes se descartaba sin aviso. Ahora se nombra, y el
@@ -882,10 +952,16 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             etiqueta = filas_so.get(asig_id)
             if etiqueta is None:
                 continue        # sin fila libre (máximo 2, límite físico de la hoja)
-            y_row = _y(row_y_map[etiqueta])
-            if asig_data.get('es_salida_optativa'):
+            if etiqueta == FILA_COMPACTA:
+                _dibujar_fila_compacta(c, curso)
+                c.setFillColor(COLOR_DATOS)
+                y_row = _y(ROW_Y_FILA_COMPACTA)
+                _dibujar_nombre_optativa(c, etiqueta, str(asig_data.get('asignatura_nombre', '')))
+            elif asig_data.get('es_salida_optativa'):
+                y_row = _y(row_y_map[etiqueta])
                 _dibujar_nombre_optativa(c, etiqueta, str(asig_data.get('asignatura_nombre', '')))
             else:
+                y_row = _y(row_y_map[etiqueta])
                 # Materia extra del colegio: igual que siempre.
                 c.setFont("Helvetica-Bold", 7.5)
                 c.drawString(67, y_row - 3, str(asig_data.get('asignatura_nombre', ''))[:26])

@@ -469,22 +469,56 @@ def filas_boletin(pdf_bytes, pagina=1):
     return doc, out
 
 
+def fila_compacta(pdf_bytes, pagina=1):
+    """(nombre, CF) de la FILA COMPACTA bajo la tabla, o ('', '') si no hay."""
+    p = pymupdf.open(stream=pdf_bytes, filetype='pdf')[pagina]
+    ws = [w for w in p.get_text('words') if 416.9 <= (w[1] + w[3]) / 2 <= 432.4 and w[0] >= 63]
+    return (' '.join(w[4] for w in ws if w[0] < 163), ' '.join(w[4] for w in ws if 660 < w[0] < 690))
+
+
 # Música (materia extra del colegio) con notas para el estudiante 1.
 for comp in (1, 2, 3, 4):
     add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=EA[0].id, asignatura_id=musica.id,
                                  ano_escolar_id=ano.id, competencia_numero=comp, p1=95, p2=95, p3=95, p4=95))
 db.commit()
 r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % EA[0].id, headers=HD)
+check('D6a con Música y las 2 optativas: 200 PDF (fila compacta)', r.status_code == 200 and r.content[:4] == b'%PDF',
+      r.text[:300])
+if r.status_code == 200:
+    guardar('boletin_4toA_estudiante1_con_musica.pdf', r.content)
+    _, f = filas_boletin(r.content)
+    check('D6b las dos filas SO siguen siendo las optativas (CF 66 y 77)',
+          f['SO1'][0].startswith('Apreciación') and f['SO1'][1] == '66'
+          and f['SO2'][0].startswith('Filosofía') and f['SO2'][1] == '77', f)
+    check('D6c Música en su fila compacta, con CF 95', fila_compacta(r.content) == ('Música', '95'),
+          fila_compacta(r.content))
+r = c.get('/api/boletines/curso/%d/pdf-minerd-v2' % A.id, headers=HD)
+check('D6d lote de 4to A: 200 PDF con los 3 estudiantes (6 páginas)',
+      r.status_code == 200 and len(pymupdf.open(stream=r.content, filetype='pdf')) == 2 * len(EA),
+      (r.status_code, r.text[:200]))
+if r.status_code == 200:
+    guardar('boletines_4toA_lote_con_musica.pdf', r.content)
+    comp = [fila_compacta(r.content, 2 * k + 1) for k in range(len(EA))]
+    check('D6e lote: Música solo en el estudiante que la tiene; los demás sin fila compacta',
+          comp == [('Música', '95'), ('', ''), ('', '')], comp)
+# Dos materias del colegio con las dos optativas: no caben; se nombran y no se emite.
+coro = add(M.Asignatura(colegio_id=col.id, nombre='Coro', codigo='CORO'))
+for comp_ in (1, 2, 3, 4):
+    add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=EA[0].id, asignatura_id=coro.id,
+                                 ano_escolar_id=ano.id, competencia_numero=comp_, p1=80, p2=80, p3=80, p4=80))
+db.commit()
+r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % EA[0].id, headers=HD)
 js = r.json() if 'json' in r.headers.get('content-type', '') else {}
-check('D6a con Música y las 2 filas ocupadas: 409 boletin_sin_fila que nombra Música, sin PDF',
-      r.status_code == 409 and js.get('motivo') == 'boletin_sin_fila' and js.get('materias') == ['Música'],
+check('D6f Música + Coro + 2 optativas: 409 que nombra AMBAS, sin PDF',
+      r.status_code == 409 and js.get('motivo') == 'boletin_sin_fila' and sorted(js.get('materias', [])) == ['Coro', 'Música'],
       (r.status_code, r.text[:300]))
 r = c.get('/api/boletines/curso/%d/pdf-minerd-v2' % A.id, headers=HD)
 js = r.json() if 'json' in r.headers.get('content-type', '') else {}
-check('D6b el lote tampoco se emite y nombra al estudiante afectado',
-      r.status_code == 409 and js.get('motivo') == 'boletin_sin_fila'
-      and [x['estudiante'] for x in js.get('estudiantes', [])] == [EA[0].nombre_completo],
+check('D6g el lote tampoco se emite y nombra al estudiante afectado',
+      r.status_code == 409 and [x['estudiante'] for x in js.get('estudiantes', [])] == [EA[0].nombre_completo],
       (r.status_code, r.text[:300]))
+db.query(M.CalificacionSecundaria).filter_by(estudiante_id=EA[0].id, asignatura_id=coro.id).delete()
+db.commit()
 # Sin Música en ese curso, el boletín sale normal.
 db.query(M.CalificacionSecundaria).filter_by(estudiante_id=EA[0].id, asignatura_id=musica.id).delete()
 db.commit()
@@ -572,6 +606,56 @@ js = r.json() if 'json' in r.headers.get('content-type', '') else {}
 check('D9d 1ro con dos materias extra: 409 que nombra la que no cabe, sin PDF',
       r.status_code == 409 and js.get('motivo') == 'boletin_sin_fila' and len(js.get('materias', [])) == 1
       and js['materias'][0] in ('Música', 'Robótica'), (r.status_code, r.text[:300]))
+
+# 5to y 6to: dos componentes de salidas distintas + Música, individual y lote.
+for gn, orden, cods in (('5to', 5, ('HLM-LE-5', 'HCS-CS-5')), ('6to', 6, ('HLM-LE-6', 'HCS-CS-6'))):
+    gX = add(M.Grado(colegio_id=col.id, nombre='%s Secundaria' % gn, nivel='secundaria', orden=orden, activo=True))
+    cX = add(M.Curso(colegio_id=col.id, nombre='A', grado_id=gX.id, tanda_id=tanda.id, ano_escolar_id=ano.id,
+                     activo=True))
+    add(M.AsignacionProfesor(colegio_id=col.id, profesor_id=julio.id, curso_id=cX.id, asignatura_id=lengua.id,
+                             ano_escolar_id=ano.id, activo=True, es_titular=True))
+    db.commit()
+    EX = estudiantes(cX, gn[0])
+    db.commit()
+    r1 = put(cX, {'salida_optativa_codigo': 'HLM', 'profesores': {cods[0]: julio.id}})
+    r2 = post(cX, {'componente_codigo': cods[1], 'profesor_id': rosana.id})
+    check('%s-1 %s con Julio y %s con Rosana' % (gn, cods[0], cods[1]),
+          r1.status_code == 200 and r2.status_code == 200, (r1.text[:150], r2.text[:150]))
+    mX = mapeos(cX)
+    for k, e in enumerate(EX):
+        notas = [(lengua.id, 80 + k), (mX[cods[0]], 62 + k), (mX[cods[1]], 72 + k)]
+        if k < 2:
+            notas.append((musica.id, 90 + k))     # Música para los dos primeros
+        for asig, v in notas:
+            for comp_ in (1, 2, 3, 4):
+                add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=e.id, asignatura_id=asig,
+                                             ano_escolar_id=ano.id, competencia_numero=comp_,
+                                             p1=v, p2=v, p3=v, p4=v))
+    db.commit()
+    for k, e in enumerate(EX):
+        r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % e.id, headers=HD)
+        ok = r.status_code == 200 and r.content[:4] == b'%PDF'
+        f = filas_boletin(r.content)[1] if ok else {}
+        fc = fila_compacta(r.content) if ok else None
+        esperado_fc = ('Música', str(90 + k)) if k < 2 else ('', '')
+        check('%s-2 individual estudiante %d: SO1 CF %d, SO2 CF %d, fila compacta %s' % (gn, k + 1, 62 + k, 72 + k, esperado_fc),
+              ok and f['SO1'][1] == str(62 + k) and f['SO2'][1] == str(72 + k) and fc == esperado_fc,
+              (r.status_code, f, fc))
+        if ok and k == 0:
+            guardar('boletin_%s_estudiante1_con_musica.pdf' % gn, r.content)
+    r = c.get('/api/boletines/curso/%d/pdf-minerd-v2' % cX.id, headers=HD)
+    ok = r.status_code == 200 and r.content[:4] == b'%PDF'
+    n_pag = len(pymupdf.open(stream=r.content, filetype='pdf')) if ok else 0
+    check('%s-3 lote: 200 con los %d estudiantes (%d páginas)' % (gn, len(EX), 2 * len(EX)),
+          ok and n_pag == 2 * len(EX), (r.status_code, n_pag, r.text[:150] if not ok else ''))
+    if ok:
+        guardar('boletines_%s_lote_con_musica.pdf' % gn, r.content)
+        comp = [fila_compacta(r.content, 2 * k + 1) for k in range(len(EX))]
+        so = [filas_boletin(r.content, 2 * k + 1)[1] for k in range(len(EX))]
+        check('%s-4 lote: ninguna materia fuera (optativas en SO1/SO2, Música donde corresponde)' % gn,
+              comp == [('Música', '90'), ('Música', '91'), ('', '')]
+              and [(x['SO1'][1], x['SO2'][1]) for x in so] == [(str(62 + k), str(72 + k)) for k in range(3)],
+              (comp, so))
 
 # Tres componentes escritos por otra vía (no por la API): ningún documento.
 import salida_optativa_service as SVC

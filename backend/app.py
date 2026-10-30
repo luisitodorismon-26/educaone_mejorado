@@ -16592,9 +16592,10 @@ def _respuesta_boletin_sin_fila(por_estudiante):
     SALIDAS-MIXTAS — 409 cuando alguna materia con notas no tiene fila en la
     plantilla oficial del boletín. `por_estudiante` = [(nombre, [materias])].
 
-    La plantilla de 4to-6to solo tiene dos filas propias del colegio (las de
-    "SALIDA OPTATIVA") y la de 1ro-3ro, una calibrada. Ampliarla es una decisión
-    aparte; mientras tanto no se emite un boletín que omita notas.
+    En 4to-6to caben las dos filas de "SALIDA OPTATIVA" y, si ambas son de
+    componentes optativos, una FILA COMPACTA para una materia del colegio; en
+    1ro-3ro, una fila calibrada. Lo que no cabe ahí no se omite: no se emite el
+    boletín y se nombra.
     """
     materias = sorted({m for _, ms in por_estudiante for m in ms})
     return JSONResponse({
