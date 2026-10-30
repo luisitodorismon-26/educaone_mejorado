@@ -5848,6 +5848,7 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
         return JSONResponse({'error': 'Body inválido'}, status_code=400)
     if not isinstance(data, dict):
         return JSONResponse({'error': 'Body inválido'}, status_code=400)
+    curso = _bloquear_curso_optativas(db, curso)      # SALIDAS-MIXTAS: concurrencia
 
     grado_numero = _svc.grado_numero_de_curso(curso)
     if not _cat.grado_admite_salida(grado_numero):
@@ -6160,6 +6161,24 @@ async def guardar_salida_optativa(id, request: Request, db: Session = Depends(ge
     return _salida_optativa_estado(db, curso)
 
 
+def _bloquear_curso_optativas(db, curso):
+    """
+    SALIDAS-MIXTAS — serializa las escrituras de la Salida Optativa de UN curso.
+
+    `SELECT ... FOR UPDATE` sobre la fila del curso hasta el commit o rollback
+    de la petición. Dos peticiones simultáneas —el mismo componente dos veces,
+    o dos componentes distintos que juntos superarían la capacidad— ya no
+    pueden leer el mismo estado y escribir las dos: la segunda espera y vuelve
+    a leer lo que la primera dejó confirmado, así que la comprobación de
+    capacidad y la búsqueda del vínculo existente siempre ven la verdad.
+
+    En SQLite `FOR UPDATE` no existe y SQLAlchemy lo omite; SQLite ya serializa
+    las escrituras de toda la base.
+    """
+    return (db.query(Curso).filter(Curso.id == curso.id)
+            .with_for_update().populate_existing().one())
+
+
 def _respuesta_identidad_por_elegir(exc):
     """409 de SALIDAS-MIXTAS: el curso ya tiene asignaturas para ese componente."""
     comp = exc.componente
@@ -6213,6 +6232,7 @@ async def agregar_componente_optativo(id, request: Request, db: Session = Depend
         return JSONResponse({'error': 'Body inválido'}, status_code=400)
     if not isinstance(data, dict):
         return JSONResponse({'error': 'Body inválido'}, status_code=400)
+    curso = _bloquear_curso_optativas(db, curso)      # SALIDAS-MIXTAS: concurrencia
 
     grado_numero = _svc.grado_numero_de_curso(curso)
     if not _cat.grado_admite_salida(grado_numero):
@@ -6293,9 +6313,11 @@ async def agregar_componente_optativo(id, request: Request, db: Session = Depend
             asig_comp, _creada, correccion = _doc.resolver_identidad_calificable(
                 db, curso, comp, mapeo_actual)
         elif asignatura_id is not None:
-            # Identidad elegida por Dirección: una asignatura propia del colegio
-            # (normalmente una de las candidatas del curso) que no represente ya
-            # a otro componente. Nunca una troncal y nunca una inactiva:
+            # Identidad elegida por Dirección: SOLO una de las candidatas de ESTE
+            # componente en ESTE curso (`candidatas_identidad`). Cualquier otra
+            # asignatura —de otro componente, de otro curso o una materia propia
+            # del colegio sin relación con el componente— se rechaza aunque sea
+            # del mismo colegio. Nunca una troncal y nunca una inactiva:
             # reactivarla es una decisión aparte, en Configuración -> Asignaturas.
             asig_comp = db.query(Asignatura).filter(
                 Asignatura.id == asignatura_id,
@@ -6308,16 +6330,20 @@ async def agregar_componente_optativo(id, request: Request, db: Session = Depend
                     'error': f'{asig_comp.nombre!r} es una materia troncal del Registro y '
                              'no puede representar un componente optativo.'
                 }, status_code=400)
+            validas = {x['asignatura_id'] for x in _doc.candidatas_identidad(db, curso, comp)}
+            if asig_comp.id not in validas:
+                return JSONResponse({
+                    'error': f'La asignatura {asig_comp.nombre!r} (#{asig_comp.id}) no es una '
+                             f'identidad válida para {comp.nombre_oficial} ({comp.codigo}) en '
+                             'este curso. Solo se puede elegir una de las asignaturas que este '
+                             'curso ya usó para ese componente y que hoy no están vinculadas.',
+                    'motivo': 'identidad_no_valida',
+                    'candidatas_validas': sorted(validas),
+                }, status_code=400)
             if asig_comp.activo is False:
                 return JSONResponse({
                     'error': f'La asignatura {asig_comp.nombre!r} está inactiva. Reactívela '
                              'desde Configuración -> Asignaturas si es la del componente.'
-                }, status_code=400)
-            if db.query(CursoComponenteOptativo).filter(
-                    CursoComponenteOptativo.colegio_id == curso.colegio_id,
-                    CursoComponenteOptativo.asignatura_id == asig_comp.id).first():
-                return JSONResponse({
-                    'error': 'Esa asignatura ya representa un componente optativo.'
                 }, status_code=400)
         elif crear_nueva:
             asig_comp = _doc.crear_asignatura_dedicada(db, curso, comp)
@@ -6345,7 +6371,17 @@ async def agregar_componente_optativo(id, request: Request, db: Session = Depend
     elif mapeo_actual.asignatura_id != asig_comp.id:
         # Solo el repunte legacy de R3.4 (troncal -> dedicada) llega aquí.
         mapeo_actual.asignatura_id = asig_comp.id
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # Última línea: el bloqueo del curso ya serializa estas escrituras, pero
+        # si las únicas de la tabla saltan, no se guarda nada y se dice.
+        db.rollback()
+        return JSONResponse({
+            'error': 'Otra operación cambió los componentes de este curso al mismo '
+                     'tiempo. Recargue la configuración y vuelva a intentarlo.',
+            'motivo': 'conflicto_concurrente',
+        }, status_code=409)
 
     if profesor_id is not None:
         err = _doc.asignar_profesor(db, curso, asig_comp, profesor_id)
@@ -6392,6 +6428,7 @@ async def quitar_componente_optativo(id, componente_codigo, request: Request,
                                           resumen_historia)
 
     curso = get_tenant_or_404(db, Curso, id, current_user, name='curso')
+    curso = _bloquear_curso_optativas(db, curso)      # SALIDAS-MIXTAS: concurrencia
     mapeo = db.query(CursoComponenteOptativo).filter(
         CursoComponenteOptativo.curso_id == curso.id,
         CursoComponenteOptativo.colegio_id == curso.colegio_id,
@@ -16550,6 +16587,29 @@ def _situacion_canonica_primaria(db, current_user, estudiante, ano, precarga,
     return paquete
 
 
+def _respuesta_boletin_sin_fila(por_estudiante):
+    """
+    SALIDAS-MIXTAS — 409 cuando alguna materia con notas no tiene fila en la
+    plantilla oficial del boletín. `por_estudiante` = [(nombre, [materias])].
+
+    La plantilla de 4to-6to solo tiene dos filas propias del colegio (las de
+    "SALIDA OPTATIVA") y la de 1ro-3ro, una calibrada. Ampliarla es una decisión
+    aparte; mientras tanto no se emite un boletín que omita notas.
+    """
+    materias = sorted({m for _, ms in por_estudiante for m in ms})
+    return JSONResponse({
+        'error': ('La plantilla oficial del boletín no tiene fila para: '
+                  + ', '.join(materias)
+                  + '. Las filas que la plantilla deja para materias fuera de las áreas '
+                    'oficiales ya están ocupadas (en 4to-6to, primero por los componentes de '
+                    'Salida Optativa). No se emite el boletín para no omitir esas '
+                    'calificaciones.'),
+        'motivo': 'boletin_sin_fila',
+        'materias': materias,
+        'estudiantes': [{'estudiante': n, 'materias': ms} for n, ms in por_estudiante],
+    }, status_code=409)
+
+
 def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano):
     """Helper que arma el dict calificaciones_por_asig esperado por
     generar_boletin_secundaria_minerd, leyendo de la BD las
@@ -16604,6 +16664,9 @@ def _construir_datos_boletin_secundaria(db, estudiante, curso, current_user, ano
             'cf_exacto': cf_exacto,
             'literal': literal,
             'evaluacion_extra': extras_idx.get(asig.id),
+            # SALIDAS-MIXTAS: identidad curricular para elegir la fila oficial
+            # sin depender del nombre (ver `boletin_minerd_secundaria._fila_oficial`).
+            'area_curricular_codigo': getattr(asig, 'area_curricular_codigo', None),
         }
 
     # SALIDAS-MIXTAS: los componentes optativos del curso van a las filas de
@@ -18195,7 +18258,7 @@ async def generar_boletin_minerd_v2(
     
     v2.13.9: validaciones tempranas + mensajes específicos de error.
     """
-    from boletin_minerd_secundaria import generar_boletin_secundaria_minerd
+    from boletin_minerd_secundaria import generar_boletin_secundaria_minerd, materias_sin_fila
 
     estudiante = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
 
@@ -18266,6 +18329,12 @@ async def generar_boletin_minerd_v2(
         return JSONResponse({
             'error': f'{estudiante.nombre_completo} no tiene calificaciones completas (las 4 competencias) en ninguna asignatura. Verificá que los profesores hayan cargado todas las competencias.'
         }, status_code=400)
+
+    # SALIDAS-MIXTAS: una materia con notas sin fila en la plantilla oficial ya
+    # no se descarta en silencio.
+    _sin_fila = materias_sin_fila(curso, califs_por_asig)
+    if _sin_fila:
+        return _respuesta_boletin_sin_fila([(estudiante.nombre_completo, _sin_fila)])
     
     # ── R4-A3 · La situación sale del motor canónico ──
     #
@@ -18346,7 +18415,7 @@ async def generar_boletines_curso_minerd_v2(
     current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))
 ):
     """Boletines MINERD pixel-exacto de todo un curso (en un solo PDF, v2.13)."""
-    from boletin_minerd_secundaria import generar_boletin_secundaria_minerd
+    from boletin_minerd_secundaria import generar_boletin_secundaria_minerd, materias_sin_fila
     
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     if not _es_curso_secundaria(db, curso_id):
@@ -18412,6 +18481,7 @@ async def generar_boletines_curso_minerd_v2(
         db, current_user, _ids, ano, EvaluacionExtraSecundaria)
     _asist_idx = _asistencias_estudiantes(db, current_user, _ids, ano)
 
+    sin_fila_lote = []
     for est in estudiantes:
         try:
             califs = _construir_datos_boletin_secundaria(db, est, curso, current_user, ano)
@@ -18422,6 +18492,13 @@ async def generar_boletines_curso_minerd_v2(
             asist_anual = _asistencia_anual_boletin(db, est.id, current_user, ano)
             if not califs:
                 continue  # skip si no tiene notas cargadas
+            # SALIDAS-MIXTAS: se anota y, al final, el lote entero se rechaza.
+            # Generarlo igual dejaría fuera esas notas (o, si el generador
+            # fallara, al estudiante, con solo una cabecera X-Errores).
+            _sin_fila = materias_sin_fila(curso, califs)
+            if _sin_fila:
+                sin_fila_lote.append((est.nombre_completo, _sin_fila))
+                continue
             # ── R4-A3 · El MISMO helper que el boletín individual ──
             #
             # Antes esto era una comprensión aparte —`(cf or 0) >= 70`— con su
@@ -18452,6 +18529,9 @@ async def generar_boletines_curso_minerd_v2(
             logger.warning(f"Error generando boletín para estudiante {est.id} ({est.nombre_completo}): {e}")
             errores_individuales.append(f"{est.nombre_completo}: {type(e).__name__}")
     
+    if sin_fila_lote:
+        return _respuesta_boletin_sin_fila(sin_fila_lote)
+
     if estudiantes_incluidos == 0:
         # No se pudo generar ningún boletín
         if errores_individuales:

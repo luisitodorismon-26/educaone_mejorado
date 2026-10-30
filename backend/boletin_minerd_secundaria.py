@@ -315,7 +315,7 @@ def _filas_salida_optativa(calificaciones_por_asig: dict, row_y_map: dict) -> di
     filas = {}
     libres = list(candidatas)
     fuera = [k for k, d in calificaciones_por_asig.items()
-             if _normalizar_nombre_asignatura(d.get('asignatura_nombre', '')) not in row_y_map]
+             if _fila_oficial(d) not in row_y_map]
     optativas = sorted((k for k in fuera if calificaciones_por_asig[k].get('es_salida_optativa')),
                        key=lambda k: calificaciones_por_asig[k].get('so_orden', len(candidatas)))
     for k in optativas:
@@ -335,6 +335,36 @@ def _filas_salida_optativa(calificaciones_por_asig: dict, row_y_map: dict) -> di
             break
         filas[k] = libres.pop(0)
     return filas
+
+
+class MateriasSinFila(Exception):
+    """Hay materias con notas que la plantilla oficial no tiene dónde imprimir."""
+
+    def __init__(self, nombres):
+        super().__init__(', '.join(nombres))
+        self.nombres = list(nombres)
+
+
+def materias_sin_fila(curso, calificaciones_por_asig: dict) -> list:
+    """Nombres de las materias con notas que NO tendrían fila en el boletín.
+
+    SALIDAS-MIXTAS. La plantilla oficial no tiene filas para materias propias
+    del colegio (Música, etc.):
+      * 4to-6to: solo las dos de "SALIDA OPTATIVA", que se reparten primero
+        entre los componentes optativos y después entre las materias extra
+        (`_filas_salida_optativa`);
+      * 1ro-3ro: una fila calibrada bajo Formación Integral (`_dibujar_fila_extra`).
+    Lo que no cabe antes se descartaba sin aviso. Ahora se nombra, y el
+    boletín no se emite hasta resolverlo: imprimirlo sería omitir notas.
+    """
+    if _es_segundo_ciclo(curso):
+        filas = _filas_salida_optativa(calificaciones_por_asig, ROW_Y_SEGUNDO)
+        return [d.get('asignatura_nombre', '') for k, d in calificaciones_por_asig.items()
+                if _fila_oficial(d) not in ROW_Y_SEGUNDO
+                and k not in filas]
+    extras = [d.get('asignatura_nombre', '') for d in calificaciones_por_asig.values()
+              if _fila_oficial(d) not in ROW_Y_PRIMERO]
+    return extras[1:]
 
 
 def _dibujar_fila_extra(c, indice: int) -> float:
@@ -449,6 +479,33 @@ def _normalizar_nombre_asignatura(nombre: str) -> str:
         'humana y religiosa': 'Formación Integral Humana y Religiosa',
     }
     return mapeo.get(n, nombre)  # si no encuentra, mantiene el original
+
+
+# SALIDAS-MIXTAS — fila oficial por IDENTIDAD curricular (R2.1C), no por nombre.
+# `Asignatura.area_curricular_codigo` dice qué bloque troncal es una asignatura;
+# antes el boletín solo miraba el nombre, y una troncal con un nombre que
+# `_normalizar_nombre_asignatura` no conoce ("Lenguas Extranjeras - Inglés")
+# se trataba como materia extra: ocupaba una fila de Salida Optativa o se
+# perdía. Ahora, con la detección de materias sin fila, eso sería un 409.
+AREA_CURRICULAR_A_FILA = {
+    'LE': 'Lengua Española',
+    'LEI': 'Lenguas Extranjeras (Inglés)',
+    'LEF': 'Lenguas Extranjeras (Francés)',
+    'MAT': 'Matemática',
+    'CS': 'Ciencias Sociales',
+    'CN': 'Ciencias de la Naturaleza',
+    'EA': 'Educación Artística',
+    'EF': 'Educación Física',
+    'FIHR': 'Formación Integral Humana y Religiosa',
+}
+
+
+def _fila_oficial(asig_data: dict) -> str:
+    """Nombre de fila del boletín: por `area_curricular_codigo` si lo hay; si no, por nombre."""
+    area = asig_data.get('area_curricular_codigo')
+    if area in AREA_CURRICULAR_A_FILA:
+        return AREA_CURRICULAR_A_FILA[area]
+    return _normalizar_nombre_asignatura(asig_data.get('asignatura_nombre', ''))
 
 
 def _texto_de(valor, attr='nombre') -> str:
@@ -803,13 +860,20 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
     # Tabla de notas
     c.setFont("Helvetica", 8)
     
+    # SALIDAS-MIXTAS: ninguna materia con notas se descarta en silencio. Los
+    # endpoints lo comprueban antes con `materias_sin_fila` y responden 409;
+    # esto es la última línea para cualquier otro llamador.
+    _sin_fila = materias_sin_fila(curso, calificaciones_por_asig)
+    if _sin_fila:
+        raise MateriasSinFila(_sin_fila)
+
     extras_usadas = 0  # v2.13.42: contador de materias extra del colegio
     # SALIDAS-MIXTAS: en el segundo ciclo las dos filas de Salida Optativa se
     # reparten ANTES del bucle (optativas primero, en su orden; extras después).
     filas_so = (_filas_salida_optativa(calificaciones_por_asig, row_y_map)
                 if 'SALIDA OPTATIVA 1' in row_y_map else None)
     for asig_id, asig_data in calificaciones_por_asig.items():
-        nombre_asig = _normalizar_nombre_asignatura(asig_data.get('asignatura_nombre', ''))
+        nombre_asig = _fila_oficial(asig_data)
 
         # Determinar fila correcta
         if nombre_asig in row_y_map:

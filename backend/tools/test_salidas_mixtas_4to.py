@@ -274,6 +274,44 @@ db.commit()
 r = post(F_, {'componente_codigo': 'HCS-CS-4', 'profesor_id': rosana.id, 'asignatura_id': lengua.id})
 check('B14 una troncal no puede ser la identidad elegida', r.status_code == 400, r.text[:200])
 
+# asignatura_id solo admite candidatas de ESE componente en ESE curso.
+Nn = curso('N', salida='HLM')
+otro_col = add(M.Colegio(nombre='Otro Colegio', codigo='OTRO', activo=True))
+ajena_col = add(M.Asignatura(colegio_id=otro_col.id, nombre='Apreciación y Producción Literarias',
+                             codigo='HLM-LE-4', area='', area_curricular_codigo=None, activo=True))
+
+
+def dedicada(codigo, curso_, activa=True):
+    a_ = add(M.Asignatura(colegio_id=col.id, nombre=codigo, codigo=codigo, area='', area_curricular_codigo=None,
+                          activo=activa))
+    add(M.AsignacionProfesor(colegio_id=col.id, profesor_id=julio.id, curso_id=curso_.id, asignatura_id=a_.id,
+                             ano_escolar_id=ano.id, activo=False))
+    return a_
+
+
+valida_N = dedicada('HLM-LE-4', Nn)
+otro_comp_N = dedicada('HCS-CS-4', Nn)           # de este curso, pero de OTRO componente
+de_otro_curso = dedicada('HLM-LE-4', F_)         # del mismo componente, pero de OTRO curso
+inactiva_N = dedicada('HLM-IN-4', Nn, activa=False)
+db.commit()
+estado0 = (mapeos(Nn), asignaciones(Nn), n_asignaturas())
+NEG = (('B15 materia propia del colegio sin relación (Música)', 'HLM-LE-4', musica.id, 400),
+       ('B16 asignatura del curso pero de otro componente (HCS-CS-4)', 'HLM-LE-4', otro_comp_N.id, 400),
+       ('B17 asignatura del mismo componente pero de otro curso', 'HLM-LE-4', de_otro_curso.id, 400),
+       ('B18 troncal del colegio (Lengua Española)', 'HLM-LE-4', lengua.id, 400),
+       ('B19 asignatura de OTRO colegio', 'HLM-LE-4', ajena_col.id, 404),
+       ('B20 id inexistente', 'HLM-LE-4', 999999, 404),
+       ('B21 asignatura que ya representa HLM-LE-4 en 4to A', 'HLM-LE-4', hlm_le, 400),
+       ('B22 candidata válida pero INACTIVA (no se reactiva sola)', 'HLM-IN-4', inactiva_N.id, 400))
+for nombre, cod, aid, esperado in NEG:
+    r = post(Nn, {'componente_codigo': cod, 'profesor_id': julio.id, 'asignatura_id': aid})
+    check('%s: %d y nada cambia' % (nombre, esperado),
+          r.status_code == esperado and (mapeos(Nn), asignaciones(Nn), n_asignaturas()) == estado0,
+          (r.status_code, r.text[:200]))
+r = post(Nn, {'componente_codigo': 'HLM-LE-4', 'profesor_id': julio.id, 'asignatura_id': valida_N.id})
+check('B23 la candidata válida sí se acepta', r.status_code == 200 and mapeos(Nn) == {'HLM-LE-4': valida_N.id},
+      (r.status_code, r.text[:200]))
+
 # =====================================================================
 print('\n=== C. Mismo maestro: materia normal y optativa separadas ===')
 for prof, H, normal, opt, n_val, o_val in ((julio, HJ, lengua.id, hlm_le, 91, 64),
@@ -437,15 +475,28 @@ for comp in (1, 2, 3, 4):
                                  ano_escolar_id=ano.id, competencia_numero=comp, p1=95, p2=95, p3=95, p4=95))
 db.commit()
 r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % EA[0].id, headers=HD)
+js = r.json() if 'json' in r.headers.get('content-type', '') else {}
+check('D6a con Música y las 2 filas ocupadas: 409 boletin_sin_fila que nombra Música, sin PDF',
+      r.status_code == 409 and js.get('motivo') == 'boletin_sin_fila' and js.get('materias') == ['Música'],
+      (r.status_code, r.text[:300]))
+r = c.get('/api/boletines/curso/%d/pdf-minerd-v2' % A.id, headers=HD)
+js = r.json() if 'json' in r.headers.get('content-type', '') else {}
+check('D6b el lote tampoco se emite y nombra al estudiante afectado',
+      r.status_code == 409 and js.get('motivo') == 'boletin_sin_fila'
+      and [x['estudiante'] for x in js.get('estudiantes', [])] == [EA[0].nombre_completo],
+      (r.status_code, r.text[:300]))
+# Sin Música en ese curso, el boletín sale normal.
+db.query(M.CalificacionSecundaria).filter_by(estudiante_id=EA[0].id, asignatura_id=musica.id).delete()
+db.commit()
+r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % EA[0].id, headers=HD)
 check('D6 Boletín individual de 4to A: 200 PDF', r.status_code == 200 and r.content[:4] == b'%PDF', r.text[:200])
 if r.status_code == 200:
-    guardar('boletin_4toA_estudiante1_con_musica.pdf', r.content)
+    guardar('boletin_4toA_estudiante1.pdf', r.content)
     _, f = filas_boletin(r.content)
     check('D7 boletín SO1 = Apreciación y Producción Literarias (completo), CF 66',
           f['SO1'][0] == 'Apreciación y Producción Literarias' and f['SO1'][1] == '66', f)
     check('D8 boletín SO2 = Filosofía Social y Pensamiento Dominicano (completo), CF 77',
           f['SO2'][0] == 'Filosofía Social y Pensamiento Dominicano' and f['SO2'][1] == '77', f)
-    check('D9 Música no desplaza a ninguna optativa', 'Música' not in f['SO1'][0] + f['SO2'][0], f)
 r = c.get('/api/boletines/curso/%d/pdf-minerd-v2' % A.id, headers=HD)
 check('D10 Boletines por lote de 4to A: 200 PDF', r.status_code == 200 and r.content[:4] == b'%PDF', r.text[:200])
 if r.status_code == 200:
@@ -456,6 +507,71 @@ if r.status_code == 200:
         check('D11 lote, estudiante %d: SO1 CF %d y SO2 CF %d en el mismo orden' % (k + 1, 66 + k, 77 + k),
               f['SO1'][0].startswith('Apreciación') and f['SO1'][1] == str(66 + k)
               and f['SO2'][0].startswith('Filosofía') and f['SO2'][1] == str(77 + k), f)
+
+# Un solo componente + Música: Música ocupa la fila libre (SO2) y se imprime.
+Mu = curso('M', salida='HLM')
+add(M.AsignacionProfesor(colegio_id=col.id, profesor_id=julio.id, curso_id=Mu.id, asignatura_id=lengua.id,
+                         ano_escolar_id=ano.id, activo=True, es_titular=True))
+db.commit()
+EM = estudiantes(Mu, 'M')
+db.commit()
+r = put(Mu, {'profesores': {'HLM-LE-4': julio.id}})
+mM = mapeos(Mu)['HLM-LE-4']
+for asig, v in ((mM, 70), (musica.id, 95)):
+    for comp in (1, 2, 3, 4):
+        add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=EM[0].id, asignatura_id=asig,
+                                     ano_escolar_id=ano.id, competencia_numero=comp, p1=v, p2=v, p3=v, p4=v))
+db.commit()
+r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % EM[0].id, headers=HD)
+check('D9 1 componente + Música: 200 PDF', r.status_code == 200 and r.content[:4] == b'%PDF', r.text[:200])
+if r.status_code == 200:
+    guardar('boletin_4toM_1optativa_y_musica.pdf', r.content)
+    _, f = filas_boletin(r.content)
+    check('D9b SO1 = la optativa (CF 70) y SO2 = Música (CF 95)',
+          f['SO1'][0].startswith('Apreciación') and f['SO1'][1] == '70'
+          and f['SO2'][0] == 'Música' and f['SO2'][1] == '95', f)
+# Troncal con un nombre que el boletín no reconoce, pero con su identidad
+# curricular (LEI): va a la fila oficial de Inglés, no a una de Salida Optativa.
+ingles_raro = add(M.Asignatura(colegio_id=col.id, nombre='Lenguas Extranjeras - Inglés', codigo='IN',
+                               area_curricular_codigo='LEI'))
+for comp in (1, 2, 3, 4):
+    add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=EM[0].id, asignatura_id=ingles_raro.id,
+                                 ano_escolar_id=ano.id, competencia_numero=comp, p1=83, p2=83, p3=83, p4=83))
+db.commit()
+r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % EM[0].id, headers=HD)
+check('D9e troncal "Lenguas Extranjeras - Inglés" (LEI) + optativa + Música: 200 PDF',
+      r.status_code == 200 and r.content[:4] == b'%PDF', r.text[:200])
+if r.status_code == 200:
+    d_, f = filas_boletin(r.content)
+    fila_ingles = ' '.join(w[4] for w in d_[1].get_text('words') if 168 <= (w[1] + w[3]) / 2 <= 190
+                           and 660 < w[0] < 690)
+    check('D9f Inglés en su fila oficial (CF 83) y las filas SO siguen siendo optativa y Música',
+          fila_ingles == '83' and f['SO1'][1] == '70' and f['SO2'][0] == 'Música', (fila_ingles, f))
+
+# 1ro de Secundaria: una sola fila extra calibrada; la segunda materia extra
+# ya no se descarta en silencio.
+g1 = add(M.Grado(colegio_id=col.id, nombre='1ro Secundaria', nivel='secundaria', orden=1, activo=True))
+c1 = add(M.Curso(colegio_id=col.id, nombre='A', grado_id=g1.id, tanda_id=tanda.id, ano_escolar_id=ano.id,
+                 activo=True))
+robotica = add(M.Asignatura(colegio_id=col.id, nombre='Robótica', codigo='ROB'))
+E1 = add(M.Estudiante(colegio_id=col.id, nombre='Uno', apellido='Primero', curso_id=c1.id, no_lista=1,
+                      activo=True, condicion='activo', sexo='F', fecha_ingreso=dt.date(2026, 8, 1)))
+for comp in (1, 2, 3, 4):
+    add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=E1.id, asignatura_id=musica.id,
+                                 ano_escolar_id=ano.id, competencia_numero=comp, p1=88, p2=88, p3=88, p4=88))
+db.commit()
+r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % E1.id, headers=HD)
+check('D9c 1ro con una materia extra (Música): 200 PDF', r.status_code == 200 and r.content[:4] == b'%PDF',
+      r.text[:200])
+for comp in (1, 2, 3, 4):
+    add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=E1.id, asignatura_id=robotica.id,
+                                 ano_escolar_id=ano.id, competencia_numero=comp, p1=77, p2=77, p3=77, p4=77))
+db.commit()
+r = c.get('/api/boletines/estudiante/%d/pdf-minerd-v2' % E1.id, headers=HD)
+js = r.json() if 'json' in r.headers.get('content-type', '') else {}
+check('D9d 1ro con dos materias extra: 409 que nombra la que no cabe, sin PDF',
+      r.status_code == 409 and js.get('motivo') == 'boletin_sin_fila' and len(js.get('materias', [])) == 1
+      and js['materias'][0] in ('Música', 'Robótica'), (r.status_code, r.text[:300]))
 
 # Tres componentes escritos por otra vía (no por la API): ningún documento.
 import salida_optativa_service as SVC
