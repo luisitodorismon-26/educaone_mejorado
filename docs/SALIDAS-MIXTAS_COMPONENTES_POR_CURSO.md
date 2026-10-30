@@ -45,6 +45,7 @@ El orden es el **slot del catálogo** en todos los espacios:
 | Acta, págs. 225–226 | SO1/SO2 en el mismo orden (`curso_info['salida_optativa_slots']`); antes un componente de otra salida no aparecía |
 | Boletín, filas SO1/SO2 | Mismo orden, con el nombre completo ajustado a la celda; las optativas van antes que las materias extra del colegio, que solo ocupan filas libres |
 | Boletín, Música (u otra materia del colegio) con las dos optativas | **Fila compacta propia** bajo la tabla (416.9–432.4, 15.5 pt), con sus 16 notas, PC1–PC4, CF y la condición A/R de siempre. Las dos filas optativas no cambian y el boletín sigue teniendo dos páginas. Se dibuja con la cuadrícula y el color de la plantilla de cada grado, porque las columnas de 5to van ~3.6 pt a la derecha y su plantilla es rosa. No tapa ni desplaza asistencia, leyenda, situación ni firmas, que empiezan en 434.2. Solo se usa en ese caso: los boletines que ya cabían no cambian |
+| Boletín 4to–6to, posición de los valores | En todas las filas, cada valor (períodos, PC1–PC4, CF, completiva, extraordinaria, especial y A/R) se centra en la casilla real de la plantilla del grado. Las coordenadas comunes estaban calibradas para 1ro–3ro y en 4to–6to quedaban entre 2.7 y 10.9 pt a la izquierda; en 5to, varios números cruzaban la línea. 1ro–3ro y Primaria no cambian |
 | Boletín, materias con notas que aun así no caben | Ya no se descartan: el boletín individual y el lote responden **409 `boletin_sin_fila`** con las materias y los estudiantes afectados. Pasa en 4to–6to con dos o más materias del colegio y las dos optativas, y en 1ro–3ro con una segunda materia extra. No se recortan datos ni se añaden páginas |
 
 **Más de 2 componentes:** el registro oficial, el borrador, el boletín individual y el lote responden
@@ -82,6 +83,9 @@ pendiente de una solución para los documentos.
 - `tools/test_boletin_fila_compacta.py`: fila compacta en 4to, 5to y 6to con el generador real. Fuera de
   la fila, el boletín es idéntico píxel a píxel al mismo sin Música. Comprueba las notas, PC, CF y A/R,
   la cuadrícula y el color de cada plantilla.
+- `tools/test_boletin_alineacion_4to6to.py`: en 4to–6to, todas las filas y columnas con valores que
+  incluyen 0, 100 y decimales. Cada valor queda en su columna, centrado y dentro de los bordes, y cada
+  fila tiene su propio CF y nota final. En 1ro–3ro, las coordenadas siguen sin cambios.
 - `tools/test_salidas_concurrencia_pg.py`: concurrencia real en PostgreSQL. Recibe solo la conexión de
   administración a un servidor local (`EO_PG_TEST_SERVER`) y trabaja en una base temporal que crea ella
   misma, con nombre único y un token propio. Antes de crear tablas verifica que la base conectada es esa

@@ -224,7 +224,9 @@ SO_CELDA_Y = {'SALIDA OPTATIVA 1': (366.3, 391.6), 'SALIDA OPTATIVA 2': (391.6, 
 # ocupa 416.9-432.4 (15.5 pt) y deja 1.8 pt libres: no tapa ni desplaza nada.
 # Las columnas y el color NO son idénticos entre plantillas (5to va ~3.6 pt a
 # la derecha y es rosa), así que la cuadrícula se guarda por archivo, con las
-# verticales, los fondos y el color reales de la fila SO2 de cada uno.
+# verticales, los fondos y el color reales de la fila SO2 de cada uno. Esas
+# verticales son las de toda la tabla: también dan el centro de cada casilla
+# para TODAS las filas (`_centros_columnas_segundo_ciclo`).
 FILA_COMPACTA = 'FILA COMPACTA'
 FILA_COMPACTA_Y1 = 432.4
 SO_CELDA_Y[FILA_COMPACTA] = (416.9, FILA_COMPACTA_Y1)
@@ -391,14 +393,19 @@ _ORDEN_COLUMNAS_DERECHA = ('p_cf_50', 'cec', 'p_cec_50', 'ccf', 'p_cf_30', 'ceex
                            'cexf', 'esp_cf', 'esp_ce', 'A', 'R')
 
 
-def _centros_fila_compacta(curso):
-    """(COMP_X, PC_X, RIGHT_X) con el CENTRO real de cada casilla de la FILA COMPACTA.
+def _centros_columnas_segundo_ciclo(curso):
+    """(COMP_X, PC_X, RIGHT_X) con el CENTRO real de cada casilla en 4to-6to.
 
-    Salen de las verticales de la plantilla del curso: tras la celda del rótulo
-    y la del nombre vienen 16 casillas de períodos (4 competencias x P1-P4),
-    PC1-PC4, CF y las 12 de la derecha en el orden de `_ORDEN_COLUMNAS_DERECHA`
-    (35 casillas entre 36 verticales). Las constantes comunes COMP_X/PC_X/RIGHT_X
-    no sirven aquí: no coinciden con las casillas de 4to-6to.
+    Salen de las verticales de la plantilla del curso —las mismas en todas las
+    filas de la tabla, comprobado en las tres—: tras la celda del rótulo y la
+    del nombre vienen 16 casillas de períodos (4 competencias x P1-P4), PC1-PC4,
+    CF y las 12 de la derecha en el orden de `_ORDEN_COLUMNAS_DERECHA` (35
+    casillas entre 36 verticales).
+
+    Las constantes comunes COMP_X/PC_X/RIGHT_X están calibradas sobre la
+    plantilla de 1ro-3ro y en 4to-6to quedaban entre 2.7 y 10.9 pt a la
+    izquierda del centro (en 5to, varios números cruzaban la línea vecina).
+    1ro-3ro las sigue usando sin cambios.
     """
     geo = FILA_COMPACTA_GEOMETRIA.get(os.path.basename(_get_plantilla_path(curso)),
                                       FILA_COMPACTA_GEOMETRIA['Boletin-6to-grado-NS.pdf'])
@@ -966,9 +973,10 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
     # reparten ANTES del bucle (optativas primero, en su orden; extras después).
     filas_so = (_filas_salida_optativa(calificaciones_por_asig, row_y_map)
                 if 'SALIDA OPTATIVA 1' in row_y_map else None)
+    _columnas = (_centros_columnas_segundo_ciclo(curso) if _es_segundo_ciclo(curso)
+                 else (COMP_X, PC_X, RIGHT_X))
     for asig_id, asig_data in calificaciones_por_asig.items():
         nombre_asig = _fila_oficial(asig_data)
-        _es_compacta = False
 
         # Determinar fila correcta
         if nombre_asig in row_y_map:
@@ -978,7 +986,6 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             if etiqueta is None:
                 continue        # sin fila libre (máximo 2, límite físico de la hoja)
             if etiqueta == FILA_COMPACTA:
-                _es_compacta = True
                 _dibujar_fila_compacta(c, curso)
                 c.setFillColor(COLOR_DATOS)
                 y_row = _y(ROW_Y_FILA_COMPACTA)
@@ -1011,10 +1018,9 @@ def _dibujar_tabla_calificaciones(c: canvas.Canvas,
             c.drawString(67, y_row - 3, str(asig_data.get('asignatura_nombre', ''))[:26])
             c.setFont("Helvetica", 8)
         
-        # Columnas: las de siempre; en la FILA COMPACTA, el centro real de cada
-        # casilla de la plantilla del curso (`_centros_fila_compacta`).
-        _cx, _px, _rx = (_centros_fila_compacta(curso) if _es_compacta
-                         else (COMP_X, PC_X, RIGHT_X))
+        # Columnas: en 4to-6to, el centro real de cada casilla de la plantilla
+        # del curso, en TODAS las filas; en 1ro-3ro, las de siempre.
+        _cx, _px, _rx = _columnas
         competencias = asig_data.get('competencias', [])
         if not competencias:
             continue
