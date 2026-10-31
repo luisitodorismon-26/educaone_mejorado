@@ -16,9 +16,19 @@ EducaOne — Asignatura del reporte de conducta.
   P. PDF: con materia, general, reporte antiguo, nombres largos.
   Z. Nada más cambia: reportes antiguos, asignaciones, nada enviado a padres.
 
-Base temporal aislada (SQLite) o PostgreSQL LOCAL eo_test* con EO_TEST_PG_URL.
+Base temporal aislada (SQLite) o, con EO_PG_TEST_SERVER, una base PostgreSQL
+TEMPORAL y exclusiva creada por la propia prueba (tools/pg_base_temporal.py):
+se marca con un token, se verifica su identidad antes de cualquier DROP COLUMN
+y al terminar se elimina solo esa base. Antes de crearla, una base ordinaria
+con datos (EO_PG_TEST_ORDINARIA o, si no se indica, la de administración) debe
+ser rechazada y quedar idéntica. EO_TEST_PG_URL ya no se acepta: nunca se
+altera una base recibida directamente por una variable de entorno.
 
-Uso (desde backend/):  python tools/test_reporte_asignatura.py [carpeta_pdfs]
+Uso (desde backend/):
+    python tools/test_reporte_asignatura.py [carpeta_pdfs]                 # SQLite
+    EO_PG_TEST_SERVER=postgresql://usuario@127.0.0.1:PUERTO/postgres \\
+    [EO_PG_TEST_ORDINARIA=postgresql://usuario@127.0.0.1:PUERTO/base_con_datos] \\
+        python tools/test_reporte_asignatura.py [carpeta_pdfs]             # PostgreSQL
 """
 import datetime as dt
 import hashlib
@@ -41,24 +51,41 @@ os.makedirs(OUT, exist_ok=True)
 
 from test_utils import aislar_base_de_datos  # noqa: E402
 
-PG_URL = os.environ.get('EO_TEST_PG_URL')
-if PG_URL:
-    from urllib.parse import urlparse
-    _u = urlparse(PG_URL)
-    if _u.hostname not in ('127.0.0.1', 'localhost') or not _u.path.lstrip('/').startswith('eo_test'):
-        raise SystemExit('EO_TEST_PG_URL debe ser un PostgreSQL LOCAL con base eo_test*: %s' % _u.hostname)
-    os.environ['DATABASE_URL'] = PG_URL
+if os.environ.get('EO_TEST_PG_URL'):
+    raise SystemExit('EO_TEST_PG_URL ya no se acepta en esta prueba: use EO_PG_TEST_SERVER (la prueba crea y '
+                     'elimina su propia base temporal; nunca altera una base indicada por variable de entorno).')
+PG_SERVER = os.environ.get('EO_PG_TEST_SERVER')
+PRE = []                                 # comprobaciones previas al import de la app
+if PG_SERVER:
+    import pg_base_temporal as PGT
+    PG = PGT.BaseTemporal(PG_SERVER, prefijo='eo_tmp_repasig_')
+    _ord = os.environ.get('EO_PG_TEST_ORDINARIA') or PG_SERVER
+    import psycopg2 as _pg
+    _c = _pg.connect(_ord)
+    HUELLA_ORD = PGT.huella_base(_c)     # se vuelve a comparar al final de la prueba
+    _c.close()
+    _rech, _intacta, _motivo, _ntab, _nfil = PG.comprobar_rechazo(_ord)
+    print('Base ordinaria de control: %d tablas, %d filas -> %s' % (_ntab, _nfil, _motivo or 'NO RECHAZADA'))
+    PRE.append(('S-01 una base preexistente (%d tablas, %d filas) se rechaza antes de tocarla' % (_ntab, _nfil),
+                _rech, _motivo))
+    PRE.append(('S-02 ...y queda idéntica: tablas, filas, contenido y columnas', _intacta, ''))
+    if not (_rech and _intacta):
+        raise SystemExit('ABORTADO: la base ordinaria no fue rechazada o cambió.')
+    os.environ['DATABASE_URL'] = PG.crear()
+    PRE.append(('S-03 la base de la prueba es temporal, propia, marcada con el token y vacía', True, ''))
     TMP = None
 else:
+    PG = None
     TMP = aislar_base_de_datos('reporte_asignatura')
 
 from database import engine, SessionLocal  # noqa: E402
 from test_utils import verificar_engine_aislado  # noqa: E402
 
-if PG_URL:
-    assert engine.dialect.name == 'postgresql' and engine.url.host in ('127.0.0.1', 'localhost') \
-        and str(engine.url.database).startswith('eo_test'), engine.url
-    print('Motor: PostgreSQL local aislado (%s)' % engine.url.database)
+if PG:
+    assert engine.dialect.name == 'postgresql' and engine.url.database == PG.nombre \
+        and engine.url.host in ('127.0.0.1', 'localhost'), engine.url
+    PG.engines.append(engine)
+    print('Motor: PostgreSQL, base temporal %s' % engine.url.database)
 else:
     verificar_engine_aislado(engine, TMP)
     print('Motor: SQLite temporal')
@@ -79,10 +106,19 @@ def check(nombre, ok, detalle=''):
     print(('  OK  ' if ok else '  FALLA ') + nombre + ('' if ok else '  -> ' + str(detalle)[:300]))
 
 
+if PRE:
+    print('\n=== S. SEGURIDAD DE LA BASE ===')
+    for _n, _ok, _d in PRE:
+        check(_n, _ok, _d)
+
+
 # ── Esquema ANTERIOR: reportes_conducta sin las columnas de asignatura ─────────
 M.Base.metadata.create_all(bind=engine)
 with engine.begin() as conn:
     if engine.dialect.name == 'postgresql':
+        # Solo sobre la base temporal de ESTA ejecución: se vuelve a verificar
+        # nombre y token en la misma conexión que va a ejecutar el DROP COLUMN.
+        PG.verificar_identidad(conn.connection.driver_connection)
         conn.execute(text('ALTER TABLE reportes_conducta DROP COLUMN asignatura_id'))
         conn.execute(text('ALTER TABLE reportes_conducta DROP COLUMN asignatura_nombre'))
     else:
@@ -539,6 +575,18 @@ check('Z-03 nada se envió a los padres',
 ctx.__exit__(None, None, None)
 db.close()
 engine.dispose()
+if PG:
+    PG.eliminar()
+    _c = _pg.connect(PG_SERVER)
+    _cur = _c.cursor()
+    _cur.execute('SELECT 1 FROM pg_database WHERE datname = %s', [PG.nombre])
+    _sigue = _cur.fetchone() is not None
+    _c.close()
+    _c = _pg.connect(_ord)
+    _final = PGT.huella_base(_c)
+    _c.close()
+    check('S-04 al terminar se eliminó SOLO la base temporal de la prueba', not _sigue, PG.nombre)
+    check('S-05 la base preexistente sigue idéntica al final de la prueba', _final == HUELLA_ORD, '')
 ok = sum(1 for _, r in RES if r)
 print('\nPDFs en: %s' % OUT)
 print('RESULTADO ASIGNATURA DEL REPORTE: %d PASARON / %d FALLARON' % (ok, len(RES) - ok))

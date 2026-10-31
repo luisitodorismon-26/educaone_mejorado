@@ -110,7 +110,17 @@ export const ReportesPage = () => {
   const [opcionesAsig, setOpcionesAsig] = useState<{ estudianteId: number; asignaturas: { id: number; nombre: string }[] }>(
     { estudianteId: 0, asignaturas: [] });
   const [cargandoAsig, setCargandoAsig] = useState(false);
-  const estudianteFormRef = useRef(0);
+  const [errorAsig, setErrorAsig] = useState<string | null>(null);
+  const [reintentoAsig, setReintentoAsig] = useState(0);
+  // Cada consulta lleva un número; solo la ÚLTIMA puede aplicar su respuesta
+  // (comparar el estudiante no basta: A → B → A dejaría pasar la primera de A).
+  const peticionAsigRef = useRef(0);
+  // Igual que enviandoRef: se lee en el mismo tick del clic.
+  const cargandoAsigRef = useRef(false);
+  // Tras un intento de envío, una respuesta de opciones ya no toca el
+  // formulario (ni preselecciona ni limpia): el contenido —y con él la clave
+  // del reintento— solo cambia por una acción del usuario.
+  const intentoEnvioRef = useRef(false);
 
   // Filtros
   const [filtroEstado, setFiltroEstado] = useState('');
@@ -187,18 +197,27 @@ export const ReportesPage = () => {
   // Al cambiar de estudiante se cargan sus opciones. Un profesor con una sola
   // asignatura en ese curso la ve preseleccionada (se puede quitar); con varias,
   // y para los demás roles, el selector empieza vacío.
-  // Una respuesta que llega tarde para otro estudiante se descarta.
+  // Solo aplica la respuesta de la última consulta (las anteriores se cancelan
+  // y, si aun así llegan, se descartan por su número).
   useEffect(() => {
     const estId = form.estudiante_id;
-    estudianteFormRef.current = estId;
+    const peticion = ++peticionAsigRef.current;
+    const control = new AbortController();
     setOpcionesAsig({ estudianteId: estId, asignaturas: [] });
-    if (!estId || !showModal) return;
+    setErrorAsig(null);
+    if (!estId || !showModal) {
+      cargandoAsigRef.current = false;
+      setCargandoAsig(false);
+      return;
+    }
+    cargandoAsigRef.current = true;
     setCargandoAsig(true);
-    api.get('/reportes/asignaturas-opciones', { params: { estudiante_id: estId } })
+    api.get('/reportes/asignaturas-opciones', { params: { estudiante_id: estId }, signal: control.signal })
       .then(r => {
-        if (estudianteFormRef.current !== estId) return;
+        if (peticionAsigRef.current !== peticion) return;
         const asignaturas = r.data?.asignaturas || [];
         setOpcionesAsig({ estudianteId: estId, asignaturas });
+        if (intentoEnvioRef.current) return;
         setForm(f => {
           if (f.estudiante_id !== estId) return f;
           if (f.asignatura_id && !asignaturas.some((a: { id: number }) => a.id === f.asignatura_id)) {
@@ -210,17 +229,31 @@ export const ReportesPage = () => {
           return f;
         });
       })
-      .catch(() => { if (estudianteFormRef.current === estId) setOpcionesAsig({ estudianteId: estId, asignaturas: [] }); })
-      .finally(() => { if (estudianteFormRef.current === estId) setCargandoAsig(false); });
+      .catch((e: any) => {
+        if (peticionAsigRef.current !== peticion) return;
+        // Un fallo NO es «no hay asignaturas»: se muestra y se puede reintentar.
+        setErrorAsig(e?.response?.data?.error || 'No se pudieron cargar las asignaturas.');
+      })
+      .finally(() => {
+        if (peticionAsigRef.current !== peticion) return;
+        cargandoAsigRef.current = false;
+        setCargandoAsig(false);
+      });
+    return () => control.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form.estudiante_id, showModal]);
+  }, [form.estudiante_id, showModal, reintentoAsig]);
 
   const handleCreate = async () => {
     if (enviandoRef.current) return;
+    if (cargandoAsigRef.current) {
+      setMessage({ type: 'error', text: 'Espere a que carguen las asignaturas del estudiante.' });
+      return;
+    }
     if (!form.estudiante_id || !form.titulo) {
       setMessage({ type: 'error', text: 'Complete los campos requeridos' });
       return;
     }
+    intentoEnvioRef.current = true;
     enviandoRef.current = true;
     setEnviando(true);
     if (!claveEnvioRef.current) claveEnvioRef.current = nuevaClaveEnvio();
@@ -237,6 +270,7 @@ export const ReportesPage = () => {
       setShowModal(false);
       // setFormEstado: el reset es parte de ESTE envío (la guarda de setForm lo bloquearía).
       setFormEstado({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '', asignatura_id: 0 });
+      intentoEnvioRef.current = false;
     } catch (e: any) {
       // El formulario NO se limpia: el usuario puede reintentar tal cual.
       setMessage({ type: 'error', text: e.response?.data?.error || 'Error al crear' });
@@ -711,7 +745,9 @@ export const ReportesPage = () => {
         footer={
           <>
             <Button variant="secondary" onClick={() => setShowModal(false)} disabled={enviando}>Cancelar</Button>
-            <Button onClick={handleCreate} loading={enviando}>{enviando ? 'Enviando…' : 'Crear Reporte'}</Button>
+            <Button onClick={handleCreate} loading={enviando} disabled={cargandoAsig}>
+              {enviando ? 'Enviando…' : cargandoAsig ? 'Cargando asignaturas…' : 'Crear Reporte'}
+            </Button>
           </>
         }
       >
@@ -722,14 +758,24 @@ export const ReportesPage = () => {
           <Select
             label="Curso"
             value={form.curso_filter || ''}
-            onChange={e => setForm({ ...form, curso_filter: e.target.value, estudiante_id: 0, asignatura_id: 0 })}
+            onChange={e => {
+              if (enviandoRef.current) return;
+              intentoEnvioRef.current = false;
+              setForm({ ...form, curso_filter: e.target.value, estudiante_id: 0, asignatura_id: 0 });
+            }}
             options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
             placeholder="Filtrar por curso"
           />
           <Select
             label="Estudiante *"
             value={form.estudiante_id}
-            onChange={e => setForm({ ...form, estudiante_id: parseInt(e.target.value) || 0, asignatura_id: 0 })}
+            onChange={e => {
+              if (enviandoRef.current) return;
+              // Elegir otro estudiante es una acción del usuario: sus opciones
+              // vuelven a poder preseleccionar.
+              intentoEnvioRef.current = false;
+              setForm({ ...form, estudiante_id: parseInt(e.target.value) || 0, asignatura_id: 0 });
+            }}
             options={estudiantes
               .filter(e => !form.curso_filter || e.curso_id === parseInt(form.curso_filter))
               .map(e => ({ value: e.id, label: `${e.nombre_completo}${!form.curso_filter ? ` - ${e.curso}` : ''}` }))}
@@ -740,22 +786,35 @@ export const ReportesPage = () => {
               label="Asignatura del reporte"
               value={form.asignatura_id || ''}
               onChange={e => setForm({ ...form, asignatura_id: parseInt(e.target.value) || 0 })}
-              disabled={!form.estudiante_id || cargandoAsig}
+              disabled={!form.estudiante_id || cargandoAsig || !!errorAsig}
               options={[
                 { value: '', label: 'Sin asignatura específica' },
                 ...(opcionesAsig.estudianteId === form.estudiante_id ? opcionesAsig.asignaturas : [])
                   .map(a => ({ value: a.id, label: a.nombre })),
               ]}
             />
-            <p className="mt-1 text-xs text-slate-500">
-              {!form.estudiante_id
-                ? 'Elija primero el estudiante.'
-                : cargandoAsig
-                  ? 'Cargando asignaturas…'
-                  : opcionesAsig.asignaturas.length === 0
-                    ? 'No hay asignaturas disponibles para este estudiante; el reporte se guardará sin asignatura específica.'
-                    : 'Opcional. Indique la asignatura en la que ocurrió, o «Sin asignatura específica» para una situación general.'}
-            </p>
+            {errorAsig && !cargandoAsig ? (
+              <div role="alert" className="mt-1 flex flex-wrap items-center gap-2 text-xs text-red-600">
+                <span>No se pudieron cargar las asignaturas: {errorAsig}</span>
+                <button
+                  type="button"
+                  onClick={() => setReintentoAsig(n => n + 1)}
+                  className="px-2 py-0.5 rounded border border-red-300 text-red-700 hover:bg-red-50"
+                >
+                  Reintentar
+                </button>
+              </div>
+            ) : (
+              <p className="mt-1 text-xs text-slate-500">
+                {!form.estudiante_id
+                  ? 'Elija primero el estudiante.'
+                  : cargandoAsig
+                    ? 'Cargando asignaturas…'
+                    : opcionesAsig.asignaturas.length === 0
+                      ? 'No hay asignaturas disponibles para este estudiante; el reporte se guardará sin asignatura específica.'
+                      : 'Opcional. Indique la asignatura en la que ocurrió, o «Sin asignatura específica» para una situación general.'}
+              </p>
+            )}
           </div>
           <Input
             label="Título *"
