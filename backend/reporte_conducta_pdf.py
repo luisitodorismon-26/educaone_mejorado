@@ -298,10 +298,45 @@ def _dibujar_barra_metadatos(c, x, y, ancho, items):
     return y - alto - 0.10*inch
 
 
+def _dibujar_autoria(c, x, y, ancho, autor, asignatura):
+    """Franja «Reportado por» y, si el reporte la tiene identificada, «Asignatura
+    del reporte». El texto se achica hasta caber; nunca se corta."""
+    filas = [("Reportado por", autor)]
+    if asignatura:
+        filas.append(("Asignatura del reporte", asignatura))
+    alto_fila = 0.22*inch
+    alto = alto_fila * len(filas) + 0.08*inch
+    c.setFillColor(COLOR_META_FONDO)
+    c.roundRect(x, y - alto, ancho, alto, 3, stroke=0, fill=1)
+    for i, (label, valor) in enumerate(filas):
+        yb = y - 0.07*inch - (i + 0.6) * alto_fila
+        etiqueta = f"{label.upper()}:"
+        c.setFont('Helvetica-Bold', 7.5)
+        c.setFillColor(HexColor('#475569'))
+        c.drawString(x + 0.12*inch, yb, etiqueta)
+        x_val = x + 0.12*inch + stringWidth(etiqueta, 'Helvetica-Bold', 7.5) + 5
+        disponible = x + ancho - 0.12*inch - x_val
+        tam = 9.5
+        texto = str(valor)
+        while tam > 6.5 and stringWidth(texto, 'Helvetica-Bold', tam) > disponible:
+            tam -= 0.5
+        c.setFont('Helvetica-Bold', tam)
+        c.setFillColor(HexColor('#0F172A'))
+        c.drawString(x_val, yb, texto)
+    return y - alto - 0.08*inch
+
+
 def generar_reporte_conducta_pdf(reporte, estudiante, curso, grado, tanda,
                                     reportador, respondedor, config, colegio,
-                                    ano_escolar: str = None) -> bytes:
-    """Genera el PDF del reporte de conducta."""
+                                    ano_escolar: str = None,
+                                    asignatura_nombre: str = None) -> bytes:
+    """Genera el PDF del reporte de conducta.
+
+    `asignatura_nombre`: la materia del reporte SOLO si el reporte la guarda
+    identificada. Nunca se deduce de las asignaciones actuales del autor: un
+    profesor puede dar varias materias, y lo que da hoy no prueba en qué
+    materia ocurrió un incidente antiguo. Sin ella, la línea no se imprime.
+    """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
     ancho_pag, alto_pag = letter
@@ -383,9 +418,7 @@ def generar_reporte_conducta_pdf(reporte, estudiante, curso, grado, tanda,
     # METADATOS
     reporter_nombre = "—"
     if reportador:
-        n = f"{reportador.nombre or ''} {reportador.apellido or ''}".strip()
-        rol = (reportador.role or '').capitalize()
-        reporter_nombre = f"{n} ({rol})" if rol else n
+        reporter_nombre = f"{reportador.nombre or ''} {reportador.apellido or ''}".strip() or "—"
     
     estado = (reporte.estado or 'pendiente').lower()
     if estado == 'pendiente':
@@ -404,8 +437,8 @@ def generar_reporte_conducta_pdf(reporte, estudiante, curso, grado, tanda,
     fecha_gen = formato_fecha_corto(reporte.fecha_respuesta or reporte.fecha)
     
     y -= 0.05*inch
+    y = _dibujar_autoria(c, margen_izq, y, ancho_util, reporter_nombre, asignatura_nombre)
     y = _dibujar_barra_metadatos(c, margen_izq, y, ancho_util, [
-        ("Reportado por", reporter_nombre, None),
         ("Estado", estado_label, estado_color),
         ("Generado", fecha_gen, None),
     ])
