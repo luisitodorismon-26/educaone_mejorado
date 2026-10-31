@@ -329,7 +329,7 @@ export const ConfiguracionPage = () => {
   const confirmarPendientesSalida = () =>
     pendientesSalida === 0 || window.confirm(
       `Hay ${pendientesSalida} profesor(es) de la Salida Optativa elegidos sin guardar. ` +
-      'Este botón no los guarda: se perderán. ¿Continuar de todos modos?');
+      '«Guardar datos del curso» no los guarda: se perderán. ¿Continuar de todos modos?');
   const cerrarModalCurso = () => {
     if (confirmarPendientesSalida()) {
       setPendientesSalida(0);
@@ -1242,7 +1242,7 @@ export const ConfiguracionPage = () => {
 
       {/* Modal Curso */}
       <Modal isOpen={showModal && modalType === 'curso'} onClose={cerrarModalCurso} title={editingItem ? `Editar Curso — ${labelCurso(editingItem)}` : 'Nuevo Curso'} size="md"
-        footer={<><Button variant="secondary" onClick={cerrarModalCurso}>Cancelar</Button><Button onClick={saveCurso} loading={saving}>{editingItem ? 'Guardar' : 'Crear'}</Button></>}>
+        footer={<><Button variant="secondary" onClick={cerrarModalCurso}>Cancelar</Button><Button onClick={saveCurso} loading={saving}>{editingItem ? 'Guardar datos del curso' : 'Crear'}</Button></>}>
         <div className="space-y-4">
           <Select label="Grado *" value={cursoForm.grado_id} onChange={e => setCursoForm({ ...cursoForm, grado_id: parseInt(e.target.value) })} options={grados.map(g => ({ value: g.id, label: g.nombre }))} placeholder="Seleccionar grado" />
           <div className="grid grid-cols-2 gap-4">

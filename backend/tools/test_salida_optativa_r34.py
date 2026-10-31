@@ -999,7 +999,12 @@ def _():
     src = _leer(os.path.join("pages", "configuracion", "SalidaOptativaSection.tsx"))
     assert "if (pid) soloProfes[cod] = pid;" not in src, \
         "no debe descartar los null: haria imposible retirar al profesor"
-    assert "?? null" in src and "enviaProfes" in src, "debe enviar el null explicito"
+    # Desde la pantalla por componente (PR #61), retirar al profesor es retirar
+    # el componente: «Quitar del curso» -> DELETE, con confirmación previa. Ya no
+    # hay un PUT masivo con nulls.
+    assert "Quitar del curso" in src and "api.delete(" in src and "/salida-optativa/componentes/" in src, \
+        "debe ofrecer retirar el componente (y su profesor) con DELETE"
+    assert "window.confirm(" in src, "retirar debe pedir confirmación"
 
 
 # ===========================================================================

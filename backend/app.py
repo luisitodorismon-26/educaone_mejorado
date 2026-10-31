@@ -5764,7 +5764,9 @@ def _salida_optativa_estado(db, curso):
     # para añadirlos y, si hay candidatas, obliga a elegir una en vez de crear
     # otra.
     disponibles = []
-    if aplica and salida:
+    # El catálogo del grado se ofrece aunque el curso aún no tenga salida: la
+    # pantalla lo usa para elegir la primera asignación.
+    if aplica:
         _en_curso = {c['componente_codigo'] for c in componentes}
         for _sal in sorted(_cat.SALIDAS):
             for comp in _cat.componentes_de(_sal, grado_numero):
@@ -6243,11 +6245,6 @@ async def agregar_componente_optativo(id, request: Request, db: Session = Depend
     ok, err = _svc.validar_ano_para_curso(db, curso)
     if not ok:
         return JSONResponse({'error': err}, status_code=400)
-    if not _cat.salida_valida(getattr(curso, 'salida_optativa_codigo', None)):
-        return JSONResponse({
-            'error': 'Elija primero la Salida Optativa del curso: es la que figura en '
-                     'la portada y en el acta del Registro.'
-        }, status_code=400)
 
     codigo = data.get('componente_codigo')
     comp = _cat.componente(codigo) if isinstance(codigo, str) else None
@@ -6259,6 +6256,12 @@ async def agregar_componente_optativo(id, request: Request, db: Session = Depend
             'error': f'El componente {comp.codigo} ({comp.nombre_oficial}) es de '
                      f'{comp.grado}to y este curso es de {grado_numero}to.'
         }, status_code=400)
+    # Curso todavía sin salida: la primera asignación fija como salida del curso
+    # la de su componente (la pantalla ya no tiene un selector que cambie la
+    # salida del curso). Si el curso ya tiene salida, NUNCA se cambia aquí. Se
+    # guarda con el resto en la misma transacción; un error posterior la deshace.
+    if not _cat.salida_valida(getattr(curso, 'salida_optativa_codigo', None)):
+        curso.salida_optativa_codigo = comp.salida
 
     profesor_id = data.get('profesor_id')
     if profesor_id is not None and (isinstance(profesor_id, bool) or not isinstance(profesor_id, int)):
