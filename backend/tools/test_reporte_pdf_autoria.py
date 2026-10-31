@@ -97,6 +97,68 @@ y_aut = min(w[1] for w in palabras(pdf_con) if w[4] == 'REPORTADO')
 y_firma = min(w[1] for w in palabras(pdf_con) if w[4] == 'Coordinación')
 check('A7 la franja de autoría queda por encima de las firmas', y_aut < y_firma, (y_aut, y_firma))
 
+# A8–A13: textos que NO caben ni al tamaño mínimo → varias líneas, franja más alta.
+from reportlab.pdfbase.pdfmetrics import stringWidth
+import reporte_conducta_pdf as RCP
+AUTOR_XL = ('María de los Ángeles Altagracia del Carmen Inmaculada Concepción Fernández de la Rosa '
+            'Santos Hernández Peña Rodríguez Valdez Martínez Jiménez Castillo Almonte de los Santos Guzmán')
+ASIG_XL = ('Formación Integral Humana y Religiosa con Orientación Vocacional, Ética Ciudadana, '
+           'Proyecto de Vida para la Convivencia Escolar Pacífica e Inclusiva y Educación Emocional')
+SIN_ESPACIOS = 'Educación' + 'ArtísticaMusicalYEscénica' * 6
+ancho_util = pymupdf.open(stream=pdf_sin, filetype='pdf')[0].rect.width - 72
+disp_aut = ancho_util - 0.24 * 72 - stringWidth('REPORTADO POR:', 'Helvetica-Bold', 7.5) - 5
+disp_asig = ancho_util - 0.24 * 72 - stringWidth('ASIGNATURA DEL REPORTE:', 'Helvetica-Bold', 7.5) - 5
+check('A8 los textos de prueba superan el ancho al tamaño mínimo',
+      all(stringWidth(t, 'Helvetica-Bold', RCP.AUTORIA_TAM_MIN) > d
+          for t, d in ((AUTOR_XL, disp_aut), (ASIG_XL, disp_asig), (SIN_ESPACIOS, disp_asig))), '')
+
+
+def franja(pdf):
+    """(rectángulo de la franja, palabras dentro de su alto, todas las palabras)."""
+    pag = pymupdf.open(stream=pdf, filetype='pdf')[0]
+    ws = pag.get_text('words')
+    lab = next(w for w in ws if w[4] == 'REPORTADO')
+    fondo = tuple(round(v / 255, 3) for v in (0xF0, 0xF4, 0xF8))
+    rect = next(d['rect'] for d in pag.get_drawings()
+                if d.get('fill') and tuple(round(v, 3) for v in d['fill']) == fondo
+                and d['rect'].y0 <= lab[1] <= d['rect'].y1)
+    return rect, [w for w in ws if rect.y0 - 1 <= w[1] <= rect.y1 + 1], ws, pag.rect.width
+
+
+def sin_espacios(s):
+    return ''.join(s.split())
+
+
+for etiqueta_caso, autor_c, asig_c, nombre_pdf in (
+        ('nombres largos', AUTOR_XL, ASIG_XL, 'reporte_autoria_varias_lineas.pdf'),
+        ('palabra sin espacios', 'Julio Alberto Sena', SIN_ESPACIOS, 'reporte_autoria_palabra_larga.pdf')):
+    pdf_xl = generar_reporte_conducta_pdf(**dict(comunes, reportador=Obj(nombre=autor_c, apellido='', role='profesor')),
+                                          asignatura_nombre=asig_c)
+    open(os.path.join(OUT, nombre_pdf), 'wb').write(pdf_xl)
+    rect, dentro, ws, ancho_pag = franja(pdf_xl)
+    texto_franja = ''.join(w[4] for w in sorted(dentro, key=lambda w: (round(w[1], 1), w[0])))
+    lineas_valor = {round(w[1], 1) for w in dentro if w[0] > rect.x0 + 100}
+    check('A9 [%s] nada se corta: el autor y la asignatura completos están en la franja' % etiqueta_caso,
+          sin_espacios(autor_c) in texto_franja and sin_espacios(asig_c) in texto_franja, texto_franja[:300])
+    check('A10 [%s] el texto se reparte en varias líneas' % etiqueta_caso, len(lineas_valor) >= 3, sorted(lineas_valor))
+    check('A11 [%s] todo el texto queda dentro de la franja y de los márgenes' % etiqueta_caso,
+          all(rect.x0 <= w[0] and w[2] <= rect.x1 + 0.5 and rect.y0 - 0.5 <= w[1] and w[3] <= rect.y1 + 0.5
+              for w in dentro) and all(w[2] <= ancho_pag - 36 + 0.5 for w in ws),
+          [(w[4], w[2], w[3]) for w in dentro if w[2] > rect.x1 + 0.5 or w[3] > rect.y1 + 0.5][:5])
+    y_estado = min(w[1] for w in ws if w[4] == 'ESTADO:')
+    y_firma_xl = min(w[1] for w in ws if w[4] == 'Coordinación')
+    lab_asig = next(w for w in ws if w[4] == 'ASIGNATURA')
+    ultimo_autor = max(w[3] for w in dentro if w[1] < lab_asig[1] - 1 and w[4] not in ('REPORTADO', 'POR:'))
+    if autor_c == AUTOR_XL:
+        check('A10b el autor, por sí solo, ocupa varias líneas',
+              len({round(w[1], 1) for w in dentro if w[1] < lab_asig[1] - 1}) >= 2, '')
+    check('A12 [%s] sin superposición: autor → asignatura → «Estado» → firmas' % etiqueta_caso,
+          ultimo_autor <= lab_asig[1] + 0.5 and rect.y1 <= y_estado and y_estado < y_firma_xl,
+          (ultimo_autor, lab_asig[1], rect.y1, y_estado, y_firma_xl))
+rect_corto = franja(pdf_con)[0]
+check('A13 un texto que sí cabe sigue en una sola línea (franja igual de alta que antes)',
+      abs(rect_corto.height - (0.22 * 2 + 0.08) * 72) < 1, rect_corto.height)
+
 # ===================================================================== B
 print('\n=== B. Endpoint real ===')
 db = SessionLocal()
