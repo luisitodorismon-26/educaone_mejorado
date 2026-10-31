@@ -487,6 +487,23 @@ async def lifespan(app):
                             logger.warning(f"No se pudo agregar reportes_conducta.{col_name}: {e}")
                             raise
 
+        # === 6a-bis. Asignatura del reporte de conducta ===
+        # Aditivo: dos columnas NULL, sin DEFAULT ni backfill. Los reportes
+        # existentes quedan sin asignatura (no se deduce de las asignaciones).
+        if 'reportes_conducta' in inspector.get_table_names():
+            rep_cols = {c['name'] for c in inspect(engine).get_columns('reportes_conducta')}
+            for col_name, col_def in (('asignatura_id', 'INTEGER REFERENCES asignaturas(id)'),
+                                      ('asignatura_nombre', 'VARCHAR(100)')):
+                if col_name not in rep_cols:
+                    with engine.connect() as conn:
+                        try:
+                            conn.execute(text(f'ALTER TABLE reportes_conducta ADD COLUMN {col_name} {col_def}'))
+                            conn.commit()
+                            logger.info(f"✅ Migración: columna {col_name} agregada a reportes_conducta")
+                        except Exception as e:
+                            logger.warning(f"No se pudo agregar reportes_conducta.{col_name}: {e}")
+                            raise
+
         # === 6b. Notificaciones: campos de Fase A (v2.19) ===
         # OBLIGATORIO: la verificación post-migración de más abajo compara cada
         # columna de cada modelo contra el esquema físico y aborta el arranque si
@@ -13099,6 +13116,9 @@ async def get_reportes(request: Request, db: Session = Depends(get_db),
             'estudiante_curso_id': r.estudiante.curso_id if r.estudiante else None,
             'reportado_por': r.reportador.nombre_completo if r.reportador else None,
             'reportado_por_id': r.reportado_por,
+            # Nombre guardado al crear el reporte (NULL = sin asignatura específica).
+            'asignatura_id': r.asignatura_id,
+            'asignatura_nombre': r.asignatura_nombre,
             'fecha': r.fecha.isoformat() if r.fecha else None,
             # Respuesta v2.11: 3 campos guiados
             'acciones_centro': r.acciones_centro,
@@ -13147,13 +13167,64 @@ def _generar_numero_reporte(db: Session, colegio_id: int) -> str:
 _RE_CLAVE_ENVIO = re.compile(r'[A-Za-z0-9-]{8,64}')
 
 
-def _huella_reporte(estudiante_id, titulo, descripcion, tipo, gravedad):
+def _huella_reporte(estudiante_id, titulo, descripcion, tipo, gravedad, asignatura_id=None):
     """SHA-256 del contenido YA saneado: distingue un reintento del mismo
-    envío de una clave reutilizada con otro contenido."""
+    envío de una clave reutilizada con otro contenido.
+
+    Sin asignatura, la lista es exactamente la de siempre (los reintentos de
+    reportes anteriores siguen coincidiendo). Con asignatura se añade un
+    elemento marcado con su ID validado: «con X» nunca coincide con «sin
+    asignatura» ni con «con Y»."""
     import hashlib
     import json as _j
-    base = _j.dumps([int(estudiante_id), titulo, descripcion, tipo, gravedad], ensure_ascii=False)
+    partes = [int(estudiante_id), titulo, descripcion, tipo, gravedad]
+    if asignatura_id is not None:
+        partes.append(['asignatura', int(asignatura_id)])
+    base = _j.dumps(partes, ensure_ascii=False)
     return hashlib.sha256(base.encode('utf-8')).hexdigest()
+
+
+def _asignaturas_reporte_permitidas(db, current_user, estudiante):
+    """Asignaturas que quien reporta puede indicar para un estudiante: las
+    ACTIVAS con asignación activa en el curso del estudiante, del mismo
+    colegio (troncales y optativas: ambas llegan por AsignacionProfesor). Un
+    profesor, solo las suyas. Ordenadas por nombre."""
+    if not estudiante.curso_id:
+        return []
+    q = (db.query(Asignatura)
+         .join(AsignacionProfesor, AsignacionProfesor.asignatura_id == Asignatura.id)
+         .filter(AsignacionProfesor.colegio_id == current_user.colegio_id,
+                 Asignatura.colegio_id == current_user.colegio_id,
+                 AsignacionProfesor.curso_id == estudiante.curso_id,
+                 AsignacionProfesor.activo == True,  # noqa: E712
+                 Asignatura.activo.isnot(False)))
+    if current_user.role == 'profesor':
+        q = q.filter(AsignacionProfesor.profesor_id == current_user.id)
+    return sorted({a.id: a for a in q.all()}.values(), key=lambda a: ((a.nombre or '').lower(), a.id))
+
+
+def _validar_asignatura_reporte(db, current_user, estudiante, valor):
+    """(asignatura | None, error | None). Vacío / None / 0 = sin asignatura.
+    Un ID que no es de este colegio responde 404 (no revela su existencia);
+    uno del colegio que no corresponde al curso o al profesor, 400."""
+    if valor in (None, '', 0, '0'):
+        return None, None
+    if isinstance(valor, bool):
+        return None, JSONResponse({'error': 'asignatura_id inválido'}, status_code=400)
+    try:
+        asig_id = int(valor)
+    except (TypeError, ValueError):
+        return None, JSONResponse({'error': 'asignatura_id inválido'}, status_code=400)
+    if isinstance(valor, float) and valor != asig_id:
+        return None, JSONResponse({'error': 'asignatura_id inválido'}, status_code=400)
+    asig = db.get(Asignatura, asig_id)
+    if asig is None or asig.colegio_id != current_user.colegio_id:
+        return None, JSONResponse({'error': 'Asignatura no encontrada'}, status_code=404)
+    if asig.id not in {a.id for a in _asignaturas_reporte_permitidas(db, current_user, estudiante)}:
+        return None, JSONResponse({'error': 'Esa asignatura no corresponde al curso del estudiante'
+                                            + (' ni a sus asignaciones' if current_user.role == 'profesor' else '')},
+                                  status_code=400)
+    return asig, None
 
 
 def _respuesta_reporte_existente(existente, huella):
@@ -13168,6 +13239,32 @@ def _respuesta_reporte_existente(existente, huella):
         'numero_reporte': existente.numero_reporte,
         'reintento': True,
     }, status_code=200)
+
+
+@app.get("/api/reportes/asignaturas-opciones")
+async def opciones_asignatura_reporte(estudiante_id: int, db: Session = Depends(get_db), current_user: Usuario = Depends(get_current_user)):
+    """Opciones del selector «Asignatura del reporte» para un estudiante.
+
+    Mismas reglas que al crear: módulo activo, estudiante del colegio, candado
+    de división y —para un profesor— asignación activa al curso. Las opciones
+    son las de `_asignaturas_reporte_permitidas`; el POST vuelve a validarlas."""
+    assert_modulo_activo(db, current_user, 'reportes_conducta')
+    _guard = validar_nivel_escritura(db, current_user, estudiante_id=estudiante_id)
+    if _guard:
+        return _guard
+    estudiante = get_tenant_or_404(db, Estudiante, estudiante_id, current_user, name='estudiante')
+    opciones = _asignaturas_reporte_permitidas(db, current_user, estudiante)
+    if current_user.role == 'profesor' and not opciones:
+        tiene_asig = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=estudiante.curso_id, activo=True).first()
+        if not tiene_asig:
+            return JSONResponse({'error': 'Solo podés reportar estudiantes de tus cursos asignados'},
+                                status_code=403)
+    return {
+        'estudiante_id': estudiante.id,
+        'curso_id': estudiante.curso_id,
+        'asignaturas': [{'id': a.id, 'nombre': a.nombre} for a in opciones],
+    }
 
 
 @app.post("/api/reportes")
@@ -13230,6 +13327,12 @@ async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db:
     tipo = data.get('tipo', 'conducta')
     gravedad = data.get('gravedad', 'leve')
 
+    # Asignatura del reporte (opcional): se valida ANTES de tocar la base.
+    asignatura, _err = _validar_asignatura_reporte(db, current_user, estudiante, data.get('asignatura_id'))
+    if _err:
+        return _err
+    asignatura_id = asignatura.id if asignatura else None
+
     # REP-DUP-1 · idempotencia del envío. Sin clave: comportamiento de siempre
     # (dos reportes con el mismo texto son dos incidentes distintos). Con
     # clave: un solo reporte por colegio + autor + clave.
@@ -13239,7 +13342,7 @@ async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db:
         clave = str(clave).strip()
         if not _RE_CLAVE_ENVIO.fullmatch(clave):
             return JSONResponse({'error': 'client_request_id inválido'}, status_code=400)
-        huella = _huella_reporte(estudiante.id, titulo, descripcion, tipo, gravedad)
+        huella = _huella_reporte(estudiante.id, titulo, descripcion, tipo, gravedad, asignatura_id)
         existente = db.query(ReporteConducta).filter_by(
             colegio_id=current_user.colegio_id, reportado_por=current_user.id,
             client_request_id=clave).first()
@@ -13258,6 +13361,8 @@ async def crear_reporte(request: Request, background_tasks: BackgroundTasks, db:
         numero_reporte=_generar_numero_reporte(db, current_user.colegio_id),
         client_request_id=clave,
         client_request_hash=huella,
+        asignatura_id=asignatura_id,
+        asignatura_nombre=asignatura.nombre if asignatura else None,
     )
     db.add(reporte)
     try:
@@ -13459,6 +13564,8 @@ async def imprimir_reporte_pdf(id, request: Request, db: Session = Depends(get_d
             reportador=reportador, respondedor=respondedor,
             config=config, colegio=colegio,
             ano_escolar=ano_str,
+            # El nombre guardado con el reporte; nunca se deduce de las asignaciones.
+            asignatura_nombre=reporte.asignatura_nombre or None,
         )
 
         raw = f"reporte_{reporte.numero_reporte or reporte.id}.pdf"

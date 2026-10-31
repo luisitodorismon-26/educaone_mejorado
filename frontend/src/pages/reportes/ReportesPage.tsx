@@ -33,6 +33,8 @@ interface Reporte {
   estudiante_curso_id?: number;
   reportado_por: string;
   reportado_por_id?: number;
+  /** Nombre guardado al crear el reporte; null = sin asignatura específica. */
+  asignatura_nombre?: string | null;
   fecha: string;
   // v2.11: 3 campos guiados
   acciones_centro?: string;
@@ -97,8 +99,18 @@ export const ReportesPage = () => {
     gravedad: 'leve',
     titulo: '',
     descripcion: '',
-    curso_filter: ''
+    curso_filter: '',
+    // 0 = sin asignatura específica
+    asignatura_id: 0
   });
+
+  // Opciones del selector «Asignatura del reporte» para el estudiante elegido.
+  // Las calcula el backend (para un profesor, solo sus asignaturas activas en
+  // el curso del estudiante) y las vuelve a validar al crear el reporte.
+  const [opcionesAsig, setOpcionesAsig] = useState<{ estudianteId: number; asignaturas: { id: number; nombre: string }[] }>(
+    { estudianteId: 0, asignaturas: [] });
+  const [cargandoAsig, setCargandoAsig] = useState(false);
+  const estudianteFormRef = useRef(0);
 
   // Filtros
   const [filtroEstado, setFiltroEstado] = useState('');
@@ -172,6 +184,37 @@ export const ReportesPage = () => {
       ? crypto.randomUUID()
       : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
+  // Al cambiar de estudiante se cargan sus opciones. Un profesor con una sola
+  // asignatura en ese curso la ve preseleccionada (se puede quitar); con varias,
+  // y para los demás roles, el selector empieza vacío.
+  // Una respuesta que llega tarde para otro estudiante se descarta.
+  useEffect(() => {
+    const estId = form.estudiante_id;
+    estudianteFormRef.current = estId;
+    setOpcionesAsig({ estudianteId: estId, asignaturas: [] });
+    if (!estId || !showModal) return;
+    setCargandoAsig(true);
+    api.get('/reportes/asignaturas-opciones', { params: { estudiante_id: estId } })
+      .then(r => {
+        if (estudianteFormRef.current !== estId) return;
+        const asignaturas = r.data?.asignaturas || [];
+        setOpcionesAsig({ estudianteId: estId, asignaturas });
+        setForm(f => {
+          if (f.estudiante_id !== estId) return f;
+          if (f.asignatura_id && !asignaturas.some((a: { id: number }) => a.id === f.asignatura_id)) {
+            return { ...f, asignatura_id: 0 };
+          }
+          if (!f.asignatura_id && asignaturas.length === 1 && user?.role === 'profesor') {
+            return { ...f, asignatura_id: asignaturas[0].id };
+          }
+          return f;
+        });
+      })
+      .catch(() => { if (estudianteFormRef.current === estId) setOpcionesAsig({ estudianteId: estId, asignaturas: [] }); })
+      .finally(() => { if (estudianteFormRef.current === estId) setCargandoAsig(false); });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.estudiante_id, showModal]);
+
   const handleCreate = async () => {
     if (enviandoRef.current) return;
     if (!form.estudiante_id || !form.titulo) {
@@ -182,12 +225,18 @@ export const ReportesPage = () => {
     setEnviando(true);
     if (!claveEnvioRef.current) claveEnvioRef.current = nuevaClaveEnvio();
     try {
-      await api.post('/reportes', { ...form, client_request_id: claveEnvioRef.current });
+      // La asignatura forma parte del contenido: cambiarla renueva la clave
+      // (efecto sobre `form`) y el backend la incluye en la huella.
+      await api.post('/reportes', {
+        ...form,
+        asignatura_id: form.asignatura_id || null,
+        client_request_id: claveEnvioRef.current,
+      });
       setMessage({ type: 'success', text: 'Reporte creado correctamente' });
       loadData();
       setShowModal(false);
       // setFormEstado: el reset es parte de ESTE envío (la guarda de setForm lo bloquearía).
-      setFormEstado({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '' });
+      setFormEstado({ estudiante_id: 0, tipo: 'conducta', gravedad: 'leve', titulo: '', descripcion: '', curso_filter: '', asignatura_id: 0 });
     } catch (e: any) {
       // El formulario NO se limpia: el usuario puede reintentar tal cual.
       setMessage({ type: 'error', text: e.response?.data?.error || 'Error al crear' });
@@ -673,19 +722,41 @@ export const ReportesPage = () => {
           <Select
             label="Curso"
             value={form.curso_filter || ''}
-            onChange={e => setForm({ ...form, curso_filter: e.target.value, estudiante_id: 0 })}
+            onChange={e => setForm({ ...form, curso_filter: e.target.value, estudiante_id: 0, asignatura_id: 0 })}
             options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))}
             placeholder="Filtrar por curso"
           />
           <Select
             label="Estudiante *"
             value={form.estudiante_id}
-            onChange={e => setForm({ ...form, estudiante_id: parseInt(e.target.value) })}
+            onChange={e => setForm({ ...form, estudiante_id: parseInt(e.target.value) || 0, asignatura_id: 0 })}
             options={estudiantes
               .filter(e => !form.curso_filter || e.curso_id === parseInt(form.curso_filter))
               .map(e => ({ value: e.id, label: `${e.nombre_completo}${!form.curso_filter ? ` - ${e.curso}` : ''}` }))}
             placeholder="Seleccionar estudiante"
           />
+          <div>
+            <Select
+              label="Asignatura del reporte"
+              value={form.asignatura_id || ''}
+              onChange={e => setForm({ ...form, asignatura_id: parseInt(e.target.value) || 0 })}
+              disabled={!form.estudiante_id || cargandoAsig}
+              options={[
+                { value: '', label: 'Sin asignatura específica' },
+                ...(opcionesAsig.estudianteId === form.estudiante_id ? opcionesAsig.asignaturas : [])
+                  .map(a => ({ value: a.id, label: a.nombre })),
+              ]}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              {!form.estudiante_id
+                ? 'Elija primero el estudiante.'
+                : cargandoAsig
+                  ? 'Cargando asignaturas…'
+                  : opcionesAsig.asignaturas.length === 0
+                    ? 'No hay asignaturas disponibles para este estudiante; el reporte se guardará sin asignatura específica.'
+                    : 'Opcional. Indique la asignatura en la que ocurrió, o «Sin asignatura específica» para una situación general.'}
+            </p>
+          </div>
           <Input
             label="Título *"
             value={form.titulo}
@@ -801,6 +872,12 @@ export const ReportesPage = () => {
                 <p className="text-slate-500 text-xs">Reportado por</p>
                 <p className="font-medium">{selectedReporte.reportado_por}</p>
               </div>
+              {selectedReporte.asignatura_nombre && (
+                <div>
+                  <p className="text-slate-500 text-xs">Asignatura del reporte</p>
+                  <p className="font-medium">{selectedReporte.asignatura_nombre}</p>
+                </div>
+              )}
               <div>
                 <p className="text-slate-500 text-xs">Fecha</p>
                 <p className="font-medium">{new Date(selectedReporte.fecha).toLocaleString('es-DO')}</p>
