@@ -323,7 +323,22 @@ export const ConfiguracionPage = () => {
     setShowModal(true);
   };
 
+  // Profesores de la Salida Optativa elegidos y SIN guardar en la sección. El
+  // «Guardar» del curso no los guarda, así que se avisa antes de perderlos.
+  const [pendientesSalida, setPendientesSalida] = useState(0);
+  const confirmarPendientesSalida = () =>
+    pendientesSalida === 0 || window.confirm(
+      `Hay ${pendientesSalida} profesor(es) de la Salida Optativa elegidos sin guardar. ` +
+      'Este botón no los guarda: se perderán. ¿Continuar de todos modos?');
+  const cerrarModalCurso = () => {
+    if (confirmarPendientesSalida()) {
+      setPendientesSalida(0);
+      setShowModal(false);
+    }
+  };
+
   const saveCurso = async () => {
+    if (!confirmarPendientesSalida()) return;
     setSaving(true);
     try {
       const data = {
@@ -1226,8 +1241,8 @@ export const ConfiguracionPage = () => {
       </Modal>
 
       {/* Modal Curso */}
-      <Modal isOpen={showModal && modalType === 'curso'} onClose={() => setShowModal(false)} title={editingItem ? `Editar Curso — ${labelCurso(editingItem)}` : 'Nuevo Curso'} size="md"
-        footer={<><Button variant="secondary" onClick={() => setShowModal(false)}>Cancelar</Button><Button onClick={saveCurso} loading={saving}>{editingItem ? 'Guardar' : 'Crear'}</Button></>}>
+      <Modal isOpen={showModal && modalType === 'curso'} onClose={cerrarModalCurso} title={editingItem ? `Editar Curso — ${labelCurso(editingItem)}` : 'Nuevo Curso'} size="md"
+        footer={<><Button variant="secondary" onClick={cerrarModalCurso}>Cancelar</Button><Button onClick={saveCurso} loading={saving}>{editingItem ? 'Guardar' : 'Crear'}</Button></>}>
         <div className="space-y-4">
           <Select label="Grado *" value={cursoForm.grado_id} onChange={e => setCursoForm({ ...cursoForm, grado_id: parseInt(e.target.value) })} options={grados.map(g => ({ value: g.id, label: g.nombre }))} placeholder="Seleccionar grado" />
           <div className="grid grid-cols-2 gap-4">
@@ -1240,7 +1255,8 @@ export const ConfiguracionPage = () => {
               oculta sola si el grado no es 4to-6to de Secundaria. */}
           {editingItem && (
             <SalidaOptativaSection cursoId={editingItem.id} curso={editingItem}
-                                   asignaturas={asignaturas} />
+                                   asignaturas={asignaturas}
+                                   onCambiosPendientes={setPendientesSalida} />
           )}
         </div>
       </Modal>
