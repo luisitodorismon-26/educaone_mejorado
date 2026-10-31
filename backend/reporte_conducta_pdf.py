@@ -298,10 +298,87 @@ def _dibujar_barra_metadatos(c, x, y, ancho, items):
     return y - alto - 0.10*inch
 
 
+AUTORIA_TAM_MAX = 9.5
+AUTORIA_TAM_MIN = 6.5
+
+
+def _partir_lineas(texto, fuente, tam, ancho):
+    """Reparte el texto en líneas que caben en `ancho`, por palabras. Una palabra
+    que sola no cabe se parte por caracteres. No se pierde ningún carácter."""
+    lineas, actual = [], ''
+    for palabra in texto.split():
+        prueba = f"{actual} {palabra}" if actual else palabra
+        if stringWidth(prueba, fuente, tam) <= ancho:
+            actual = prueba
+            continue
+        if actual:
+            lineas.append(actual)
+        actual = ''
+        for ch in palabra:
+            if actual and stringWidth(actual + ch, fuente, tam) > ancho:
+                lineas.append(actual)
+                actual = ''
+            actual += ch
+    if actual:
+        lineas.append(actual)
+    return lineas or ['']
+
+
+def _maquetar_valor_autoria(texto, disponible):
+    """(tamaño, líneas): se achica hasta AUTORIA_TAM_MIN; si aun así no cabe, se
+    reparte en varias líneas a ese tamaño."""
+    tam = AUTORIA_TAM_MAX
+    while tam > AUTORIA_TAM_MIN and stringWidth(texto, 'Helvetica-Bold', tam) > disponible:
+        tam -= 0.5
+    if stringWidth(texto, 'Helvetica-Bold', tam) <= disponible:
+        return tam, [texto]
+    return tam, _partir_lineas(texto, 'Helvetica-Bold', tam, disponible)
+
+
+def _dibujar_autoria(c, x, y, ancho, autor, asignatura):
+    """Franja «Reportado por» y, si el reporte la tiene identificada, «Asignatura
+    del reporte». El texto se achica hasta el mínimo y, si aun así no cabe, pasa a
+    varias líneas y la franja crece; nunca se corta ni se superpone."""
+    filas = [("Reportado por", autor)]
+    if asignatura:
+        filas.append(("Asignatura del reporte", asignatura))
+    alto_fila = 0.22*inch
+    maquetas = []
+    for label, valor in filas:
+        etiqueta = f"{label.upper()}:"
+        dx_val = 0.12*inch + stringWidth(etiqueta, 'Helvetica-Bold', 7.5) + 5
+        tam, lineas = _maquetar_valor_autoria(str(valor), ancho - 0.12*inch - dx_val)
+        interlinea = tam * 1.2
+        alto = max(alto_fila, alto_fila + (len(lineas) - 1) * interlinea)
+        maquetas.append((etiqueta, dx_val, tam, lineas, interlinea, alto))
+    alto_total = sum(m[5] for m in maquetas) + 0.08*inch
+    c.setFillColor(COLOR_META_FONDO)
+    c.roundRect(x, y - alto_total, ancho, alto_total, 3, stroke=0, fill=1)
+    y_fila = y - 0.07*inch
+    for etiqueta, dx_val, tam, lineas, interlinea, alto in maquetas:
+        yb = y_fila - 0.6 * alto_fila
+        c.setFont('Helvetica-Bold', 7.5)
+        c.setFillColor(HexColor('#475569'))
+        c.drawString(x + 0.12*inch, yb, etiqueta)
+        c.setFont('Helvetica-Bold', tam)
+        c.setFillColor(HexColor('#0F172A'))
+        for j, linea in enumerate(lineas):
+            c.drawString(x + dx_val, yb - j * interlinea, linea)
+        y_fila -= alto
+    return y - alto_total - 0.08*inch
+
+
 def generar_reporte_conducta_pdf(reporte, estudiante, curso, grado, tanda,
                                     reportador, respondedor, config, colegio,
-                                    ano_escolar: str = None) -> bytes:
-    """Genera el PDF del reporte de conducta."""
+                                    ano_escolar: str = None,
+                                    asignatura_nombre: str = None) -> bytes:
+    """Genera el PDF del reporte de conducta.
+
+    `asignatura_nombre`: la materia del reporte SOLO si el reporte la guarda
+    identificada. Nunca se deduce de las asignaciones actuales del autor: un
+    profesor puede dar varias materias, y lo que da hoy no prueba en qué
+    materia ocurrió un incidente antiguo. Sin ella, la línea no se imprime.
+    """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
     ancho_pag, alto_pag = letter
@@ -383,9 +460,7 @@ def generar_reporte_conducta_pdf(reporte, estudiante, curso, grado, tanda,
     # METADATOS
     reporter_nombre = "—"
     if reportador:
-        n = f"{reportador.nombre or ''} {reportador.apellido or ''}".strip()
-        rol = (reportador.role or '').capitalize()
-        reporter_nombre = f"{n} ({rol})" if rol else n
+        reporter_nombre = f"{reportador.nombre or ''} {reportador.apellido or ''}".strip() or "—"
     
     estado = (reporte.estado or 'pendiente').lower()
     if estado == 'pendiente':
@@ -404,8 +479,8 @@ def generar_reporte_conducta_pdf(reporte, estudiante, curso, grado, tanda,
     fecha_gen = formato_fecha_corto(reporte.fecha_respuesta or reporte.fecha)
     
     y -= 0.05*inch
+    y = _dibujar_autoria(c, margen_izq, y, ancho_util, reporter_nombre, asignatura_nombre)
     y = _dibujar_barra_metadatos(c, margen_izq, y, ancho_util, [
-        ("Reportado por", reporter_nombre, None),
         ("Estado", estado_label, estado_color),
         ("Generado", fecha_gen, None),
     ])
