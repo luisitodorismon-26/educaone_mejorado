@@ -1686,6 +1686,15 @@ class ReporteConducta(Base):
     client_request_id = Column(String(64), nullable=True)
     client_request_hash = Column(String(64), nullable=True)
 
+    # === ASIGNATURA DEL REPORTE (opcional) ===
+    # La elige quien crea el reporte entre las asignaturas activas del curso del
+    # estudiante (un profesor, solo las suyas). NULL = sin asignatura específica,
+    # y también todos los reportes anteriores: nunca se deduce ni se rellena a
+    # partir de las asignaciones. `asignatura_nombre` guarda el nombre al crear
+    # el reporte para que el PDF histórico no cambie si la materia se renombra.
+    asignatura_id = Column(Integer, ForeignKey('asignaturas.id'), nullable=True)
+    asignatura_nombre = Column(String(100), nullable=True)
+
     __table_args__ = (
         Index('uq_reporte_autor_client_request', 'colegio_id', 'reportado_por', 'client_request_id',
               unique=True, postgresql_where=text('client_request_id IS NOT NULL'),
