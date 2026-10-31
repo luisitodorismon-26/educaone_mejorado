@@ -215,18 +215,27 @@ export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPe
   // Cambiar de salida cambia el juego de componentes: se guarda al instante y
   // el servidor responde con los componentes que tocan.
   const cambiarSalida = async (codigo: string) => {
-    // Cambiar la salida retira TODOS los componentes vinculados (si ninguno
-    // tiene datos académicos; si alguno los tiene, el servidor lo impide). Se
-    // avisa antes, nombrándolos, para que no se haga por error.
+    if (codigo === (estado?.salida_optativa_codigo || '')) return;
+    // Antes de cambiar, se dice TODO lo que se perdería y se pide confirmación:
+    //  * los componentes vinculados, que el servidor retira (si ninguno tiene
+    //    datos académicos; si alguno los tiene, lo impide);
+    //  * las selecciones locales sin guardar (profesores elegidos en una tarjeta
+    //    o en «Añadir»), aunque no haya ningún componente vinculado.
+    // Cancelar no toca nada: el selector vuelve solo a la salida guardada y las
+    // selecciones pendientes se conservan.
     const vinculados = (estado?.componentes || []).filter(c => c.asignatura_id);
-    if (vinculados.length && codigo !== (estado?.salida_optativa_codigo || '')) {
-      const lista = vinculados.map(c => `• ${c.nombre_oficial} (${c.componente_codigo})`).join('\n');
-      if (!window.confirm(
-        `Cambiar la Salida Optativa retira estos componentes del curso y sus ` +
-        `profesores:\n${lista}\n\nPara añadir un componente de otra salida sin ` +
-        `quitar los actuales, usa «Añadir componente». ¿Cambiar la salida?`)) {
-        return;
-      }
+    const avisos: string[] = [];
+    if (vinculados.length) {
+      avisos.push('Se retiran estos componentes del curso y sus profesores:\n' +
+        vinculados.map(c => `• ${c.nombre_oficial} (${c.componente_codigo})`).join('\n'));
+    }
+    if (pendientes > 0) {
+      avisos.push(`Hay ${pendientes} profesor(es) elegido(s) sin guardar, que se perderán.`);
+    }
+    if (avisos.length && !window.confirm(
+        `Cambiar la Salida Optativa:\n\n${avisos.join('\n\n')}\n\nPara añadir un componente de ` +
+        'otra salida sin quitar los actuales, usa «Añadir otro componente». ¿Cambiar la salida?')) {
+      return;
     }
     setError(null);
     setOk(null);
@@ -236,6 +245,9 @@ export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPe
         salida_optativa_codigo: codigo || null,
       });
       setEdicion({});
+      setNuevoCodigo('');
+      setNuevoProfe(null);
+      setNuevaIdentidad(null);
       tras(r.data, codigo ? 'Salida guardada. Falta asignar el profesor de cada componente.'
                           : 'Salida retirada.');
     } catch (e: any) {
@@ -293,15 +305,31 @@ export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPe
     }
   };
 
+  // Asignatura que muestra el selector de vínculo manual. Es EXACTAMENTE la que
+  // se envía: si Dirección no lo ha tocado, la guardada; si eligió «Sin
+  // vincular», null a propósito (no se confunde con «sin tocar»).
+  const vinculoVisible = (c: ComponenteEstado): number | null =>
+    c.componente_codigo in vinculo ? vinculo[c.componente_codigo] : c.asignatura_id;
+
   // Vínculo manual de R3.2: SOLO ese componente, por el PUT de siempre.
   const vincularManual = async (c: ComponenteEstado) => {
+    const elegida = vinculoVisible(c);
+    if (elegida === c.asignatura_id) return;          // sin cambios: no se envía nada
+    if (elegida === null && !window.confirm(
+        `¿Desvincular ${c.nombre_oficial} (${c.componente_codigo}) de su asignatura? ` +
+        'La asignatura y sus datos no se borran.')) {
+      return;
+    }
     setError(null);
     setOk(null);
     setGuardando(c.componente_codigo);
     try {
       const r = await api.put(`/cursos/${cursoId}/salida-optativa`, {
-        componentes: { [c.componente_codigo]: vinculo[c.componente_codigo] ?? null },
+        componentes: { [c.componente_codigo]: elegida },
       });
+      const resto = { ...vinculo };
+      delete resto[c.componente_codigo];
+      setVinculo(resto);
       tras(r.data, 'Vínculo guardado.');
     } catch (e: any) {
       setError(e.response?.data?.error || 'No se pudo guardar el vínculo');
@@ -486,14 +514,17 @@ export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPe
                         </summary>
                         <div className="mt-2 flex gap-2 items-end">
                           <div className="flex-1">
-                            <Select label="" value={vinculo[c.componente_codigo] ?? c.asignatura_id ?? 0}
+                            <Select label="" value={vinculoVisible(c) ?? 0}
                               disabled={!!guardando}
                               onChange={e => setVinculo({ ...vinculo, [c.componente_codigo]: parseInt(e.target.value) || null })}
                               options={asignaturas.map(a => ({ value: a.id, label: a.nombre }))}
                               placeholder="Sin vincular" />
                           </div>
-                          <Button size="sm" variant="secondary" disabled={!!guardando}
-                            onClick={() => vincularManual(c)}>Vincular</Button>
+                          <Button size="sm" variant="secondary"
+                            disabled={!!guardando || vinculoVisible(c) === c.asignatura_id}
+                            onClick={() => vincularManual(c)}>
+                            {vinculoVisible(c) === null && c.asignatura_id ? 'Desvincular' : 'Vincular'}
+                          </Button>
                         </div>
                       </details>
                     )}
