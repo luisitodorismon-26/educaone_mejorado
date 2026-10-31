@@ -4,14 +4,21 @@ import { Button, Select, Alert } from '../../components/ui';
 import { labelCurso, CursoEtiquetable } from '../../utils/labelCurso';
 
 /**
- * R3.2 — Salida Optativa de un curso de 4to-6to de Secundaria.
+ * Salida Optativa de un curso de 4to-6to de Secundaria.
  *
  * Vive DENTRO del modal de edición del curso (Configuración → Cursos), no en
- * un item nuevo del menú: la salida es un atributo del curso, como su tanda.
+ * un item nuevo del menú.
  *
- * Todo lo que se pinta sale del backend —las 4 salidas y los nombres oficiales
- * de los componentes llegan en la respuesta—, así que el frontend NO tiene
- * ninguna copia del catálogo MINERD que pueda quedar desincronizada.
+ * Dos zonas:
+ *   1. ASIGNACIONES GUARDADAS — lo que confirmó el servidor: salida, componente,
+ *      profesor y estado. Nada de lo que se pinta aquí sale de otra fuente.
+ *   2. AÑADIR — «Seleccionar salida» solo sirve para EXPLORAR el catálogo del
+ *      grado: muestra los componentes de esa salida, cada uno con su profesor y
+ *      su botón «Guardar asignación». Cambiarlo NO guarda nada ni retira nada.
+ *
+ * Todo lo que se pinta sale del backend —las 4 salidas y los componentes del
+ * grado llegan en la respuesta—, así que el frontend NO tiene ninguna copia
+ * del catálogo MINERD que pueda quedar desincronizada.
  */
 
 interface ComponenteEstado {
@@ -22,11 +29,9 @@ interface ComponenteEstado {
   asignatura_id: number | null;
   asignatura_nombre: string | null;
   tiene_historia: boolean;
-  // R3.4
   identidad_independiente: boolean;
   profesor_id: number | null;
   profesor_nombre: string | null;
-  // SALIDAS-MIXTAS
   salida_codigo: string;
   salida_nombre: string;
   de_la_salida_del_curso: boolean;
@@ -40,6 +45,7 @@ interface Candidata {
   asignatura_id: number;
   nombre: string;
   activo: boolean;
+  historia: { tabla: string; filas: number }[];
   historia_resumen: string;
   asignaciones: { profesor_id: number; profesor_nombre: string | null; activo: boolean }[];
 }
@@ -53,44 +59,6 @@ interface ComponenteDisponible {
   salida_nombre: string;
   candidatas: Candidata[];
 }
-
-// Elección explícita de la asignatura de un componente cuando el curso ya
-// tiene alguna sin vincular (p. ej. dos "Apreciación y Producción Literarias").
-const ElegirIdentidad = ({ nombre, candidatas, valor, onChange }: {
-  nombre: string;
-  candidatas: Candidata[];
-  valor: number | 'nueva' | null;
-  onChange: (v: number | 'nueva') => void;
-}) => (
-  <div className="border rounded-md p-2 bg-amber-50 text-xs space-y-1 mt-2">
-    <p className="text-amber-800">
-      Este curso ya tiene {candidatas.length === 1 ? 'una asignatura' : `${candidatas.length} asignaturas`} de
-      este componente sin vincular. Elige cuál es la del componente; no se crea otra ni se elige
-      ninguna sola.
-    </p>
-    {candidatas.map(cand => (
-      <label key={cand.asignatura_id} className="flex gap-2 items-start">
-        <input type="radio" name={nombre}
-          checked={valor === cand.asignatura_id}
-          disabled={!cand.activo}
-          onChange={() => onChange(cand.asignatura_id)} />
-        <span>
-          #{cand.asignatura_id} {cand.nombre}
-          {!cand.activo && ' (inactiva: reactívala en Asignaturas si es esta)'}
-          {' · '}{cand.historia_resumen || 'sin datos académicos'}
-          {cand.asignaciones.length > 0 && ' · ' + cand.asignaciones.map(a =>
-            `${a.profesor_nombre || a.profesor_id}${a.activo ? '' : ' (asignación inactiva)'}`).join(', ')}
-        </span>
-      </label>
-    ))}
-    <label className="flex gap-2 items-start">
-      <input type="radio" name={nombre}
-        checked={valor === 'nueva'}
-        onChange={() => onChange('nueva')} />
-      <span>Ninguna: crear una asignatura nueva</span>
-    </label>
-  </div>
-);
 
 interface Profesor {
   id: number;
@@ -124,49 +92,105 @@ interface Asignatura {
   nombre: string;
 }
 
-// Estado de una tarjeta. Sale SIEMPRE de lo que confirmó el servidor, salvo
-// «pendiente», que es una selección local todavía no enviada.
-type EstadoTarjeta = 'guardada' | 'sin_profesor' | 'pendiente';
+// Componente del catálogo del grado, visto desde «Seleccionar salida».
+interface FilaCatalogo {
+  componente_codigo: string;
+  nombre_oficial: string;
+  salida_codigo: string;
+  guardado: ComponenteEstado | null;      // si ya está en el curso con asignatura
+  candidatas: Candidata[];
+  slot: number;
+}
 
-const ETIQUETA_ESTADO: Record<EstadoTarjeta, { texto: string; clase: string }> = {
-  guardada: { texto: 'Asignación guardada', clase: 'bg-green-50 text-green-700 border-green-200' },
-  sin_profesor: { texto: 'Sin profesor', clase: 'bg-amber-50 text-amber-800 border-amber-200' },
-  pendiente: { texto: 'Profesor pendiente de guardar', clase: 'bg-blue-50 text-blue-700 border-blue-200' },
+// Lo que el servidor guarda como historia, dicho en lenguaje del colegio.
+const TABLAS_LEGIBLES: Record<string, string> = {
+  calificaciones_secundaria: 'notas',
+  calificaciones: 'notas',
+  evaluaciones_extra_secundaria: 'evaluaciones completivas o extraordinarias',
+  asistencias: 'asistencias',
+  indicadores_logro: 'indicadores de logro',
+  items_completivos: 'evaluaciones completivas',
+  eval_interna_estudiante: 'evaluaciones internas',
 };
 
-interface Edicion {
+const describirCandidata = (c: Candidata) => {
+  const datos = (c.historia || []).map(h => `${h.filas} ${TABLAS_LEGIBLES[h.tabla] || 'registros'}`);
+  const profes = c.asignaciones.map(a =>
+    `${a.profesor_nombre || 'profesor sin nombre'}${a.activo ? '' : ' (ya no asignado)'}`);
+  return [
+    datos.length ? `con ${datos.join(', ')}` : 'sin notas ni asistencias',
+    profes.length ? `profesor anterior: ${profes.join(', ')}` : '',
+    c.activo ? '' : 'asignatura desactivada: hay que reactivarla en Asignaturas para usarla',
+  ].filter(Boolean).join(' · ');
+};
+
+// Elección explícita cuando el curso ya tiene asignaturas de ese componente
+// sin vincular. Sin números internos: se describen por sus datos.
+const ElegirAsignatura = ({ nombre, candidatas, valor, onChange }: {
+  nombre: string;
+  candidatas: Candidata[];
+  valor: number | 'nueva' | null;
+  onChange: (v: number | 'nueva') => void;
+}) => (
+  <div className="border rounded-md p-2 bg-amber-50 text-xs space-y-1 mt-2">
+    <p className="text-amber-800">
+      Este curso ya tuvo {candidatas.length === 1 ? 'una asignatura' : `${candidatas.length} asignaturas`} para
+      este componente que hoy no están en uso. Elige cuál conservar para no duplicarla: el sistema no
+      elige ni crea ninguna por su cuenta.
+    </p>
+    {candidatas.map((cand, i) => (
+      <label key={cand.asignatura_id} className="flex gap-2 items-start" title={`ref. ${cand.asignatura_id}`}>
+        <input type="radio" name={nombre}
+          checked={valor === cand.asignatura_id}
+          disabled={!cand.activo}
+          onChange={() => onChange(cand.asignatura_id)} />
+        <span>
+          <strong>{candidatas.length > 1 ? `Opción ${String.fromCharCode(65 + i)}` : 'La existente'}</strong>
+          {': '}{describirCandidata(cand)}
+        </span>
+      </label>
+    ))}
+    <label className="flex gap-2 items-start">
+      <input type="radio" name={nombre} checked={valor === 'nueva'} onChange={() => onChange('nueva')} />
+      <span>Ninguna: empezar con una asignatura nueva</span>
+    </label>
+  </div>
+);
+
+interface Eleccion {
+  seleccionado: boolean;          // casilla marcada en «Componentes de esta salida»
   profesorId: number | null;
   identidad: number | 'nueva' | null;
 }
 
-export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPendientes }: {
+const Punto = ({ color }: { color: string }) => (
+  <span className={`inline-block w-2 h-2 rounded-full ${color}`} aria-hidden="true" />
+);
+
+export const SalidaOptativaSection = ({ cursoId, curso, onCambiosPendientes }: {
   cursoId: number;
-  // Solo para rotular. La identidad sigue siendo `cursoId`: en multi-tanda el
-  // mismo grado existe en Matutina y Vespertina, y la pantalla tiene que decir
-  // cuál de los dos se está configurando.
+  // Solo para rotular. La identidad sigue siendo `cursoId`.
   curso?: CursoEtiquetable;
-  asignaturas: Asignatura[];
-  // Número de componentes con un profesor elegido y SIN guardar. El modal del
-  // curso lo usa para avisar antes de cerrarse: su botón «Guardar» no guarda
-  // los profesores de la Salida Optativa.
+  // Se mantiene en la firma por compatibilidad con el modal; esta pantalla ya
+  // no ofrece el vínculo manual a una asignatura cualquiera.
+  asignaturas?: Asignatura[];
+  // Componentes con un profesor elegido y SIN guardar. El modal del curso lo
+  // usa para avisar antes de cerrarse.
   onCambiosPendientes?: (n: number) => void;
 }) => {
-  // `estado` es SIEMPRE la última respuesta del servidor. Nada de lo que se
-  // pinta como guardado sale de otra fuente.
+  // `estado` es SIEMPRE la última respuesta del servidor.
   const [estado, setEstado] = useState<SalidaEstado | null>(null);
   const [profesores, setProfesores] = useState<Profesor[]>([]);
   const [cargando, setCargando] = useState(true);
-  const [guardando, setGuardando] = useState<string | null>(null);   // qué se está guardando
+  const [guardando, setGuardando] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
-  // Tarjetas abiertas para editar, con la selección LOCAL todavía no guardada.
-  const [edicion, setEdicion] = useState<Record<string, Edicion>>({});
-  // Vínculo manual a una asignatura existente (R3.2), por componente.
-  const [vinculo, setVinculo] = useState<Record<string, number | null>>({});
-  // Formulario «Añadir componente», separado de las tarjetas.
-  const [nuevoCodigo, setNuevoCodigo] = useState<string>('');
-  const [nuevoProfe, setNuevoProfe] = useState<number | null>(null);
-  const [nuevaIdentidad, setNuevaIdentidad] = useState<number | 'nueva' | null>(null);
+  // Salida que se está EXPLORANDO. Es local: no es la salida del curso.
+  const [explorar, setExplorar] = useState<string>('');
+  // Elecciones locales por componente (casilla, profesor y, si hace falta, asignatura).
+  const [elecciones, setElecciones] = useState<Record<string, Eleccion>>({});
+  // Asignación guardada cuyo profesor se está cambiando desde arriba.
+  const [cambiando, setCambiando] = useState<string | null>(null);
 
   const cargar = async () => {
     setCargando(true);
@@ -183,6 +207,7 @@ export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPe
 
   const cargarProfesores = async () => {
     try {
+      // El servidor solo devuelve usuarios del colegio de quien consulta.
       const r = await api.get('/usuarios');
       setProfesores((r.data || []).filter((u: Profesor) => u.role === 'profesor'));
     } catch {
@@ -192,169 +217,102 @@ export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPe
 
   useEffect(() => { cargar(); cargarProfesores(); /* eslint-disable-next-line */ }, [cursoId]);
 
-  const nombreProfe = (id: number | null) => {
-    const p = profesores.find(x => x.id === id);
-    return p ? (p.nombre_completo || `${p.nombre || ''} ${p.apellido || ''}`.trim()) : '';
+  const guardados = (estado?.componentes || []).filter(c => c.asignatura_id);
+  const eleccionDe = (codigo: string): Eleccion =>
+    elecciones[codigo] || { seleccionado: false, profesorId: null, identidad: null };
+  const profeGuardado = (codigo: string) =>
+    (estado?.componentes || []).find(c => c.componente_codigo === codigo)?.profesor_id ?? null;
+  // Pendiente = profesor elegido (en una fila marcada o en «Cambiar profesor»)
+  // distinto del que el servidor tiene guardado.
+  const esPendiente = (codigo: string) => {
+    const e = elecciones[codigo];
+    if (!e || !e.profesorId) return false;
+    if (!e.seleccionado && cambiando !== codigo) return false;
+    return e.profesorId !== profeGuardado(codigo);
   };
-
-  const estadoDe = (c: ComponenteEstado): EstadoTarjeta => {
-    const ed = edicion[c.componente_codigo];
-    if (ed && ed.profesorId && ed.profesorId !== c.profesor_id) return 'pendiente';
-    return c.asignatura_id && c.profesor_id ? 'guardada' : 'sin_profesor';
-  };
-
-  const pendientes = (estado?.componentes || []).filter(c => estadoDe(c) === 'pendiente').length
-    + (nuevoCodigo && nuevoProfe ? 1 : 0);
+  const pendientes = Object.keys(elecciones).filter(esPendiente).length;
   useEffect(() => { onCambiosPendientes?.(pendientes); /* eslint-disable-next-line */ }, [pendientes]);
 
-  const tras = (d: SalidaEstado, msg: string) => {
-    setEstado(d);
-    setOk(msg);
-  };
+  const elegir = (codigo: string, cambios: Partial<Eleccion>) =>
+    setElecciones(prev => ({ ...prev, [codigo]: { ...(prev[codigo] || { seleccionado: false, profesorId: null, identidad: null }), ...cambios } }));
+  const olvidar = (codigos: string[]) =>
+    setElecciones(prev => {
+      const r = { ...prev };
+      codigos.forEach(k => delete r[k]);
+      return r;
+    });
 
-  // Cambiar de salida cambia el juego de componentes: se guarda al instante y
-  // el servidor responde con los componentes que tocan.
-  const cambiarSalida = async (codigo: string) => {
-    if (codigo === (estado?.salida_optativa_codigo || '')) return;
-    // Antes de cambiar, se dice TODO lo que se perdería y se pide confirmación:
-    //  * los componentes vinculados, que el servidor retira (si ninguno tiene
-    //    datos académicos; si alguno los tiene, lo impide);
-    //  * las selecciones locales sin guardar (profesores elegidos en una tarjeta
-    //    o en «Añadir»), aunque no haya ningún componente vinculado.
-    // Cancelar no toca nada: el selector vuelve solo a la salida guardada y las
-    // selecciones pendientes se conservan.
-    const vinculados = (estado?.componentes || []).filter(c => c.asignatura_id);
-    const avisos: string[] = [];
-    if (vinculados.length) {
-      avisos.push('Se retiran estos componentes del curso y sus profesores:\n' +
-        vinculados.map(c => `• ${c.nombre_oficial} (${c.componente_codigo})`).join('\n'));
-    }
-    if (pendientes > 0) {
-      avisos.push(`Hay ${pendientes} profesor(es) elegido(s) sin guardar, que se perderán.`);
-    }
-    if (avisos.length && !window.confirm(
-        `Cambiar la Salida Optativa:\n\n${avisos.join('\n\n')}\n\nPara añadir un componente de ` +
-        'otra salida sin quitar los actuales, usa «Añadir otro componente». ¿Cambiar la salida?')) {
+  // Cambiar la salida que se explora: no envía nada al servidor. Si había
+  // profesores elegidos sin guardar en la salida que se deja, se pregunta.
+  const cambiarExploracion = (codigo: string) => {
+    const enEsta = Object.keys(elecciones).filter(k => esPendiente(k) && k !== cambiando);
+    if (enEsta.length && !window.confirm(
+        (enEsta.length === 1 ? 'Hay un profesor elegido sin guardar' : `Hay ${enEsta.length} profesores elegidos sin guardar`) +
+        ' en la salida que estás viendo. Si cambias de salida se descartarán. ¿Cambiar de todos modos?')) {
       return;
     }
-    setError(null);
-    setOk(null);
-    setGuardando('salida');
-    try {
-      const r = await api.put(`/cursos/${cursoId}/salida-optativa`, {
-        salida_optativa_codigo: codigo || null,
-      });
-      setEdicion({});
-      setNuevoCodigo('');
-      setNuevoProfe(null);
-      setNuevaIdentidad(null);
-      tras(r.data, codigo ? 'Salida guardada. Falta asignar el profesor de cada componente.'
-                          : 'Salida retirada.');
-    } catch (e: any) {
-      setError(e.response?.data?.error || 'No se pudo cambiar la Salida Optativa');
-    } finally {
-      setGuardando(null);
-    }
+    setElecciones(prev => (cambiando && prev[cambiando] ? { [cambiando]: prev[cambiando] } : {}));
+    setExplorar(codigo);
   };
 
-  // Guarda UN componente (profesor y, si hace falta, la asignatura elegida).
-  // Solo toca ese componente; la respuesta del servidor es lo que se pinta.
-  const guardarComponente = async (codigo: string, profesorId: number | null,
-                                   identidad: number | 'nueva' | null) => {
+  // POST de UNA asignación; devuelve el estado del servidor o lanza el error.
+  const enviar = async (codigo: string) => {
+    const e = eleccionDe(codigo);
+    const r = await api.post(`/cursos/${cursoId}/salida-optativa/componentes`, {
+      componente_codigo: codigo,
+      profesor_id: e.profesorId,
+      ...(typeof e.identidad === 'number' ? { asignatura_id: e.identidad } : {}),
+      ...(e.identidad === 'nueva' ? { crear_identidad_nueva: true } : {}),
+    });
+    return r.data as SalidaEstado;
+  };
+
+  // Guarda las asignaciones indicadas, una a una. Lo que se pinta después es la
+  // respuesta del servidor; si una falla, las anteriores ya quedaron guardadas
+  // y se dice cuál falló.
+  const guardar = async (codigos: string[]) => {
     setError(null);
     setOk(null);
-    setGuardando(codigo);
+    setGuardando(true);
+    const hechos: string[] = [];
     try {
-      const r = await api.post(`/cursos/${cursoId}/salida-optativa/componentes`, {
-        componente_codigo: codigo,
-        profesor_id: profesorId,
-        ...(typeof identidad === 'number' ? { asignatura_id: identidad } : {}),
-        ...(identidad === 'nueva' ? { crear_identidad_nueva: true } : {}),
-      });
-      const guardado = (r.data as SalidaEstado).componentes.find(c => c.componente_codigo === codigo);
-      tras(r.data, guardado?.profesor_nombre
-        ? `Guardado: ${guardado.profesor_nombre} imparte ${guardado.nombre_oficial}.`
-        : 'Componente guardado.');
-      return true;
-    } catch (e: any) {
-      const d = e.response?.data;
-      setError(d?.error || 'No se pudo guardar el componente');
-      // Asignaturas del curso que hay que elegir: se recargan para mostrarlas.
+      for (const codigo of codigos) {
+        const d = await enviar(codigo);
+        setEstado(d);
+        const g = d.componentes.find(c => c.componente_codigo === codigo);
+        hechos.push(g?.profesor_nombre ? `${g.profesor_nombre} imparte ${g.nombre_oficial}` : codigo);
+      }
+      setOk(`Asignación guardada: ${hechos.join('; ')}.`);
+      if (cambiando && codigos.includes(cambiando)) setCambiando(null);
+    } catch (err: any) {
+      const d = err.response?.data;
+      setError((hechos.length ? `Guardado: ${hechos.join('; ')}. ` : '') +
+               (d?.error || 'No se pudo guardar la asignación'));
+      // Hay asignaturas del curso que elegir: se recargan para mostrarlas.
       if (d?.motivo === 'identidad_por_elegir') cargar();
-      return false;
     } finally {
-      setGuardando(null);
+      olvidar(codigos.slice(0, hechos.length));
+      setGuardando(false);
     }
   };
 
-  const guardarTarjeta = async (c: ComponenteEstado) => {
-    const ed = edicion[c.componente_codigo];
-    if (!ed?.profesorId) return;
-    if (await guardarComponente(c.componente_codigo, ed.profesorId, ed.identidad)) {
-      const resto = { ...edicion };
-      delete resto[c.componente_codigo];
-      setEdicion(resto);
-    }
-  };
-
-  const guardarNuevo = async () => {
-    if (await guardarComponente(nuevoCodigo, nuevoProfe, nuevaIdentidad)) {
-      setNuevoCodigo('');
-      setNuevoProfe(null);
-      setNuevaIdentidad(null);
-    }
-  };
-
-  // Asignatura que muestra el selector de vínculo manual. Es EXACTAMENTE la que
-  // se envía: si Dirección no lo ha tocado, la guardada; si eligió «Sin
-  // vincular», null a propósito (no se confunde con «sin tocar»).
-  const vinculoVisible = (c: ComponenteEstado): number | null =>
-    c.componente_codigo in vinculo ? vinculo[c.componente_codigo] : c.asignatura_id;
-
-  // Vínculo manual de R3.2: SOLO ese componente, por el PUT de siempre.
-  const vincularManual = async (c: ComponenteEstado) => {
-    const elegida = vinculoVisible(c);
-    if (elegida === c.asignatura_id) return;          // sin cambios: no se envía nada
-    if (elegida === null && !window.confirm(
-        `¿Desvincular ${c.nombre_oficial} (${c.componente_codigo}) de su asignatura? ` +
-        'La asignatura y sus datos no se borran.')) {
-      return;
-    }
-    setError(null);
-    setOk(null);
-    setGuardando(c.componente_codigo);
-    try {
-      const r = await api.put(`/cursos/${cursoId}/salida-optativa`, {
-        componentes: { [c.componente_codigo]: elegida },
-      });
-      const resto = { ...vinculo };
-      delete resto[c.componente_codigo];
-      setVinculo(resto);
-      tras(r.data, 'Vínculo guardado.');
-    } catch (e: any) {
-      setError(e.response?.data?.error || 'No se pudo guardar el vínculo');
-    } finally {
-      setGuardando(null);
-    }
-  };
-
-  const quitarComponente = async (c: ComponenteEstado) => {
+  const quitar = async (c: ComponenteEstado) => {
     if (!window.confirm(
-      `¿Quitar ${c.nombre_oficial} (${c.componente_codigo}) de este curso? ` +
-      `La asignatura y sus datos no se borran; su profesor deja de tenerla asignada.`)) {
+        `¿Quitar ${c.nombre_oficial} de este curso? ` +
+        'La asignatura, sus notas y sus asistencias no se borran; su profesor deja de tenerla asignada.')) {
       return;
     }
     setError(null);
     setOk(null);
-    setGuardando(c.componente_codigo);
+    setGuardando(true);
     try {
-      const r = await api.delete(
-        `/cursos/${cursoId}/salida-optativa/componentes/${c.componente_codigo}`);
-      tras(r.data, 'Componente retirado.');
-    } catch (e: any) {
-      setError(e.response?.data?.error || 'No se pudo quitar el componente');
+      const r = await api.delete(`/cursos/${cursoId}/salida-optativa/componentes/${c.componente_codigo}`);
+      setEstado(r.data);
+      setOk('Componente retirado del curso.');
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'No se pudo quitar el componente');
     } finally {
-      setGuardando(null);
+      setGuardando(false);
     }
   };
 
@@ -362,229 +320,186 @@ export const SalidaOptativaSection = ({ cursoId, curso, asignaturas, onCambiosPe
   // 1ro-3ro de Secundaria y toda Primaria: la sección NO existe.
   if (!estado || !estado.aplica) return null;
 
-  const comps = estado.componentes;
-  const guardadas = comps.filter(c => c.asignatura_id && c.profesor_id).length;
-  // Resumen del curso según el SERVIDOR (nunca según selecciones locales).
-  const resumen = !estado.salida_optativa_codigo
-    ? { texto: 'Sin Salida Optativa', clase: 'text-gray-600' }
-    : guardadas === 0
-      ? { texto: 'Salida seleccionada · ningún profesor asignado todavía', clase: 'text-amber-800' }
-      : guardadas < comps.length
-        ? { texto: `Asignaciones guardadas: ${guardadas} de ${comps.length}`, clase: 'text-amber-800' }
-        : { texto: `Configurada · ${guardadas} de ${comps.length} asignaciones guardadas`, clase: 'text-green-700' };
-  const vinculadas = comps.filter(c => c.asignatura_id).length;
-  const sinEspacio = vinculadas >= estado.capacidad_registro;
-  const elegido = estado.componentes_disponibles.find(d => d.componente_codigo === nuevoCodigo);
-  const faltaIdentidad = !!elegido && elegido.candidatas.length > 0 && nuevaIdentidad === null;
-  const pendientesSalida = estado.modo === 'salida' ? comps.filter(c => !c.asignatura_id) : [];
   const opcionesProfe = profesores.map(p => ({
     value: p.id,
     label: p.nombre_completo || `${p.nombre || ''} ${p.apellido || ''}`.trim(),
   }));
+  const espaciosLibres = estado.capacidad_registro - guardados.length;
+  const nombreSalida = (cod: string) => estado.salidas_disponibles.find(s => s.codigo === cod)?.nombre || cod;
+
+  // Catálogo del grado para la salida que se explora, en el orden oficial.
+  const catalogo: FilaCatalogo[] = !explorar ? [] : [
+    ...estado.componentes.filter(c => c.salida_codigo === explorar).map(c => ({
+      componente_codigo: c.componente_codigo, nombre_oficial: c.nombre_oficial, salida_codigo: c.salida_codigo,
+      guardado: c.asignatura_id ? c : null, candidatas: c.candidatas || [], slot: c.slot,
+    })),
+    ...estado.componentes_disponibles.filter(d => d.salida_codigo === explorar).map(d => ({
+      componente_codigo: d.componente_codigo, nombre_oficial: d.nombre_oficial, salida_codigo: d.salida_codigo,
+      guardado: null, candidatas: d.candidatas || [], slot: d.slot,
+    })),
+  ].sort((a, b) => a.slot - b.slot);
+
+  const marcados = catalogo.filter(f => !f.guardado && eleccionDe(f.componente_codigo).seleccionado);
+  const listos = marcados.filter(f => {
+    const e = eleccionDe(f.componente_codigo);
+    return e.profesorId && !(f.candidatas.length > 0 && e.identidad === null);
+  });
+  const motivoNoGuardar =
+    marcados.length === 0 ? 'Marca un componente y elige su profesor.'
+      : marcados.length > espaciosLibres
+        ? `Solo ${espaciosLibres === 1 ? 'queda 1 espacio' : `quedan ${espaciosLibres} espacios`}: el registro y el boletín admiten ${estado.capacidad_registro} componentes.`
+        : listos.length < marcados.length ? 'Falta elegir el profesor (o la asignatura) de algún componente marcado.' : '';
 
   return (
-    <div className="border-t pt-4 mt-2">
-      <h4 className="font-semibold text-gray-800 mb-1">Salida Optativa — Modalidad Académica</h4>
-      {curso && <p className="text-xs font-medium text-gray-700 mb-1">{labelCurso(curso)}</p>}
-      <p className="text-xs text-gray-500 mb-3">
-        Cada componente se guarda con su propio botón. El «Guardar» del curso no guarda los profesores.
-      </p>
+    <div className="border-t pt-4 mt-2" data-testid="seccion-salidas">
+      <h4 className="font-semibold text-gray-800 text-base">Salidas optativas</h4>
+      {curso && <p className="text-xs text-gray-500 mb-2">{labelCurso(curso)}</p>}
 
-      {error && <div className="mb-3"><Alert variant="error">{error}</Alert></div>}
-      {ok && <div className="mb-3"><Alert variant="success">{ok}</Alert></div>}
+      {error && <div className="mb-2"><Alert variant="error">{error}</Alert></div>}
+      {ok && <div className="mb-2"><Alert variant="success">{ok}</Alert></div>}
 
-      <Select
-        label="Salida Optativa del curso"
-        value={estado.salida_optativa_codigo || ''}
-        disabled={!!guardando}
-        onChange={e => cambiarSalida(e.target.value)}
-        options={estado.salidas_disponibles.map(s => ({ value: s.codigo, label: `${s.nombre} (${s.codigo})` }))}
-        placeholder="Sin Salida Optativa"
-      />
-
-      {estado.salida_optativa_codigo && (
-        <div className="mt-2 flex items-center justify-between text-xs">
-          <span className={`font-medium ${resumen.clase}`} data-testid="resumen-salida">{resumen.texto}</span>
-          <span className={estado.excede_capacidad ? 'text-red-700' : 'text-gray-600'}>
-            Espacios del registro: {estado.espacios_en_uso} de {estado.capacidad_registro}
-          </span>
+      {/* 1. ASIGNACIONES GUARDADAS (confirmadas por el servidor) */}
+      {guardados.length === 0 ? (
+        <p className="text-sm text-gray-500 border rounded-md px-3 py-2" data-testid="sin-asignaciones">
+          Ninguna asignación guardada todavía.
+        </p>
+      ) : (
+        <div className="space-y-2" data-testid="lista-guardadas">
+          {guardados.map(c => (
+            <div key={c.componente_codigo} data-guardado={c.componente_codigo}
+                 className={`rounded-md border px-3 py-2 ${c.profesor_id ? 'bg-green-50 border-green-200' : 'bg-amber-50 border-amber-200'}`}>
+              <div className="flex gap-3">
+                <span className={`mt-0.5 flex-none w-5 h-5 rounded-full text-white text-xs flex items-center justify-center ${c.profesor_id ? 'bg-green-600' : 'bg-amber-500'}`}
+                      aria-hidden="true">{c.profesor_id ? '✓' : '!'}</span>
+                <div className="min-w-0 flex-1">
+                  <p className={`text-xs font-medium ${c.profesor_id ? 'text-green-700' : 'text-amber-800'}`} data-testid="estado">
+                    {c.profesor_id ? 'Asignación guardada' : 'Guardada sin profesor'}
+                  </p>
+                  <p className="text-sm font-semibold text-gray-900" data-testid="profesor">
+                    {c.profesor_nombre || 'Sin profesor'}
+                  </p>
+                  <p className="text-sm text-gray-800">{c.nombre_oficial}</p>
+                  <p className="text-xs text-gray-500">{c.salida_nombre}</p>
+                  {cambiando === c.componente_codigo ? (
+                    <div className="mt-2 space-y-2">
+                      <Select label="Profesor responsable" value={eleccionDe(c.componente_codigo).profesorId || 0}
+                        disabled={guardando}
+                        onChange={ev => elegir(c.componente_codigo, { profesorId: parseInt(ev.target.value) || null })}
+                        options={opcionesProfe} placeholder="Elegir profesor" />
+                      {esPendiente(c.componente_codigo) && (
+                        <p className="text-xs text-blue-700 flex items-center gap-1"><Punto color="bg-blue-600" /> Pendiente de guardar</p>
+                      )}
+                      <div className="flex gap-2">
+                        <Button size="sm" loading={guardando} disabled={!esPendiente(c.componente_codigo)}
+                          onClick={() => guardar([c.componente_codigo])}>Guardar asignación</Button>
+                        <Button size="sm" variant="secondary" disabled={guardando}
+                          onClick={() => { olvidar([c.componente_codigo]); setCambiando(null); }}>Cancelar</Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex gap-3 mt-1 text-xs">
+                      <button type="button" className="text-blue-700 hover:underline disabled:opacity-50" disabled={guardando}
+                        onClick={() => { setCambiando(c.componente_codigo);
+                          elegir(c.componente_codigo, { profesorId: c.profesor_id, identidad: null }); }}>
+                        Cambiar profesor
+                      </button>
+                      <button type="button" className="text-red-700 hover:underline disabled:opacity-50" disabled={guardando}
+                        onClick={() => quitar(c)}>
+                        Quitar del curso
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
         </div>
       )}
       {estado.excede_capacidad && estado.mensaje_capacidad && (
         <div className="mt-2"><Alert variant="error">{estado.mensaje_capacidad}</Alert></div>
       )}
-      {pendientes > 0 && (
-        <div className="mt-2">
-          <Alert variant="warning">
-            Hay {pendientes} cambio{pendientes === 1 ? '' : 's'} sin guardar. Usa «Guardar» en cada
-            componente; al cerrar el curso se perderían.
-          </Alert>
-        </div>
-      )}
 
-      {estado.salida_optativa_codigo && comps.length > 0 && (
-        <div className="mt-4 space-y-3">
-          <p className="text-xs font-semibold text-gray-500 uppercase">Componentes del curso</p>
-          {comps.map(c => {
-            const est = estadoDe(c);
-            const ed = edicion[c.componente_codigo];
-            const etq = ETIQUETA_ESTADO[est];
-            return (
-              <div key={c.componente_codigo} data-componente={c.componente_codigo}
-                   className="border rounded-md p-3 bg-white">
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <p className="font-medium text-gray-800 text-sm">{c.orden_impresion}. {c.nombre_oficial}</p>
-                    <p className="text-xs text-gray-500">
-                      {c.componente_codigo} · {c.salida_nombre} · espacio {c.orden_impresion} en asistencia, acta y boletín
-                    </p>
-                  </div>
-                  <span className={`text-[11px] px-2 py-0.5 rounded border whitespace-nowrap ${etq.clase}`}
-                        data-testid="estado-componente">
-                    {etq.texto}
-                  </span>
-                </div>
+      <hr className="my-4" />
 
-                {/* Lo GUARDADO, siempre visible: viene del servidor. */}
-                <p className="text-sm mt-2" data-testid="profesor-guardado">
-                  <span className="text-gray-500">Profesor guardado: </span>
-                  {c.profesor_nombre
-                    ? <strong>{c.profesor_nombre}</strong>
-                    : <span className="text-amber-800">ninguno</span>}
-                </p>
-                {c.asignatura_id && !c.identidad_independiente && (
-                  <p className="text-xs text-amber-700 mt-1">
-                    Hoy apunta a una materia del Registro; al guardar el profesor se le dará identidad
-                    propia y las notas de esa materia no se tocan.
-                  </p>
-                )}
+      {/* 2. SELECCIONAR SALIDA: explorar y añadir. No cambia lo guardado. */}
+      <p className="text-sm font-semibold text-gray-800 mb-1">Seleccionar salida</p>
+      <Select
+        label=""
+        value={explorar}
+        disabled={guardando}
+        onChange={e => cambiarExploracion(e.target.value)}
+        options={estado.salidas_disponibles.map(s => ({ value: s.codigo, label: s.nombre }))}
+        placeholder="Elegir salida"
+      />
+      <p className="text-xs text-gray-500 mt-1">Sus componentes aparecen debajo.</p>
 
-                {!ed ? (
-                  <div className="flex gap-2 mt-2">
-                    <Button size="sm" variant="secondary" disabled={!!guardando}
-                      onClick={() => setEdicion({ ...edicion, [c.componente_codigo]: {
-                        profesorId: c.profesor_id, identidad: null } })}>
-                      {c.profesor_id ? 'Cambiar profesor' : 'Asignar profesor'}
-                    </Button>
-                    {c.asignatura_id && (
-                      <Button size="sm" variant="ghost" disabled={!!guardando}
-                        onClick={() => quitarComponente(c)}>
-                        Quitar del curso
-                      </Button>
-                    )}
-                  </div>
-                ) : (
-                  <div className="mt-2 border-t pt-2 space-y-2">
-                    <Select
-                      label="Profesor responsable"
-                      value={ed.profesorId || 0}
-                      disabled={!!guardando}
-                      onChange={e => setEdicion({ ...edicion, [c.componente_codigo]: {
-                        ...ed, profesorId: parseInt(e.target.value) || null } })}
-                      options={opcionesProfe}
-                      placeholder="Elegir profesor"
-                    />
-                    {(c.candidatas || []).length > 0 && (
-                      <ElegirIdentidad nombre={`identidad-${c.componente_codigo}`} candidatas={c.candidatas}
-                        valor={ed.identidad}
-                        onChange={v => setEdicion({ ...edicion, [c.componente_codigo]: { ...ed, identidad: v } })} />
-                    )}
-                    {est === 'pendiente' && (
-                      <p className="text-xs text-blue-700">
-                        {nombreProfe(ed.profesorId)} todavía no está guardado.
+      {explorar && (
+        <div className="mt-2 rounded-md border border-blue-100 overflow-hidden" data-testid="catalogo">
+          <div className="bg-blue-50 px-3 py-2">
+            <p className="text-sm font-semibold text-gray-800">Componentes de esta salida</p>
+            <p className="text-xs text-gray-600">{nombreSalida(explorar)}</p>
+          </div>
+          <div className="p-2 space-y-2">
+            {catalogo.map(f => {
+              const e = eleccionDe(f.componente_codigo);
+              return (
+                <div key={f.componente_codigo} data-catalogo={f.componente_codigo}
+                     className={`rounded-md border p-2 ${e.seleccionado ? 'border-blue-300 bg-blue-50/40' : 'bg-white'}`}>
+                  <label className="flex gap-3 items-start cursor-pointer">
+                    <input type="checkbox" className="mt-1 w-4 h-4"
+                      checked={!!f.guardado || e.seleccionado}
+                      disabled={!!f.guardado || guardando}
+                      onChange={ev => elegir(f.componente_codigo, { seleccionado: ev.target.checked })} />
+                    <span className="text-sm font-medium text-gray-800">{f.nombre_oficial}</span>
+                  </label>
+                  <div className="pl-7 mt-1">
+                    {f.guardado ? (
+                      <p className="text-xs text-green-700 flex items-center gap-1">
+                        <Punto color="bg-green-600" /> Guardado{f.guardado.profesor_nombre ? ` con ${f.guardado.profesor_nombre}` : ''}
                       </p>
-                    )}
-                    <div className="flex gap-2">
-                      <Button size="sm" loading={guardando === c.componente_codigo}
-                        disabled={!ed.profesorId || ed.profesorId === c.profesor_id
-                                  || ((c.candidatas || []).length > 0 && ed.identidad === null)}
-                        onClick={() => guardarTarjeta(c)}>
-                        Guardar
-                      </Button>
-                      <Button size="sm" variant="secondary" disabled={guardando === c.componente_codigo}
-                        onClick={() => { const r = { ...edicion }; delete r[c.componente_codigo]; setEdicion(r); }}>
-                        Cancelar
-                      </Button>
-                    </div>
-                    {/* Vínculo manual de R3.2, como respaldo. */}
-                    {c.de_la_salida_del_curso && !c.tiene_historia && (
-                      <details>
-                        <summary className="text-xs text-gray-500 cursor-pointer">
-                          Vincular a una asignatura existente (opcional)
-                        </summary>
-                        <div className="mt-2 flex gap-2 items-end">
-                          <div className="flex-1">
-                            <Select label="" value={vinculoVisible(c) ?? 0}
-                              disabled={!!guardando}
-                              onChange={e => setVinculo({ ...vinculo, [c.componente_codigo]: parseInt(e.target.value) || null })}
-                              options={asignaturas.map(a => ({ value: a.id, label: a.nombre }))}
-                              placeholder="Sin vincular" />
-                          </div>
-                          <Button size="sm" variant="secondary"
-                            disabled={!!guardando || vinculoVisible(c) === c.asignatura_id}
-                            onClick={() => vincularManual(c)}>
-                            {vinculoVisible(c) === null && c.asignatura_id ? 'Desvincular' : 'Vincular'}
-                          </Button>
-                        </div>
-                      </details>
+                    ) : !e.seleccionado ? (
+                      <p className="text-xs text-gray-500 flex items-center gap-1"><Punto color="bg-gray-400" /> No seleccionado</p>
+                    ) : (
+                      <div className="space-y-2">
+                        <Select label="Profesor responsable" value={e.profesorId || 0} disabled={guardando}
+                          onChange={ev => elegir(f.componente_codigo, { profesorId: parseInt(ev.target.value) || null })}
+                          options={opcionesProfe} placeholder="Elegir profesor" />
+                        {f.candidatas.length > 0 && (
+                          <ElegirAsignatura nombre={`asig-${f.componente_codigo}`} candidatas={f.candidatas}
+                            valor={e.identidad} onChange={v => elegir(f.componente_codigo, { identidad: v })} />
+                        )}
+                        {esPendiente(f.componente_codigo) ? (
+                          <p className="text-xs text-blue-700 flex items-center gap-1"><Punto color="bg-blue-600" /> Pendiente de guardar</p>
+                        ) : (
+                          <p className="text-xs text-gray-500 flex items-center gap-1"><Punto color="bg-gray-400" /> Falta elegir profesor</p>
+                        )}
+                      </div>
                     )}
                   </div>
-                )}
-              </div>
-            );
-          })}
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
-      {/* AÑADIR COMPONENTE: formulario aparte, nunca mezclado con los guardados. */}
-      {estado.salida_optativa_codigo && estado.componentes_disponibles.length > 0 && (
-        <div className="mt-4 border-2 border-dashed rounded-md p-3 bg-gray-50 space-y-2" data-testid="form-anadir">
-          <p className="text-xs font-semibold text-gray-600 uppercase">Añadir otro componente</p>
-          {sinEspacio ? (
-            <p className="text-xs text-amber-700">
-              El registro y el boletín tienen {estado.capacidad_registro} espacios para la Salida Optativa y ya
-              están en uso. Un tercer componente no se puede guardar todavía: imprimirlo obligaría a omitir
-              datos. Para cambiar uno, quítalo primero.
-            </p>
-          ) : (
-            <>
-              <Select
-                label="Componente"
-                value={nuevoCodigo}
-                disabled={!!guardando}
-                onChange={e => { setNuevoCodigo(e.target.value); setNuevaIdentidad(null); }}
-                options={estado.componentes_disponibles.map(d => ({
-                  value: d.componente_codigo, label: `${d.nombre_oficial} (${d.componente_codigo})`, group: d.salida_nombre,
-                }))}
-                placeholder="Elegir componente"
-              />
-              {elegido && elegido.candidatas.length > 0 && (
-                <ElegirIdentidad nombre="identidad-nueva" candidatas={elegido.candidatas}
-                  valor={nuevaIdentidad} onChange={setNuevaIdentidad} />
-              )}
-              <Select
-                label="Profesor responsable"
-                value={nuevoProfe || 0}
-                disabled={!!guardando}
-                onChange={e => setNuevoProfe(parseInt(e.target.value) || null)}
-                options={opcionesProfe}
-                placeholder="Elegir profesor"
-              />
-              {elegido && pendientesSalida.length > 0 && elegido.salida_codigo !== estado.salida_optativa_codigo && (
-                <p className="text-xs text-gray-600">
-                  Al añadirlo, el curso pasa a definirse por sus componentes vinculados:{' '}
-                  {pendientesSalida.map(p => p.nombre_oficial).join(', ')} dejará de figurar como pendiente.
-                </p>
-              )}
-              <div className="flex justify-end">
-                <Button size="sm" loading={guardando === nuevoCodigo}
-                  disabled={!nuevoCodigo || !nuevoProfe || faltaIdentidad}
-                  onClick={guardarNuevo}>
-                  Guardar componente
-                </Button>
-              </div>
-            </>
-          )}
+      <p className="text-xs text-gray-600 mt-3 flex items-center gap-2">
+        <span className="flex-none w-4 h-4 rounded-full bg-gray-500 text-white text-[10px] flex items-center justify-center" aria-hidden="true">i</span>
+        Elegir otra salida no cambia las asignaciones guardadas.
+      </p>
+      {pendientes > 0 && (
+        <p className="text-xs text-amber-800 mt-1" data-testid="aviso-pendientes">
+          {pendientes === 1 ? 'Hay un profesor elegido sin guardar.' : `Hay ${pendientes} profesores elegidos sin guardar.`}
+          {' '}«Guardar datos del curso» no guarda profesores.
+        </p>
+      )}
+      {explorar && (
+        <div className="flex flex-col items-end mt-3 gap-1">
+          <Button loading={guardando} disabled={!!motivoNoGuardar}
+            onClick={() => guardar(listos.map(f => f.componente_codigo))}>
+            Guardar asignación
+          </Button>
+          {motivoNoGuardar && <p className="text-xs text-gray-500">{motivoNoGuardar}</p>}
         </div>
       )}
     </div>
