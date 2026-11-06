@@ -119,6 +119,31 @@ def _dibujar_logo(c, config, x, y, max_w, max_h):
 
 
 RP_FONDO = colors.HexColor('#fdf1e6')     # columnas de recuperación pedagógica
+ALTO_LINEA_NOMBRE = 8                     # interlineado del nombre de la asignatura (letra de 7 pt)
+
+
+def _partir_nombre(c, texto, ancho, fuente, tam):
+    """Líneas del nombre que caben en `ancho`, sin perder ningún carácter.
+
+    Corta por palabras; una palabra que sola no cabe se parte por caracteres.
+    """
+    lineas, actual = [], ''
+    for palabra in str(texto).split():
+        prueba = (actual + ' ' + palabra).strip()
+        if c.stringWidth(prueba, fuente, tam) <= ancho:
+            actual = prueba
+            continue
+        if actual:
+            lineas.append(actual)
+            actual = ''
+        for ch in palabra:
+            if actual and c.stringWidth(actual + ch, fuente, tam) > ancho:
+                lineas.append(actual)
+                actual = ''
+            actual += ch
+    if actual:
+        lineas.append(actual)
+    return lineas or ['']
 
 
 def _encabezado_tabla_en(c, header_y, tabla_x, col_asig, col_comp, col_parcial, col_pc):
@@ -252,11 +277,15 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
     # En cada competencia y período, la nota original P y su recuperación RP
     # van en columnas contiguas (como en el Registro), «—» si no la hubo:
     # ninguna sustituye visualmente a la otra. El nombre de la asignatura se
-    # parte en dos líneas si no cabe, en lugar de recortarse.
+    # parte en las líneas que necesite y la fila crece, en lugar de recortarse.
     row_y = header_y - 30
-    row_h = 18
-    ancho_nombre = col_asig - 5
+    ancho_nombre = col_asig - 6          # 3 pt de margen a cada lado: nunca invade P/RP
     for asig in asignaturas_data:
+        # El nombre completo, en tantas líneas como haga falta (también una
+        # palabra sin espacios, que se parte por caracteres). La fila crece
+        # para que quepan todas: nada se recorta ni se sale de su columna.
+        lineas = _partir_nombre(c, asig['nombre'], ancho_nombre, 'Helvetica', 7)
+        row_h = max(18, ALTO_LINEA_NOMBRE * len(lineas) + 6)
         if row_y - row_h < margin + 70:
             # Nueva página si no cabe, con el encabezado de la tabla repetido.
             c.showPage()
@@ -268,28 +297,11 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
         c.rect(tabla_x, row_y, col_asig, row_h, fill=1, stroke=1)
         c.setFillColor(colors.black)
         c.setFont('Helvetica', 7)
-        lineas, actual = [], ''
-        for palabra in asig['nombre'].split():
-            prueba = (actual + ' ' + palabra).strip()
-            if c.stringWidth(prueba, 'Helvetica', 7) <= ancho_nombre or not actual:
-                actual = prueba
-            else:
-                lineas.append(actual)
-                actual = palabra
-        if actual:
-            lineas.append(actual)
-        if len(lineas) > 2:       # tercera línea: se une a la segunda con letra menor
-            lineas = [lineas[0], ' '.join(lineas[1:])]
-        if len(lineas) == 1:
-            c.drawString(tabla_x + 3, row_y + row_h / 2 - 2.5, lineas[0])
-        else:
-            c.drawString(tabla_x + 3, row_y + row_h / 2 + 1.5, lineas[0])
-            tam = 7
-            while tam > 4.5 and c.stringWidth(lineas[1], 'Helvetica', tam) > ancho_nombre:
-                tam -= 0.25
-            c.setFont('Helvetica', tam)
-            c.drawString(tabla_x + 3, row_y + 3, lineas[1])
-            c.setFont('Helvetica', 7)
+        alto_texto = ALTO_LINEA_NOMBRE * len(lineas)
+        y_linea = row_y + (row_h + alto_texto) / 2 - 6.5      # línea de base de la primera, centrado vertical
+        for linea in lineas:
+            c.drawString(tabla_x + 3, y_linea, linea)
+            y_linea -= ALTO_LINEA_NOMBRE
 
         cx = tabla_x + col_asig
         pcs = []

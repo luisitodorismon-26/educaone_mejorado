@@ -315,6 +315,82 @@ st, dB, rB = pdf('/api/boletines/estudiante/%d/pdf' % EB.id, user=dirB)
 check('E5 su «Ana Cuatro» no trae nada del colegio A (su curso no tiene asignaturas: 400 «sin asignaturas»)',
       (st == 400 and 'no tiene asignaturas' in rB.text) or (st == 200 and '85' not in dB[0].get_text()), (st, rB.text[:150]))
 
+# ════════════════ G. NOMBRES LARGOS EN EL BOLETÍN ════════════════
+print('\n=== G. Nombres largos en el Boletín para Padres ===')
+from types import SimpleNamespace as _N  # noqa: E402
+import boletin_padres as BP  # noqa: E402
+NOMBRES_LARGOS = [
+    'FormaciónIntegralHumanaYReligiosaConOrientaciónVocacionalYProyectoDeVida',   # sin espacios
+    'Lengua Española y Literatura Dominicana con Taller de Expresión Oral y Escrita para la Vida',
+    'Música',
+]
+datos_g = [{'nombre': n, 'competencias': {1: M.CalificacionSecundaria(competencia_numero=1, p1=60, rp1=75)}}
+           for n in NOMBRES_LARGOS]
+buf = BP.generar_boletin_padres(_N(nombre='Prueba', apellido='Nombres', matricula='X'),
+                                _N(nombre='A', grado=_N(nombre='5to Secundaria')), datos_g,
+                                _N(nombre='Colegio Sintético', logo=None), '2026-2027',
+                                asistencia_anual={'sin_registros': True})
+contenido = buf.read()
+open(os.path.join(OUT, 'boletin_padres_nombres_largos.pdf'), 'wb').write(contenido)
+pg = pymupdf.open(stream=contenido, filetype='pdf')[0]
+ws = pg.get_text('words')
+lim = MARGEN + COL_ASIG
+x_p1 = MARGEN + COL_ASIG + COL_PAR / 2
+x_rp1 = MARGEN + COL_ASIG + 1.5 * COL_PAR
+p_vals = sorted([w for w in ws if w[4] == '60' and abs((w[0] + w[2]) / 2 - x_p1) < COL_PAR / 2], key=lambda w: w[1])
+rp_vals = sorted([w for w in ws if w[4] == '75' and abs((w[0] + w[2]) / 2 - x_rp1) < COL_PAR / 2], key=lambda w: w[1])
+check('G0 cada fila conserva su P «60» y, al lado, su RP «75»', len(p_vals) == 3 and len(rp_vals) == 3, (len(p_vals), len(rp_vals)))
+# Asigna cada palabra de la columna «Asignatura» a la fila cuyo «60» le queda más cerca en vertical.
+centros = [(w[1] + w[3]) / 2 for w in p_vals]
+encabezado = min(w[3] for w in ws if w[4] == 'Asignatura')
+fin_tabla = min(w[1] for w in ws if w[4] == 'ASISTENCIA')      # la franja de asistencia empieza debajo de la tabla
+nombre_ws = [w for w in ws if w[0] < lim and w[1] > encabezado and w[4] not in ('Asignatura',) and w[3] < fin_tabla]
+filas = {i: [] for i in range(3)}
+for w in nombre_ws:
+    i = min(range(3), key=lambda k: abs((w[1] + w[3]) / 2 - centros[k]))
+    filas[i].append(w)
+texto_fila = {i: ''.join(w[4] for w in sorted(v, key=lambda w: (round(w[1]), w[0]))) for i, v in filas.items()}
+check('G1 nombres completos, también el que no tiene espacios (se parte por caracteres, sin perder ninguno)',
+      all(texto_fila[i] == ''.join(NOMBRES_LARGOS[i].split()) for i in range(3)),
+      {i: texto_fila[i] for i in range(3)})
+check('G2 ninguna línea del nombre se sale de su columna ni invade P/RP',
+      all(w[2] <= lim - 1 for w in nombre_ws), max(w[2] for w in nombre_ws) - lim)
+rangos = [(min(w[1] for w in filas[i]), max(w[3] for w in filas[i])) for i in range(3)]
+check('G3 la fila crece con el nombre: el sin espacios y el largo ocupan varias líneas y las filas no se montan',
+      len({round(w[1]) for w in filas[0]}) >= 2 and len({round(w[1]) for w in filas[1]}) >= 3
+      and rangos[0][1] <= rangos[1][0] and rangos[1][1] <= rangos[2][0], rangos)
+check('G4 cada nombre queda a la altura de sus propias notas',
+      all(rangos[i][0] - 1 <= centros[i] <= rangos[i][1] + 1 for i in range(3)), (rangos, centros))
+
+# ════════════════ H. TEXTO DE LA NOTA DEL PERÍODO EN PRIMARIA ════════════════
+print('\n=== H. Primaria: su regla no cambia y la pantalla la describe tal cual ===')
+gP = add(M.Grado(colegio_id=colA.id, nombre='2do Primaria', nivel='primaria', orden=2, activo=True))
+curP = add(M.Curso(colegio_id=colA.id, nombre='A', grado_id=gP.id, ano_escolar_id=anoA.id, activo=True))
+asigP = add(M.Asignatura(colegio_id=colA.id, nombre='Lengua Española (Primaria)', codigo='LEP', area_curricular_codigo='LE'))
+add(M.AsignacionProfesor(colegio_id=colA.id, profesor_id=dirA.id, curso_id=curP.id, asignatura_id=asigP.id,
+                         ano_escolar_id=anoA.id, activo=True))
+eP = est('Pía', 'Primaria', 1, cur=curP)
+for comp, campos in ((1, {'p1': 70}), (2, {'p1': 80, 'rp1': 90}), (3, {'p1': 60})):
+    add(M.CalificacionPrimaria(colegio_id=colA.id, estudiante_id=eP.id, asignatura_id=asigP.id, ano_escolar_id=anoA.id,
+                               competencia_numero=comp, **campos))
+db.commit()
+r = c.get('/api/calificaciones/por-periodo?curso_id=%d&periodo=1' % curP.id, headers=H(dirA))
+nota_p = r.json()['estudiantes'][0]['asignaturas'].get(asigP.nombre)
+check('H1 Primaria sin cambios: promedio de sus competencias con la RP en lugar de la P -> (70 + 90 + 60) / 3 = 73.33',
+      r.json().get('nivel') == 'primaria' and nota_p == 73.33, (r.json().get('nivel'), nota_p))
+tsx = open(os.path.join(BK, '..', 'frontend', 'src', 'pages', 'calificaciones-general', 'CalificacionesGeneralPage.tsx'),
+           encoding='utf-8').read()
+import re as _re  # noqa: E402
+reglas = _re.search(r"const REGLA_NOTA_PERIODO = \{(.*?)\};", tsx, _re.S).group(1)
+regla_pri = _re.search(r"primaria: '([^']*)'", reglas).group(1)
+regla_sec = _re.search(r"secundaria: '([^']*)'", reglas).group(1)
+check('H2 el texto de Primaria describe su cálculo (promedio de competencias, RP en lugar de P) y no dice «último P»',
+      'promedio de sus competencias' in regla_pri and 'RP en lugar de la P' in regla_pri and 'último P' not in regla_pri, regla_pri)
+check('H3 el texto de Secundaria es el del último P (con el mayor entre P y RP)',
+      'último P' in regla_sec and 'mayor entre P y RP' in regla_sec, regla_sec)
+check('H4 la tabla elige el texto según el nivel que devuelve el backend',
+      "REGLA_NOTA_PERIODO[data.nivel === 'primaria' ? 'primaria' : 'secundaria']" in tsx, '')
+
 # ════════════════ F. CERO PÉRDIDA ════════════════
 print('\n=== F. Cero pérdida ===')
 check('F1 las notas guardadas no cambiaron (mismas filas y valores)', huella_notas() == HUELLA0, (huella_notas(), HUELLA0))
