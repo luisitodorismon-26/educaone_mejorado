@@ -10366,7 +10366,9 @@ async def get_competencias_periodo_curso(curso_id: int, periodo: int,
             # v2.13.39: ÚLTIMO P del período = el de la competencia más alta con
             # valor. Es la nota que el colegio PROYECTA/entrega a los padres al
             # final de cada período (práctica MINERD confirmada por el colegio).
-            ultimo_p = vals[-1] if vals else None
+            # La misma función que la vista resumen y los dos PDF del período.
+            from nota_periodo import nota_del_periodo
+            ultimo_p = nota_del_periodo(comps, periodo)
             
             asignaturas_data.append({
                 'asignatura_id': asig_id,
@@ -10486,17 +10488,11 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
             logger.warning(f"No se pudo decodificar el logo del colegio: {e}")
             logo_img = None
     
+    from nota_periodo import nota_del_periodo, formatear_nota
+
     def _nota_periodo_asignatura(comps):
         """Último P del período: valor del período en la competencia más alta con valor."""
-        if not comps:
-            return None
-        for num in (4, 3, 2, 1):
-            c_obj = comps.get(num)
-            if c_obj is not None:
-                v = c_obj.valor_periodo(periodo_rep)
-                if v is not None:
-                    return v
-        return None
+        return nota_del_periodo(comps, periodo_rep)
     
     titulo_competencia = f"Período {periodo_rep}"
     
@@ -10565,7 +10561,7 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
             if nota is not None:
                 color = rl_colors.HexColor('#16a34a') if nota >= 70 else rl_colors.HexColor('#dc2626')
                 c.setFillColor(color)
-                c.drawString(12.5*cm, y, str(nota))
+                c.drawString(12.5*cm, y, formatear_nota(nota))
                 c.setFillColor(rl_colors.black)
                 c.drawString(15.3*cm, y, _lit(nota))
                 c.drawString(17.5*cm, y, "Aprobado" if nota >= 70 else "En riesgo")
@@ -20680,7 +20676,11 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
     elements.append(Spacer(1, 8))
     
     # Construir tabla
-    headers = ['#', 'Estudiante'] + [a.nombre[:15] for a in asignaturas] + ['Prom.']
+    # El nombre completo, partido en líneas: recortado a 15 caracteres se salía
+    # de su columna y se montaba sobre el de al lado.
+    _cab = ParagraphStyle('Cab', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=6.5,
+                          leading=7.5, textColor=colors.white, alignment=1)
+    headers = ['#', 'Estudiante'] + [Paragraph(a.nombre, _cab) for a in asignaturas] + ['Prom.']
     table_data = [headers]
     
     # v2.13.8: pre-cargar dual-modelo
@@ -20706,33 +20706,31 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
     ).all() if est_ids and asig_ids_list else []
     leg_por_est_asig_pdf = {(c.estudiante_id, c.asignatura_id): c for c in califs_leg_pdf}
     
+    from nota_periodo import nota_del_periodo, formatear_nota, promedio_de_notas
     for est in estudiantes:
         row = [str(est.no_lista or ''), est.nombre_completo[:25]]
         notas = []
         for asig in asignaturas:
             # Modelo NUEVO primero
             comps = sec_por_est_asig_pdf.get((est.id, asig.id), [])
-            pc = None
-            if comps:
-                # v2.13.39: la nota del período que se ENTREGA es el ÚLTIMO P
-                # (el de la competencia más alta con valor), no el promedio.
-                con_valor = sorted(
-                    [c for c in comps if hasattr(c, 'valor_periodo') and c.valor_periodo(periodo) is not None],
-                    key=lambda c: c.competencia_numero or 0
-                )
-                pc = con_valor[-1].valor_periodo(periodo) if con_valor else None
-            
+            # v2.13.39: la nota del período que se ENTREGA es el ÚLTIMO P
+            # (el de la competencia más alta con valor), no el promedio. La
+            # misma función que la pantalla y el Reporte del Período.
+            pc = nota_del_periodo(comps, periodo)
+
             # Fallback LEGACY
             if pc is None:
                 calif_leg = leg_por_est_asig_pdf.get((est.id, asig.id))
                 if calif_leg:
                     pc = getattr(calif_leg, f'pc{periodo}', None)
-            
-            row.append(str(int(pc)) if pc is not None else '-')
+
+            # Escrita igual que en pantalla: sin truncar (antes `int()` hacía de 84.6 un 84).
+            row.append(formatear_nota(pc) if pc is not None else '-')
             if pc is not None:
                 notas.append(pc)
-        prom = round(sum(notas) / len(notas), 1) if notas else None
-        row.append(str(prom) if prom else '-')
+        prom = promedio_de_notas(notas)
+        # `is not None`: un promedio de 0 es un dato, no un vacío.
+        row.append('%.1f' % prom if prom is not None else '-')
         table_data.append(row)
     
     # Anchos de columna
@@ -20769,9 +20767,15 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
                 pass
     
     elements.append(t)
+    elements.append(Spacer(1, 6))
+    elements.append(Paragraph(
+        f'Cada asignatura muestra la nota del Período {periodo}: el último P registrado '
+        f'(competencia más alta con valor), no el promedio de las competencias. '
+        f'«Prom.» es el promedio de esas notas entre las asignaturas.',
+        ParagraphStyle('Nota', parent=styles['Normal'], fontSize=7, textColor=colors.HexColor('#555555'))))
     doc.build(elements)
     buffer.seek(0)
-    
+
     filename = f"Notas_P{periodo}_{curso_nombre.replace(' ', '_')}.pdf"
     return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 

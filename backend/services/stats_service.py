@@ -929,7 +929,7 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
         .filter_by(activo=True).first()
     )
     
-    # notas_por_est_asig: dict (est_id, asig_id) → nota del período (PC)
+    # notas_por_est_asig: dict (est_id, asig_id) → nota del período (último P registrado)
     notas_por_est_asig: Dict[tuple, float] = {}
     
     if ano_activo and asig_ids:
@@ -947,15 +947,15 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
         for c in califs_sec:
             sec_grouped[(c.estudiante_id, c.asignatura_id)].append(c)
         
-        # PC del período = AVG de las competencias (usando valor_periodo: max(P, RP))
+        # Nota del período = el valor del período en la competencia más alta que
+        # lo tenga (de la 4 a la 1), NO el promedio de las competencias. Es la
+        # misma función que usan la tabla general en PDF y el Reporte del
+        # Período para padres, así que pantalla y documentos no pueden diferir.
+        from nota_periodo import nota_del_periodo
         for (eid, aid), comps in sec_grouped.items():
-            vals = []
-            for comp in comps:
-                v = comp.valor_periodo(periodo) if hasattr(comp, 'valor_periodo') else None
-                if v is not None:
-                    vals.append(v)
-            if vals:
-                notas_por_est_asig[(eid, aid)] = round(sum(vals) / len(vals), 2)
+            nota = nota_del_periodo(comps, periodo)
+            if nota is not None:
+                notas_por_est_asig[(eid, aid)] = nota
     
     # 2. Modelo LEGACY: Calificacion (solo para estudiantes/asignaturas SIN datos en modelo nuevo)
     califs = (
@@ -980,8 +980,9 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
             d['asignaturas'][asig.nombre] = nota
             if nota is not None:
                 notas.append(nota)
-        if notas:
-            d['promedio'] = round(sum(notas) / len(notas), 2)
+        # Mismo cálculo y redondeo que la columna «Prom.» de la tabla general en PDF.
+        from nota_periodo import promedio_de_notas
+        d['promedio'] = promedio_de_notas(notas)
         result_est.append(d)
 
     return {
