@@ -52,8 +52,29 @@ def _fmt(valor) -> str:
         return '—'
 
 
+def _fmt_registrada(valor) -> str:
+    """Una P o RP tal como se registró: entera si lo es, si no con un decimal."""
+    if valor is None:
+        return '—'
+    from nota_periodo import formatear_nota
+    try:
+        return formatear_nota(valor)
+    except (ValueError, TypeError):
+        return '—'
+
+
 def _valor_periodo(comp, periodo: int):
-    """Valor efectivo del período, según la definición canónica de Primaria."""
+    """Valor efectivo del período con la regla VIGENTE del nivel de la fila.
+
+    Cada modelo trae la suya: `CalificacionSecundaria.valor_periodo` toma el
+    mayor entre P y RP; `CalificacionPrimaria.valor_periodo` toma la RP si
+    existe (`calculo_primaria.valor_periodo_primaria`). Antes este reporte
+    aplicaba SIEMPRE la de Primaria, también a Secundaria —que es lo que recibe
+    hoy—, así que con una RP menor que la P el PC de la competencia salía más
+    bajo que en el boletín oficial y en el registro.
+    """
+    if hasattr(comp, 'valor_periodo'):
+        return comp.valor_periodo(periodo)
     from calculo_primaria import valor_periodo_primaria
     return valor_periodo_primaria(
         getattr(comp, f'p{periodo}', None), getattr(comp, f'rp{periodo}', None))
@@ -95,6 +116,72 @@ def _dibujar_logo(c, config, x, y, max_w, max_h):
         return True
     except Exception:
         return False
+
+
+RP_FONDO = colors.HexColor('#fdf1e6')     # columnas de recuperación pedagógica
+ALTO_LINEA_NOMBRE = 8                     # interlineado del nombre de la asignatura (letra de 7 pt)
+
+
+def _partir_nombre(c, texto, ancho, fuente, tam):
+    """Líneas del nombre que caben en `ancho`, sin perder ningún carácter.
+
+    Corta por palabras; una palabra que sola no cabe se parte por caracteres.
+    """
+    lineas, actual = [], ''
+    for palabra in str(texto).split():
+        prueba = (actual + ' ' + palabra).strip()
+        if c.stringWidth(prueba, fuente, tam) <= ancho:
+            actual = prueba
+            continue
+        if actual:
+            lineas.append(actual)
+            actual = ''
+        for ch in palabra:
+            if actual and c.stringWidth(actual + ch, fuente, tam) > ancho:
+                lineas.append(actual)
+                actual = ''
+            actual += ch
+    if actual:
+        lineas.append(actual)
+    return lineas or ['']
+
+
+def _encabezado_tabla_en(c, header_y, tabla_x, col_asig, col_comp, col_parcial, col_pc):
+    """Encabezado: Asignatura | Competencia 1-4 x (P1 RP1 P2 RP2 P3 RP3 P4 RP4) | PC.
+
+    Como en el Registro, la RP de cada período va AL LADO de su P.
+    """
+    c.setFont('Helvetica-Bold', 7)
+    # Celda "Asignatura"
+    c.setFillColor(AZUL_CLARO)
+    c.rect(tabla_x, header_y - 30, col_asig, 30, fill=1, stroke=1)
+    c.setFillColor(colors.black)
+    c.drawString(tabla_x + 3, header_y - 20, 'Asignatura')
+
+    cx = tabla_x + col_asig
+    for comp_num in range(1, 5):
+        c.setFillColor(AZUL_CLARO if comp_num % 2 else colors.HexColor('#dde8f2'))
+        c.rect(cx, header_y - 15, col_comp, 15, fill=1, stroke=1)
+        c.setFillColor(colors.black)
+        c.drawCentredString(cx + col_comp / 2, header_y - 11, f'Competencia {comp_num}')
+        # Sub-encabezado: P1 RP1 P2 RP2 P3 RP3 P4 RP4
+        c.setFont('Helvetica', 5.5)
+        for k in range(8):
+            px = cx + k * col_parcial
+            es_rp = k % 2 == 1
+            c.setFillColor(RP_FONDO if es_rp else GRIS)
+            c.rect(px, header_y - 30, col_parcial, 15, fill=1, stroke=1)
+            c.setFillColor(colors.black)
+            c.drawCentredString(px + col_parcial / 2, header_y - 25.5,
+                                ('RP%d' if es_rp else 'P%d') % (k // 2 + 1))
+        c.setFont('Helvetica-Bold', 7)
+        cx += col_comp
+
+    # Celda PC
+    c.setFillColor(DORADO)
+    c.rect(cx, header_y - 30, col_pc, 30, fill=1, stroke=1)
+    c.setFillColor(colors.white)
+    c.drawCentredString(cx + col_pc / 2, header_y - 20, 'PC (1·2·3·4)')
 
 
 def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
@@ -174,75 +261,63 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
     y -= 20
     tabla_x = margin
     col_asig = 3.4 * cm          # ancho columna asignatura
-    col_parcial = 0.85 * cm      # ancho de cada parcial (P1-P4)
-    col_comp = col_parcial * 4   # ancho de una competencia (4 parciales)
     col_pc = 2.4 * cm            # ancho columna PC (los 4 PC)
+    # 4 competencias x 4 períodos x (P, RP) = 32 celdas en el ancho restante.
+    col_parcial = (W - 2 * margin - col_asig - col_pc) / 32
+    col_comp = col_parcial * 8   # ancho de una competencia (P y RP de 4 períodos)
 
-    # Encabezado nivel 1: nombres de competencias
+    def _encabezado_tabla(header_y):
+        """Encabezado de la tabla; se repite en cada página nueva."""
+        _encabezado_tabla_en(c, header_y, tabla_x, col_asig, col_comp, col_parcial, col_pc)
+
     header_y = y
-    c.setFont('Helvetica-Bold', 7)
-    # Celda "Asignatura"
-    c.setFillColor(AZUL_CLARO)
-    c.rect(tabla_x, header_y - 30, col_asig, 30, fill=1, stroke=1)
-    c.setFillColor(colors.black)
-    c.drawString(tabla_x + 3, header_y - 20, 'Asignatura')
-
-    cx = tabla_x + col_asig
-    for comp_num in range(1, 5):
-        c.setFillColor(AZUL_CLARO if comp_num % 2 else colors.HexColor('#dde8f2'))
-        c.rect(cx, header_y - 15, col_comp, 15, fill=1, stroke=1)
-        c.setFillColor(colors.black)
-        c.drawCentredString(cx + col_comp / 2, header_y - 11, f'Competencia {comp_num}')
-        # Sub-encabezado: P1 P2 P3 P4
-        c.setFont('Helvetica', 6)
-        for i, p in enumerate(['P1', 'P2', 'P3', 'P4']):
-            px = cx + i * col_parcial
-            c.setFillColor(GRIS)
-            c.rect(px, header_y - 30, col_parcial, 15, fill=1, stroke=1)
-            c.setFillColor(colors.black)
-            c.drawCentredString(px + col_parcial / 2, header_y - 26, p)
-        c.setFont('Helvetica-Bold', 7)
-        cx += col_comp
-
-    # Celda PC
-    c.setFillColor(DORADO)
-    c.rect(cx, header_y - 30, col_pc, 30, fill=1, stroke=1)
-    c.setFillColor(colors.white)
-    c.drawCentredString(cx + col_pc / 2, header_y - 20, 'PC (1·2·3·4)')
-
-    # Filas de asignaturas
+    _encabezado_tabla(header_y)
+    # Filas de asignaturas.
+    #
+    # En cada competencia y período, la nota original P y su recuperación RP
+    # van en columnas contiguas (como en el Registro), «—» si no la hubo:
+    # ninguna sustituye visualmente a la otra. El nombre de la asignatura se
+    # parte en las líneas que necesite y la fila crece, en lugar de recortarse.
     row_y = header_y - 30
-    row_h = 16
-    c.setFont('Helvetica', 7)
+    ancho_nombre = col_asig - 6          # 3 pt de margen a cada lado: nunca invade P/RP
     for asig in asignaturas_data:
-        if row_y - row_h < margin + 40:
-            # Nueva página si no cabe
+        # El nombre completo, en tantas líneas como haga falta (también una
+        # palabra sin espacios, que se parte por caracteres). La fila crece
+        # para que quepan todas: nada se recorta ni se sale de su columna.
+        lineas = _partir_nombre(c, asig['nombre'], ancho_nombre, 'Helvetica', 7)
+        row_h = max(18, ALTO_LINEA_NOMBRE * len(lineas) + 6)
+        if row_y - row_h < margin + 70:
+            # Nueva página si no cabe, con el encabezado de la tabla repetido.
             c.showPage()
-            row_y = H - margin - 20
+            _encabezado_tabla(H - margin)
+            row_y = H - margin - 30
         row_y -= row_h
         # Nombre asignatura
         c.setFillColor(colors.white)
         c.rect(tabla_x, row_y, col_asig, row_h, fill=1, stroke=1)
         c.setFillColor(colors.black)
         c.setFont('Helvetica', 7)
-        nombre_asig = asig['nombre'][:28]
-        c.drawString(tabla_x + 3, row_y + 5, nombre_asig)
+        alto_texto = ALTO_LINEA_NOMBRE * len(lineas)
+        y_linea = row_y + (row_h + alto_texto) / 2 - 6.5      # línea de base de la primera, centrado vertical
+        for linea in lineas:
+            c.drawString(tabla_x + 3, y_linea, linea)
+            y_linea -= ALTO_LINEA_NOMBRE
 
         cx = tabla_x + col_asig
         pcs = []
         for comp_num in range(1, 5):
             comp = asig['competencias'].get(comp_num)
             for i in range(1, 5):
-                px = cx + (i - 1) * col_parcial
-                c.setFillColor(colors.white)
-                c.rect(px, row_y, col_parcial, row_h, fill=1, stroke=1)
-                val = _valor_periodo(comp, i) if comp else None
-                if val is None:
-                    c.setFillColor(GRIS_TEXTO)
-                else:
-                    c.setFillColor(colors.black)
-                c.drawCentredString(px + col_parcial / 2, row_y + 5, _fmt(val))
-            # PC de esta competencia
+                for k, campo in ((0, 'p'), (1, 'rp')):
+                    px = cx + ((i - 1) * 2 + k) * col_parcial
+                    val = getattr(comp, f'{campo}{i}', None) if comp else None
+                    c.setFillColor(RP_FONDO if k else colors.white)
+                    c.rect(px, row_y, col_parcial, row_h, fill=1, stroke=1)
+                    c.setFillColor(GRIS_TEXTO if val is None else colors.black)
+                    c.setFont('Helvetica', 6.5)
+                    # La nota TAL COMO SE REGISTRÓ (81.5 se ve 81.5, no 82).
+                    c.drawCentredString(px + col_parcial / 2, row_y + row_h / 2 - 2.2, _fmt_registrada(val))
+            # PC de esta competencia (regla vigente del nivel, ver _valor_periodo)
             pc = _pc_competencia(comp) if comp else None
             pcs.append(pc)
             cx += col_comp
@@ -253,7 +328,7 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
         c.setFillColor(colors.black)
         c.setFont('Helvetica-Bold', 6)
         pc_str = ' · '.join(_fmt(p) for p in pcs)
-        c.drawCentredString(cx + col_pc / 2, row_y + 5, pc_str)
+        c.drawCentredString(cx + col_pc / 2, row_y + row_h / 2 - 2, pc_str)
         c.setFont('Helvetica', 7)
 
     # ─── Asistencia anual ───
@@ -263,6 +338,10 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
     # maqueta es nuestra y hay sitio de sobra sobre las firmas, así que cabe
     # el desglose entero en una línea: las cuatro cuentas y los dos
     # porcentajes, todo del mismo cálculo que los PDF oficiales.
+    # Asistencia (22) + leyenda (40) deben quedar por encima de las firmas.
+    if row_y - 70 < margin + 42:
+        c.showPage()
+        row_y = H - margin - 20
     if asistencia_anual is not None:
         row_y -= 22
         c.setFillColor(colors.HexColor('#eef8f1'))
@@ -295,16 +374,22 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
                          % (asistencia_anual.get('dias_computados') or 0, _lect))
             c.drawString(margin + 94, row_y + 3, _txt)
 
-    # ─── Nota aclaratoria ───
-    row_y -= 24
+    # ─── Leyenda ───
+    row_y -= 34
     c.setFillColor(colors.HexColor('#eef5fc'))
-    c.rect(margin, row_y - 6, W - 2 * margin, 24, fill=1, stroke=0)
+    c.rect(margin, row_y - 6, W - 2 * margin, 33, fill=1, stroke=0)
     c.setFillColor(colors.black)
+    c.setFont('Helvetica-Bold', 7)
+    c.drawString(margin + 6, row_y + 17, 'Cómo leer este reporte:')
     c.setFont('Helvetica', 7)
+    c.drawString(margin + 100, row_y + 17,
+                 'P = nota del período.   RP (al lado de su P) = recuperación pedagógica de ese período, si se hizo.   '
+                 '— = sin nota registrada (en una columna RP: sin recuperación).')
     c.drawString(margin + 6, row_y + 8,
-                 'El PC (Promedio por Competencia) aparece solo cuando los 4 períodos de esa competencia están completos.')
+                 'El PC (Promedio por Competencia) aparece solo cuando los 4 períodos de esa competencia están completos; '
+                 'cuando hay recuperación, cada período cuenta con la nota que establece la norma vigente.')
     c.drawString(margin + 6, row_y - 1,
-                 'Los "—" indican parciales aún no registrados. Este reporte refleja el estado actual de las calificaciones.')
+                 'Este reporte refleja el estado actual de las calificaciones.')
 
     # ─── Firmas ───
     firma_y = margin + 30

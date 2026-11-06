@@ -14,7 +14,15 @@ interface NotaPeriodo {
 interface ReporteData {
   curso: string; periodo: number;
   asignaturas_nombres: string[]; estudiantes: NotaPeriodo[];
+  nivel?: 'primaria' | 'secundaria';
 }
+
+// Cómo se forma la nota del período en cada nivel. Solo describe el cálculo
+// que hace el backend para ese nivel; no lo cambia.
+const REGLA_NOTA_PERIODO = {
+  secundaria: 'nota del período: el último P registrado (competencia más alta con valor; con recuperación, el mayor entre P y RP), no el promedio',
+  primaria: 'nota del período: el promedio de sus competencias en ese período (si hubo recuperación, cuenta la RP en lugar de la P)',
+};
 
 interface CompetenciaValor { competencia: number; valor: number | null; }
 interface AsigCompetencias {
@@ -31,6 +39,13 @@ interface CompetenciasData {
 }
 
 type Vista = 'pc' | 'competencias';
+
+// La nota se escribe igual que en los PDF del período: entera si lo es, si no
+// con un decimal. No se redondea a entero ni se trunca (84.5 se ve 84.5).
+const fmtNota = (nota: number | null | undefined) => {
+  if (nota === null || nota === undefined) return '-';
+  return Math.abs(nota - Math.round(nota)) < 0.05 ? String(Math.round(nota)) : nota.toFixed(1);
+};
 
 export const CalificacionesGeneralPage = () => {
   const { user } = useAuth();
@@ -162,7 +177,7 @@ export const CalificacionesGeneralPage = () => {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2"><FileBarChart className="text-blue-600" /> Notas por Periodo</h1>
-        <p className="text-gray-500 mt-1">Reporte de calificaciones por periodo. Vista por PC o desglose por competencia.</p>
+        <p className="text-gray-500 mt-1">Nota del período por asignatura. Vista resumen o desglose por competencia.</p>
       </div>
 
       {error && <Alert variant="error" onClose={() => setError('')}>{error}</Alert>}
@@ -170,7 +185,7 @@ export const CalificacionesGeneralPage = () => {
       <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 w-fit">
         <button onClick={() => { setVista('pc'); setData(null); setCompData(null); }}
           className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${vista === 'pc' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
-          <List size={16} /> Vista Promedios (resumen)
+          <List size={16} /> Vista Nota del Período (resumen)
         </button>
         <button onClick={() => { setVista('competencias'); setData(null); setCompData(null); }}
           className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${vista === 'competencias' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
@@ -196,7 +211,11 @@ export const CalificacionesGeneralPage = () => {
               <div className="border-l border-gray-200 pl-6">
                 <p className="text-[11px] font-medium text-gray-600 mb-1.5">Reporte del Período para padres</p>
                 <Button onClick={descargarReportePadresCurso} variant="primary" loading={descargandoPadres} icon={<Users size={16} />} className="text-xs">Reporte del Período {periodo} (curso)</Button>
-                <p className="text-[9px] text-gray-400 mt-0.5">Un reporte por estudiante con la nota del período (último P registrado) por asignatura</p>
+                <p className="text-[9px] text-gray-400 mt-0.5">
+                  {data.nivel === 'primaria'
+                    ? 'La tabla general y este reporte leen calificaciones de Secundaria: todavía no incluyen las de Primaria'
+                    : 'Un reporte por estudiante con la nota del período (último P registrado) por asignatura'}
+                </p>
               </div>
             </div>
           </div>
@@ -224,7 +243,7 @@ export const CalificacionesGeneralPage = () => {
         <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
           <div className="p-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white">
             <h2 className="text-lg font-bold">{data.curso} - Periodo {data.periodo}</h2>
-            <p className="text-blue-100 text-sm">{data.estudiantes.length} estudiantes - {data.asignaturas_nombres.length} {data.asignaturas_nombres.length === 1 ? 'asignatura' : 'asignaturas'} - cada celda = promedio del periodo (promedio de las 4 competencias en ese periodo)</p>
+            <p className="text-blue-100 text-sm">{data.estudiantes.length} estudiantes - {data.asignaturas_nombres.length} {data.asignaturas_nombres.length === 1 ? 'asignatura' : 'asignaturas'} - cada celda = {REGLA_NOTA_PERIODO[data.nivel === 'primaria' ? 'primaria' : 'secundaria']} · Prom. = promedio de esas notas</p>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -250,7 +269,7 @@ export const CalificacionesGeneralPage = () => {
                     <td className="p-2 font-medium text-gray-800 truncate max-w-[200px]">{est.nombre}</td>
                     {data.asignaturas_nombres.map(asig => {
                       const nota = est.asignaturas[asig];
-                      return (<td key={asig} className={`p-2 text-center ${getBgNota(nota)}`}><span className={`text-sm ${getColorNota(nota)}`}>{nota !== null && nota !== undefined ? Math.round(nota) : '-'}</span></td>);
+                      return (<td key={asig} className={`p-2 text-center ${getBgNota(nota)}`}><span className={`text-sm ${getColorNota(nota)}`}>{fmtNota(nota)}</span></td>);
                     })}
                     {data.asignaturas_nombres.length > 1 && (
                       <td className="p-2 text-center bg-blue-50"><span className={`text-sm font-bold ${getColorNota(est.promedio)}`}>{est.promedio !== null ? est.promedio.toFixed(1) : '-'}</span></td>
@@ -285,7 +304,7 @@ export const CalificacionesGeneralPage = () => {
           <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
             <div className="p-4 bg-gradient-to-r from-indigo-600 to-indigo-700 text-white">
               <h2 className="text-lg font-bold">{compData.curso} - {asignaturaSel} - Periodo {compData.periodo}</h2>
-              <p className="text-indigo-100 text-sm">Desglose de las 4 competencias y el PC resultante (PC = promedio de las competencias)</p>
+              <p className="text-indigo-100 text-sm">Desglose de las 4 competencias y la nota del período (último P registrado)</p>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -310,11 +329,11 @@ export const CalificacionesGeneralPage = () => {
                         <td className="p-2 font-medium text-gray-800 truncate max-w-[200px]">{est.nombre}</td>
                         {asig.competencias.map(cv => (
                           <td key={cv.competencia} className={`p-2 text-center ${getBgNota(cv.valor)}`}>
-                            <span className={`text-sm ${getColorNota(cv.valor)}`}>{cv.valor !== null ? Math.round(cv.valor) : '-'}</span>
+                            <span className={`text-sm ${getColorNota(cv.valor)}`}>{fmtNota(cv.valor)}</span>
                           </td>
                         ))}
                         <td className="p-2 text-center bg-indigo-50">
-                          <span className={`text-sm font-bold ${getColorNota(asig.ultimo_p)}`}>{asig.ultimo_p !== null ? Math.round(asig.ultimo_p) : '-'}</span>
+                          <span className={`text-sm font-bold ${getColorNota(asig.ultimo_p)}`}>{fmtNota(asig.ultimo_p)}</span>
                           {asig.pc !== null && <span className="block text-[9px] text-gray-500">prom {asig.pc.toFixed(1)}</span>}
                           {!asig.completo && asig.ultimo_p !== null && <span className="block text-[9px] text-amber-500">parcial</span>}
                         </td>
@@ -326,7 +345,7 @@ export const CalificacionesGeneralPage = () => {
             </div>
             <div className="p-3 bg-gray-50 border-t text-xs text-gray-500">
               <strong>Nota P{compData.periodo}</strong> = último P registrado del periodo (competencia más alta con valor) — la nota que se entrega a los padres. <em>prom</em> = promedio de las 4 competencias, como referencia.
-              "parcial" indica que aun no estan las 4 competencias cargadas (el PC mostrado es provisional).
+              "parcial" indica que aún no están las 4 competencias cargadas: la nota del período es la de la última competencia con dato.
             </div>
           </div>
         </>
@@ -337,9 +356,13 @@ export const CalificacionesGeneralPage = () => {
           <h3 className="font-semibold text-blue-800 mb-2">Sobre esta vista</h3>
           <p className="text-blue-700 text-sm mb-2">Selecciona un curso y periodo, luego "Ver Notas".</p>
           <ul className="text-blue-700 text-sm list-disc list-inside space-y-1">
-            <li><strong>Vista Promedios (resumen):</strong> el promedio de cada asignatura en el periodo elegido (promedio de sus 4 competencias) + promedio general. Aca descargas el reporte de calificaciones, individual o de todo el curso.</li>
-            <li><strong>Vista por Competencia:</strong> eliges una asignatura y ves como se forma el PC - el valor de cada una de las 4 competencias en el periodo.</li>
-            <li><strong>Reporte por competencia:</strong> eleg\u00ed la <strong>Competencia</strong> que se trabaja (1-4) y la nota a usar: "PC" (promedio de los 4 P de esa competencia) o "\u00daltimo P" (el P4). Sirve para reportar antes del cierre y dar tiempo de recuperaci\u00f3n. El PDF dice solo "Competencia N" \u2014 el padre no ve si es PC o P4. Sale con el logo del colegio.</li>
+            <li><strong>Vista Nota del Período (resumen):</strong> la nota del período elegido en cada asignatura. «Prom.» es el promedio de esas notas.
+              <ul className="list-[circle] list-inside ml-5">
+                <li><strong>Secundaria:</strong> el último P registrado (la competencia más alta con valor; un 0 cuenta como nota; con recuperación, el mayor entre P y RP). Aquí descargas la tabla general y el Reporte del Período para padres, individual o de todo el curso: los tres muestran las mismas notas.</li>
+                <li><strong>Primaria:</strong> el promedio de sus competencias en el período (si hubo recuperación, cuenta la RP en lugar de la P).</li>
+              </ul>
+            </li>
+            <li><strong>Vista por Competencia (Secundaria):</strong> eliges una asignatura y ves el valor de cada una de las 4 competencias en el período y de cuál sale la nota del período.</li>
           </ul>
         </div>
       )}
