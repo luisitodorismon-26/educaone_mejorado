@@ -8418,6 +8418,21 @@ def _ocupados_detalle(db, current_user, curso_id, estudiante_id):
     return ocupados, lista
 
 
+def _bloquear_ficha(db, est):
+    """Bloquea la fila del estudiante hasta el fin de la transacción
+    (PostgreSQL; en SQLite las escrituras ya se serializan) y la relee."""
+    try:
+        db.query(Estudiante).filter(Estudiante.id == est.id).with_for_update().first()
+    except Exception:
+        pass
+    try:
+        db.refresh(est)
+    except Exception:
+        pass
+    est.__dict__.pop('_tras_intervalos_no_aplica', None)
+    db.info.pop('_tras_movs_por_colegio', None)
+
+
 def _respuesta_movimiento_error(codigo, mensaje, status=409, **extra):
     cuerpo = {'error': codigo, 'message': mensaje}
     cuerpo.update(extra)
@@ -8533,17 +8548,39 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
 
     nombre_curso = _nombre_curso_fn(db, current_user)
     crid = (str(client_request_id).strip()[:64] or None) if client_request_id else None
+    # Huella de lo que se pide: un reintento solo es tal si pide EXACTAMENTE lo
+    # mismo. Con el mismo identificador y otro contenido se rechaza sin tocar nada.
+    huella_solicitud = {
+        'tipo': tipo, 'estudiante_id': est.id,
+        'desde': desde.isoformat() if isinstance(desde, date) else str(desde),
+        'curso_destino_id': int(curso_destino_id) if curso_destino_id not in (None, '') else None,
+        'no_lista': int(no_lista) if str(no_lista or '').strip().isdigit() else None,
+        'motivo': (str(motivo).strip()[:300] or None) if motivo else None,
+    }
+
+    def _es_reintento(previo):
+        return (previo.estudiante_id == est.id and previo.tipo == tipo
+                and (previo.get_detalle() or {}).get('solicitud') == huella_solicitud)
 
     # 1. Reintento / doble clic: la misma solicitud devuelve el mismo movimiento.
     if crid:
         previo = db.query(MovimientoEstudiante).filter_by(
             colegio_id=current_user.colegio_id, client_request_id=crid).first()
         if previo is not None:
-            if previo.estudiante_id == est.id and previo.tipo == tipo:
+            if _es_reintento(previo):
                 return {'message': 'Movimiento ya registrado (reintento)', 'reintento': True,
                         'movimiento': _movimiento_dict(previo, nombre_curso)}
             return _respuesta_movimiento_error(
-                'SOLICITUD_REPETIDA', 'Esa solicitud ya se usó para otro movimiento.')
+                'SOLICITUD_REPETIDA_DISTINTA',
+                'Esa solicitud ya se usó con otro contenido (estudiante, tipo, fecha, destino, número '
+                'o motivo). No se registró nada; repita la operación como una solicitud nueva.')
+
+    # 3. La ficha se BLOQUEA antes de validar (PostgreSQL: SELECT ... FOR
+    #    UPDATE) y se relee: toda la validación (permanencia, conflictos con
+    #    marcas, números) se hace con el estado que hay al tener el bloqueo. Las
+    #    cargas de asistencia y de notas toman el mismo bloqueo antes de mirar
+    #    la permanencia, así que una carga simultánea espera y se reevalúa.
+    _bloquear_ficha(db, est)
 
     ano = _ano_activo_colegio(db, current_user)
     if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
@@ -8699,6 +8736,7 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
             }, status_code=409)
     if tipo == 'traslado':
         detalle['notas_previas'] = _instantanea_notas(db, current_user, est, ano)
+    detalle['solicitud'] = huella_solicitud
 
     # Primer retiro sin traslados ni reactivaciones en el año: la ficha ya lo
     # representa entero (curso, número, fecha, motivo y autor), como siempre.
@@ -8842,7 +8880,7 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
         if 'client_request' in texto:
             previo = db.query(MovimientoEstudiante).filter_by(
                 colegio_id=current_user.colegio_id, client_request_id=crid).first()
-            if previo is not None and previo.estudiante_id == est.id and previo.tipo == tipo:
+            if previo is not None and _es_reintento(previo):
                 return {'message': 'Movimiento ya registrado (reintento)', 'reintento': True,
                         'movimiento': _movimiento_dict(previo, nombre_curso)}
         if 'reserva' in texto or 'no_lista' in texto:
@@ -11599,6 +11637,7 @@ def _autorizar_nota_permanencia(db, current_user, est, asignatura_id, data, mode
     asignado al curso actual escribe (y si no, 403 con el mensaje de siempre).
     """
     import permanencia as _PERM
+    _bloquear_ficha(db, est)
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
     calif = None
     if ano is not None:
@@ -15757,6 +15796,9 @@ def _permanencia_asistencia(db, current_user, est, curso, fecha):
     retirarse) no se registra asistencia ordinaria: 409 con la explicación.
     """
     import permanencia as _PERM
+    # Mismo bloqueo que los movimientos: si hay uno en curso, se espera y se
+    # mira la permanencia ya con su resultado.
+    _bloquear_ficha(db, est)
     base = curso if curso is not None else est.curso
     ano_id = getattr(base, 'ano_escolar_id', None)
     tramos = _PERM.tramos_de(db, est, ano_id)
@@ -15841,29 +15883,35 @@ async def get_asistencia(request: Request, db: Session = Depends(get_db), curren
     if _err_lectura is not None:
         return _err_lectura
 
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso.id, activo=True
-    ).order_by(Estudiante.no_lista).all()
+    # TRAS-1 · quienes pertenecen al curso ESE día (como la lista del curso):
+    # los activos de siempre, más quien estaba antes de trasladarse o
+    # retirarse; menos quien aún no se había incorporado. Con su número en
+    # ESTE curso y solo las marcas de ESTE curso.
+    import permanencia as _PERM
+    _miembros = [m for m in _PERM.miembros_curso(db, curso, current_user.colegio_id)
+                 if m.aplica(fecha) and (m.estudiante.activo or m.salio)]
+    _no_de = {m.estudiante.id: m.no_lista for m in _miembros}
+    estudiantes = [m.estudiante for m in _miembros]
     est_ids = [e.id for e in estudiantes]
-    
+
     if not est_ids:
         return []
-    
+
     # Bulk load asistencias en UNA query (sin N+1)
     asist_query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
         Asistencia.estudiante_id.in_(est_ids), Asistencia.fecha == fecha
     )
     if asignatura_id:
         asist_query = asist_query.filter_by(asignatura_id=asignatura_id)
-    asistencias_map = {a.estudiante_id: a for a in asist_query.all()}
-    
+    asistencias_map = {a.estudiante_id: a for a in asist_query.all() if a.curso_id in (None, curso.id)}
+
     resultado = []
     for est in estudiantes:
         asistencia = asistencias_map.get(est.id)
         resultado.append({
             'estudiante_id': est.id,
             'estudiante': est.nombre_completo,
-            'no_lista': est.no_lista,
+            'no_lista': _no_de.get(est.id, est.no_lista),
             'estado': asistencia.estado if asistencia else None,
             'asistencia_id': asistencia.id if asistencia else None
         })
@@ -16556,6 +16604,17 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
 
     ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
     estudiantes_lote = {}
+    _autorizados_lote = set()
+    # TRAS-1 · las fichas del lote se bloquean JUNTAS y en orden de id antes de
+    # mirar su permanencia: dos lotes (o un lote y un movimiento) no se cruzan.
+    try:
+        _ids_lote = sorted({int(i.get('estudiante_id')) for i in asistencias
+                            if isinstance(i, dict) and str(i.get('estudiante_id') or '').isdigit()})
+        if _ids_lote:
+            tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
+                Estudiante.id.in_(_ids_lote)).order_by(Estudiante.id).with_for_update().all()
+    except Exception:
+        pass
 
     # Prevalidar TODO antes de escribir: estudiante, tenant, retiro, curso y estado.
     for item in asistencias:
@@ -16575,7 +16634,20 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         _err_item, _tramo_item, _curso_item = _permanencia_asistencia(db, current_user, estudiante, curso, fecha)
         if _err_item is not None:
             return _err_item
-        estudiantes_lote[estudiante.id] = (estudiante, estado_item, _curso_item or curso)
+        _curso_item = _curso_item or curso
+        # La autorización ya no sale solo del PRIMER estudiante: el docente
+        # debe estar autorizado (asignación activa a curso y asignatura; en
+        # Primaria, titular) en el curso de CADA estudiante ese día. Un lote de
+        # varios cursos sigue siendo válido si lo está en todos.
+        if _curso_item is not None and _curso_item.id not in _autorizados_lote:
+            _ctx_c, _err_c = _guard_asistencia(
+                db, current_user, curso_id=_curso_item.id,
+                asignatura_id=getattr(asignatura_id, 'id', asignatura_id))
+            if _err_c:
+                db.rollback()
+                return _err_c
+            _autorizados_lote.add(_curso_item.id)
+        estudiantes_lote[estudiante.id] = (estudiante, estado_item, _curso_item)
 
     primer_est = estudiantes_lote.get(int(_primer_est))[0] if _primer_est and int(_primer_est) in estudiantes_lote else None
     if primer_est and primer_est.curso_id:
@@ -16589,6 +16661,13 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     _s1_lote = _bloqueo_por_sesion_no_impartida(
         db, colegio_id=current_user.colegio_id, curso_id=_curso_s1,
         asignatura_id=asignatura_id, fecha=fecha)
+    # Y la sesión no impartida de CADA curso del lote, no solo la del primero.
+    for _cid in sorted(_autorizados_lote - {_curso_s1}):
+        if _s1_lote:
+            break
+        _s1_lote = _bloqueo_por_sesion_no_impartida(
+            db, colegio_id=current_user.colegio_id, curso_id=_cid,
+            asignatura_id=asignatura_id, fecha=fecha)
     if _s1_lote:
         return _s1_lote
 
@@ -24813,7 +24892,13 @@ def _estudiantes_registro(db, current_user, curso):
                 marca = '[REINC %s]' % _f(m.ultimo.desde)
         info[est.id] = {'no_lista': m.no_lista, 'salio': m.salio, 'marca': marca}
         lista.append(est)
-    return _con_filas_vacias(lista, info, curso, _capacidad_registro(curso)), info
+    # Con retiros o traslados el Registro es SIEMPRE fila = número: si el número
+    # más alto no cabe, el generador lo rechaza (422) y el validador lo explica;
+    # no se imprime comprimido. Sin movimientos, como en main (ver REG-43).
+    _con_mov = any(m.salio or m.primero.motivo_inicio != _PERM.INICIO or len(m.en_curso) > 1
+                   for m in miembros)
+    return _con_filas_vacias(lista, info, curso,
+                             None if _con_mov else _capacidad_registro(curso)), info
 
 
 def _capacidad_registro(curso):

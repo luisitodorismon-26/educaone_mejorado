@@ -229,6 +229,25 @@ def _agregar_aviso_fuera_de_permanencia(r, fuera, miembros) -> None:
     r.info['marcas_fuera_de_permanencia'] = len(fuera)
 
 
+def _error_numeracion_registro(r, miembros, hay_movimientos, grado_numero):
+    """TRAS-1 · Con retiros o traslados el Registro va fila = número. Si el
+    número más alto no cabe en la plantilla, no se emite (ni comprimido)."""
+    if not hay_movimientos:
+        return
+    numeros = [m.no_lista for m in miembros if m.no_lista]
+    if not numeros:
+        return
+    from registro_escolar import FILAS_PLANTILLA, PLANTILLAS_AMPLIADAS
+    amp = PLANTILLAS_AMPLIADAS.get(grado_numero)
+    capacidad = amp['filas'] if amp else FILAS_PLANTILLA
+    if max(numeros) > capacidad:
+        r.add_error(
+            "NUMERACION_EXCEDE_PLANTILLA: el número de lista más alto del curso es %d y la hoja "
+            "oficial tiene %d filas. Con retiros o traslados cada estudiante va en la fila de su "
+            "número, así que el Registro no se emite comprimido (pondría a un estudiante en la "
+            "fila de otro número). Revise la numeración con Dirección." % (max(numeros), capacidad))
+
+
 def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> ValidationResult:
     """
     Valida que un curso de secundaria tenga todos los datos necesarios
@@ -320,6 +339,7 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
     
     r.info['total_estudiantes'] = len(estudiantes)
     r.info['estudiante_ids'] = [e.id for e in estudiantes]
+    _error_numeracion_registro(r, miembros, hay_movimientos, grado_numero)
     
     # Validar que todos los estudiantes tengan curso_id correcto (consistencia).
     # TRAS-1 · quien se trasladó tiene la ficha en su nuevo curso: es correcto.

@@ -395,8 +395,11 @@ check('C7 instantánea de las notas existentes (incluida la RP de Artística)', 
     v['asignatura_id'] == art.id and v['competencia'] == 1 and v['valores'].get('rp1') == 75 for v in snap.values()), len(snap))
 
 # Reintento, doble clic y concurrencia.
+# Un reintento (doble clic, red) reenvía EXACTAMENTE el mismo cuerpo; con
+# otro contenido es 409 SOLICITUD_REPETIDA_DISTINTA (test_retiros_traslados_auditoria R1).
 st2, js2 = post('/api/estudiantes/%d/traslado' % RIC.id, dire,
-                {'curso_destino_id': MA.id, 'desde': '2026-10-21', 'client_request_id': 'tras-ric-1'})
+                {'curso_destino_id': MA.id, 'desde': '2026-10-21', 'motivo': 'Cambio de tanda (sintético)',
+                 'client_request_id': 'tras-ric-1'})
 check('C8 reintento con la misma solicitud -> mismo movimiento, sin duplicar', st2 == 200 and js2.get('reintento')
       and js2['movimiento']['id'] == mov.id and db.query(M.MovimientoEstudiante).count() == 1, js2)
 st3, js3 = post('/api/estudiantes/%d/traslado' % RIC.id, dire, {'curso_destino_id': MA.id, 'desde': '2026-10-21'})
