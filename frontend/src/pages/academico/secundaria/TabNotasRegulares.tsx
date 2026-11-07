@@ -121,8 +121,11 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
 
   const renderCelda = (est: EstudianteData, compNum: number, campo: CampoEditable, isRP: boolean) => {
     const val = getValor(est, compNum, campo);
-    const esRetirado = !!est.estudiante.retirado;
+    const esRetirado = !!est.estudiante.retirado || !!est.permanencia?.solo_lectura;
     const cellKey = `${est.estudiante.id}-${compNum}-${campo}`;
+    // TRAS-1 · nota registrada antes del traslado: se ve, pero no se
+    // sobrescribe sin el permiso temporal de corrección de Dirección.
+    const protegida = (est.permanencia?.notas_previas_traslado?.[String(compNum)] || []).includes(campo);
 
     // v2.13.35: ¿el período de este campo está cerrado? (p1/rp1 → 1, p2/rp2 → 2, etc.)
     const numPeriodo = campo.replace(/[^0-9]/g, '');
@@ -137,6 +140,15 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
       const pVal = getValor(est, compNum, pCampo);
       // RP queda deshabilitado si: P no existe O P >= 70
       rpDeshabilitado = pVal === null || pVal >= 70;
+    }
+
+    if (protegida && !esRetirado) {
+      return (
+        <span title="Registrada antes del traslado. Para corregirla hace falta el permiso temporal de corrección de Dirección."
+              className={`inline-block w-16 text-center text-sm ${isRP ? 'text-amber-700' : 'text-gray-700'} ${getNotaClass(val)}`}>
+          {val !== null ? val.toFixed(2) : '—'} <span aria-hidden>🔒</span>
+        </span>
+      );
     }
 
     // Si no puede editar, está retirado, o el período está cerrado → solo lectura
@@ -186,7 +198,8 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
     );
   };
 
-  const conCF = useMemo(() => estudiantes.filter(e => e.cf !== null && !e.estudiante.retirado), [estudiantes]);
+  const conCF = useMemo(() => estudiantes.filter(e => e.cf !== null && !e.estudiante.retirado
+    && !e.permanencia?.solo_lectura), [estudiantes]);
   const aprobados = useMemo(() => conCF.filter(e => (e.cf ?? 0) >= 70).length, [conCF]);
   const reprobados = conCF.length - aprobados;
   const promedio = useMemo(() => conCF.length > 0
@@ -264,7 +277,7 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
                   const promLocal = calcularPromedioCompetencia(est, competenciaActiva);
                   const promBackend = est.competencias[competenciaActiva]?.promedio_competencia ?? null;
                   const prom = promLocal ?? promBackend;
-                  const esRetirado = !!est.estudiante.retirado;
+                  const esRetirado = !!est.estudiante.retirado || !!est.permanencia?.solo_lectura;
                   return (
                     <tr key={`${est.estudiante.id}-${competenciaActiva}`} className={`border-b ${esRetirado ? 'bg-gray-50' : 'hover:bg-gray-50'}`}>
                       <td className={`px-2 py-1 ${esRetirado ? 'text-gray-400 line-through' : 'text-gray-500'}`}>{est.estudiante.no_lista ?? '—'}</td>
@@ -289,10 +302,19 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
                               title={est.estudiante.motivo_retiro || 'Estudiante retirado'}
                               className="inline-block px-2 py-0.5 bg-gray-700 text-white text-[10px] font-medium rounded uppercase tracking-wide"
                             >
-                              RETIRADO {est.estudiante.fecha_retiro ? est.estudiante.fecha_retiro.slice(5).replace('-','/') : ''}
+                              {(est.permanencia?.avisos || []).some(a => a.startsWith('Trasladado'))
+                                ? 'TRASLADADO'
+                                : `RETIRADO ${est.estudiante.fecha_retiro ? est.estudiante.fecha_retiro.slice(5).replace('-','/') : ''}`}
                             </span>
                           )}
                         </div>
+                        {(est.permanencia?.avisos || []).length > 0 && (
+                          <div className="text-[10px] text-indigo-700">
+                            {est.permanencia!.avisos.join(' · ')}
+                            {Object.keys(est.permanencia!.notas_previas_traslado || {}).length > 0
+                              && ' · 🔒 notas registradas antes del traslado'}
+                          </div>
+                        )}
                       </td>
                       {CAMPOS_PERIODOS.map(({ p, rp }) => (
                         <Fragment key={`${p}-${rp}`}>
@@ -339,7 +361,12 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
               </thead>
               <tbody>
                 {estudiantes.map((est, idx) => {
-                  const esRetirado = !!est.estudiante.retirado;
+                  // TRAS-1 · quien salió del curso (trasladado o retirado) no tiene
+                  // aquí calificación final ni estado: no se presenta como aprobado.
+                  const salio = !!est.permanencia?.solo_lectura;
+                  const esRetirado = !!est.estudiante.retirado || salio;
+                  const rotuloSalida = salio && (est.permanencia?.avisos || []).some(a => a.startsWith('Trasladado'))
+                    ? 'Trasladado' : 'Retirado';
                   const aprobado = est.cf !== null && est.cf >= 70;
                   return (
                     <tr key={est.estudiante.id} className={`border-b ${esRetirado ? 'bg-gray-50' : ''}`}>
@@ -356,14 +383,14 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
                         );
                       })}
                       <td className={`px-3 py-2 text-center font-bold ${esRetirado ? 'text-gray-400' : getNotaClass(est.cf)}`}>
-                        {est.cf !== null ? est.cf.toFixed(0) : '—'}
+                        {salio ? '—' : (est.cf !== null ? est.cf.toFixed(0) : '—')}
                       </td>
                       <td className={`px-3 py-2 text-center font-bold ${esRetirado ? 'text-gray-400' : getNotaClass(est.cf)}`}>
                         {esRetirado ? '—' : (est.literal || getLiteral(est.cf))}
                       </td>
                       <td className="px-3 py-2 text-center">
                         {esRetirado ? (
-                          <span className="px-2 py-1 rounded-full text-xs font-medium bg-gray-200 text-gray-600">Retirado</span>
+                          <span className="px-2 py-1 rounded-full text-xs font-medium bg-gray-200 text-gray-600">{rotuloSalida}</span>
                         ) : est.cf !== null ? (
                           <span className={`px-2 py-1 rounded-full text-xs font-medium ${
                             aprobado ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'

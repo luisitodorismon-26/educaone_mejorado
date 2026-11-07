@@ -574,6 +574,47 @@ class Estudiante(Base):
     curso = relationship('Curso', backref='estudiantes')
 
     @property
+    def intervalos_no_aplica(self):
+        """TRAS-1 · Días entre un retiro y su reactivación: no pertenecía a
+        ningún curso, así que NO APLICAN (ni ausencias ni días esperados).
+
+        Lo lee `asistencia_canonica`. Sin movimientos devuelve [] y la
+        asistencia queda exactamente como antes. Se calcula una vez por objeto.
+        """
+        guardado = self.__dict__.get('_tras_intervalos_no_aplica')
+        if guardado is not None:
+            return guardado
+        resultado = []
+        try:
+            from sqlalchemy.orm import object_session
+            sesion = object_session(self)
+            if sesion is not None and self.id is not None and self.colegio_id is not None:
+                # Una sola consulta por sesión y colegio (no una por
+                # estudiante): el boletín por lote, el motor y el cierre
+                # recorren cursos enteros. Las operaciones de movimiento
+                # vacían esta caché al registrar.
+                cache = sesion.info.setdefault('_tras_movs_por_colegio', {})
+                if self.colegio_id not in cache:
+                    por_est = {}
+                    for m in sesion.query(MovimientoEstudiante).filter(
+                            MovimientoEstudiante.colegio_id == self.colegio_id).all():
+                        por_est.setdefault(m.estudiante_id, []).append(m)
+                    cache[self.colegio_id] = por_est
+                filas = cache[self.colegio_id].get(self.id, [])
+                if filas:
+                    import permanencia as _P
+                    por_ano = {}
+                    for m in filas:
+                        por_ano.setdefault(m.ano_escolar_id, []).append(m)
+                    for movs in por_ano.values():
+                        resultado.extend(_P.intervalos_sin_permanencia(
+                            _P.construir_tramos(self, movs)))
+        except Exception:
+            resultado = []
+        self.__dict__['_tras_intervalos_no_aplica'] = resultado
+        return resultado
+
+    @property
     def nombre_completo(self):
         return f"{self.nombre} {self.apellido}"
 
@@ -2804,6 +2845,99 @@ class CursoComponenteOptativo(Base):
             'asignatura': self.asignatura.nombre if self.asignatura else None,
             'activo': self.activo,
         }
+
+
+# ============== RETIROS Y TRASLADOS (TRAS-1) ==============
+
+class MovimientoEstudiante(Base):
+    """
+    Un retiro, un traslado de curso/tanda o una reactivación, con su fecha.
+
+    TABLA NUEVA Y ADITIVA. No modifica ni rellena ninguna fila existente: un
+    estudiante sin movimientos sigue exactamente como hoy (su curso y su número
+    de la ficha, del inicio del año a `fecha_retiro`). Ver `permanencia.py`.
+
+    LA FECHA ES «DESDE QUÉ DÍA»
+      · traslado: el estudiante pertenece al DESTINO desde `fecha_efectiva` y
+        al ORIGEN hasta el día anterior;
+      · retiro: está retirado desde `fecha_efectiva`; su último día es el
+        anterior (y eso es lo que se guarda en `Estudiante.fecha_retiro`, cuyo
+        significado de siempre es «último día que le cuenta»);
+      · reactivación: vuelve a pertenecer al curso desde `fecha_efectiva`.
+
+    No se mueve, copia, re-fecha ni re-asigna ninguna nota ni asistencia: cada
+    marca conserva su curso, su asignatura, su fecha y su autor.
+
+    BARRERAS FÍSICAS
+      · (colegio, client_request_id): el doble clic o el reintento devuelven el
+        mismo movimiento;
+      · (estudiante, año, secuencia): dos movimientos simultáneos del mismo
+        estudiante no pueden entrar los dos.
+    """
+    __tablename__ = 'movimientos_estudiante'
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=False, index=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'), nullable=False, index=True)
+    # 'traslado' | 'retiro' | 'reactivacion'
+    tipo = Column(String(20), nullable=False)
+    # Orden de los movimientos del estudiante en el año (1, 2, 3...).
+    secuencia = Column(Integer, nullable=False)
+    fecha_efectiva = Column(Date, nullable=False)
+    curso_origen_id = Column(Integer, ForeignKey('cursos.id'), nullable=True, index=True)
+    no_lista_origen = Column(Integer, nullable=True)
+    curso_destino_id = Column(Integer, ForeignKey('cursos.id'), nullable=True, index=True)
+    no_lista_destino = Column(Integer, nullable=True)
+    motivo = Column(String(300))
+    # JSON: instantánea de las notas que YA existían al trasladar (para
+    # proteger su sobrescritura), los conflictos explicados al confirmar y,
+    # en una reactivación de un retiro anterior a esta tabla, los datos de
+    # aquel retiro que antes se borraban.
+    detalle = Column(Text, default='{}')
+    registrado_por = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    registrado_en = Column(DateTime, default=_now_dr, nullable=False)
+    client_request_id = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('colegio_id', 'client_request_id',
+                         name='uq_movimiento_client_request'),
+        UniqueConstraint('estudiante_id', 'ano_escolar_id', 'secuencia',
+                         name='uq_movimiento_secuencia'),
+        Index('ix_movimiento_est_ano', 'estudiante_id', 'ano_escolar_id'),
+    )
+
+    def get_detalle(self) -> dict:
+        import json
+        try:
+            return json.loads(self.detalle or '{}')
+        except Exception:
+            return {}
+
+
+class ReservaNumeroLista(Base):
+    """
+    El número de lista de un estudiante en un curso, reservado para él.
+
+    Se crea al mover a un estudiante: su número en el ORIGEN queda reservado
+    (no se reutiliza para reemplazarlo durante ese año, y si vuelve lo
+    recupera) y el del DESTINO se reserva al asignarlo. UNIQUE(curso, número)
+    es la barrera física para que dos movimientos simultáneos no den el mismo
+    número a dos estudiantes. Los cursos ya pertenecen a un año escolar, así
+    que la reserva dura lo que dura ese curso.
+    """
+    __tablename__ = 'reservas_numero_lista'
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False, index=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'), nullable=False, index=True)
+    no_lista = Column(Integer, nullable=False)
+    movimiento_id = Column(Integer, ForeignKey('movimientos_estudiante.id'), nullable=True)
+    creado_en = Column(DateTime, default=_now_dr, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('curso_id', 'no_lista', name='uq_reserva_curso_numero'),
+        UniqueConstraint('curso_id', 'estudiante_id', name='uq_reserva_curso_estudiante'),
+    )
 
 
 def _generar_password_inicial() -> str:

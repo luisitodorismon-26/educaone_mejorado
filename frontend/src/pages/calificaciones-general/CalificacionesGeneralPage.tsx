@@ -10,6 +10,8 @@ interface Curso { id: number; nombre_completo: string; grado?: string; nombre?: 
 interface NotaPeriodo {
   estudiante_id: number; nombre: string; no_lista: number;
   asignaturas: Record<string, number | null>; promedio: number | null;
+  // TRAS-1 · «Trasladado a…», «Retirado desde…», «Incorporado desde…».
+  avisos?: string[];
 }
 interface ReporteData {
   curso: string; periodo: number;
@@ -31,6 +33,7 @@ interface AsigCompetencias {
 }
 interface EstCompetencias {
   estudiante_id: number; no_lista: number; nombre: string;
+  avisos?: string[];
   asignaturas: AsigCompetencias[];
 }
 interface CompetenciasData {
@@ -266,7 +269,7 @@ export const CalificacionesGeneralPage = () => {
                 {estudiantesOrdenados.map((est) => (
                   <tr key={est.estudiante_id} className="hover:bg-gray-50">
                     <td className="p-2 text-gray-500 text-center">{est.no_lista}</td>
-                    <td className="p-2 font-medium text-gray-800 truncate max-w-[200px]">{est.nombre}</td>
+                    <td className="p-2 font-medium text-gray-800 max-w-[200px]"><span className="block truncate">{est.nombre}</span>{(est.avisos || []).length > 0 && (<span className="block text-[10px] font-normal text-indigo-700 whitespace-normal">{(est.avisos || []).join(' · ')}</span>)}</td>
                     {data.asignaturas_nombres.map(asig => {
                       const nota = est.asignaturas[asig];
                       return (<td key={asig} className={`p-2 text-center ${getBgNota(nota)}`}><span className={`text-sm ${getColorNota(nota)}`}>{fmtNota(nota)}</span></td>);
@@ -326,7 +329,7 @@ export const CalificacionesGeneralPage = () => {
                     return (
                       <tr key={est.estudiante_id} className="hover:bg-gray-50">
                         <td className="p-2 text-gray-500 text-center">{est.no_lista}</td>
-                        <td className="p-2 font-medium text-gray-800 truncate max-w-[200px]">{est.nombre}</td>
+                        <td className="p-2 font-medium text-gray-800 max-w-[200px]"><span className="block truncate">{est.nombre}</span>{(est.avisos || []).length > 0 && (<span className="block text-[10px] font-normal text-indigo-700 whitespace-normal">{(est.avisos || []).join(' · ')}</span>)}</td>
                         {asig.competencias.map(cv => (
                           <td key={cv.competencia} className={`p-2 text-center ${getBgNota(cv.valor)}`}>
                             <span className={`text-sm ${getColorNota(cv.valor)}`}>{fmtNota(cv.valor)}</span>

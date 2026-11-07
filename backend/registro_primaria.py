@@ -583,8 +583,19 @@ def generar_registro_primaria(
                 if edad is not None and 0 < edad < 30:
                     c.drawCentredString(_centro(EST_IZQ['edad']), y, str(edad))
 
+    # TRAS-1 · leyendas de permanencia (margen superior, solo si el curso
+    # tiene estudiantes trasladados, incorporados, retirados o reincorporados).
+    hay_movimientos = any(e and e.get('marca_movimiento') for e in estudiantes)
+
+    def _leyenda(c, w, h, texto):
+        from registro_escolar import _leyenda_margen_en
+        _leyenda_margen_en(c, w, h, texto)
+
     def draw_estudiantes_der(c, w, h):
         cols = EST_DER[variante_der]
+        if hay_movimientos:
+            from registro_escolar import LEYENDA_MARCAS
+            _leyenda(c, w, h, LEYENDA_MARCAS)
         for i, est in enumerate(estudiantes):
             y = _base_fila(EST_FILAS, i, h)
             if est.get('direccion'):
@@ -632,6 +643,9 @@ def generar_registro_primaria(
                 celda = (ASIST_VERTICALES[k], ASIST_VERTICALES[k + 1])
                 c.drawCentredString(_centro(celda), h - ASIST_FECHA_Y, str(dia))
             totales = [0] * len(dias)
+            if hay_movimientos and any(v == '-' for f in filas for v in (f.get('valores') or [])):
+                from registro_escolar import LEYENDA_NO_APLICA
+                _leyenda(c, w, h, LEYENDA_NO_APLICA)
             for i, fila in enumerate(filas):
                 y = _base_fila(ASIST_FILAS, i, h)
                 valores = fila.get('valores') or []

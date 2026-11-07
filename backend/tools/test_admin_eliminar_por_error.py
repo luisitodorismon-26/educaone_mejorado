@@ -257,8 +257,15 @@ with client:
                             and isinstance(_a.args[0], _ast.Constant)
                             and str(_a.args[0].value).startswith('estudiantes.')):
                         _con_fk.add(_n2.name)
+    # TRAS-1 · Toda tabla con FK a estudiantes está en UNA de dos listas: la del
+    # borrado (ficha creada por error) o la de las que PROTEGEN la ficha
+    # (traslados, reactivaciones, números reservados: historia real que no se
+    # borra en cascada; con filas ahí, la eliminación se rechaza). Ninguna puede
+    # quedar fuera de las dos, y ninguna en las dos a la vez.
+    _protegen = set(getattr(APP, '_MODELOS_QUE_PROTEGEN_LA_FICHA', ()))
     check('E00 la lista del borrado cubre TODAS las tablas con FK a estudiantes',
-          set(APP._MODELOS_DEL_ESTUDIANTE) == _con_fk,
+          (set(APP._MODELOS_DEL_ESTUDIANTE) | _protegen) == _con_fk
+          and not (set(APP._MODELOS_DEL_ESTUDIANTE) & _protegen),
           'faltan: %s  sobran: %s'
           % (sorted(_con_fk - set(APP._MODELOS_DEL_ESTUDIANTE)),
              sorted(set(APP._MODELOS_DEL_ESTUDIANTE) - _con_fk)))
@@ -589,8 +596,32 @@ with client:
     r = client.post('/api/estudiantes/%d/eliminar-por-error' % ID_RETIRADO,
                     json={'confirmar_estudiante_id': ID_RETIRADO,
                           'motivo': 'ficha por error'}, headers=auth(DIR))
-    check('AF-07c y se elimina sin problema', r.status_code == 200,
+    # TRAS-1 · CAMBIO DE REGLA (pedido expresamente): reactivar registra un
+    # movimiento con el retiro previo (fecha, motivo y autor), y esa
+    # trazabilidad administrativa no se borra para poder eliminar la ficha.
+    # Antes AF-07c esperaba 200; ahora la ficha queda protegida (409) y entera.
+    check('AF-07c y queda protegida: su historia de retiro y reactivación no se borra',
+          r.status_code == 409 and err(r) == 'FICHA_CON_TRAYECTORIA',
           '-> %d %s' % (r.status_code, err(r)))
+    _d = SessionLocal()
+    try:
+        _movs = (_d.query(M.MovimientoEstudiante).filter_by(estudiante_id=ID_RETIRADO)
+                 .order_by(M.MovimientoEstudiante.secuencia).all())
+        _prev = (_movs[0].get_detalle().get('retiro_previo') or {}) if _movs else {}
+        _ret2 = _movs[1] if len(_movs) > 1 else None
+        # El fixture crea la ficha retirada SIN fecha, motivo ni autor: el retiro
+        # previo se registra tal como estaba (claves presentes, valores vacíos).
+        # El segundo retiro, hecho por la acción de siempre, queda COMPLETO.
+        check('AF-07d ficha entera; la reactivación registra el retiro previo tal como estaba y el '
+              'segundo retiro conserva fecha, motivo y autor',
+              filas_de(ID_RETIRADO)['estudiantes'] == 1
+              and [m.tipo for m in _movs] == ['reactivacion', 'retiro']
+              and {'fecha_retiro', 'motivo_retiro', 'retirado_por'} <= set(_prev)
+              and _ret2 is not None and _ret2.motivo == 'otra vez' and _ret2.fecha_efectiva is not None
+              and _ret2.registrado_por is not None,
+              str(([m.tipo for m in _movs], _prev, _ret2 and (_ret2.motivo, _ret2.fecha_efectiva, _ret2.registrado_por)))[:300])
+    finally:
+        _d.close()
 
     print("\n=== AF · COORDINACION NO ADMINISTRA EL RETIRO ===")
 

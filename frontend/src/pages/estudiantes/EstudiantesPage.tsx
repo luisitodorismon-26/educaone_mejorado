@@ -9,6 +9,7 @@ import { useNivelesActivos, Nivel } from '../../hooks/useNivelesActivos';
 import { filterByNivel } from '../../hooks/useFiltroCascada';
 import { EstudianteKPIs } from './EstudianteKPIs';
 import { labelCurso } from '../../utils/labelCurso';
+import { MovimientoEstudianteModal, HistorialCursos, TipoMovimiento } from './MovimientoEstudianteModal';
 
 interface Estudiante {
   id: number;
@@ -131,9 +132,9 @@ export const EstudiantesPage = () => {
   const [tabHistorial, setTabHistorial] = useState<'progreso' | 'conducta' | 'asistencia' | 'psicologia' | 'datos'>('progreso');
   const [activeTab, setActiveTab] = useState<'activos' | 'retirados'>('activos');
   const [estudiantesRetirados, setEstudiantesRetirados] = useState<Estudiante[]>([]);
-  // Modal para retirar estudiante (con motivo opcional)
-  const [retirando, setRetirando] = useState<Estudiante | null>(null);
-  const [motivoRetiro, setMotivoRetiro] = useState('');
+  // TRAS-1 · Retirar, trasladar o reactivar: un solo modal con la vista previa
+  // del servidor («desde qué día», número, conflictos, asignaturas).
+  const [movimiento, setMovimiento] = useState<{ est: Estudiante; tipo: TipoMovimiento } | null>(null);
   const niveles = useNivelesActivos();
   const [nivelFiltro, setNivelFiltro] = useState<Nivel | 'todos'>('todos');
 
@@ -221,16 +222,9 @@ export const EstudiantesPage = () => {
     }
   };
 
-  const handleReactivar = async (estudianteId: number) => {
-    if (!confirm('¿Está seguro de reactivar este estudiante?')) return;
-    
-    try {
-      await api.post(`/estudiantes/${estudianteId}/reactivar`);
-      setMessage({ type: 'success', text: 'Estudiante reactivado exitosamente' });
-      loadData();
-    } catch (e: any) {
-      setMessage({ type: 'error', text: e.response?.data?.error || 'Error al reactivar' });
-    }
+  const handleReactivar = (estudianteId: number) => {
+    const est = estudiantesRetirados.find(x => x.id === estudianteId);
+    if (est) setMovimiento({ est, tipo: 'reactivacion' });
   };
 
   // Mapa curso_id -> nivel como fallback si el estudiante no trae nivel propio
@@ -308,28 +302,7 @@ export const EstudiantesPage = () => {
   };
 
   const handleDelete = (e: Estudiante) => {
-    setRetirando(e);
-    setMotivoRetiro('');
-  };
-  
-  const confirmarRetiro = async () => {
-    if (!retirando) return;
-    try {
-      // DELETE con body opcional con motivo
-      await api.delete(`/estudiantes/${retirando.id}`, {
-        data: motivoRetiro ? { motivo_retiro: motivoRetiro } : {},
-      });
-      setMessage({ type: 'success', text: `${retirando.nombre_completo} retirado` });
-      setRetirando(null);
-      setMotivoRetiro('');
-      loadData();
-    } catch (e: any) {
-      setMessage({
-        type: 'error',
-        text: e.response?.data?.message || e.response?.data?.error
-          || 'Error al retirar estudiante',
-      });
-    }
+    setMovimiento({ est: e, tipo: 'retiro' });
   };
 
   const openEdit = (e: Estudiante) => {
@@ -808,6 +781,13 @@ export const EstudiantesPage = () => {
             >
               Editar
             </button>
+            <button
+              onClick={(ev) => { ev.stopPropagation(); setMovimiento({ est: e, tipo: 'traslado' }); }}
+              className="text-indigo-600 hover:text-indigo-800 text-sm"
+              title="Cambiar de curso o tanda sin perder su historial"
+            >
+              Trasladar
+            </button>
             {canManageRetirados && (
               <button
                 onClick={(ev) => { ev.stopPropagation(); handleDelete(e); }}
@@ -1039,6 +1019,9 @@ export const EstudiantesPage = () => {
               </div>
             </div>
             
+            {/* TRAS-1 · historial de cursos del año (traslados, retiros, reactivaciones) */}
+            <HistorialCursos estudianteId={showDetalle.id} />
+
             {/* Banner prominente de retiro: visible al inicio del modal */}
             {!showDetalle.activo && (
               <div className="bg-gray-100 border-l-4 border-gray-700 rounded p-3">
@@ -1166,35 +1149,13 @@ export const EstudiantesPage = () => {
         )}
       </Modal>
 
-      {/* Modal Retirar Estudiante (con motivo opcional) */}
-      <Modal
-        isOpen={!!retirando}
-        onClose={() => { setRetirando(null); setMotivoRetiro(''); }}
-        title="Retirar estudiante"
-        size="md"
-        footer={
-          <>
-            <Button variant="secondary" onClick={() => { setRetirando(null); setMotivoRetiro(''); }}>Cancelar</Button>
-            <Button variant="danger" onClick={confirmarRetiro}>Retirar estudiante</Button>
-          </>
-        }
-      >
-        {retirando && (
-          <div className="space-y-4">
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-800">
-              <p className="font-medium">¿Confirmás que querés retirar a <span className="font-bold">{retirando.nombre_completo}</span>?</p>
-              <p className="text-xs mt-1">El estudiante deja de poder ser calificado o tener nuevas marcas de asistencia. Sus notas y asistencia previas quedan intactas. Podés reactivarlo en cualquier momento desde la pestaña "Retirados".</p>
-            </div>
-            <Input
-              label="Motivo del retiro (opcional)"
-              value={motivoRetiro}
-              onChange={e => setMotivoRetiro(e.target.value)}
-              placeholder="Ej. Cambio de colegio, mudanza, abandono"
-            />
-            <p className="text-xs text-gray-500">Fecha de retiro: hoy ({new Date().toISOString().slice(0,10)})</p>
-          </div>
-        )}
-      </Modal>
+      {/* TRAS-1 · Modal de movimiento (traslado, retiro, reactivación) */}
+      <MovimientoEstudianteModal
+        estudiante={movimiento?.est || null}
+        tipo={movimiento?.tipo || 'retiro'}
+        onClose={() => setMovimiento(null)}
+        onDone={(texto) => { setMovimiento(null); setMessage({ type: 'success', text: texto }); loadData(); }}
+      />
       <Modal
         isOpen={showImportModal}
         onClose={() => setShowImportModal(false)}
