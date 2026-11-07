@@ -8363,7 +8363,33 @@ def _instantanea_notas(db, current_user, est, ano):
                 snap[clave][str(c.id)] = {'asignatura_id': c.asignatura_id,
                                           'competencia': c.competencia_numero,
                                           'valores': valores}
+    # Evaluaciones extra de Secundaria (C.E.C., C.E.EX., C.E.) ya registradas.
+    snap['extra_secundaria'] = {}
+    for ev in tenant_filter(db.query(EvaluacionExtraSecundaria), EvaluacionExtraSecundaria,
+                            current_user).filter(EvaluacionExtraSecundaria.estudiante_id == est.id,
+                                                 EvaluacionExtraSecundaria.ano_escolar_id == ano.id).all():
+        valores = {k: getattr(ev, k) for k in _CAMPOS_EXTRA_TRAS if getattr(ev, k, None) is not None}
+        if valores:
+            snap['extra_secundaria'][str(ev.id)] = {'asignatura_id': ev.asignatura_id, 'valores': valores}
     return snap
+
+
+_CAMPOS_EXTRA_TRAS = ('cec', 'ceex', 'ce')
+
+
+def _extra_protegidos_por_traslado(db, current_user, est, ev, cambios):
+    """Campos de `cambios` (cec/ceex/ce) cuyo valor YA existía cuando el
+    estudiante se trasladó (instantánea del movimiento): se conservan."""
+    import permanencia as _PERM
+    protegidos = []
+    for m in _PERM.movimientos_por_estudiante(
+            db, current_user.colegio_id, ev.ano_escolar_id, [est.id]).get(est.id, []):
+        if m.tipo != _PERM.TRASLADO:
+            continue
+        previos = (((m.get_detalle().get('notas_previas') or {}).get('extra_secundaria') or {})
+                   .get(str(ev.id)) or {}).get('valores') or {}
+        protegidos.extend(c for c in cambios if c in previos and c not in protegidos)
+    return protegidos
 
 
 def _asignaturas_de_curso(db, current_user, curso_id):
@@ -8602,8 +8628,11 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
             'Esa solicitud ya se usó con otro contenido (estudiante, tipo, fecha, destino, número '
             'o motivo). No se registró nada; repita la operación como una solicitud nueva.')
 
-    # 1. Reintento / doble clic: la misma solicitud devuelve el mismo movimiento.
-    if crid:
+    def _resolver_solicitud():
+        """Si el identificador ya se usó (movimiento o primer retiro): el
+        resultado de entonces si el contenido es el mismo; si no, 409."""
+        if not crid:
+            return None
         previo = db.query(MovimientoEstudiante).filter_by(
             colegio_id=current_user.colegio_id, client_request_id=crid).first()
         if previo is not None:
@@ -8614,9 +8643,12 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
                 'SOLICITUD_REPETIDA_DISTINTA',
                 'Esa solicitud ya se usó con otro contenido (estudiante, tipo, fecha, destino, número '
                 'o motivo). No se registró nada; repita la operación como una solicitud nueva.')
-        _resp_ret = _respuesta_reintento_retiro(_retiro_por_solicitud(db, current_user.colegio_id, crid))
-        if _resp_ret is not None:
-            return _resp_ret
+        return _respuesta_reintento_retiro(_retiro_por_solicitud(db, current_user.colegio_id, crid))
+
+    # 1. Reintento / doble clic: la misma solicitud devuelve el mismo movimiento.
+    _resp_sol = _resolver_solicitud()
+    if _resp_sol is not None:
+        return _resp_sol
 
     # 3. La ficha se BLOQUEA antes de validar (PostgreSQL: SELECT ... FOR
     #    UPDATE) y se relee: toda la validación (permanencia, conflictos con
@@ -8624,6 +8656,13 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
     #    cargas de asistencia y de notas toman el mismo bloqueo antes de mirar
     #    la permanencia, así que una carga simultánea espera y se reevalúa.
     _bloquear_ficha(db, est)
+    # Y el identificador se vuelve a consultar YA con el bloqueo y la ficha
+    # releída, antes de cualquier otra respuesta («ya retirado», etc.): si una
+    # petición con la misma clave entró mientras se esperaba, manda la huella.
+    _resp_sol = _resolver_solicitud()
+    if _resp_sol is not None:
+        db.rollback()
+        return _resp_sol
 
     ano = _ano_activo_colegio(db, current_user)
     if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
@@ -12029,11 +12068,16 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
     
     estudiante_obj = get_tenant_or_404(db, Estudiante, estudiante_id, current_user, name='estudiante')
     get_tenant_or_404(db, Asignatura, asignatura_id, current_user, name='asignatura')
-    
+    # TRAS-1 · mismo bloqueo que retiros y traslados, ANTES de autorizar: si hay
+    # uno en curso se espera, y la ficha se relee con su resultado.
+    _bloquear_ficha(db, estudiante_obj)
+
     if not estudiante_obj.activo:
         return JSONResponse({'error': 'Estudiante retirado'}, status_code=403)
-    
-    # Verificar asignación del profesor
+
+    # Verificar asignación del profesor (TRAS-1: la ficha ya está bloqueada y
+    # releída, así que `curso_id` y `activo` son los posteriores a un retiro o
+    # traslado simultáneo).
     # v2.15 F2: apretado — con tenant_filter y solo asignaciones ACTIVAS
     # (antes una asignación desactivada seguía autorizando)
     tiene_asig = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
@@ -12126,6 +12170,34 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
                          f'Ejemplo oficial MINERD: CF=64 + CE=10 → 74.'
             }, status_code=400)
     
+    # TRAS-1 · Lo registrado ANTES de un traslado se conserva: el docente del
+    # curso actual completa lo vacío, pero cambiar (o limpiar, en una
+    # corrección) un valor previo exige el permiso temporal de corrección de
+    # Dirección para este curso y asignatura con período «todo el año» (las
+    # evaluaciones extra van sobre la CF de los cuatro períodos).
+    _campo_tipo = {'completiva': 'cec', 'extraordinaria': 'ceex', 'especial': 'ce'}[tipo]
+    _nuevos = {_campo_tipo: nota_f}
+    if es_correccion:
+        for _c in {'completiva': ('ceex', 'ce'), 'extraordinaria': ('ce',)}.get(tipo, ()):
+            _nuevos[_c] = None
+    _cambian = [c for c, v in _nuevos.items()
+                if (getattr(ev, c) is None) != (v is None)
+                or (v is not None and abs(float(getattr(ev, c)) - v) > 1e-9)]
+    _permiso_extra = None
+    _protegidos = _extra_protegidos_por_traslado(db, current_user, estudiante_obj, ev, _cambian)
+    if _protegidos:
+        _permiso_extra = _permiso_correccion(db, current_user, estudiante_obj.curso_id, asignatura_id, None)
+        if _permiso_extra is None:
+            db.rollback()
+            return JSONResponse({
+                'error': 'NOTA_PREVIA_AL_TRASLADO',
+                'message': ('Esa evaluación se registró antes del traslado del estudiante. Se conserva '
+                            'tal cual; para corregirla hace falta el permiso temporal de corrección de '
+                            'Dirección (este curso y asignatura, todo el año). Las fases vacías sí '
+                            'puede completarlas.'),
+                'campos': sorted(_protegidos),
+            }, status_code=409)
+
     # Asignar nota según el tipo (si es corrección, limpiar las fases posteriores)
     if tipo == 'completiva':
         ev.cec = nota_f
@@ -12143,7 +12215,9 @@ async def save_evaluacion_extra(request: Request, db: Session = Depends(get_db),
     
     log_auditoria(db, 'EVALUACION_EXTRA_GUARDADA', 'evaluaciones_extra_secundaria', ev.id,
                   None, {'tipo': tipo, 'nota': nota_f, 'condicion_final': ev.condicion_final,
-                         'estudiante_id': estudiante_id, 'asignatura_id': asignatura_id},
+                         'estudiante_id': estudiante_id, 'asignatura_id': asignatura_id,
+                         **({'permiso_correccion_id': _permiso_extra.id, 'campos_previos_al_traslado':
+                             sorted(_protegidos)} if _permiso_extra is not None else {})},
                   user=current_user, request=request)
     
     db.commit()

@@ -13,6 +13,8 @@
   R1r primer retiro sin trayectoria: también conserva la solicitud y su huella.
   R2f el endpoint OFICIAL del Registro rechaza la numeración que no cabe.
   R3c (solo PostgreSQL) movimiento frente a un LOTE de asistencia.
+  R1s (solo PostgreSQL) dos primeros retiros simultáneos con la misma clave.
+  EX  evaluaciones extra de Secundaria frente a traslados y retiros.
 
 Base: SQLite temporal aislada o, con EO_PG_TEST_SERVER, una base PostgreSQL
 TEMPORAL propia (tools/pg_base_temporal.py). Datos sintéticos.
@@ -119,6 +121,11 @@ for e in EV:
 ER = estudiante('V7', V, 7)        # R1r: primer retiro sin trayectoria
 EE = estudiante('V8', V, 8)        # R1r: retirado y luego eliminado por error
 EL1, EL2 = estudiante('V9', V, 9), estudiante('V10', V, 10)   # R3c
+RS1, RS2 = estudiante('V11', V, 11), estudiante('V12', V, 12)  # R1s
+EXA, EXB, EXC = estudiante('V13', V, 13), estudiante('V14', V, 14), estudiante('V15', V, 15)  # EX
+for _e in (EXA, EXB, EXC):
+    add(M.EvaluacionExtraSecundaria(colegio_id=col.id, estudiante_id=_e.id, asignatura_id=art.id,
+                                    ano_escolar_id=ano.id, cf_original=60.0)).recalcular_todo()
 db.commit()
 IDS = {'dire': dire.id, 'pV': pV.id, 'pM': pM.id, 'pVM': pVM.id}
 TOK = {k: create_token(u) for k, u in (('dire', dire), ('pV', pV), ('pM', pM), ('pVM', pVM))}
@@ -343,6 +350,74 @@ st, js = post('/api/estudiantes/%d/retiro' % ER.id, 'dire',
 check('R1r-k el identificador de la ficha eliminada no se reutiliza: 409', st == 409
       and js.get('error') == 'SOLICITUD_REPETIDA_DISTINTA' and estado_retiro(ER.id) == tras_reac, (st, js))
 
+# ═════════════ EX. EVALUACIONES EXTRA ═════════════
+print('\n== EX. Evaluaciones extra de Secundaria frente a traslados ==')
+
+
+def ev_de(eid):
+    db.expire_all()
+    e_ = db.query(M.EvaluacionExtraSecundaria).filter_by(estudiante_id=eid, asignatura_id=art.id).one()
+    return (e_.cec, e_.ceex, e_.ce, e_.completiva_final, e_.extraordinaria_final, e_.condicion_final)
+
+
+def extra(k, eid, tipo, nota):
+    return post('/api/calificaciones-secundaria/evaluacion-extra', k,
+                {'estudiante_id': eid, 'asignatura_id': art.id, 'tipo': tipo, 'nota': nota})
+
+
+def esperado(**valores):
+    t = M.EvaluacionExtraSecundaria(cf_original=60.0, **valores)
+    t.recalcular_todo()
+    return (t.cec, t.ceex, t.ce, t.completiva_final, t.extraordinaria_final, t.condicion_final)
+
+
+st, js = extra('pV', EXA.id, 'completiva', 65)
+check('EX-a el docente del origen registra la completiva antes del traslado', st == 200
+      and ev_de(EXA.id) == esperado(cec=65.0), (st, js, ev_de(EXA.id)))
+st, js = post('/api/estudiantes/%d/traslado' % EXA.id, 'dire', {'curso_destino_id': MA.id, 'desde': '2026-11-03'})
+db.expire_all()
+_mv = db.query(M.MovimientoEstudiante).filter_by(estudiante_id=EXA.id).one_or_none()
+_snapx = ((_mv.get_detalle().get('notas_previas') or {}).get('extra_secundaria') or {}) if _mv else {}
+check('EX-b el traslado guarda en su instantánea la completiva ya registrada', st == 200
+      and any(v['valores'].get('cec') == 65 for v in _snapx.values()), (st, js, _snapx))
+base_ex = ev_de(EXA.id)
+st, js = extra('pM', EXA.id, 'completiva', 80)
+check('EX-c el docente del destino NO sobrescribe la completiva previa sin permiso: 409 y nada cambia',
+      st == 409 and js.get('error') == 'NOTA_PREVIA_AL_TRASLADO' and ev_de(EXA.id) == base_ex, (st, js))
+st, js = extra('pV', EXA.id, 'completiva', 70)
+check('EX-d el docente del origen ya no escribe (el estudiante es de otro curso): 403 y nada cambia',
+      st == 403 and ev_de(EXA.id) == base_ex, (st, js))
+add(M.PermisoTemporalCalificacion(colegio_id=col.id, profesor_id=pM.id, curso_id=MA.id, asignatura_id=art.id,
+                                  periodo=2, fecha_fin=dt.datetime(2030, 1, 1), otorgado_por=dire.id, activo=True))
+db.commit()
+st, js = extra('pM', EXA.id, 'completiva', 80)
+check('EX-e un permiso de UN período no basta para corregir la evaluación extra: 409 y nada cambia',
+      st == 409 and ev_de(EXA.id) == base_ex, (st, js))
+_perm = add(M.PermisoTemporalCalificacion(colegio_id=col.id, profesor_id=pM.id, curso_id=MA.id, asignatura_id=art.id,
+                                          periodo=None, fecha_fin=dt.datetime(2030, 1, 1), otorgado_por=dire.id,
+                                          activo=True))
+db.commit()
+_perm_id = _perm.id
+
+
+def _ultima_aud_ex():
+    db.expire_all()
+    return db.query(M.LogAuditoria).filter_by(accion='EVALUACION_EXTRA_GUARDADA').order_by(M.LogAuditoria.id.desc()).first()
+
+
+st, js = extra('pM', EXA.id, 'completiva', 66)
+check('EX-f con el permiso de corrección de todo el año el destino corrige la completiva previa (fórmulas de '
+      'siempre) y la auditoría anota el permiso', st == 200 and ev_de(EXA.id) == esperado(cec=66.0)
+      and ("'permiso_correccion_id': %d" % _perm_id) in (_ultima_aud_ex().datos_nuevos or ''), (st, js, ev_de(EXA.id)))
+st, js = extra('pM', EXA.id, 'extraordinaria', 75)
+check('EX-g la fase vacía (extraordinaria) la completa el destino sin necesitar permiso; la completiva queda',
+      st == 200 and ev_de(EXA.id) == esperado(cec=66.0, ceex=75.0)
+      and 'permiso_correccion_id' not in (_ultima_aud_ex().datos_nuevos or ''), (st, js, ev_de(EXA.id)))
+st, js = extra('pV', EXC.id, 'completiva', 66)
+st2, js2 = extra('pV', EXC.id, 'completiva', 67)
+check('EX-h sin traslado, como siempre: el docente del curso registra y corrige su última fase sin permiso',
+      st == 200 and st2 == 200 and ev_de(EXC.id) == esperado(cec=67.0), (st, js, st2, js2))
+
 # ═════════════ R3. CONCURRENCIA (solo PostgreSQL) ═════════════
 print('\n== R3. Movimiento frente a cargas simultáneas ==')
 if engine.dialect.name != 'postgresql':
@@ -420,8 +495,9 @@ else:
                 fin['mov'] = time.time()
 
             def _l():
+                t0 = time.time()
                 out_['lote'] = _req('POST', '/api/asistencia/masivo', k_lote, cuerpo_lote)
-                fin['lote'] = time.time()
+                fin['lote'] = time.time() - t0      # duración del lote
             ta_, tb_ = threading.Thread(target=_m), threading.Thread(target=_l)
             ta_.start()
             time.sleep(0.7)
@@ -441,10 +517,82 @@ else:
             out, fin = _carrera(eid_mov, k_lote, cuerpo_l)
             db.expire_all()
             despues_l = sorted((a.id, a.estudiante_id, a.curso_id, a.fecha, a.estado) for a in db.query(M.Asistencia))
-            check('R3c %s: el traslado entra; el lote ESPERA (termina después), se reevalúa y se rechaza entero; '
+            check('R3c %s: el traslado entra; el lote ESPERA (≥1 s, bloqueado), se reevalúa y se rechaza entero; '
                   'ni siquiera la fila del compañero se escribe' % etiqueta,
-                  out['mov'][0] == 200 and out['lote'][0] in (403, 409) and fin['lote'] >= fin['mov']
-                  and despues_l == antes_l, (out, round(fin.get('lote', 0) - fin.get('mov', 0), 2)))
+                  out['mov'][0] == 200 and out['lote'][0] in (403, 409) and fin['lote'] >= 1.0
+                  and despues_l == antes_l, (out, round(fin.get('lote', 0), 2)))
+        def _a_la_vez(f1, f2):
+            out_, fin_ = {}, {}
+
+            def _w(clave, f):
+                t0 = time.time()
+                out_[clave] = f()
+                fin_[clave] = time.time() - t0      # duración de esa petición
+            t1 = threading.Thread(target=_w, args=('a', f1))
+            t2 = threading.Thread(target=_w, args=('b', f2))
+            t1.start()
+            time.sleep(0.7)
+            t2.start()
+            t1.join()
+            t2.join()
+            return out_, fin_
+
+        # EX-con: evaluación extra del docente del ORIGEN mientras se traslada.
+        out, fin = _a_la_vez(
+            lambda: _req('POST', '/api/estudiantes/%d/traslado' % EXB.id, 'dire',
+                         {'curso_destino_id': MA.id, 'desde': '2026-11-03'}),
+            lambda: _req('POST', '/api/calificaciones-secundaria/evaluacion-extra', 'pV',
+                         {'estudiante_id': EXB.id, 'asignatura_id': art.id, 'tipo': 'completiva', 'nota': 64}))
+        check('EX-con-a traslado y evaluación extra del origen simultáneos: la evaluación espera, se reautoriza '
+              'con el curso nuevo y se rechaza; nada escrito',
+              out['a'][0] == 200 and out['b'][0] == 403 and fin['b'] >= 1.0 and ev_de(EXB.id) == esperado(),
+              (out, round(fin['b'], 2), ev_de(EXB.id), esperado()))
+
+        _orig_log = APP.log_auditoria
+
+        def _log_lento(db_, accion, *a, **k):
+            r_ = _orig_log(db_, accion, *a, **k)
+            if accion == 'retirar':
+                time.sleep(2.0)          # el retiro tiene la ficha bloqueada mientras tanto
+            return r_
+        APP.log_auditoria = _log_lento
+        try:
+            antes_c = ev_de(EXC.id)
+            out, fin = _a_la_vez(
+                lambda: _req('POST', '/api/estudiantes/%d/retiro' % EXC.id, 'dire',
+                             {'desde': '2026-11-05', 'motivo': 'Retiro (sintético)'}),
+                lambda: _req('POST', '/api/calificaciones-secundaria/evaluacion-extra', 'pV',
+                             {'estudiante_id': EXC.id, 'asignatura_id': art.id, 'tipo': 'completiva', 'nota': 90}))
+            check('EX-con-b retiro y evaluación extra simultáneos: la evaluación espera y se rechaza (retirado); '
+                  'la completiva previa se conserva', out['a'][0] == 200 and out['b'][0] == 403
+                  and fin['b'] >= 1.0 and ev_de(EXC.id) == antes_c, (out, round(fin['b'], 2), ev_de(EXC.id), antes_c))
+
+            # R1s: dos primeros retiros simultáneos con la MISMA clave.
+            cuerpo_s = {'desde': '2026-10-20', 'motivo': 'Mudanza (sintético)', 'client_request_id': 'aud-con-1'}
+            out, _ = _a_la_vez(lambda: _req('POST', '/api/estudiantes/%d/retiro' % RS1.id, 'dire', dict(cuerpo_s)),
+                               lambda: _req('POST', '/api/estudiantes/%d/retiro' % RS1.id, 'dire', dict(cuerpo_s)))
+            ret1 = estado_retiro(RS1.id)
+            check('R1s-a misma clave y MISMO contenido a la vez: uno retira, el otro recibe el resultado original '
+                  '(reintento, misma fecha); una sola auditoría',
+                  out['a'][0] == 200 and out['b'][0] == 200 and not out['a'][1].get('reintento')
+                  and out['b'][1].get('reintento') and out['b'][1].get('fecha_retiro') == '2026-10-19'
+                  and out['b'][1].get('desde') == '2026-10-20'
+                  and ret1 == ((False, 'retirado', dt.date(2026, 10, 19), 'Mudanza (sintético)', IDS['dire'], V.id, 11),
+                               0, 1), (out, ret1))
+            out, _ = _a_la_vez(
+                lambda: _req('POST', '/api/estudiantes/%d/retiro' % RS2.id, 'dire',
+                             {'desde': '2026-10-20', 'motivo': 'Motivo A', 'client_request_id': 'aud-con-2'}),
+                lambda: _req('POST', '/api/estudiantes/%d/retiro' % RS2.id, 'dire',
+                             {'desde': '2026-10-20', 'motivo': 'Motivo B', 'client_request_id': 'aud-con-2'}))
+            ret2 = estado_retiro(RS2.id)
+            check('R1s-b misma clave y contenido DISTINTO a la vez: el primero retira; el segundo 409 '
+                  'SOLICITUD_REPETIDA_DISTINTA; la ficha conserva el motivo del primero; una sola auditoría',
+                  out['a'][0] == 200 and out['b'][0] == 409
+                  and out['b'][1].get('error') == 'SOLICITUD_REPETIDA_DISTINTA'
+                  and ret2 == ((False, 'retirado', dt.date(2026, 10, 19), 'Motivo A', IDS['dire'], V.id, 12), 0, 1),
+                  (out, ret2))
+        finally:
+            APP.log_auditoria = _orig_log
     finally:
         APP._instantanea_notas = _orig_inst
 
