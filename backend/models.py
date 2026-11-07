@@ -589,9 +589,18 @@ class Estudiante(Base):
             from sqlalchemy.orm import object_session
             sesion = object_session(self)
             if sesion is not None and self.id is not None and self.colegio_id is not None:
-                filas = sesion.query(MovimientoEstudiante).filter(
-                    MovimientoEstudiante.estudiante_id == self.id,
-                    MovimientoEstudiante.colegio_id == self.colegio_id).all()
+                # Una sola consulta por sesión y colegio (no una por
+                # estudiante): el boletín por lote, el motor y el cierre
+                # recorren cursos enteros. Las operaciones de movimiento
+                # vacían esta caché al registrar.
+                cache = sesion.info.setdefault('_tras_movs_por_colegio', {})
+                if self.colegio_id not in cache:
+                    por_est = {}
+                    for m in sesion.query(MovimientoEstudiante).filter(
+                            MovimientoEstudiante.colegio_id == self.colegio_id).all():
+                        por_est.setdefault(m.estudiante_id, []).append(m)
+                    cache[self.colegio_id] = por_est
+                filas = cache[self.colegio_id].get(self.id, [])
                 if filas:
                     import permanencia as _P
                     por_ano = {}

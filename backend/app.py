@@ -8825,6 +8825,7 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
             mov.detalle = _json.dumps(detalle, default=str)
         db.flush()
         est.__dict__.pop('_tras_intervalos_no_aplica', None)
+        db.info.pop('_tras_movs_por_colegio', None)
         log_auditoria(db, {'traslado': 'trasladar', 'retiro': 'retirar',
                            'reactivacion': 'reactivar'}[tipo], 'estudiantes', est.id,
                       datos_anteriores,
@@ -15761,6 +15762,18 @@ def _permanencia_asistencia(db, current_user, est, curso, fecha):
     tramos = _PERM.tramos_de(db, est, ano_id)
     tramo = _PERM.tramo_en_fecha(tramos, fecha)
     nombre_curso = _nombre_curso_fn(db, current_user)
+    if not getattr(est, 'activo', True) and (tramo is None or (curso is not None and tramo.curso_id != curso.id)):
+        # El contrato de siempre para un retirado: 403. Dentro de su
+        # permanencia (corrección histórica) sí se admite, más abajo.
+        return JSONResponse({
+            'error': 'Estudiante retirado: no se puede registrar asistencia',
+            'message': ('%s está retirado%s: el %s no pertenecía al curso. Sus marcas anteriores se '
+                        'conservan y su docente puede corregirlas dentro de su permanencia.' % (
+                            est.nombre_completo,
+                            (' desde el %s' % (est.fecha_retiro + timedelta(days=1)).strftime('%d/%m/%Y'))
+                            if est.fecha_retiro else '', fecha.strftime('%d/%m/%Y'))),
+            'fecha_retiro': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
+        }, status_code=403), None, None
     if curso is not None:
         if tramo is not None and tramo.curso_id == curso.id:
             return None, tramo, curso
@@ -16499,10 +16512,10 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         asignatura_id=getattr(asignatura_id, 'id', asignatura_id), fecha=fecha)
     if _err_lote:
         return _err_lote
-    # TRAS-1 · el lote es de UN curso: el indicado o el de la permanencia del
-    # primer estudiante ese día. Cada estudiante debe pertenecerle ESE día.
-    if curso is None and (_ctx_lote or {}).get('curso') is not None:
-        curso = _ctx_lote.get('curso')
+    # TRAS-1 · Con `curso_id` (o en Primaria, por P3.1), cada estudiante debe
+    # pertenecer a ESE curso ese día. En Secundaria sin `curso_id` la semántica
+    # del lote no cambia (cerrarla es una fase propia): cada estudiante usa el
+    # curso de SU permanencia ese día, y fuera de ella se rechaza igual.
 
     # P3.1 — el lote de PRIMARIA queda cerrado al curso que autorizó el guard.
     #
@@ -16559,10 +16572,10 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         # TRAS-1 · pertenencia por PERMANENCIA en la fecha del lote (antes: el
         # curso actual y «activo»). Fuera de ella —retirado, trasladado o aún
         # no incorporado— el lote entero se rechaza con la explicación.
-        _err_item, _tramo_item, _ = _permanencia_asistencia(db, current_user, estudiante, curso, fecha)
+        _err_item, _tramo_item, _curso_item = _permanencia_asistencia(db, current_user, estudiante, curso, fecha)
         if _err_item is not None:
             return _err_item
-        estudiantes_lote[estudiante.id] = (estudiante, estado_item)
+        estudiantes_lote[estudiante.id] = (estudiante, estado_item, _curso_item or curso)
 
     primer_est = estudiantes_lote.get(int(_primer_est))[0] if _primer_est and int(_primer_est) in estudiantes_lote else None
     if primer_est and primer_est.curso_id:
@@ -16580,7 +16593,7 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         return _s1_lote
 
     for item in asistencias:
-        estudiante, estado_item = estudiantes_lote[int(item['estudiante_id'])]
+        estudiante, estado_item, _curso_fila = estudiantes_lote[int(item['estudiante_id'])]
         query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
             estudiante_id=estudiante.id,
             fecha=fecha
@@ -16591,8 +16604,8 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
             query = query.filter(Asistencia.asignatura_id.is_(None))
 
         asistencia = query.first()
-        if asistencia is not None and curso is not None and asistencia.curso_id \
-                and asistencia.curso_id != curso.id:
+        if asistencia is not None and _curso_fila is not None and asistencia.curso_id \
+                and asistencia.curso_id != _curso_fila.id:
             db.rollback()
             return JSONResponse({
                 'error': 'MARCA_DE_OTRO_CURSO',
@@ -16606,7 +16619,7 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
             db.add(Asistencia(
                 colegio_id=current_user.colegio_id,
                 estudiante_id=estudiante.id,
-                curso_id=curso.id if curso is not None else estudiante.curso_id,
+                curso_id=_curso_fila.id if _curso_fila is not None else estudiante.curso_id,
                 asignatura_id=asignatura_id,
                 fecha=fecha,
                 estado=estado_item,
@@ -24800,7 +24813,20 @@ def _estudiantes_registro(db, current_user, curso):
                 marca = '[REINC %s]' % _f(m.ultimo.desde)
         info[est.id] = {'no_lista': m.no_lista, 'salio': m.salio, 'marca': marca}
         lista.append(est)
-    return _con_filas_vacias(lista, info, curso), info
+    return _con_filas_vacias(lista, info, curso, _capacidad_registro(curso)), info
+
+
+def _capacidad_registro(curso):
+    """Filas máximas del Registro del curso (para saber si caben los huecos)."""
+    from registro_validator import _normalizar_nivel, _extraer_grado_numero
+    grado = getattr(curso, 'grado', None)
+    if grado is not None and _normalizar_nivel(getattr(grado, 'nivel', None)) == 'primaria':
+        from registro_primaria import FILAS_POR_PAGINA
+        return FILAS_POR_PAGINA
+    from registro_escolar import FILAS_PLANTILLA, PLANTILLAS_AMPLIADAS
+    numero = _extraer_grado_numero(getattr(grado, 'nombre', '') or '') if grado is not None else 0
+    ampliada = PLANTILLAS_AMPLIADAS.get(numero)
+    return ampliada['filas'] if ampliada else FILAS_PLANTILLA
 
 
 class _FilaVaciaRegistro:
@@ -24828,7 +24854,7 @@ class _FilaVaciaRegistro:
         self._tras_curso_registro = curso
 
 
-def _con_filas_vacias(lista, info, curso):
+def _con_filas_vacias(lista, info, curso, capacidad=None):
     """Fila = número de lista. Si hay huecos (un número que nadie tiene), se
     intercala una fila vacía para que cada estudiante quede en la fila de SU
     número. Sin huecos la lista es la misma de siempre. Con números repetidos o
@@ -24840,6 +24866,11 @@ def _con_filas_vacias(lista, info, curso):
     por_numero = {int(n): e for n, e in zip(numeros, lista)}
     mayor = max(por_numero)
     if mayor == len(lista):
+        return lista
+    if capacidad is not None and mayor > capacidad:
+        # El número más alto no cabe en las filas de la plantilla: no se puede
+        # representar fila = número sin dejar a alguien fuera. Se imprime en
+        # orden, como siempre (el Registro no recorta a nadie).
         return lista
     return [por_numero.get(n) or _FilaVaciaRegistro(n, curso) for n in range(1, mayor + 1)]
 

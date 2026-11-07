@@ -670,7 +670,8 @@ check('F2c cada una de las 7 marcas: igual antes, tras el rechazo y tras el reti
           and d_['cuenta_en_su_asistencia_tras_retiro'] for d_ in DATOS['F_auditoria_fechas']))
 st, js = post('/api/asistencia', pm_art, {'estudiante_id': ABR.id, 'curso_id': MA.id, 'asignatura_id': art.id,
                                           'fecha': '2026-10-27', 'estado': 'ausente'})
-check('F3 no se acumulan cargas después del retiro -> 409', st == 409, js)
+check('F3 no se acumulan cargas después del retiro -> 403 (el contrato de siempre para un retirado)',
+      st == 403, js)
 st, js = post('/api/asistencia', pm_art, {'estudiante_id': ABR.id, 'curso_id': MA.id, 'asignatura_id': art.id,
                                           'fecha': '2026-10-08', 'estado': 'presente'})
 check('F4 corrección histórica dentro de su permanencia: posible y auditada', st == 200, js)
@@ -700,7 +701,7 @@ check('G2 pase de lista: «Retirado desde 16/10/2026», no aplica, conserva n.º
       and any('Retirado desde 16/10/2026' in a for a in lv[HIL.id]['estudiante']['avisos']), lv.get(HIL.id))
 st, js = post('/api/asistencia', PROF[(D2.id, art.id)], {'estudiante_id': HIL.id, 'curso_id': D2.id,
                                                          'asignatura_id': art.id, 'fecha': '2026-10-19', 'estado': 'ausente'})
-check('G2b no se carga asistencia mientras está retirada -> 409', st == 409, js)
+check('G2b no se carga asistencia mientras está retirada -> 403', st == 403, js)
 r = c.post('/api/estudiantes/%d/reactivar' % HIL.id, headers=H(dire), json={'desde': '2026-11-03'})
 db.expire_all()
 hil = db.get(M.Estudiante, HIL.id)

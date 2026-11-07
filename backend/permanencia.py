@@ -89,7 +89,10 @@ def construir_tramos(estudiante, movimientos) -> List[Tramo]:
     """
     movs = sorted(movimientos or (), key=lambda m: (m.secuencia, m.id or 0))
     if not movs:
-        hasta = getattr(estudiante, 'fecha_retiro', None)
+        # Solo cuenta para quien está realmente INACTIVO: una ficha activa con
+        # una `fecha_retiro` antigua (dato heredado) sigue perteneciendo a su
+        # curso, como antes de los tramos.
+        hasta = getattr(estudiante, 'fecha_retiro', None) if not getattr(estudiante, 'activo', True) else None
         return [Tramo(getattr(estudiante, 'curso_id', None),
                       getattr(estudiante, 'no_lista', None), None, hasta,
                       INICIO, RETIRO if hasta is not None else None)]
