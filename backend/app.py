@@ -7512,6 +7512,10 @@ async def eliminar_estudiante_por_error(id: int, request: Request,
         'no_lista': est.no_lista,
         'condicion': est.condicion,
         'motivo_error_registro': motivo,
+        # TRAS-1 · el retiro (fecha, motivo y autor) queda también en esta traza.
+        'fecha_retiro': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
+        'motivo_retiro': est.motivo_retiro,
+        'retirado_por': est.retirado_por,
         'conteos_eliminados': conteos,
         'total_referencias': sum(conteos.values()),
     }
@@ -8433,6 +8437,29 @@ def _bloquear_ficha(db, est):
     db.info.pop('_tras_movs_por_colegio', None)
 
 
+def _retiro_por_solicitud(db, colegio_id, crid):
+    """TRAS-1 · El primer retiro sin trayectoria no crea fila de movimiento:
+    su solicitud (identificador y huella) queda en la auditoría «retirar», que
+    no se borra (ni al reactivar ni al eliminar la ficha por error). Devuelve
+    los datos guardados de esa solicitud, o None."""
+    import ast
+    if not crid:
+        return None
+    filas = db.query(LogAuditoria).filter(
+        LogAuditoria.colegio_id == colegio_id, LogAuditoria.accion == 'retirar',
+        LogAuditoria.tabla == 'estudiantes',
+        LogAuditoria.datos_nuevos.like('%%client_request_id%%%s%%' % crid)).order_by(LogAuditoria.id).all()
+    for fila in filas:
+        try:
+            datos = ast.literal_eval(fila.datos_nuevos)
+        except Exception:
+            continue
+        if isinstance(datos, dict) and datos.get('client_request_id') == crid:
+            datos['_autor_id'] = fila.usuario_id
+            return datos
+    return None
+
+
 def _respuesta_movimiento_error(codigo, mensaje, status=409, **extra):
     cuerpo = {'error': codigo, 'message': mensaje}
     cuerpo.update(extra)
@@ -8562,6 +8589,19 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
         return (previo.estudiante_id == est.id and previo.tipo == tipo
                 and (previo.get_detalle() or {}).get('solicitud') == huella_solicitud)
 
+    def _respuesta_reintento_retiro(guardado):
+        """Mismo identificador que un primer retiro ya registrado: mismo
+        contenido → el resultado de entonces (sin tocar nada); otro → 409."""
+        if guardado is None:
+            return None
+        if guardado.get('solicitud') == huella_solicitud:
+            return {'message': 'Estudiante retirado', 'reintento': True,
+                    'fecha_retiro': guardado.get('fecha_retiro'), 'desde': guardado.get('retiro_desde')}
+        return _respuesta_movimiento_error(
+            'SOLICITUD_REPETIDA_DISTINTA',
+            'Esa solicitud ya se usó con otro contenido (estudiante, tipo, fecha, destino, número '
+            'o motivo). No se registró nada; repita la operación como una solicitud nueva.')
+
     # 1. Reintento / doble clic: la misma solicitud devuelve el mismo movimiento.
     if crid:
         previo = db.query(MovimientoEstudiante).filter_by(
@@ -8574,6 +8614,9 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
                 'SOLICITUD_REPETIDA_DISTINTA',
                 'Esa solicitud ya se usó con otro contenido (estudiante, tipo, fecha, destino, número '
                 'o motivo). No se registró nada; repita la operación como una solicitud nueva.')
+        _resp_ret = _respuesta_reintento_retiro(_retiro_por_solicitud(db, current_user.colegio_id, crid))
+        if _resp_ret is not None:
+            return _resp_ret
 
     # 3. La ficha se BLOQUEA antes de validar (PostgreSQL: SELECT ... FOR
     #    UPDATE) y se relee: toda la validación (permanencia, conflictos con
@@ -8750,6 +8793,12 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
             pass
         db.refresh(est)
         if not est.activo:
+            if crid:
+                # Otra petición con este identificador pudo entrar mientras se esperaba.
+                _resp_ret = _respuesta_reintento_retiro(_retiro_por_solicitud(db, current_user.colegio_id, crid))
+                if _resp_ret is not None:
+                    return _resp_ret
+                return _respuesta_movimiento_error('YA_RETIRADO', 'El estudiante ya está retirado.')
             if _esta_retirado(est) and est.fecha_retiro == desde - timedelta(days=1):
                 return {'message': 'Estudiante retirado (ya estaba registrado así)', 'reintento': True,
                         'fecha_retiro': est.fecha_retiro.isoformat()}
@@ -8762,7 +8811,8 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
         est.retirado_por = current_user.id
         est.__dict__.pop('_tras_intervalos_no_aplica', None)
         log_auditoria(db, 'retirar', 'estudiantes', est.id, antes,
-                      dict(est.to_dict(), retiro_desde=desde.isoformat(), client_request_id=crid),
+                      dict(est.to_dict(), retiro_desde=desde.isoformat(), client_request_id=crid,
+                           retirado_por=current_user.id, solicitud=huella_solicitud),
                       user=current_user, request=request)
         db.commit()
         cache_clear_tenant(current_user.colegio_id)
@@ -16543,6 +16593,17 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     if not isinstance(asistencias, list):
         return JSONResponse({'error': 'asistencias debe ser una lista'}, status_code=400)
 
+    # TRAS-1 · las fichas del lote se bloquean JUNTAS y en orden de id ANTES de
+    # cualquier guarda (que mira la permanencia del primero): dos lotes (o un lote y un movimiento) no se cruzan.
+    try:
+        _ids_lote = sorted({int(i.get('estudiante_id')) for i in asistencias
+                            if isinstance(i, dict) and str(i.get('estudiante_id') or '').isdigit()})
+        if _ids_lote:
+            tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
+                Estudiante.id.in_(_ids_lote)).order_by(Estudiante.id).with_for_update().all()
+    except Exception:
+        pass
+
     # v2.15 F2: candado de división (curso del lote, o primer estudiante como referencia)
     _primer_est = asistencias[0].get('estudiante_id') if isinstance(asistencias[0], dict) else None
     _guard = validar_nivel_escritura(
@@ -16605,16 +16666,6 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
     estudiantes_lote = {}
     _autorizados_lote = set()
-    # TRAS-1 · las fichas del lote se bloquean JUNTAS y en orden de id antes de
-    # mirar su permanencia: dos lotes (o un lote y un movimiento) no se cruzan.
-    try:
-        _ids_lote = sorted({int(i.get('estudiante_id')) for i in asistencias
-                            if isinstance(i, dict) and str(i.get('estudiante_id') or '').isdigit()})
-        if _ids_lote:
-            tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
-                Estudiante.id.in_(_ids_lote)).order_by(Estudiante.id).with_for_update().all()
-    except Exception:
-        pass
 
     # Prevalidar TODO antes de escribir: estudiante, tenant, retiro, curso y estado.
     for item in asistencias:

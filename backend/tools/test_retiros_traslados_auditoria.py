@@ -10,6 +10,9 @@
   R4  lote: cada estudiante se autoriza en el curso de SU permanencia; el lote
       de varios cursos sigue funcionando si el docente está autorizado en todos.
   R5  GET /api/asistencia por permanencia.
+  R1r primer retiro sin trayectoria: también conserva la solicitud y su huella.
+  R2f el endpoint OFICIAL del Registro rechaza la numeración que no cabe.
+  R3c (solo PostgreSQL) movimiento frente a un LOTE de asistencia.
 
 Base: SQLite temporal aislada o, con EO_PG_TEST_SERVER, una base PostgreSQL
 TEMPORAL propia (tools/pg_base_temporal.py). Datos sintéticos.
@@ -113,6 +116,9 @@ for e in EV:
                                  ano_escolar_id=ano.id, competencia_numero=1, p1=80))
     add(M.Asistencia(colegio_id=col.id, estudiante_id=e.id, curso_id=V.id, asignatura_id=art.id,
                      fecha=dt.date(2026, 10, 14), estado='presente', registrado_por=pV.id))
+ER = estudiante('V7', V, 7)        # R1r: primer retiro sin trayectoria
+EE = estudiante('V8', V, 8)        # R1r: retirado y luego eliminado por error
+EL1, EL2 = estudiante('V9', V, 9), estudiante('V10', V, 10)   # R3c
 db.commit()
 IDS = {'dire': dire.id, 'pV': pV.id, 'pM': pM.id, 'pVM': pVM.id}
 TOK = {k: create_token(u) for k, u in (('dire', dire), ('pV', pV), ('pM', pM), ('pVM', pVM))}
@@ -224,6 +230,119 @@ filas_c4, _ = APP._estudiantes_registro(db, db.get(M.Usuario, IDS['dire']), db.g
 check('R2e curso SIN movimientos con hueco que no cabe: como en main (en orden), documentado',
       len(filas_c4) == 2, len(filas_c4))
 
+# ═════════════ R2f. ENDPOINT OFICIAL ═════════════
+print('\n== R2f. Registro oficial con numeración que no cabe ==')
+import registro_validator as RV  # noqa: E402
+
+
+def estado_numeros():
+    db.expire_all()
+    return (sorted((e.id, e.curso_id, e.no_lista) for e in db.query(M.Estudiante).filter_by(colegio_id=col.id)),
+            sorted((r.curso_id, r.no_lista, r.estudiante_id) for r in db.query(M.ReservaNumeroLista)))
+
+
+nums_antes = estado_numeros()
+for q in ('', '?force=true'):
+    r = c.get('/api/registros/secundaria/%d%s' % (MA.id, q), headers=H('dire'))
+    det = r.json().get('detalle') if r.headers.get('content-type', '').startswith('application/json') else None
+    check('R2f oficial%s: 400 con NUMERACION_EXCEDE_PLANTILLA, sin PDF' % (' (force)' if q else ''),
+          r.status_code == 400 and any('NUMERACION_EXCEDE_PLANTILLA' in str(x) for x in (det or []))
+          and not r.content.startswith(b'%PDF'), (r.status_code, str(det)[:300]))
+_orig_val = RV.validar_registro_secundaria
+
+
+def _val_sin_otros_errores(*a, **k):
+    # Simula un curso por lo demás completo (titular, horario...): se quitan
+    # TODOS los errores, también el de numeración, para ver la segunda defensa.
+    r_ = _orig_val(*a, **k)
+    r_.errors.clear()
+    r_.warnings.clear()
+    return r_
+
+
+RV.validar_registro_secundaria = _val_sin_otros_errores
+try:
+    r = c.get('/api/registros/secundaria/%d?force=true' % MA.id, headers=H('dire'))
+finally:
+    RV.validar_registro_secundaria = _orig_val
+check('R2g aunque la validación pasara, el oficial no se imprime comprimido: 422 EXCEDEN_PLANTILLA',
+      r.status_code == 422 and 'EXCEDEN_PLANTILLA' in r.text and not r.content.startswith(b'%PDF'),
+      (r.status_code, r.text[:200]))
+check('R2h nada se renumeró: fichas y reservas idénticas (el 45 sigue siendo 45)', estado_numeros() == nums_antes
+      and db.get(M.Estudiante, EV[1].id).no_lista == 45)
+
+# ═════════════ R1r. PRIMER RETIRO SIN TRAYECTORIA ═════════════
+print('\n== R1r. Primer retiro sin trayectoria: solicitud y huella ==')
+
+
+def estado_retiro(eid):
+    db.expire_all()
+    e = db.get(M.Estudiante, eid)
+    ficha = None if e is None else (e.activo, e.condicion, e.fecha_retiro, e.motivo_retiro, e.retirado_por,
+                                    e.curso_id, e.no_lista)
+    return (ficha, db.query(M.MovimientoEstudiante).filter_by(estudiante_id=eid).count(),
+            db.query(M.LogAuditoria).filter_by(registro_id=eid, accion='retirar').count())
+
+
+cuerpo_r = {'desde': '2026-10-20', 'motivo': 'Mudanza (sintético)', 'client_request_id': 'aud-ret-1'}
+st, js = post('/api/estudiantes/%d/retiro' % ER.id, 'dire', cuerpo_r)
+ret0 = estado_retiro(ER.id)
+check('R1r-a primer retiro: ficha con fecha, motivo y autor; sin fila de movimiento; una auditoría',
+      st == 200 and ret0 == ((False, 'retirado', dt.date(2026, 10, 19), 'Mudanza (sintético)', IDS['dire'], V.id, 7), 0, 1),
+      (st, js, ret0))
+aud = db.query(M.LogAuditoria).filter_by(registro_id=ER.id, accion='retirar').one()
+check('R1r-b la auditoría guarda el identificador y la huella de la solicitud',
+      "'client_request_id': 'aud-ret-1'" in aud.datos_nuevos and "'solicitud':" in aud.datos_nuevos
+      and "'motivo': 'Mudanza (sintético)'" in aud.datos_nuevos, aud.datos_nuevos[-300:])
+st, js = post('/api/estudiantes/%d/retiro' % ER.id, 'dire', dict(cuerpo_r))
+check('R1r-c mismo identificador y mismo contenido: el resultado anterior, sin cambios',
+      st == 200 and js.get('reintento') and js.get('fecha_retiro') == '2026-10-19' and js.get('desde') == '2026-10-20'
+      and estado_retiro(ER.id) == ret0, (st, js))
+for campo, valor in (('desde', '2026-10-21'), ('motivo', 'Otro motivo'), ('motivo', None)):
+    st, js = post('/api/estudiantes/%d/retiro' % ER.id, 'dire', dict(cuerpo_r, **{campo: valor}))
+    check('R1r-d mismo identificador con otro %s=%r: 409 y nada cambia' % (campo, valor),
+          st == 409 and js.get('error') == 'SOLICITUD_REPETIDA_DISTINTA' and estado_retiro(ER.id) == ret0, (st, js))
+st, js = post('/api/estudiantes/%d/traslado' % EV[0].id, 'dire',
+              {'curso_destino_id': MA.id, 'desde': '2026-10-21', 'client_request_id': 'aud-ret-1'})
+check('R1r-e el identificador de ese retiro, usado para otro estudiante/tipo: 409 y nadie cambia',
+      st == 409 and js.get('error') == 'SOLICITUD_REPETIDA_DISTINTA' and estado_retiro(ER.id) == ret0
+      and db.query(M.MovimientoEstudiante).filter_by(estudiante_id=EV[0].id).count() == 0, (st, js))
+st, js = post('/api/estudiantes/%d/reactivar' % ER.id, 'dire', {'desde': '2026-10-27'})
+db.expire_all()
+mv = db.query(M.MovimientoEstudiante).filter_by(estudiante_id=ER.id).one_or_none()
+rp = (mv.get_detalle().get('retiro_previo') if mv else None) or {}
+check('R1r-f la reactivación conserva el retiro previo (fecha, motivo y autor) en su movimiento',
+      st == 200 and rp.get('fecha_retiro') == '2026-10-19' and rp.get('motivo_retiro') == 'Mudanza (sintético)'
+      and rp.get('retirado_por') == IDS['dire'], (st, js, rp))
+tras_reac = estado_retiro(ER.id)
+st, js = post('/api/estudiantes/%d/retiro' % ER.id, 'dire', dict(cuerpo_r))
+check('R1r-g tras reactivar, repetir la solicitud original devuelve su resultado y NO vuelve a retirar',
+      st == 200 and js.get('reintento') and js.get('fecha_retiro') == '2026-10-19'
+      and estado_retiro(ER.id) == tras_reac and tras_reac[0][0] is True, (st, js, tras_reac))
+check('R1r-h la auditoría del retiro sigue ahí tras la reactivación',
+      db.query(M.LogAuditoria).filter_by(registro_id=ER.id, accion='retirar').count() == 1)
+EE_ID = EE.id
+st, js = post('/api/estudiantes/%d/retiro' % EE_ID, 'dire',
+              {'desde': '2026-10-20', 'motivo': 'Ficha duplicada (sintético)', 'client_request_id': 'aud-ret-2'})
+r = c.post('/api/estudiantes/%d/eliminar-por-error' % EE_ID, headers=H('dire'),
+           json={'confirmar_estudiante_id': EE_ID, 'motivo': 'Duplicada (sintético)'})
+db.expire_all()
+aud_r = db.query(M.LogAuditoria).filter_by(registro_id=EE_ID, accion='retirar').one_or_none()
+aud_e = [a for a in db.query(M.LogAuditoria).filter_by(registro_id=EE_ID) if a.accion != 'retirar']
+check('R1r-i eliminada por error una ficha retirada: su auditoría de retiro (solicitud, huella, fecha, motivo, autor) se conserva',
+      st == 200 and r.status_code == 200 and db.get(M.Estudiante, EE_ID) is None and aud_r is not None
+      and "'client_request_id': 'aud-ret-2'" in aud_r.datos_nuevos and "'solicitud':" in aud_r.datos_nuevos
+      and "'fecha_retiro': '2026-10-19'" in aud_r.datos_nuevos and aud_r.usuario_id == IDS['dire'],
+      (st, r.status_code, r.text[:200]))
+check('R1r-j y la traza de la eliminación también lleva la fecha, el motivo y el autor del retiro',
+      any("'fecha_retiro': '2026-10-19'" in (a.datos_anteriores or '') and 'Ficha duplicada' in (a.datos_anteriores or '')
+          and ("'retirado_por': %d" % IDS['dire']) in (a.datos_anteriores or '') for a in aud_e),
+      [(a.accion, (a.datos_anteriores or '')[:200]) for a in aud_e])
+st, js = post('/api/estudiantes/%d/retiro' % ER.id, 'dire',
+              {'desde': '2026-10-20', 'motivo': 'Mudanza', 'client_request_id': 'aud-ret-2'})
+check('R1r-k el identificador de la ficha eliminada no se reutiliza: 409', st == 409
+      and js.get('error') == 'SOLICITUD_REPETIDA_DISTINTA' and estado_retiro(ER.id) == tras_reac, (st, js))
+
 # ═════════════ R3. CONCURRENCIA (solo PostgreSQL) ═════════════
 print('\n== R3. Movimiento frente a cargas simultáneas ==')
 if engine.dialect.name != 'postgresql':
@@ -290,6 +409,42 @@ else:
         check('R3b traslado y nota del curso de origen simultáneos: la nota espera y se rechaza (ya es de curso '
               'anterior, requiere permiso); la nota sigue en 80 y la instantánea la recoge',
               out['mov'][0] == 200 and out['nota'][0] == 403 and p1 == 80 and {'p1': 80.0} in snap, (out, p1, snap))
+        # R3c: LOTE de asistencia frente a un traslado de uno de sus estudiantes.
+        def _carrera(eid_mov, k_lote, cuerpo_lote):
+            out_ = {}
+            fin = {}
+
+            def _m():
+                out_['mov'] = _req('POST', '/api/estudiantes/%d/traslado' % eid_mov, 'dire',
+                                   {'curso_destino_id': MA.id, 'desde': '2026-11-09'})
+                fin['mov'] = time.time()
+
+            def _l():
+                out_['lote'] = _req('POST', '/api/asistencia/masivo', k_lote, cuerpo_lote)
+                fin['lote'] = time.time()
+            ta_, tb_ = threading.Thread(target=_m), threading.Thread(target=_l)
+            ta_.start()
+            time.sleep(0.7)
+            tb_.start()
+            ta_.join()
+            tb_.join()
+            return out_, fin
+
+        for etiqueta, eid_mov, k_lote, extra, fecha_l in (
+                ('docente solo del origen, lote sin curso_id', EL1.id, 'pV', {}, '2026-11-10'),
+                ('docente de ambos cursos, lote con curso_id del origen', EL2.id, 'pVM', {'curso_id': V.id}, '2026-11-11')):
+            db.expire_all()
+            antes_l = sorted((a.id, a.estudiante_id, a.curso_id, a.fecha, a.estado) for a in db.query(M.Asistencia))
+            cuerpo_l = dict(extra, fecha=fecha_l, asignatura_id=art.id,
+                            asistencias=[{'estudiante_id': EV[0].id, 'estado': 'presente'},
+                                         {'estudiante_id': eid_mov, 'estado': 'presente'}])
+            out, fin = _carrera(eid_mov, k_lote, cuerpo_l)
+            db.expire_all()
+            despues_l = sorted((a.id, a.estudiante_id, a.curso_id, a.fecha, a.estado) for a in db.query(M.Asistencia))
+            check('R3c %s: el traslado entra; el lote ESPERA (termina después), se reevalúa y se rechaza entero; '
+                  'ni siquiera la fila del compañero se escribe' % etiqueta,
+                  out['mov'][0] == 200 and out['lote'][0] in (403, 409) and fin['lote'] >= fin['mov']
+                  and despues_l == antes_l, (out, round(fin.get('lote', 0) - fin.get('mov', 0), 2)))
     finally:
         APP._instantanea_notas = _orig_inst
 
