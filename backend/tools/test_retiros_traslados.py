@@ -985,7 +985,10 @@ r2 = c.post('/api/estudiantes/%d/eliminar-por-error' % ERR_ID, headers=H(dire),
 db.expire_all()
 check('L1 una ficha SIN historia, retirada, sigue pudiéndose eliminar por error (no deja movimientos huérfanos)',
       r1.status_code == 200 and r2.status_code == 200 and db.get(M.Estudiante, ERR_ID) is None, (r1.text[:200], r2.text[:200]))
-conc = CONC[0]
+# El «Ricardo» del otro colegio siempre tiene trayectoria (su traslado de J5).
+# (Conc01 no sirve: según cómo se reparta la carrera natural de C10 puede no
+# tener ningún movimiento, y entonces su eliminación sería correcta.)
+conc = RIC2
 r1 = c.request('DELETE', '/api/estudiantes/%d' % conc.id, headers=H(dir2), json={'desde': '2026-11-09'})
 h_conc = (db.query(M.MovimientoEstudiante).filter_by(estudiante_id=conc.id).count(),
           db.query(M.ReservaNumeroLista).filter_by(estudiante_id=conc.id).count())
@@ -999,6 +1002,28 @@ check('L2 una ficha CON trayectoria (traslados) queda protegida: 409 con mensaje
       and (db.query(M.MovimientoEstudiante).filter_by(estudiante_id=conc.id).count(),
            db.query(M.ReservaNumeroLista).filter_by(estudiante_id=conc.id).count()) == h_conc
       and r3.get('eliminable') is False, (r1.text[:200], r2.text[:300], h_conc))
+
+sinh = estudiante('SinHistoria', 'Sintético', C4, 7)
+db.commit()
+SINH_ID = sinh.id
+r1 = c.request('DELETE', '/api/estudiantes/%d' % SINH_ID, headers=H(secre),
+               json={'desde': '2026-11-09', 'motivo_retiro': 'Mudanza (sintético)'})
+r2 = c.post('/api/estudiantes/%d/reactivar' % SINH_ID, headers=H(dire), json={})
+db.expire_all()
+_ms = db.query(M.MovimientoEstudiante).filter_by(estudiante_id=SINH_ID).all()
+_pv = (_ms[0].get_detalle().get('retiro_previo') or {}) if _ms else {}
+check('L3 ficha SIN notas ni asistencia: reactivar conserva el retiro previo (fecha 08/11, motivo y autor)',
+      r1.status_code == 200 and r2.status_code == 200 and [m.tipo for m in _ms] == ['reactivacion']
+      and _pv.get('fecha_retiro') == '2026-11-08' and _pv.get('motivo_retiro') == 'Mudanza (sintético)'
+      and _pv.get('retirado_por') == secre.id and _ms[0].registrado_por == dire.id, (r1.text[:150], r2.text[:150], _pv))
+r3 = c.request('DELETE', '/api/estudiantes/%d' % SINH_ID, headers=H(dire), json={'desde': '2026-11-16'})
+r4 = c.post('/api/estudiantes/%d/eliminar-por-error' % SINH_ID, headers=H(dire),
+            json={'motivo': 'Prueba', 'confirmar_estudiante_id': SINH_ID})
+db.expire_all()
+check('L4 esa trazabilidad no se borra para poder eliminarla: 409 y todo intacto',
+      r3.status_code == 200 and r4.status_code == 409 and r4.json().get('error') == 'FICHA_CON_TRAYECTORIA'
+      and db.get(M.Estudiante, SINH_ID) is not None
+      and db.query(M.MovimientoEstudiante).filter_by(estudiante_id=SINH_ID).count() == 2, (r3.text[:150], r4.text[:200]))
 
 # ─────────────────────────── SALIDA ───────────────────────────
 ok = sum(1 for _, c_, _ in RESULTADOS if c_)

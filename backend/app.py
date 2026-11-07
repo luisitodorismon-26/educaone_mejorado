@@ -8892,9 +8892,9 @@ def _retiro_sin_ano_activo(db, request, current_user, est, data):
 
 
 def _reactivacion_sin_ano_activo(db, request, current_user, est):
-    """La reactivación de siempre, para fichas fuera del año activo o sin ninguna
-    historia en él. Los datos del retiro quedan en la auditoría
-    (`datos_anteriores`)."""
+    """La reactivación de siempre, para fichas cuyo curso no es del año activo
+    (no hay tramo de este año que registrar). Los datos del retiro quedan en la
+    auditoría (`datos_anteriores`)."""
     if not _esta_retirado(est):
         return JSONResponse({
             'error': ERROR_NO_ESTA_RETIRADO,
@@ -9011,12 +9011,10 @@ async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_d
     data = await _cuerpo_json(request)
     if not _movimiento_en_ano_activo(db, current_user, est):
         return _reactivacion_sin_ano_activo(db, request, current_user, est)
-    # Sin ninguna historia en el año (ni notas, ni asistencias, ni movimientos;
-    # p. ej. una ficha creada por error y retirada), no hay días que dejar de
-    # contar: se reactiva como siempre, en la ficha y con su auditoría.
-    _ano_r = _ano_activo_colegio(db, current_user)
-    if not _huella_academica_estudiante(db, current_user, est.id, ano=_ano_r):
-        return _reactivacion_sin_ano_activo(db, request, current_user, est)
+    # Toda reactivación del año activo se registra como movimiento, con el
+    # retiro previo (fecha, motivo y autor) en su detalle: esa trazabilidad
+    # administrativa no se borra, tampoco en una ficha sin notas ni asistencia.
+    # Con ella la ficha queda protegida frente a «eliminar por error».
     desde = _parse_fecha_movimiento(data.get('desde'))
     if desde == 'invalida':
         return JSONResponse({'error': 'desde debe tener formato YYYY-MM-DD'}, status_code=400)
