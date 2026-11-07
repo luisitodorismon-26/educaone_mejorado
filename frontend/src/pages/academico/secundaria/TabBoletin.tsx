@@ -94,7 +94,7 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
     }
   };
 
-  const conNotas = estudiantes.filter(e => e.cf !== null && !e.estudiante.retirado);
+  const conNotas = estudiantes.filter(e => e.cf !== null && !e.estudiante.retirado && !e.permanencia?.solo_lectura);
 
   return (
     <div className="space-y-4">
@@ -145,7 +145,7 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
               </thead>
               <tbody>
                 {estudiantes.map((est, idx) => {
-                  const esRetirado = !!est.estudiante.retirado;
+                  const esRetirado = !!est.estudiante.retirado || !!est.permanencia?.solo_lectura;
                   const tieneCF = est.cf !== null;
                   const aprobado = tieneCF && est.cf! >= 70;
                   return (

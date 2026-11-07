@@ -261,9 +261,14 @@ def build_asistencia_registro(
     curso_id: int,
     asignatura_id: Optional[int] = None,
     estudiantes: Optional[List[Estudiante]] = None,
+    ventanas_por_est: Optional[Dict[int, list]] = None,
 ) -> List[Dict]:
     """
     Construye la matriz de asistencia por mes para un curso.
+
+    TRAS-1 · `ventanas_por_est` = `{estudiante_id: [(desde, hasta), ...]}`, los
+    tramos de cada estudiante EN ESTE CURSO. Fuera de ellos la celda es «-»
+    (NO APLICA) y no cuenta para nada. Sin el parámetro, todo como antes.
 
     El resultado prioriza días esperados por horario. Si no existen
     suficientes datos estructurales, cae a modo legacy usando solo
@@ -411,6 +416,15 @@ def build_asistencia_registro(
         celdas_con_registro = 0
 
         for est in estudiantes:
+            if getattr(est, '_fila_vacia', False):
+                # TRAS-1 · hueco de numeración: fila sin datos ni conteos.
+                filas.append({
+                    'no': est_index[est.id], 'estudiante_id': est.id, 'nombre': '',
+                    'valores': [''] * len(dias_unicos), 'presentes': 0, 'tardanzas': 0,
+                    'ausentes': 0, 'con_dato': 0, 'dias_aplicables': 0,
+                    'cobertura_completa': False, 'porcentaje': None, 'fila_vacia': True,
+                })
+                continue
             valores = []
             presentes = 0
             tardanzas = 0
@@ -427,7 +441,10 @@ def build_asistencia_registro(
                 # que exista igual se conserva a la vista —no se oculta
                 # historia— pero tampoco se suma.
                 if _fecha_col is not None and not ASIS.aplica_en(
-                        ano, est, _fecha_col, primera_por_est.get(est.id)):
+                        ano, est, _fecha_col, primera_por_est.get(est.id),
+                        ventanas=((ventanas_por_est or {}).get(est.id)
+                                  if ventanas_por_est is not None
+                                  else est.__dict__.get('_tras_ventanas'))):
                     valores.append(codigo or '-')
                     continue
                 valores.append(codigo)

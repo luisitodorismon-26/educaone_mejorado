@@ -60,11 +60,12 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
   };
 
   const pendientesExtra = useMemo(
-    () => estudiantes.filter(e => e.evaluacion_extra?.fase_pendiente && !e.estudiante.retirado).length,
+    () => estudiantes.filter(e => e.evaluacion_extra?.fase_pendiente && !e.estudiante.retirado && !e.permanencia?.solo_lectura).length,
     [estudiantes]
   );
 
-  const conCF = estudiantes.filter(e => e.cf !== null && !e.estudiante.retirado).length;
+  // TRAS-1 · quien salió del curso no cuenta en los totales del curso.
+  const conCF = estudiantes.filter(e => e.cf !== null && !e.estudiante.retirado && !e.permanencia?.solo_lectura).length;
 
   const abrirFicha = (estudianteId: number) => {
     navigate(`/academico/estudiante/${estudianteId}/asignatura/${asignaturaId}`);

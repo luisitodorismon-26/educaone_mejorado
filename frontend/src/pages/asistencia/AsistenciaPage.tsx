@@ -16,6 +16,10 @@ interface Estudiante {
   retirado?: boolean;
   fecha_retiro?: string | null;
   motivo_retiro?: string | null;
+  // TRAS-1 · ¿pertenece al curso ESE día? Si no: «No aplica» (solo lectura).
+  aplica?: boolean;
+  avisos?: string[];
+  marca_fuera_de_permanencia?: boolean;
 }
 
 interface Asignatura {
@@ -249,7 +253,8 @@ export const AsistenciaPage = () => {
     setError('');
     
     try {
-      const data = asistencias.map(a => ({
+      // TRAS-1 · solo quienes pertenecen al curso ese día.
+      const data = asistencias.filter(a => a.estudiante.aplica !== false).map(a => ({
         estudiante_id: a.estudiante.id,
         curso_id: cursoId,
         estado: estado
@@ -260,7 +265,7 @@ export const AsistenciaPage = () => {
       
       await api.post('/asistencia/masivo', payload);
       
-      setAsistencias(prev => prev.map(a => ({
+      setAsistencias(prev => prev.map(a => a.estudiante.aplica === false ? a : ({
         ...a,
         asistencia: { estado, observacion: '', registrado_por: user?.nombre }
       })));
@@ -281,12 +286,14 @@ export const AsistenciaPage = () => {
     { val: 'excusa', emoji: '📋', color: 'bg-blue-500', label: 'Excusa' }
   ];
 
+  // TRAS-1 · «No aplica» no cuenta para nada: ni ausencia ni día esperado.
+  const aplicables = asistencias.filter(a => a.estudiante.aplica !== false);
   const conteo = {
-    presente: asistencias.filter(a => a.asistencia?.estado === 'presente').length,
-    ausente: asistencias.filter(a => a.asistencia?.estado === 'ausente').length,
-    tardanza: asistencias.filter(a => a.asistencia?.estado === 'tardanza').length,
-    excusa: asistencias.filter(a => a.asistencia?.estado === 'excusa').length,
-    sinMarcar: asistencias.filter(a => !a.asistencia?.estado).length
+    presente: aplicables.filter(a => a.asistencia?.estado === 'presente').length,
+    ausente: aplicables.filter(a => a.asistencia?.estado === 'ausente').length,
+    tardanza: aplicables.filter(a => a.asistencia?.estado === 'tardanza').length,
+    excusa: aplicables.filter(a => a.asistencia?.estado === 'excusa').length,
+    sinMarcar: aplicables.filter(a => !a.asistencia?.estado).length
   };
 
   const asignaturaSeleccionada = asignaturas.find(a => a.id === asignaturaId);
@@ -505,7 +512,11 @@ export const AsistenciaPage = () => {
               </thead>
               <tbody className="divide-y">
                 {asistencias.filter(a => !buscarEstudiante || a.estudiante.nombre_completo.toLowerCase().includes(buscarEstudiante.toLowerCase())).map((a, idx) => {
-                  const esRetirado = !!a.estudiante.retirado;
+                  // TRAS-1 · bloqueada = no pertenecía al curso ese día. Un
+                  // retirado DENTRO de su permanencia se puede corregir.
+                  const noAplica = a.estudiante.aplica === false;
+                  const esRetirado = noAplica || (!!a.estudiante.retirado && a.estudiante.aplica === undefined);
+                  const avisos = a.estudiante.avisos || [];
                   return (
                   <tr key={a.estudiante.id} className={esRetirado ? 'bg-gray-50' : 'hover:bg-gray-50'}>
                     <td className={`px-2 sm:px-4 py-2 font-medium text-xs ${esRetirado ? 'text-gray-400 line-through' : 'text-gray-500'}`}>
@@ -516,7 +527,12 @@ export const AsistenciaPage = () => {
                         <span className={`font-medium text-xs sm:text-sm block truncate sm:whitespace-normal ${esRetirado ? 'text-gray-400 line-through' : 'text-gray-800'}`}>
                           {a.estudiante.nombre_completo}
                         </span>
-                        {esRetirado && (
+                        {noAplica && (
+                          <span className="inline-block px-2 py-0.5 bg-gray-600 text-white text-[10px] font-medium rounded uppercase tracking-wide">
+                            No aplica
+                          </span>
+                        )}
+                        {esRetirado && !noAplica && a.estudiante.aplica === undefined && (
                           <span
                             title={a.estudiante.motivo_retiro || 'Estudiante retirado'}
                             className="inline-block px-2 py-0.5 bg-gray-700 text-white text-[10px] font-medium rounded uppercase tracking-wide"
@@ -524,7 +540,16 @@ export const AsistenciaPage = () => {
                             RETIRADO {a.estudiante.fecha_retiro ? a.estudiante.fecha_retiro.slice(5).replace('-','/') : ''}
                           </span>
                         )}
+                        {a.estudiante.marca_fuera_de_permanencia && (
+                          <span title="Esta marca existe pero cae fuera de su permanencia: se conserva y no cuenta"
+                                className="inline-block px-2 py-0.5 bg-amber-100 text-amber-800 text-[10px] font-medium rounded">
+                            Marca fuera de permanencia: {a.asistencia?.estado}
+                          </span>
+                        )}
                       </div>
+                      {avisos.length > 0 && (
+                        <div className="text-[10px] sm:text-xs text-indigo-700 mt-0.5">{avisos.join(' · ')}</div>
+                      )}
                     </td>
                     <td className="px-1 sm:px-4 py-2">
                       <div className="flex justify-center gap-1 sm:gap-2">
@@ -533,7 +558,8 @@ export const AsistenciaPage = () => {
                             key={e.val}
                             onClick={() => !esRetirado && puedeMarcar && marcarAsistencia(a.estudiante.id, e.val)}
                             disabled={saving || !puedeMarcar || esRetirado}
-                            title={esRetirado ? 'Estudiante retirado'
+                            title={noAplica ? 'No aplica: no pertenecía a este curso ese día'
+                                   : esRetirado ? 'Estudiante retirado'
                                    : sesionNI ? 'Clase no impartida: ' + sesionNI.motivo
                                    : e.label}
                             className={`w-8 h-8 sm:w-10 sm:h-10 rounded-lg text-base sm:text-xl transition-all border-2 ${

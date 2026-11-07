@@ -54,6 +54,13 @@ export interface EstudianteData {
     fecha_retiro?: string | null;
     motivo_retiro?: string | null;
   };
+  // TRAS-1 · permanencia en el curso: quien salió (trasladado o retirado) va
+  // en solo lectura; las notas registradas antes de un traslado, protegidas.
+  permanencia?: {
+    solo_lectura: boolean;
+    avisos: string[];
+    notas_previas_traslado: Record<string, string[]>;
+  };
   competencias: Record<number, CompetenciaSec>;
   pc_por_periodo: { pc1: number | null; pc2: number | null; pc3: number | null; pc4: number | null };
   a_r_por_periodo: { p1: ARPeriodo; p2: ARPeriodo; p3: ARPeriodo; p4: ARPeriodo };

@@ -63,7 +63,7 @@ from models import (
     RecuperacionPedagogicaPrimaria, CalificacionSecundaria, EvaluacionExtraSecundaria,
     AlertaAtendida, PushSubscription, CursoComponenteOptativo,
     SesionNoImpartida, MOTIVOS_SESION_NO_IMPARTIDA,
-    DecisionAcademicaEstudiante, init_db
+    DecisionAcademicaEstudiante, MovimientoEstudiante, ReservaNumeroLista, init_db
 )
 from auth import (
     get_current_user, get_current_user_optional, RolesRequired,
@@ -7315,6 +7315,35 @@ _MODELOS_DEL_ESTUDIANTE = (
 )
 
 
+# TRAS-1 · Tablas que, si tienen filas del estudiante, PROTEGEN la ficha: un
+# traslado, una reactivación o un número reservado son historia real de su
+# trayectoria en el centro. La eliminación por error NO las borra en cascada:
+# rechaza la operación con un mensaje claro y la ficha sigue entera. (Un primer
+# retiro sin trayectoria no crea fila aquí: queda en la propia ficha, así que
+# una ficha creada por error y retirada sigue siendo eliminable.)
+_MODELOS_QUE_PROTEGEN_LA_FICHA = ('MovimientoEstudiante', 'ReservaNumeroLista')
+ERROR_ELIMINAR_CON_TRAYECTORIA = 'FICHA_CON_TRAYECTORIA'
+_MENSAJE_CON_TRAYECTORIA = (
+    'Esta ficha tiene traslados, reactivaciones o un número de lista reservado: '
+    'es la historia real de un estudiante, no una ficha creada por error. No se '
+    'elimina. Si el estudiante ya no asiste, déjelo retirado.')
+
+
+def _trayectoria_que_protege(db, current_user, estudiante):
+    """`{tabla: n}` de las tablas que protegen la ficha. Solo cuenta."""
+    import models as _M
+    conteos = {}
+    for nombre in _MODELOS_QUE_PROTEGEN_LA_FICHA:
+        modelo = getattr(_M, nombre, None)
+        if modelo is None:
+            continue
+        n = db.query(modelo).filter(modelo.estudiante_id == estudiante.id,
+                                    modelo.colegio_id == current_user.colegio_id).count()
+        if n:
+            conteos[modelo.__tablename__] = n
+    return conteos
+
+
 def _impacto_eliminacion(db, current_user, estudiante):
     """Qué se borraría. Cuenta y no toca nada.
 
@@ -7349,6 +7378,16 @@ async def impacto_eliminacion_error(id: int, db: Session = Depends(get_db),
                             name='estudiante')
     curso = est.curso
     conteos = _impacto_eliminacion(db, current_user, est)
+    trayectoria = _trayectoria_que_protege(db, current_user, est)
+    if trayectoria:
+        return {
+            'estudiante_id': est.id, 'nombre': est.nombre_completo, 'matricula': est.matricula,
+            'curso': getattr(curso, 'nombre_completo', None), 'curso_id': est.curso_id,
+            'no_lista': est.no_lista, 'activo': bool(est.activo), 'condicion': est.condicion,
+            'eliminable': False, 'motivo_no_eliminable': _MENSAJE_CON_TRAYECTORIA,
+            'trayectoria': trayectoria, 'conteos': conteos,
+            'total_referencias': sum(conteos.values()),
+        }
     return {
         'estudiante_id': est.id,
         'nombre': est.nombre_completo,
@@ -7412,6 +7451,15 @@ async def eliminar_estudiante_por_error(id: int, request: Request,
             'error': ERROR_NO_ESTA_RETIRADO,
             'message': _MENSAJE_NO_RETIRADO,
             'condicion': est.condicion,
+        }, status_code=409)
+
+    # TRAS-1 · historia real de trayectoria: la ficha queda protegida.
+    _tray = _trayectoria_que_protege(db, current_user, est)
+    if _tray:
+        return JSONResponse({
+            'error': ERROR_ELIMINAR_CON_TRAYECTORIA,
+            'message': _MENSAJE_CON_TRAYECTORIA,
+            'trayectoria': _tray,
         }, status_code=409)
 
     motivo = (cuerpo.get('motivo') or '').strip()
@@ -7634,6 +7682,8 @@ _TABLAS_HUELLA_ACADEMICA = (
     ('historial_academico', 'HistorialAcademico'),
     ('decisiones_academicas', 'DecisionAcademicaEstudiante'),
     ('evaluacion_interna', 'EvalInternaEstudiante'),
+    # TRAS-1 · un retiro o traslado registrado también es historia.
+    ('movimientos', 'MovimientoEstudiante'),
 )
 _TABLAS_HUELLA_PERSONAL = (
     ('casos_psicologia', 'CasoPsicologia'),
@@ -7792,6 +7842,13 @@ def _validar_identidad_estudiante(db: Session, current_user: Usuario, *, matricu
         existente = q.first()
         if existente:
             return f'El número de lista {no_lista} ya está asignado a otro estudiante activo de este curso.'
+        # TRAS-1 · el número de un retirado o de quien se trasladó sigue siendo
+        # suyo durante el año: no se reutiliza para reemplazarlo.
+        import permanencia as _PERM
+        duenio = _PERM.numeros_ocupados(db, curso_id, current_user.colegio_id).get(int(no_lista))
+        if duenio is not None and duenio != excluir_id:
+            return (f'El número de lista {no_lista} está reservado en este curso para un '
+                    f'estudiante retirado o trasladado. Elija otro número libre.')
     return None
 
 
@@ -7980,6 +8037,41 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
     if _guard_exp:
         return _guard_exp
 
+    # TRAS-1 · Cambiar el curso de quien ya tiene historia en el año (notas,
+    # asistencia, movimientos...) es un TRASLADO: tiene fecha, conserva el
+    # número de origen y deja a cada curso su tramo. Editar la ficha no lo
+    # registra, así que se rechaza para TODOS los roles y se indica la acción.
+    # Sin historia en el año (p. ej. un alta mal ubicada) se corrige como antes.
+    if 'curso_id' in data and data.get('curso_id') not in (None, '') \
+            and str(data.get('curso_id')) != str(est.curso_id or '') and est.curso_id:
+        _curso_ant = est.curso
+        _ano_ant = None
+        if _curso_ant is not None and _curso_ant.ano_escolar_id:
+            _ano_ant = (tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user)
+                        .filter(AnoEscolar.id == _curso_ant.ano_escolar_id).first())
+        _huella_curso = _huella_academica_estudiante(db, current_user, est.id, ano=_ano_ant)
+        if _huella_curso:
+            return JSONResponse({
+                'error': ERROR_TRASLADO_REQUERIDO,
+                'message': ('Este estudiante ya tiene historia en este año escolar. Para '
+                            'cambiarlo de curso o tanda use «Trasladar»: así se registra '
+                            'desde qué día, se conserva su número y su historial en el curso '
+                            'de origen, y no se mueve ninguna nota ni asistencia.'),
+                'huella': _huella_curso,
+            }, status_code=409)
+
+    # TRAS-1 · retirar y reactivar tienen su acción (con fecha y sin borrar la
+    # historia); la ficha no cambia esa condición.
+    if 'condicion' in data:
+        _nueva = (data.get('condicion') or '').strip().lower()
+        _actual = (est.condicion or '').strip().lower()
+        if _nueva != _actual and CONDICION_RETIRADO in (_nueva, _actual):
+            return JSONResponse({
+                'error': 'RETIRO_REQUIERE_ACCION',
+                'message': ('Para retirar o reactivar use las acciones «Retirar» y '
+                            '«Reactivar»: registran desde qué día y conservan la historia.'),
+            }, status_code=409)
+
     # Y `condicion` no es un campo administrativo cualquiera: es el que el
     # writer antiguo de promoción usaba como si fuera un resultado académico,
     # y de ahí salió media reconstrucción del Cierre. Secretaría administra
@@ -8064,50 +8156,745 @@ async def update_estudiante(id, request: Request, db: Session = Depends(get_db),
     return {'message': 'Estudiante actualizado'}
 
 
-@app.delete("/api/estudiantes/{id}")
-async def delete_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
-    """Soft-delete (retiro) del estudiante. Valida tenant.
-    Acepta body opcional con {motivo_retiro: str} para registrar la razón.
-    Setea fecha_retiro=hoy y retirado_por=usuario actual automáticamente.
+# ══ TRAS-1 · RETIROS Y TRASLADOS SIN PERDER HISTORIAL ══════════════════════
+#
+# Una sola ficha por estudiante. Retirar, trasladar de curso/tanda o reactivar
+# NO crea otra ficha ni mueve, copia, re-fecha o re-asigna ninguna nota ni
+# asistencia: se guarda un `MovimientoEstudiante` con su fecha «desde» y, de
+# los movimientos, `permanencia.py` deduce en qué curso estuvo cada día.
+#
+#   · traslado: destino desde el día efectivo; origen hasta el anterior;
+#   · retiro: retirado desde el día efectivo (`fecha_retiro` = día anterior,
+#     que es lo que ese campo significó siempre: último día que le cuenta);
+#   · reactivación: vuelve desde el día efectivo; el retiro queda en la
+#     historia (antes se borraba).
+#
+# Todo en UNA transacción, con barreras físicas (únicos) contra el doble clic,
+# el reintento y la concurrencia, y con auditoría.
 
-    SECRETARÍA-2 · Secretaría puede retirar. A pesar del verbo DELETE esto NO
-    borra: marca `activo=False`, guarda motivo, fecha y quién, y deja
-    auditoría. El expediente y sus notas siguen enteros, y se puede
-    reactivar. El borrado FÍSICO vive en `/api/estudiantes/retirados/{id}`,
-    sigue siendo de Dirección y además responde 403 desde P0."""
-    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
-    
-    # Body opcional con motivo
-    motivo = None
+ERROR_CONFLICTOS_FECHA = 'CONFLICTOS_CON_LA_FECHA'
+ERROR_TRASLADO_REQUERIDO = 'CAMBIO_DE_CURSO_REQUIERE_TRASLADO'
+
+
+def _ano_activo_colegio(db, current_user):
+    return tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+
+
+def _parse_fecha_movimiento(valor):
+    if not valor:
+        return None
     try:
-        data = await request.json()
-        if isinstance(data, dict):
-            motivo = data.get('motivo_retiro')
+        return datetime.strptime(str(valor)[:10], '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return 'invalida'
+
+
+def _nombre_curso_fn(db, current_user):
+    cache = {}
+
+    def nombre(curso_id):
+        if curso_id is None:
+            return ''
+        if curso_id not in cache:
+            c = tenant_filter(db.query(Curso), Curso, current_user).filter_by(id=curso_id).first()
+            cache[curso_id] = c.nombre_completo if c else f'curso {curso_id}'
+        return cache[curso_id]
+    return nombre
+
+
+def _movimiento_dict(m, nombre_curso):
+    return {
+        'id': m.id,
+        'tipo': m.tipo,
+        'secuencia': m.secuencia,
+        'desde': m.fecha_efectiva.isoformat() if m.fecha_efectiva else None,
+        'curso_origen_id': m.curso_origen_id,
+        'curso_origen': nombre_curso(m.curso_origen_id),
+        'no_lista_origen': m.no_lista_origen,
+        'curso_destino_id': m.curso_destino_id,
+        'curso_destino': nombre_curso(m.curso_destino_id),
+        'no_lista_destino': m.no_lista_destino,
+        'motivo': m.motivo,
+        'registrado_por': m.registrado_por,
+        'registrado_en': m.registrado_en.isoformat() if m.registrado_en else None,
+    }
+
+
+def _tramo_dict(t, nombre_curso):
+    import permanencia as PERM
+    return {
+        'curso_id': t.curso_id,
+        'curso': nombre_curso(t.curso_id),
+        'no_lista': t.no_lista,
+        'desde': t.desde.isoformat() if t.desde else None,
+        'hasta': t.hasta.isoformat() if t.hasta else None,
+        'motivo_inicio': t.motivo_inicio,
+        'motivo_fin': t.motivo_fin,
+        'aviso_entrada': PERM.aviso_entrada(t, nombre_curso),
+        'aviso_salida': PERM.aviso_salida(t, nombre_curso),
+    }
+
+
+def _conflictos_movimiento(db, current_user, est, tipo, desde, curso_origen_id, curso_destino_id, ano):
+    """Marcas existentes que contradicen la fecha elegida. Solo LEE.
+
+    No se borran, no se corrigen y no se mueven: se explican y el movimiento
+    se rechaza hasta que la fecha sea coherente con ellas.
+    """
+    import copy as _copy
+    import permanencia as PERM
+    q = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+        Asistencia.estudiante_id == est.id)
+    if ano is not None and ano.fecha_inicio and ano.fecha_fin:
+        q = q.filter(Asistencia.fecha >= ano.fecha_inicio, Asistencia.fecha <= ano.fecha_fin)
+    nombre_curso = _nombre_curso_fn(db, current_user)
+    asigs = {}
+    out = []
+
+    # La permanencia ANTES y la que quedaría DESPUÉS del movimiento. Una marca
+    # contradice el movimiento si con él dejaría de estar dentro de su
+    # permanencia; o si es del destino antes del día de llegada y no
+    # corresponde a un tramo anterior suyo allí (p. ej. al volver a su curso
+    # original, las marcas de su primer tramo allí son válidas).
+    antes = PERM.tramos_de(db, est, ano.id if ano is not None else None)
+    despues = [_copy.copy(t) for t in antes]
+    vig = PERM.tramo_vigente(despues)
+    if tipo in ('traslado', 'retiro') and vig is not None:
+        vig.hasta = desde - timedelta(days=1)
+    if tipo == 'traslado' and curso_destino_id:
+        despues.append(PERM.Tramo(curso_destino_id, None, desde, None))
+
+    def _cubre(tramos, curso_id, f):
+        return any(t.curso_id == curso_id and t.contiene(f) for t in tramos)
+
+    for a in q.order_by(Asistencia.fecha).all():
+        motivo = None
+        if tipo == 'traslado':
+            if a.curso_id == curso_origen_id and a.fecha >= desde and not _cubre(despues, a.curso_id, a.fecha):
+                motivo = ('Marca en el curso de origen el %s o después: con esta fecha ese '
+                          'día ya pertenecería al destino' % desde.strftime('%d/%m/%Y'))
+            elif a.curso_id == curso_destino_id and a.fecha < desde and not _cubre(despues, a.curso_id, a.fecha):
+                motivo = ('Marca en el curso de destino antes del %s: con esta fecha ese '
+                          'día todavía pertenecería al origen' % desde.strftime('%d/%m/%Y'))
+        elif tipo == 'retiro':
+            if a.fecha >= desde and _cubre(antes, a.curso_id, a.fecha) and not _cubre(despues, a.curso_id, a.fecha):
+                motivo = ('Marca el %s o después: con esta fecha ya estaría retirado'
+                          % desde.strftime('%d/%m/%Y'))
+        elif tipo == 'reactivacion':
+            if est.fecha_retiro is not None and est.fecha_retiro < a.fecha < desde:
+                motivo = ('Marca entre su retiro (último día %s) y el %s: con esta fecha ese día '
+                          'no pertenecería a ningún curso' % (est.fecha_retiro.strftime('%d/%m/%Y'),
+                                                               desde.strftime('%d/%m/%Y')))
+        if motivo:
+            if a.asignatura_id and a.asignatura_id not in asigs:
+                _as = db.get(Asignatura, a.asignatura_id)
+                asigs[a.asignatura_id] = _as.nombre if _as else ''
+            out.append({
+                'asistencia_id': a.id,
+                'fecha': a.fecha.isoformat(),
+                'curso_id': a.curso_id,
+                'curso': nombre_curso(a.curso_id),
+                'asignatura': asigs.get(a.asignatura_id) if a.asignatura_id else None,
+                'estado': a.estado,
+                'explicacion': motivo,
+            })
+    return out
+
+
+def _fecha_sugerida_conflictos(tipo, conflictos, est, destino):
+    """Una fecha que no deja ninguna marca existente fuera de la permanencia, o
+    None si no la hay (marcas superpuestas en los dos cursos)."""
+    fechas_origen = [date.fromisoformat(c['fecha']) for c in conflictos
+                     if destino is None or c['curso_id'] != destino.id]
+    fechas_destino = [date.fromisoformat(c['fecha']) for c in conflictos
+                      if destino is not None and c['curso_id'] == destino.id]
+    if tipo == 'reactivacion':
+        return min(fechas_origen + fechas_destino).isoformat() if conflictos else None
+    if tipo == 'retiro':
+        return (max(fechas_origen) + timedelta(days=1)).isoformat() if fechas_origen else None
+    # traslado: después de la última marca del origen y no después de la
+    # primera del destino. Si se cruzan, no hay fecha posible.
+    minimo = max(fechas_origen) + timedelta(days=1) if fechas_origen else None
+    maximo = min(fechas_destino) if fechas_destino else None
+    if minimo and maximo and minimo > maximo:
+        return None
+    return (minimo or maximo).isoformat() if (minimo or maximo) else None
+
+
+def _referencias_asistencia(db, current_user, est, curso_origen_id, curso_destino_id, ano):
+    """Primera y última marca por curso, SOLO como referencia. No se deduce
+    ninguna fecha de aquí: la falta de marcas no prueba ni ausencia ni salida."""
+    q = tenant_filter(db.query(Asistencia.curso_id, func.min(Asistencia.fecha),
+                               func.max(Asistencia.fecha), func.count(Asistencia.id)),
+                      Asistencia, current_user).filter(Asistencia.estudiante_id == est.id)
+    if ano is not None and ano.fecha_inicio and ano.fecha_fin:
+        q = q.filter(Asistencia.fecha >= ano.fecha_inicio, Asistencia.fecha <= ano.fecha_fin)
+    por_curso = {c: (mn, mx, n) for c, mn, mx, n in q.group_by(Asistencia.curso_id).all()}
+    ref = {}
+    if curso_origen_id in por_curso:
+        mn, mx, n = por_curso[curso_origen_id]
+        ref['origen'] = {'primera': mn.isoformat() if mn else None,
+                         'ultima': mx.isoformat() if mx else None, 'marcas': n}
+    if curso_destino_id and curso_destino_id in por_curso:
+        mn, mx, n = por_curso[curso_destino_id]
+        ref['destino'] = {'primera': mn.isoformat() if mn else None,
+                          'ultima': mx.isoformat() if mx else None, 'marcas': n}
+    ref['nota'] = ('Solo como referencia: el sistema no deduce la fecha. Un día sin lista '
+                   'no prueba que el estudiante faltara ni que ya se hubiera ido.')
+    return ref
+
+
+def _instantanea_notas(db, current_user, est, ano):
+    """Valores YA registrados al trasladar. Protegen su sobrescritura en el
+    destino (requiere el permiso temporal de corrección de Dirección)."""
+    snap = {'secundaria': {}, 'primaria': {}}
+    if ano is None:
+        return snap
+    campos = ('p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4')
+    for clave, modelo in (('secundaria', CalificacionSecundaria), ('primaria', CalificacionPrimaria)):
+        for c in tenant_filter(db.query(modelo), modelo, current_user).filter(
+                modelo.estudiante_id == est.id, modelo.ano_escolar_id == ano.id).all():
+            valores = {k: getattr(c, k) for k in campos if getattr(c, k, None) is not None}
+            if valores:
+                snap[clave][str(c.id)] = {'asignatura_id': c.asignatura_id,
+                                          'competencia': c.competencia_numero,
+                                          'valores': valores}
+    return snap
+
+
+def _asignaturas_de_curso(db, current_user, curso_id):
+    filas = (tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user)
+             .filter_by(curso_id=curso_id, activo=True).all())
+    ids = sorted({a.asignatura_id for a in filas if a.asignatura_id})
+    if not ids:
+        return {}
+    return {a.id: a.nombre for a in tenant_filter(db.query(Asignatura), Asignatura, current_user)
+            .filter(Asignatura.id.in_(ids)).all()}
+
+
+def _comparar_asignaturas(db, current_user, est, curso_origen_id, curso_destino_id, ano):
+    """Qué asignaturas son comunes y cuáles solo existen en un curso, y cuántas
+    notas tiene el estudiante en cada una. NO se asume ninguna equivalencia y
+    NO se mueve ninguna nota."""
+    orig = _asignaturas_de_curso(db, current_user, curso_origen_id)
+    dest = _asignaturas_de_curso(db, current_user, curso_destino_id)
+    notas = {}
+    if ano is not None:
+        for modelo in (CalificacionSecundaria, CalificacionPrimaria):
+            for c in tenant_filter(db.query(modelo), modelo, current_user).filter(
+                    modelo.estudiante_id == est.id, modelo.ano_escolar_id == ano.id).all():
+                if any(getattr(c, k, None) is not None for k in ('p1', 'p2', 'p3', 'p4')):
+                    notas[c.asignatura_id] = notas.get(c.asignatura_id, 0) + 1
+
+    def fila(aid, nombre):
+        return {'asignatura_id': aid, 'nombre': nombre, 'competencias_con_nota': notas.get(aid, 0)}
+    return {
+        'comunes': [fila(a, n) for a, n in orig.items() if a in dest],
+        'solo_origen': [fila(a, n) for a, n in orig.items() if a not in dest],
+        'solo_destino': [fila(a, n) for a, n in dest.items() if a not in orig],
+        'nota': ('Las notas se quedan en su asignatura. Si el destino usa otra asignatura '
+                 '(por ejemplo, otra optativa), no se copian ni se dan por equivalentes: '
+                 'lo decide Dirección.'),
+    }
+
+
+def _ocupados_detalle(db, current_user, curso_id, estudiante_id):
+    import permanencia as PERM
+    ocupados = PERM.numeros_ocupados(db, curso_id, current_user.colegio_id)
+    ids = set(ocupados.values())
+    ests = {e.id: e for e in tenant_filter(db.query(Estudiante), Estudiante, current_user)
+            .filter(Estudiante.id.in_(list(ids) or [0])).all()}
+    lista = []
+    for n in sorted(ocupados):
+        e = ests.get(ocupados[n])
+        estado = 'activo'
+        if e is not None and e.curso_id != curso_id:
+            estado = 'reservado (salió del curso)'
+        elif e is not None and not e.activo:
+            estado = 'reservado (retirado)'
+        lista.append({'no_lista': n, 'estudiante_id': ocupados[n],
+                      'nombre': e.nombre_completo if e else None, 'estado': estado,
+                      'es_el_mismo': ocupados[n] == estudiante_id})
+    return ocupados, lista
+
+
+def _respuesta_movimiento_error(codigo, mensaje, status=409, **extra):
+    cuerpo = {'error': codigo, 'message': mensaje}
+    cuerpo.update(extra)
+    return JSONResponse(cuerpo, status_code=status)
+
+
+@app.get("/api/estudiantes/{id}/movimientos")
+async def historial_movimientos_estudiante(id: int, db: Session = Depends(get_db),
+                                           current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
+    """TRAS-1 · Historial de cursos del año (tramos) y movimientos. Solo LEE."""
+    import permanencia as PERM
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    ano = _ano_activo_colegio(db, current_user)
+    nombre_curso = _nombre_curso_fn(db, current_user)
+    movs = []
+    tramos = PERM.construir_tramos(est, [])
+    if ano is not None:
+        movs = PERM.movimientos_por_estudiante(db, current_user.colegio_id, ano.id, [est.id]).get(est.id, [])
+        tramos = PERM.construir_tramos(est, movs)
+    return {
+        'estudiante_id': est.id,
+        'ano_escolar': ano.nombre if ano else None,
+        'tramos': [_tramo_dict(t, nombre_curso) for t in tramos],
+        'movimientos': [_movimiento_dict(m, nombre_curso) for m in movs],
+    }
+
+
+@app.get("/api/estudiantes/{id}/movimiento/preparar")
+async def preparar_movimiento_estudiante(id: int, request: Request, db: Session = Depends(get_db),
+                                         current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
+    """TRAS-1 · Todo lo que Dirección necesita ver ANTES de confirmar. Solo LEE.
+
+    `tipo` = traslado | retiro | reactivacion; `curso_destino_id` (traslado);
+    `desde` (YYYY-MM-DD, opcional): con fecha, lista los conflictos.
+    """
+    import permanencia as PERM
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    tipo = (request.query_params.get('tipo') or 'traslado').strip().lower()
+    if tipo not in PERM.TIPOS:
+        return JSONResponse({'error': 'tipo debe ser traslado, retiro o reactivacion'}, status_code=400)
+    ano = _ano_activo_colegio(db, current_user)
+    nombre_curso = _nombre_curso_fn(db, current_user)
+    desde = _parse_fecha_movimiento(request.query_params.get('desde'))
+    if desde == 'invalida':
+        return JSONResponse({'error': 'desde debe tener formato YYYY-MM-DD'}, status_code=400)
+
+    tramos = PERM.tramos_de(db, est, ano.id if ano else None)
+    out = {
+        'estudiante': {'id': est.id, 'nombre': est.nombre_completo, 'activo': bool(est.activo),
+                       'condicion': est.condicion},
+        'curso_actual': {'id': est.curso_id, 'nombre': nombre_curso(est.curso_id), 'no_lista': est.no_lista},
+        'ano_escolar': {'id': ano.id, 'nombre': ano.nombre,
+                        'inicio': ano.fecha_inicio.isoformat() if ano and ano.fecha_inicio else None,
+                        'fin': ano.fecha_fin.isoformat() if ano and ano.fecha_fin else None} if ano else None,
+        'tramos': [_tramo_dict(t, nombre_curso) for t in tramos],
+        'regla_fecha': {
+            'traslado': 'Pertenece al destino desde el día elegido y al origen hasta el día anterior.',
+            'retiro': 'Retirado desde el día elegido: su último día en el curso es el anterior.',
+            'reactivacion': 'Vuelve a pertenecer a su curso desde el día elegido; los días del retiro no aplican.',
+        }[tipo],
+    }
+    destino_id = None
+    if tipo == 'traslado':
+        try:
+            destino_id = int(request.query_params.get('curso_destino_id') or 0) or None
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'curso_destino_id debe ser entero'}, status_code=400)
+        cursos = (tenant_filter(db.query(Curso), Curso, current_user)
+                  .filter(Curso.activo == True,  # noqa: E712
+                          Curso.ano_escolar_id == (est.curso.ano_escolar_id if est.curso else None),
+                          Curso.grado_id == (est.curso.grado_id if est.curso else None),
+                          Curso.id != est.curso_id).all())
+        out['cursos_posibles'] = [{'id': c.id, 'nombre': c.nombre_completo} for c in cursos]
+        if destino_id:
+            destino = get_tenant_or_404(db, Curso, destino_id, current_user, name='curso')
+            _, lista = _ocupados_detalle(db, current_user, destino.id, est.id)
+            ocupados = PERM.numeros_ocupados(db, destino.id, current_user.colegio_id)
+            out['destino'] = {
+                'id': destino.id, 'nombre': destino.nombre_completo,
+                'numero_propuesto': PERM.numero_propuesto(ocupados, est.id),
+                'numeros_ocupados': lista,
+                'nota_numero': ('Se propone el siguiente al mayor número ocupado o reservado '
+                                '(incluye retirados y trasladados). Puede elegir otro libre; '
+                                'no se renumera a nadie.'),
+            }
+            out['asignaturas'] = _comparar_asignaturas(db, current_user, est, est.curso_id, destino.id, ano)
+    if tipo in ('traslado', 'retiro') and est.curso_id:
+        out['numero_origen'] = {'no_lista': est.no_lista,
+                                'nota': 'Queda reservado para este estudiante durante el año; no se reutiliza.'}
+    if tipo == 'reactivacion':
+        _sug = today_rd()
+        if est.fecha_retiro is not None and _sug <= est.fecha_retiro:
+            _sug = est.fecha_retiro + timedelta(days=1)
+        out['desde_sugerido'] = _sug.isoformat()
+    out['referencias_asistencia'] = _referencias_asistencia(db, current_user, est, est.curso_id, destino_id, ano)
+    if desde:
+        out['desde'] = desde.isoformat()
+        out['conflictos'] = _conflictos_movimiento(db, current_user, est, tipo, desde,
+                                                   est.curso_id, destino_id, ano)
+        if out['conflictos']:
+            _dest = (tenant_filter(db.query(Curso), Curso, current_user).filter_by(id=destino_id).first()
+                     if destino_id else None)
+            out['fecha_sugerida'] = _fecha_sugerida_conflictos(tipo, out['conflictos'], est, _dest)
+    return out
+
+
+def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_destino_id=None,
+                          no_lista=None, motivo=None, client_request_id=None):
+    """El núcleo común de traslado, retiro y reactivación. Ver el bloque TRAS-1."""
+    import json as _json
+    import permanencia as PERM
+    from sqlalchemy.exc import IntegrityError as _IE
+
+    nombre_curso = _nombre_curso_fn(db, current_user)
+    crid = (str(client_request_id).strip()[:64] or None) if client_request_id else None
+
+    # 1. Reintento / doble clic: la misma solicitud devuelve el mismo movimiento.
+    if crid:
+        previo = db.query(MovimientoEstudiante).filter_by(
+            colegio_id=current_user.colegio_id, client_request_id=crid).first()
+        if previo is not None:
+            if previo.estudiante_id == est.id and previo.tipo == tipo:
+                return {'message': 'Movimiento ya registrado (reintento)', 'reintento': True,
+                        'movimiento': _movimiento_dict(previo, nombre_curso)}
+            return _respuesta_movimiento_error(
+                'SOLICITUD_REPETIDA', 'Esa solicitud ya se usó para otro movimiento.')
+
+    ano = _ano_activo_colegio(db, current_user)
+    if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
+        return _respuesta_movimiento_error(
+            'SIN_ANO_ACTIVO', 'No hay un año escolar activo con fechas de inicio y fin.', 400)
+    if not isinstance(desde, date):
+        return _respuesta_movimiento_error(
+            'FECHA_REQUERIDA', 'Indique desde qué día (YYYY-MM-DD).', 400)
+    if not (ano.fecha_inicio <= desde <= ano.fecha_fin):
+        return _respuesta_movimiento_error(
+            'FECHA_FUERA_DEL_ANO',
+            'La fecha debe estar dentro del año escolar (%s a %s).' % (
+                ano.fecha_inicio.strftime('%d/%m/%Y'), ano.fecha_fin.strftime('%d/%m/%Y')), 400)
+
+    curso_actual = est.curso
+    if tipo in ('traslado', 'retiro', 'reactivacion'):
+        if curso_actual is None:
+            return _respuesta_movimiento_error('SIN_CURSO', 'El estudiante no tiene curso asignado.', 400)
+        if curso_actual.ano_escolar_id != ano.id:
+            return _respuesta_movimiento_error(
+                'CURSO_DE_OTRO_ANO', 'El curso del estudiante no es del año escolar activo.')
+
+    tramos = PERM.tramos_de(db, est, ano.id)
+    vigente = PERM.tramo_vigente(tramos)
+    destino = None
+    numero_destino = None
+    detalle = {}
+
+    if tipo == 'traslado':
+        if not est.activo:
+            return _respuesta_movimiento_error(
+                'ESTA_RETIRADO', 'El estudiante está retirado. Reactívelo antes de trasladarlo.')
+        if not curso_destino_id:
+            return _respuesta_movimiento_error('DESTINO_REQUERIDO', 'Indique el curso de destino.', 400)
+        destino = get_tenant_or_404(db, Curso, curso_destino_id, current_user, name='curso')
+        if destino.id == est.curso_id:
+            return _respuesta_movimiento_error(
+                'YA_EN_ESE_CURSO', 'El estudiante ya pertenece a ese curso.')
+        if destino.ano_escolar_id != ano.id or not destino.activo:
+            return _respuesta_movimiento_error(
+                'DESTINO_NO_DISPONIBLE', 'El curso de destino no está activo en este año escolar.')
+        if destino.grado_id != curso_actual.grado_id:
+            return _respuesta_movimiento_error(
+                'CAMBIO_DE_GRADO_NO_DISPONIBLE',
+                'El traslado es entre secciones o tandas del mismo grado. Un cambio de grado '
+                'a mitad de año requiere una decisión académica de Dirección y no se hace aquí.')
+        _guard = (validar_nivel_escritura(db, current_user, estudiante_id=est.id)
+                  or validar_nivel_escritura(db, current_user, curso_id=destino.id))
+        if _guard:
+            return _guard
+        assert_nivel_curso_activo(db, current_user, destino.id)
+        if getattr(current_user, 'role', None) == 'secretaria':
+            huella = _huella_academica_estudiante(db, current_user, est.id, ano=ano)
+            if huella:
+                return JSONResponse({
+                    'error': ERROR_CURSO_REQUIERE_DIRECCION,
+                    'message': ('Este estudiante ya tiene calificaciones, asistencia o '
+                                'recuperaciones registradas en ese año escolar. Su traslado '
+                                'lo registra Dirección.'),
+                    'huella': huella,
+                }, status_code=409)
+        ocupados = PERM.numeros_ocupados(db, destino.id, current_user.colegio_id)
+        if no_lista not in (None, ''):
+            try:
+                numero_destino = int(no_lista)
+                if numero_destino <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return _respuesta_movimiento_error('NUMERO_INVALIDO', 'El número de lista debe ser un entero positivo.', 400)
+            if not PERM.numero_libre_para(ocupados, numero_destino, est.id):
+                return _respuesta_movimiento_error(
+                    'NUMERO_OCUPADO',
+                    'El número %d ya está ocupado o reservado en %s.' % (numero_destino, destino.nombre_completo),
+                    numero_propuesto=PERM.numero_propuesto(ocupados, est.id))
+        else:
+            numero_destino = PERM.numero_propuesto(ocupados, est.id)
+    elif tipo == 'retiro':
+        if not est.activo:
+            if _esta_retirado(est) and est.fecha_retiro == desde - timedelta(days=1):
+                return {'message': 'Estudiante retirado (ya estaba registrado así)', 'reintento': True,
+                        'fecha_retiro': est.fecha_retiro.isoformat()}
+            return _respuesta_movimiento_error('YA_RETIRADO', 'El estudiante ya está retirado.')
+    elif tipo == 'reactivacion':
+        if not _esta_retirado(est):
+            return JSONResponse({
+                'error': ERROR_NO_ESTA_RETIRADO,
+                'message': 'Esta ficha no está retirada. Solo se reactiva a quien fue retirado.',
+                'condicion': est.condicion, 'activo': bool(est.activo),
+            }, status_code=409)
+        if est.fecha_retiro is not None and desde <= est.fecha_retiro:
+            return _respuesta_movimiento_error(
+                'FECHA_ANTERIOR_AL_RETIRO',
+                'Su último día antes del retiro fue el %s: la reactivación debe ser posterior.'
+                % est.fecha_retiro.strftime('%d/%m/%Y'), 400)
+        numero_destino = est.no_lista
+        if no_lista not in (None, ''):
+            try:
+                numero_destino = int(no_lista)
+                if numero_destino <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return _respuesta_movimiento_error('NUMERO_INVALIDO', 'El número de lista debe ser un entero positivo.', 400)
+        ocupados = PERM.numeros_ocupados(db, est.curso_id, current_user.colegio_id)
+        otro_activo = (tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
+            Estudiante.curso_id == est.curso_id, Estudiante.no_lista == numero_destino,
+            Estudiante.activo == True, Estudiante.id != est.id).first()  # noqa: E712
+            if numero_destino is not None else None)
+        if numero_destino is not None and (otro_activo is not None
+                                           or not PERM.numero_libre_para(ocupados, numero_destino, est.id)):
+            return _respuesta_movimiento_error(
+                'NUMERO_OCUPADO',
+                'El número %d de este estudiante lo tiene ahora otra ficha del curso. '
+                'Elija otro número libre para reactivarlo.' % numero_destino,
+                numero_propuesto=PERM.numero_propuesto(
+                    {n: e for n, e in ocupados.items() if e != est.id}))
+        movs_previos = PERM.movimientos_por_estudiante(
+            db, current_user.colegio_id, ano.id, [est.id]).get(est.id, [])
+        if not any(m.tipo == 'retiro' for m in movs_previos):
+            # Retiro anterior a TRAS-1: se guarda aquí lo que reactivar borraba.
+            detalle['retiro_previo'] = {
+                'fecha_retiro': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
+                'motivo_retiro': est.motivo_retiro,
+                'retirado_por': est.retirado_por,
+            }
+
+    # Fecha coherente con la permanencia actual: posterior al inicio de su tramo.
+    if tipo in ('traslado', 'retiro') and vigente is not None and vigente.desde is not None \
+            and desde <= vigente.desde:
+        return _respuesta_movimiento_error(
+            'FECHA_ANTERIOR_AL_TRAMO',
+            'Pertenece a %s desde el %s: la fecha debe ser posterior. Deshacer un movimiento '
+            'ya registrado no está disponible.' % (nombre_curso(vigente.curso_id),
+                                                    vigente.desde.strftime('%d/%m/%Y')), 400)
+
+    # Conflictos: una marca existente que contradice la fecha NO se oculta ni se
+    # excluye de porcentajes o documentos. Si la fecha las dejaría fuera de la
+    # permanencia, el movimiento se RECHAZA con la lista y una fecha coherente
+    # sugerida. Nada se borra, mueve ni corrige.
+    conflictos = []
+    if tipo in ('traslado', 'retiro', 'reactivacion'):
+        conflictos = _conflictos_movimiento(db, current_user, est, tipo, desde, est.curso_id,
+                                            destino.id if destino else None, ano)
+        if conflictos:
+            return JSONResponse({
+                'error': ERROR_CONFLICTOS_FECHA,
+                'message': ('Hay %d marca(s) de asistencia que contradicen esa fecha. No se registra '
+                            'un movimiento que las dejaría fuera de la permanencia (dejarían de '
+                            'contar en porcentajes y documentos). Elija una fecha coherente con '
+                            'esas marcas o pida al docente que las corrija si son erróneas.'
+                            % len(conflictos)),
+                'conflictos': conflictos,
+                'fecha_sugerida': _fecha_sugerida_conflictos(tipo, conflictos, est, destino),
+            }, status_code=409)
+    if tipo == 'traslado':
+        detalle['notas_previas'] = _instantanea_notas(db, current_user, est, ano)
+
+    # Primer retiro sin traslados ni reactivaciones en el año: la ficha ya lo
+    # representa entero (curso, número, fecha, motivo y autor), como siempre.
+    # No hace falta una fila de movimiento, y así una ficha creada por error y
+    # retirada sigue pudiéndose eliminar sin dejar huérfanos.
+    if tipo == 'retiro' and not PERM.movimientos_por_estudiante(
+            db, current_user.colegio_id, ano.id, [est.id]).get(est.id):
+        try:
+            db.query(Estudiante).filter(Estudiante.id == est.id).with_for_update().first()
+        except Exception:
+            pass
+        db.refresh(est)
+        if not est.activo:
+            if _esta_retirado(est) and est.fecha_retiro == desde - timedelta(days=1):
+                return {'message': 'Estudiante retirado (ya estaba registrado así)', 'reintento': True,
+                        'fecha_retiro': est.fecha_retiro.isoformat()}
+            return _respuesta_movimiento_error('YA_RETIRADO', 'El estudiante ya está retirado.')
+        antes = est.to_dict()
+        est.activo = False
+        est.condicion = CONDICION_RETIRADO
+        est.fecha_retiro = desde - timedelta(days=1)
+        est.motivo_retiro = (str(motivo).strip()[:300] or None) if motivo else None
+        est.retirado_por = current_user.id
+        est.__dict__.pop('_tras_intervalos_no_aplica', None)
+        log_auditoria(db, 'retirar', 'estudiantes', est.id, antes,
+                      dict(est.to_dict(), retiro_desde=desde.isoformat(), client_request_id=crid),
+                      user=current_user, request=request)
+        db.commit()
+        cache_clear_tenant(current_user.colegio_id)
+        cache_clear(f'cursos:{current_user.colegio_id}')
+        cache_clear(f'stats:{current_user.colegio_id}')
+        return {'message': 'Estudiante retirado', 'fecha_retiro': est.fecha_retiro.isoformat(),
+                'desde': desde.isoformat()}
+
+    # 2. Bloqueo de la ficha (PostgreSQL) y secuencia: dos movimientos
+    #    simultáneos del mismo estudiante no entran los dos. Tras obtener el
+    #    bloqueo se RELEE la ficha: si otra petición la cambió mientras se
+    #    esperaba (curso, número o estado), lo validado ya no vale y se rechaza.
+    _foto = (est.curso_id, est.no_lista, bool(est.activo), est.condicion)
+    try:
+        db.query(Estudiante).filter(Estudiante.id == est.id).with_for_update().first()
     except Exception:
-        pass  # body vacío es OK — retiro sin motivo
-    
+        pass
+    db.refresh(est)
+    if (est.curso_id, est.no_lista, bool(est.activo), est.condicion) != _foto:
+        db.rollback()
+        return _respuesta_movimiento_error(
+            'MOVIMIENTO_CONCURRENTE',
+            'Otro movimiento de este estudiante se registró al mismo tiempo. Revise su historial.')
+    secuencia = (db.query(func.max(MovimientoEstudiante.secuencia)).filter(
+        MovimientoEstudiante.estudiante_id == est.id,
+        MovimientoEstudiante.ano_escolar_id == ano.id).scalar() or 0) + 1
+
+    datos_anteriores = est.to_dict()
+    mov = MovimientoEstudiante(
+        colegio_id=current_user.colegio_id, ano_escolar_id=ano.id, estudiante_id=est.id,
+        tipo=tipo, secuencia=secuencia, fecha_efectiva=desde,
+        curso_origen_id=est.curso_id, no_lista_origen=est.no_lista,
+        curso_destino_id=(destino.id if destino else (est.curso_id if tipo == 'reactivacion' else None)),
+        no_lista_destino=numero_destino if tipo in ('traslado', 'reactivacion') else None,
+        motivo=(str(motivo).strip()[:300] or None) if motivo else None,
+        detalle=_json.dumps(detalle, default=str),
+        registrado_por=current_user.id, client_request_id=crid,
+    )
+    db.add(mov)
+
+    class _NumeroTomado(Exception):
+        pass
+
+    def _reservar(curso_id, numero, obligatoria=False):
+        """Reserva (curso, número) para este estudiante.
+
+        `obligatoria` = el número que va a USAR (destino o reactivación): si
+        otro lo reservó entretanto (dos movimientos a la vez), se aborta todo.
+        La del origen es solo conservación: si un dato heredado ya lo tenía
+        otro, se anota y se sigue (no se le quita a nadie)."""
+        if curso_id is None or numero is None:
+            return
+        propia = db.query(ReservaNumeroLista).filter_by(curso_id=curso_id, estudiante_id=est.id).first()
+        ajena = db.query(ReservaNumeroLista).filter(
+            ReservaNumeroLista.curso_id == curso_id, ReservaNumeroLista.no_lista == numero,
+            ReservaNumeroLista.estudiante_id != est.id).first()
+        if ajena is not None:
+            if obligatoria:
+                raise _NumeroTomado()
+            detalle.setdefault('reservas_omitidas', []).append(
+                {'curso_id': curso_id, 'no_lista': numero, 'reservado_por': ajena.estudiante_id})
+            return
+        if propia is not None:
+            propia.no_lista = numero
+            return
+        db.add(ReservaNumeroLista(colegio_id=current_user.colegio_id, curso_id=curso_id,
+                                  estudiante_id=est.id, no_lista=numero))
+
+    try:
+        db.flush()
+        if tipo == 'traslado':
+            _reservar(est.curso_id, est.no_lista)
+            _reservar(destino.id, numero_destino, obligatoria=True)
+            # Otra ficha (activa o no) con ese número en el destino, creada
+            # entre la comprobación y ahora: tampoco se duplica.
+            if tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
+                    Estudiante.curso_id == destino.id, Estudiante.no_lista == numero_destino,
+                    Estudiante.id != est.id).first() is not None:
+                raise _NumeroTomado()
+            est.curso_id = destino.id
+            est.no_lista = numero_destino
+        elif tipo == 'retiro':
+            _reservar(est.curso_id, est.no_lista)
+            est.activo = False
+            est.condicion = CONDICION_RETIRADO
+            est.fecha_retiro = desde - timedelta(days=1)
+            est.motivo_retiro = mov.motivo
+            est.retirado_por = current_user.id
+        elif tipo == 'reactivacion':
+            _reservar(est.curso_id, numero_destino, obligatoria=True)
+            est.activo = True
+            est.condicion = 'activo'
+            est.no_lista = numero_destino
+            est.fecha_retiro = None
+            est.motivo_retiro = None
+            est.retirado_por = None
+        if detalle.get('reservas_omitidas'):
+            mov.detalle = _json.dumps(detalle, default=str)
+        db.flush()
+        est.__dict__.pop('_tras_intervalos_no_aplica', None)
+        log_auditoria(db, {'traslado': 'trasladar', 'retiro': 'retirar',
+                           'reactivacion': 'reactivar'}[tipo], 'estudiantes', est.id,
+                      datos_anteriores,
+                      dict(est.to_dict(), movimiento_id=mov.id, movimiento=_movimiento_dict(mov, nombre_curso)),
+                      user=current_user, request=request)
+        db.commit()
+    except _NumeroTomado:
+        db.rollback()
+        return _respuesta_movimiento_error(
+            'NUMERO_OCUPADO', 'Ese número de lista se acaba de asignar a otro estudiante. Vuelva a intentarlo.')
+    except _IE as exc:
+        db.rollback()
+        texto = str(getattr(exc, 'orig', exc))
+        if 'client_request' in texto:
+            previo = db.query(MovimientoEstudiante).filter_by(
+                colegio_id=current_user.colegio_id, client_request_id=crid).first()
+            if previo is not None and previo.estudiante_id == est.id and previo.tipo == tipo:
+                return {'message': 'Movimiento ya registrado (reintento)', 'reintento': True,
+                        'movimiento': _movimiento_dict(previo, nombre_curso)}
+        if 'reserva' in texto or 'no_lista' in texto:
+            return _respuesta_movimiento_error(
+                'NUMERO_OCUPADO', 'Ese número de lista se acaba de asignar a otro estudiante. Vuelva a intentarlo.')
+        return _respuesta_movimiento_error(
+            'MOVIMIENTO_CONCURRENTE',
+            'Otro movimiento de este estudiante se registró al mismo tiempo. Revise su historial.')
+
+    cache_clear_tenant(current_user.colegio_id)
+    cache_clear(f'cursos:{current_user.colegio_id}')
+    cache_clear(f'stats:{current_user.colegio_id}')
+    db.refresh(mov)
+    respuesta = {
+        'message': {'traslado': 'Estudiante trasladado', 'retiro': 'Estudiante retirado',
+                    'reactivacion': 'Estudiante reactivado'}[tipo],
+        'movimiento': _movimiento_dict(mov, nombre_curso),
+    }
+    if tipo == 'retiro':
+        respuesta['fecha_retiro'] = est.fecha_retiro.isoformat()
+    return respuesta
+
+
+def _movimiento_en_ano_activo(db, current_user, est):
+    """¿Se puede registrar el movimiento con fecha? Solo si la ficha está en un
+    curso del año escolar activo (que tenga fechas). Una ficha de un año
+    anterior conserva el comportamiento de siempre (ver las dos funciones de
+    abajo): no hay tramo de este año que deducir."""
+    ano = _ano_activo_colegio(db, current_user)
+    curso = est.curso
+    return bool(ano is not None and ano.fecha_inicio and ano.fecha_fin
+                and curso is not None and curso.ano_escolar_id == ano.id)
+
+
+def _retiro_sin_ano_activo(db, request, current_user, est, data):
+    """El retiro de siempre, para fichas fuera del año activo."""
+    if not est.activo:
+        return _respuesta_movimiento_error('YA_RETIRADO', 'El estudiante ya está retirado.')
     est.activo = False
-    est.condicion = 'retirado'  # canónico minúsculas
+    est.condicion = CONDICION_RETIRADO
     est.fecha_retiro = today_rd()
-    est.motivo_retiro = motivo
+    est.motivo_retiro = data.get('motivo_retiro') or data.get('motivo')
     est.retirado_por = current_user.id
-    
     log_auditoria(db, 'retirar', 'estudiantes', est.id, est.to_dict(), None, user=current_user, request=request)
     db.commit()
     cache_clear_tenant(current_user.colegio_id)
     return {'message': 'Estudiante retirado', 'fecha_retiro': est.fecha_retiro.isoformat()}
 
 
-@app.post("/api/estudiantes/{id}/reactivar")
-async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
-    """Reactivar estudiante retirado. Limpia fecha_retiro, motivo y retirado_por.
-    Valida tenant.
-
-    AUDIT-FINAL · Solo una ficha REALMENTE retirada. Un egresado está
-    inactivo por haber terminado, no por haberse ido: devolverlo a «activo»
-    por esta puerta le borraría el egreso sin que nadie lo decidiera.
-    """
-    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+def _reactivacion_sin_ano_activo(db, request, current_user, est):
+    """La reactivación de siempre, para fichas fuera del año activo o sin ninguna
+    historia en él. Los datos del retiro quedan en la auditoría
+    (`datos_anteriores`)."""
     if not _esta_retirado(est):
         return JSONResponse({
             'error': ERROR_NO_ESTA_RETIRADO,
@@ -8116,15 +8903,134 @@ async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_d
             'condicion': est.condicion,
             'activo': bool(est.activo),
         }, status_code=409)
+    # TRAS-1 · su número no puede tenerlo ya otro estudiante activo del curso.
+    if est.curso_id and est.no_lista is not None and tenant_filter(
+            db.query(Estudiante), Estudiante, current_user).filter(
+            Estudiante.curso_id == est.curso_id, Estudiante.no_lista == est.no_lista,
+            Estudiante.activo == True, Estudiante.id != est.id).first() is not None:  # noqa: E712
+        return _respuesta_movimiento_error(
+            'NUMERO_OCUPADO',
+            'El número %d de este estudiante lo tiene ahora otra ficha activa del curso.' % est.no_lista)
+    antes = est.to_dict()
     est.activo = True
     est.condicion = 'activo'
     est.fecha_retiro = None
     est.motivo_retiro = None
     est.retirado_por = None
-    log_auditoria(db, 'reactivar', 'estudiantes', est.id, None, est.to_dict(), user=current_user, request=request)
+    log_auditoria(db, 'reactivar', 'estudiantes', est.id, antes, est.to_dict(), user=current_user, request=request)
     db.commit()
     cache_clear_tenant(current_user.colegio_id)
     return {'message': 'Estudiante reactivado'}
+
+
+async def _cuerpo_json(request):
+    try:
+        data = await request.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@app.post("/api/estudiantes/{id}/traslado")
+async def trasladar_estudiante(id: int, request: Request, db: Session = Depends(get_db),
+                               current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'secretaria'))):
+    """TRAS-1 · Cambiar de curso/tanda sin perder historial.
+
+    Body: {curso_destino_id, desde (YYYY-MM-DD), no_lista?, motivo?,
+           client_request_id?}
+    """
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    data = await _cuerpo_json(request)
+    desde = _parse_fecha_movimiento(data.get('desde'))
+    if desde == 'invalida':
+        return JSONResponse({'error': 'desde debe tener formato YYYY-MM-DD'}, status_code=400)
+    return _registrar_movimiento(
+        db, request, current_user, est, 'traslado', desde=desde,
+        curso_destino_id=data.get('curso_destino_id'), no_lista=data.get('no_lista'),
+        motivo=data.get('motivo'), client_request_id=data.get('client_request_id'))
+
+
+@app.post("/api/estudiantes/{id}/retiro")
+async def retirar_estudiante_desde(id: int, request: Request, db: Session = Depends(get_db),
+                                   current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
+    """TRAS-1 · Retirar «desde qué día». Body: {desde, motivo?, client_request_id?}.
+    Conserva fila, número e historia."""
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    data = await _cuerpo_json(request)
+    desde = _parse_fecha_movimiento(data.get('desde'))
+    if desde == 'invalida':
+        return JSONResponse({'error': 'desde debe tener formato YYYY-MM-DD'}, status_code=400)
+    return _registrar_movimiento(
+        db, request, current_user, est, 'retiro', desde=desde,
+        motivo=data.get('motivo') or data.get('motivo_retiro'),
+        client_request_id=data.get('client_request_id'))
+
+
+@app.delete("/api/estudiantes/{id}")
+async def delete_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
+    """Soft-delete (retiro) del estudiante. Valida tenant.
+
+    SECRETARÍA-2 · A pesar del verbo DELETE esto NO borra: marca `activo=False`,
+    guarda motivo, fecha y quién, y deja auditoría. El borrado FÍSICO vive en
+    `/api/estudiantes/retirados/{id}` y responde 403 desde P0.
+
+    TRAS-1 · Es el mismo retiro que `POST …/retiro`, con sus protecciones.
+    Sin `desde` conserva el comportamiento de siempre: hoy fue su último día
+    (`fecha_retiro` = hoy), es decir, retirado desde mañana.
+    """
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    data = await _cuerpo_json(request)
+    if not _movimiento_en_ano_activo(db, current_user, est):
+        return _retiro_sin_ano_activo(db, request, current_user, est, data)
+    desde = _parse_fecha_movimiento(data.get('desde'))
+    if desde == 'invalida':
+        return JSONResponse({'error': 'desde debe tener formato YYYY-MM-DD'}, status_code=400)
+    if desde is None:
+        desde = today_rd() + timedelta(days=1)
+        ano = _ano_activo_colegio(db, current_user)
+        if ano is not None and ano.fecha_fin and desde > ano.fecha_fin:
+            desde = ano.fecha_fin
+    return _registrar_movimiento(
+        db, request, current_user, est, 'retiro', desde=desde,
+        motivo=data.get('motivo_retiro') or data.get('motivo'),
+        client_request_id=data.get('client_request_id'))
+
+
+@app.post("/api/estudiantes/{id}/reactivar")
+async def reactivar_estudiante(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'secretaria'))):
+    """Reactivar estudiante retirado. Valida tenant.
+
+    AUDIT-FINAL · Solo una ficha REALMENTE retirada (un egresado no).
+
+    TRAS-1 · Ya no borra la historia: el retiro queda registrado y la
+    reactivación es un movimiento con su fecha («desde», por defecto hoy). Los
+    días entre el retiro y la reactivación no aplican. Recupera su número; si
+    otra ficha lo tiene, pide elegir otro libre (`no_lista`).
+    """
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    data = await _cuerpo_json(request)
+    if not _movimiento_en_ano_activo(db, current_user, est):
+        return _reactivacion_sin_ano_activo(db, request, current_user, est)
+    # Sin ninguna historia en el año (ni notas, ni asistencias, ni movimientos;
+    # p. ej. una ficha creada por error y retirada), no hay días que dejar de
+    # contar: se reactiva como siempre, en la ficha y con su auditoría.
+    _ano_r = _ano_activo_colegio(db, current_user)
+    if not _huella_academica_estudiante(db, current_user, est.id, ano=_ano_r):
+        return _reactivacion_sin_ano_activo(db, request, current_user, est)
+    desde = _parse_fecha_movimiento(data.get('desde'))
+    if desde == 'invalida':
+        return JSONResponse({'error': 'desde debe tener formato YYYY-MM-DD'}, status_code=400)
+    if desde is None:
+        # Por defecto, hoy; pero nunca dentro del retiro: si su último día fue
+        # hoy (retiro y reactivación el mismo día, p. ej. un retiro por error),
+        # vuelve desde mañana y no queda ningún día sin curso.
+        desde = today_rd()
+        if est.fecha_retiro is not None and desde <= est.fecha_retiro:
+            desde = est.fecha_retiro + timedelta(days=1)
+    return _registrar_movimiento(
+        db, request, current_user, est, 'reactivacion', desde=desde,
+        no_lista=data.get('no_lista'), motivo=data.get('motivo'),
+        client_request_id=data.get('client_request_id'))
 
 # Condición de ENTRADA que el CSV puede declarar. Son las del Registro
 # Escolar (columna «Promovido | Repitente | Reingreso») más nuevo/transferido.
@@ -8195,6 +9101,10 @@ async def importar_estudiantes(request: Request, archivo: UploadFile = File(...)
         e.no_lista for e in existentes_tenant
         if e.activo and e.curso_id == curso.id and e.no_lista is not None
     }
+    # TRAS-1 · y los de quienes se fueron (retirados, trasladados) y las
+    # reservas: no se reutilizan para reemplazarlos durante el año.
+    import permanencia as _PERM
+    numeros_usados |= set(_PERM.numeros_ocupados(db, curso.id, current_user.colegio_id))
 
     cupos_restantes = None
     if current_user.colegio_id:
@@ -9818,26 +10728,13 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     # El botón "Maestro titular" de Asignaciones crea el lote completo de áreas.
     if not estudiante_obj.curso_id:
         return JSONResponse({'error': 'El estudiante no tiene curso asignado'}, status_code=400)
-    _tiene_asignacion = tenant_filter(
-        db.query(AsignacionProfesor), AsignacionProfesor, current_user
-    ).filter_by(
-        profesor_id=current_user.id,
-        curso_id=estudiante_obj.curso_id,
-        asignatura_id=asignatura_id,
-        activo=True,
-    ).first()
-    if not _tiene_asignacion:
-        return JSONResponse({
-            'error': 'No tienes asignada esta asignatura en el curso del estudiante. '
-                     'Pide a dirección que la asigne en la pantalla de Asignaciones.'
-        }, status_code=403)
-    
-    # Bloquear calificación de estudiante retirado
-    if not estudiante_obj.activo:
-        return JSONResponse({
-            'error': 'Estudiante retirado: no se pueden modificar sus calificaciones',
-            'fecha_retiro': estudiante_obj.fecha_retiro.isoformat() if estudiante_obj.fecha_retiro else None,
-        }, status_code=403)
+    # TRAS-1 · asignación, retiro y notas previas a un traslado (ver
+    # `_autorizar_nota_permanencia`). Sin movimientos ni retiro, como siempre.
+    _err_tras, _curso_nota, _permisos_tras = _autorizar_nota_permanencia(
+        db, current_user, estudiante_obj, asignatura_id, data, CalificacionPrimaria,
+        competencia_numero)
+    if _err_tras is not None:
+        return _err_tras
 
     # El curso tiene que ser de PRIMARIA de verdad. El docstring decía «siempre
     # primaria acá», pero nada lo comprobaba: se podía crear una
@@ -10094,6 +10991,14 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
         calif.final_competencia = None
         calif.literal = None
     
+    if _permisos_tras:
+        # TRAS-1 · corrección autorizada (antecedente de traslado, curso
+        # anterior o retirado): se audita con el permiso usado.
+        db.flush()
+        log_auditoria(db, 'CORREGIR_NOTA_PRIMARIA_AUTORIZADA', 'calificaciones_primaria', calif.id,
+                      None, {**{c: getattr(calif, c, None) for c in _CAMPOS_NOTA_TRAS},
+                             '_permiso_correccion': _permisos_tras, '_curso_de_la_nota': _curso_nota},
+                      user=current_user, request=request)
     db.commit()
     cache_clear(f'stats:{current_user.colegio_id}')
     respuesta = {'message': 'Calificación primaria guardada', 'id': calif.id,
@@ -10213,6 +11118,28 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
     # Solo cambia el ORDEN: cada nota sigue indexada por estudiante_id.
     estudiantes.sort(key=lambda e: (e.no_lista is None, e.no_lista or 0,
                                     (e.apellido or '').lower(), (e.nombre or '').lower(), e.id))
+    # TRAS-1 · el curso conserva en su planilla a quien salió en el año
+    # (trasladado o retirado), en SOLO LECTURA y con el aviso; y quien llegó
+    # por traslado muestra la procedencia de sus notas previas, protegidas.
+    import permanencia as _PERM
+    _nombre_curso = _nombre_curso_fn(db, current_user)
+    _miembros = {m.estudiante.id: m for m in _PERM.miembros_curso(db, curso, current_user.colegio_id)}
+    for _m in _miembros.values():
+        if _m.salio and _m.estudiante not in estudiantes:
+            estudiantes.append(_m.estudiante)
+    estudiantes.sort(key=lambda e: ((_miembros[e.id].no_lista if e.id in _miembros else e.no_lista) is None,
+                                    (_miembros[e.id].no_lista if e.id in _miembros else e.no_lista) or 0,
+                                    (e.apellido or '').lower(), (e.nombre or '').lower(), e.id))
+    _previas = {}
+    for _eid, _movs in _PERM.movimientos_por_estudiante(
+            db, current_user.colegio_id, ano.id, [e.id for e in estudiantes]).items():
+        for _mv in _movs:
+            if _mv.tipo != _PERM.TRASLADO:
+                continue
+            for _info in ((_mv.get_detalle().get('notas_previas') or {}).get('secundaria') or {}).values():
+                if _info.get('asignatura_id') == asignatura_id:
+                    _previas.setdefault(_eid, {}).setdefault(int(_info.get('competencia') or 0), set()).update(
+                        (_info.get('valores') or {}).keys())
     
     # Calificaciones de la asignatura
     califs = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter_by(
@@ -10268,11 +11195,36 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
         
         extra = extras_by_est.get(est.id)
         
+        _m = _miembros.get(est.id)
+        if _m is not None and _m.salio:
+            # TRAS-1 · En el curso que dejó (trasladado o retirado) se ven solo
+            # los períodos que cursó en él y SIN promedio ni calificación final:
+            # su resultado lo emite el curso donde termina el año. Las notas
+            # siguen intactas en la base; el destino las muestra todas.
+            _salida = _m.ultimo.fecha_salida
+            _visibles = {p_ for p_, ini_, _f in ASIS.rangos_periodos(ano) if _salida is None or ini_ < _salida}
+            for _num, _cd in competencias_data.items():
+                _cd = dict(_cd)
+                for p_ in (1, 2, 3, 4):
+                    if p_ not in _visibles:
+                        _cd['p%d' % p_] = None
+                        _cd['rp%d' % p_] = None
+                _cd['promedio_competencia'] = None
+                competencias_data[_num] = _cd
+            pcs = {k: (v if int(k[-1]) in _visibles else None) for k, v in pcs.items()}
+            cf, literal, extra = None, None, None
         resultado.append({
             'estudiante': {
                 'id': est.id,
                 'nombre_completo': f"{est.apellido or ''}, {est.nombre or ''}".strip(', '),
-                'no_lista': est.no_lista,  # CAL-NL-1: número guardado, o None
+                # CAL-NL-1: número guardado, o None. TRAS-1: el de ESTE curso.
+                'no_lista': _m.no_lista if _m is not None else est.no_lista,
+            },
+            # TRAS-1 · permanencia y procedencia de las notas.
+            'permanencia': {
+                'solo_lectura': bool(_m is not None and _m.salio),
+                'avisos': _PERM.avisos_miembro(_m, _nombre_curso) if _m is not None else [],
+                'notas_previas_traslado': {str(k): sorted(v) for k, v in (_previas.get(est.id) or {}).items()},
             },
             'competencias': competencias_data,
             'pc_por_periodo': pcs,            # PC1, PC2, PC3, PC4
@@ -10319,9 +11271,12 @@ async def get_competencias_periodo_curso(curso_id: int, periodo: int,
     if not ano:
         return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
     
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.apellido, Estudiante.nombre).all()
+    # TRAS-1 · la MISMA lista que la vista resumen de Notas por Período (quien
+    # se trasladó o se retiró durante el período sigue, con su aviso), en el
+    # orden de siempre de esta vista (apellido, nombre).
+    from services.stats_service import estudiantes_del_periodo
+    estudiantes, _no_lista_p, _avisos_p = estudiantes_del_periodo(db, curso, periodo)
+    estudiantes = sorted(estudiantes, key=lambda e: ((e.apellido or ''), (e.nombre or '')))
     est_ids = [e.id for e in estudiantes]
     
     # Asignaturas del curso (vía asignaciones)
@@ -10381,8 +11336,9 @@ async def get_competencias_periodo_curso(curso_id: int, periodo: int,
         
         resultado.append({
             'estudiante_id': est.id,
-            'no_lista': est.no_lista,
+            'no_lista': _no_lista_p(est) or est.no_lista,
             'nombre': est.nombre_completo,
+            'avisos': _avisos_p(est),
             'asignaturas': asignaturas_data,
         })
     
@@ -10451,10 +11407,14 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     
     # Estudiantes a incluir
-    q_est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso_id, activo=True)
+    # TRAS-1 · los mismos estudiantes que la pantalla de Notas por Período
+    # para ese período (incluye a quien se trasladó o se retiró durante él).
+    from services.stats_service import estudiantes_del_periodo
+    _curso_rep = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    estudiantes = sorted(estudiantes_del_periodo(db, _curso_rep, periodo_rep)[0],
+                         key=lambda e: ((e.apellido or ''), (e.nombre or '')))
     if estudiante_id:
-        q_est = q_est.filter(Estudiante.id == int(estudiante_id))
-    estudiantes = q_est.order_by(Estudiante.apellido, Estudiante.nombre).all()
+        estudiantes = [e for e in estudiantes if e.id == int(estudiante_id)]
     if not estudiantes:
         return JSONResponse({'error': 'No hay estudiantes para el reporte'}, status_code=404)
     
@@ -10600,6 +11560,142 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
 
 
 
+# ══ TRAS-1 · NOTAS DE QUIEN SE TRASLADÓ O SE RETIRÓ ═══════════════════════
+#
+# Las notas pertenecen al estudiante y a la asignatura (no al curso), así que
+# tras un traslado siguen con él y el docente del destino las ve. Lo que
+# cambia es QUIÉN puede sobrescribir qué, sin obligar a cerrar el período:
+#
+#   · el docente del curso actual COMPLETA lo vacío y sigue evaluando; un
+#     valor que YA existía al trasladar (instantánea del movimiento) solo se
+#     cambia con el permiso temporal de corrección de Dirección;
+#   · el docente del curso anterior corrige sus notas con ese mismo permiso
+#     (curso anterior, asignatura y período);
+#   · un retirado: las correcciones históricas siguen siendo posibles con el
+#     permiso de Dirección; sin él, 403 como siempre.
+#
+# Se reutiliza `PermisoTemporalCalificacion` tal como existe (profesor, curso,
+# asignatura, período, vigencia). La auditoría de la nota anota el permiso.
+
+_CAMPOS_NOTA_TRAS = ('p1', 'p2', 'p3', 'p4', 'rp1', 'rp2', 'rp3', 'rp4')
+
+
+def _permiso_correccion(db, current_user, curso_id, asignatura_id, periodo):
+    return tenant_filter(db.query(PermisoTemporalCalificacion), PermisoTemporalCalificacion,
+                         current_user).filter(
+        PermisoTemporalCalificacion.profesor_id == current_user.id,
+        PermisoTemporalCalificacion.activo == True,  # noqa: E712
+        PermisoTemporalCalificacion.fecha_fin > now_rd(),
+        (PermisoTemporalCalificacion.periodo == periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
+        (PermisoTemporalCalificacion.asignatura_id == asignatura_id)
+        | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+        (PermisoTemporalCalificacion.curso_id == curso_id) | (PermisoTemporalCalificacion.curso_id.is_(None)),
+    ).first()
+
+
+def _autorizar_nota_permanencia(db, current_user, est, asignatura_id, data, modelo, competencia_numero):
+    """`(error, curso_de_la_nota, permisos_usados)` para guardar una nota.
+
+    Sin movimientos ni retiro el resultado es el de siempre: el docente
+    asignado al curso actual escribe (y si no, 403 con el mensaje de siempre).
+    """
+    import permanencia as _PERM
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    calif = None
+    if ano is not None:
+        calif = tenant_filter(db.query(modelo), modelo, current_user).filter_by(
+            estudiante_id=est.id, asignatura_id=asignatura_id,
+            competencia_numero=competencia_numero, ano_escolar_id=ano.id).first()
+
+    def _num(v):
+        if v is None or v == '':
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 'x'
+
+    cambiados = []
+    for c in _CAMPOS_NOTA_TRAS:
+        if c not in data:
+            continue
+        nuevo, actual = _num(data.get(c)), (getattr(calif, c, None) if calif is not None else None)
+        if nuevo == 'x' or (nuevo is None) != (actual is None) or (
+                nuevo is not None and abs(nuevo - float(actual)) > 1e-9):
+            cambiados.append(c)
+
+    def _asignado(curso_id):
+        return tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, asignatura_id=asignatura_id,
+            activo=True).first() is not None
+
+    def _exigir_permiso(curso_id, campos, codigo, mensaje, status):
+        usados = []
+        for p in sorted({int(c[-1]) for c in campos}):
+            permiso = _permiso_correccion(db, current_user, curso_id, asignatura_id, p)
+            if permiso is None:
+                return JSONResponse({
+                    'error': codigo, 'message': mensaje, 'periodo': p,
+                    'campos': sorted(campos),
+                    'como_corregir': ('Dirección puede conceder un permiso temporal de corrección '
+                                      '(curso, asignatura y período) sin cerrar el período.'),
+                }, status_code=status), None
+            usados.append(permiso.id)
+        return None, usados
+
+    nombre_curso = _nombre_curso_fn(db, current_user)
+
+    if _asignado(est.curso_id):
+        if not est.activo:
+            if not cambiados:
+                return None, est.curso_id, []
+            err, usados = _exigir_permiso(
+                est.curso_id, cambiados, 'Estudiante retirado: no se pueden modificar sus calificaciones',
+                ('Estudiante retirado: sus notas se conservan. Para una corrección histórica '
+                 'hace falta el permiso temporal de corrección de Dirección.'), 403)
+            return err, est.curso_id, usados
+        # Valores que ya existían al trasladarlo: protegidos.
+        protegidos = []
+        if ano is not None and calif is not None and cambiados:
+            for m in _PERM.movimientos_por_estudiante(
+                    db, current_user.colegio_id, ano.id, [est.id]).get(est.id, []):
+                if m.tipo != _PERM.TRASLADO:
+                    continue
+                snap = ((m.get_detalle().get('notas_previas') or {})
+                        .get('secundaria' if modelo is CalificacionSecundaria else 'primaria') or {})
+                previos = (snap.get(str(calif.id)) or {}).get('valores') or {}
+                protegidos.extend(c for c in cambiados if c in previos and c not in protegidos)
+        if protegidos:
+            err, usados = _exigir_permiso(
+                est.curso_id, protegidos, 'NOTA_PREVIA_AL_TRASLADO',
+                ('Esa nota se registró antes del traslado del estudiante (en %s). Se conserva tal '
+                 'cual; para corregirla hace falta el permiso temporal de corrección de Dirección. '
+                 'Las notas vacías sí puede completarlas.' % (
+                     ', '.join(sorted({nombre_curso(t.curso_id) for t in _PERM.tramos_de(db, est, ano.id)
+                                       if t.curso_id != est.curso_id})) or 'el curso anterior')),
+                409)
+            return err, est.curso_id, usados
+        return None, est.curso_id, []
+
+    # ¿Docente de un curso ANTERIOR del estudiante en este año?
+    if ano is not None:
+        for t in _PERM.tramos_de(db, est, ano.id):
+            if t.curso_id and t.curso_id != est.curso_id and _asignado(t.curso_id):
+                if not cambiados:
+                    return None, t.curso_id, []
+                err, usados = _exigir_permiso(
+                    t.curso_id, cambiados, 'NOTA_DE_CURSO_ANTERIOR',
+                    ('El estudiante ya no pertenece a %s. Sus notas se conservan; para corregir '
+                     'una de ese curso hace falta el permiso temporal de corrección de Dirección.'
+                     % nombre_curso(t.curso_id)), 403)
+                return err, t.curso_id, usados
+
+    return JSONResponse({
+        'error': 'No tienes asignada esta asignatura en el curso del estudiante. '
+                 'Pide a dirección que la asigne en la pantalla de Asignaciones.'
+    }, status_code=403), None, []
+
+
 @app.post("/api/calificaciones-secundaria")
 async def save_calificacion_secundaria(request: Request, db: Session = Depends(get_db),
                                           current_user: Usuario = Depends(get_current_user)):
@@ -10638,23 +11734,14 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
     # El botón "Maestro titular" de Asignaciones crea el lote completo de áreas.
     if not estudiante_obj.curso_id:
         return JSONResponse({'error': 'El estudiante no tiene curso asignado'}, status_code=400)
-    _tiene_asignacion = tenant_filter(
-        db.query(AsignacionProfesor), AsignacionProfesor, current_user
-    ).filter_by(
-        profesor_id=current_user.id,
-        curso_id=estudiante_obj.curso_id,
-        asignatura_id=asignatura_id,
-        activo=True,
-    ).first()
-    if not _tiene_asignacion:
-        return JSONResponse({
-            'error': 'No tienes asignada esta asignatura en el curso del estudiante. '
-                     'Pide a dirección que la asigne en la pantalla de Asignaciones.'
-        }, status_code=403)
-    
-    if not estudiante_obj.activo:
-        return JSONResponse({'error': 'Estudiante retirado: no se pueden modificar sus calificaciones'}, status_code=403)
-    
+    # TRAS-1 · asignación, retiro y notas previas a un traslado. Sin
+    # movimientos ni retiro, exactamente la regla de siempre.
+    _err_tras, _curso_nota, _permisos_tras = _autorizar_nota_permanencia(
+        db, current_user, estudiante_obj, asignatura_id, data, CalificacionSecundaria,
+        competencia_numero)
+    if _err_tras is not None:
+        return _err_tras
+
     # Validar que sea curso de secundaria
     if estudiante_obj.curso_id and not _es_curso_secundaria(db, estudiante_obj.curso_id):
         return JSONResponse({
@@ -10664,9 +11751,10 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
     if estudiante_obj.curso_id:
         assert_nivel_curso_activo(db, current_user, estudiante_obj.curso_id)
     
-    # Profesor: verificar asignación
+    # Profesor: verificar asignación (TRAS-1: en el curso de la nota)
     tiene_asig = db.query(AsignacionProfesor).filter_by(
-        profesor_id=current_user.id, curso_id=estudiante_obj.curso_id, asignatura_id=asignatura_id
+        profesor_id=current_user.id, curso_id=_curso_nota or estudiante_obj.curso_id,
+        asignatura_id=asignatura_id
     ).first()
     if not tiene_asig:
         return JSONResponse({'error': 'No tiene asignación a este curso/asignatura'}, status_code=403)
@@ -10787,6 +11875,11 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
     # Esto permite rastrear exactamente qué nota cambió, de qué valor a cuál.
     try:
         _audit_despues = {c: getattr(calif, c, None) for c in ['p1','p2','p3','p4','rp1','rp2','rp3','rp4']}
+        if _permisos_tras:
+            # TRAS-1 · corrección autorizada (antecedente de traslado, curso
+            # anterior o retirado): queda anotado el permiso usado.
+            _audit_despues['_permiso_correccion'] = _permisos_tras
+            _audit_despues['_curso_de_la_nota'] = _curso_nota
         log_auditoria(
             db, accion='GUARDAR_NOTA_SECUNDARIA', tabla='calificaciones_secundaria',
             registro_id=calif.id, datos_anteriores=_audit_antes, datos_nuevos=_audit_despues,
@@ -14526,7 +15619,7 @@ def _solo_profesor_pasa_lista(current_user):
 
 
 def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
-                      asignatura_id=None):
+                      asignatura_id=None, fecha=None):
     """
     Autorizacion comun de escritura de asistencia. Devuelve `(ctx, error)`.
 
@@ -14580,7 +15673,17 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
             return None, JSONResponse({'error': 'Curso no encontrado'},
                                       status_code=404)
 
-    if est is not None:
+    tramo = None
+    if est is not None and fecha is not None:
+        # TRAS-1 · el curso que manda es el de la PERMANENCIA del estudiante
+        # ese día. Antes era siempre su curso actual: tras un traslado, el
+        # docente del destino escribía sobre los días de la tarde y el del
+        # origen ya no podía corregir los suyos. Sin movimientos, el tramo es
+        # el de la ficha y el resultado es el mismo de siempre.
+        _err_p, tramo, curso = _permanencia_asistencia(db, current_user, est, curso, fecha)
+        if _err_p is not None:
+            return None, _err_p
+    elif est is not None:
         if curso is not None and est.curso_id != curso.id:
             return None, JSONResponse(
                 {'error': 'El estudiante no pertenece al curso indicado'},
@@ -14643,7 +15746,49 @@ def _guard_asistencia(db, current_user, estudiante_id=None, curso_id=None,
             if _err_titular is not None:
                 return None, _err_titular
 
-    return {'curso': curso, 'nivel': nivel, 'asignatura': asignatura}, None
+    return {'curso': curso, 'nivel': nivel, 'asignatura': asignatura, 'tramo': tramo}, None
+
+
+def _permanencia_asistencia(db, current_user, est, curso, fecha):
+    """TRAS-1 · `(error, tramo, curso)` de la permanencia del estudiante en `fecha`.
+
+    · Con `curso`: el estudiante debe pertenecer a ESE curso ese día.
+    · Sin `curso`: se usa el curso al que pertenecía ese día.
+    Fuera de su permanencia (antes de incorporarse, después de trasladarse o
+    retirarse) no se registra asistencia ordinaria: 409 con la explicación.
+    """
+    import permanencia as _PERM
+    base = curso if curso is not None else est.curso
+    ano_id = getattr(base, 'ano_escolar_id', None)
+    tramos = _PERM.tramos_de(db, est, ano_id)
+    tramo = _PERM.tramo_en_fecha(tramos, fecha)
+    nombre_curso = _nombre_curso_fn(db, current_user)
+    if curso is not None:
+        if tramo is not None and tramo.curso_id == curso.id:
+            return None, tramo, curso
+        propios = _PERM.tramos_en_curso(tramos, curso.id)
+        if not propios:
+            return JSONResponse({'error': 'El estudiante no pertenece al curso indicado'},
+                                status_code=400), None, None
+        avisos = [a for t in propios for a in (_PERM.aviso_entrada(t, nombre_curso),
+                                                _PERM.aviso_salida(t, nombre_curso)) if a]
+        return JSONResponse({
+            'error': 'FUERA_DE_PERMANENCIA',
+            'message': ('%s no pertenecía a %s el %s (%s). Ese día no aplica: no se registra '
+                        'asistencia ordinaria fuera de su permanencia.' % (
+                            est.nombre_completo, curso.nombre_completo,
+                            fecha.strftime('%d/%m/%Y'), '; '.join(avisos) or 'fuera de su tramo')),
+            'avisos': avisos,
+        }, status_code=409), None, None
+    if tramo is None:
+        return JSONResponse({
+            'error': 'FUERA_DE_PERMANENCIA',
+            'message': ('%s no pertenecía a ningún curso el %s (retirado). No se registra '
+                        'asistencia ordinaria fuera de su permanencia.' % (
+                            est.nombre_completo, fecha.strftime('%d/%m/%Y'))),
+        }, status_code=409), None, None
+    curso = tenant_filter(db.query(Curso), Curso, current_user).filter_by(id=tramo.curso_id).first()
+    return None, tramo, curso
 
 
 @app.get("/api/asistencia")
@@ -14741,13 +15886,23 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     # cualquier asignacion en el curso, asi que el profesor de Lengua podia pasar
     # lista de la Salida Optativa que imparte otro. En Secundaria la asistencia
     # es por materia, de modo que curso y asignatura forman una sola llave.
+    # TRAS-1 · la fecha entra en la guarda: el curso válido es el de la
+    # permanencia del estudiante ESE día.
+    try:
+        _fecha_guard = datetime.strptime(data.get('fecha') or today_rd().isoformat(), '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return JSONResponse(
+            {'error': f"fecha inválida: {data.get('fecha')!r}. Formato esperado: YYYY-MM-DD"},
+            status_code=400)
     _ctx, _err = _guard_asistencia(
         db, current_user,
         estudiante_id=data.get('estudiante_id'),
         curso_id=data.get('curso_id'),
-        asignatura_id=data.get('asignatura_id'))
+        asignatura_id=data.get('asignatura_id'),
+        fecha=_fecha_guard)
     if _err:
         return _err
+    _curso_perm = _ctx.get('curso')
     
     # Validar estado contra valores permitidos (anteriormente: cualquier string entraba)
     ESTADOS_VALIDOS = {'presente', 'ausente', 'tardanza', 'excusa'}
@@ -14766,14 +15921,12 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     if current_user.role != 'superadmin' and estudiante.colegio_id != current_user.colegio_id:
         return JSONResponse({'error': 'Estudiante no pertenece a su colegio'}, status_code=403)
     
-    # Bloquear escritura sobre estudiante retirado. Sus marcas previas se conservan,
-    # pero ningún rol puede agregar nuevas marcas. Si el director quiere modificar,
-    # primero debe reactivar al estudiante.
-    if not estudiante.activo:
-        return JSONResponse({
-            'error': 'Estudiante retirado: no se puede registrar asistencia',
-            'fecha_retiro': estudiante.fecha_retiro.isoformat() if estudiante.fecha_retiro else None,
-        }, status_code=403)
+    # TRAS-1 · Retirado: ya no se bloquea por estar retirado, sino por la
+    # PERMANENCIA (comprobada en la guarda). Después del retiro no se acepta
+    # ninguna carga; dentro de su permanencia, el docente de su curso puede
+    # corregir sus días (corrección histórica), y queda auditado más abajo.
+    _es_correccion_historica = not estudiante.activo or (
+        _curso_perm is not None and estudiante.curso_id != _curso_perm.id)
     
     # Validar que el nivel del curso del estudiante esté activo
     if estudiante.curso_id:
@@ -14842,7 +15995,8 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     # centro sigue sin impedir pasar lista; solo lo impide la declaracion
     # explicita del profesor sobre ESTA clase.
     _s1 = _bloqueo_por_sesion_no_impartida(
-        db, colegio_id=estudiante.colegio_id, curso_id=estudiante.curso_id,
+        db, colegio_id=estudiante.colegio_id,
+        curso_id=_curso_perm.id if _curso_perm is not None else estudiante.curso_id,
         asignatura_id=asignatura_id, fecha=fecha)
     if _s1:
         return _s1
@@ -14858,7 +16012,19 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
         query = query.filter(Asistencia.asignatura_id.is_(None))
     
     asistencia = query.first()
-    
+
+    # TRAS-1 · una marca que pertenece a OTRO curso no se sobrescribe desde
+    # este: cada curso conserva sus marcas con su curso, docente y horario.
+    if asistencia is not None and _curso_perm is not None and asistencia.curso_id \
+            and asistencia.curso_id != _curso_perm.id:
+        return JSONResponse({
+            'error': 'MARCA_DE_OTRO_CURSO',
+            'message': ('Ya existe una marca de este estudiante ese día en otro curso. No se '
+                        'sobrescribe desde aquí; la corrige el docente de ese curso.'),
+        }, status_code=409)
+    _antes_marca = ({'estado': asistencia.estado, 'curso_id': asistencia.curso_id}
+                    if asistencia is not None else None)
+
     if asistencia:
         asistencia.estado = estado
         asistencia.observacion = data.get('observacion', '')
@@ -14875,7 +16041,9 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     else:
         asistencia = Asistencia(
             estudiante_id=data['estudiante_id'],
-            curso_id=estudiante.curso_id,
+            # TRAS-1 · el curso de su permanencia ese día (el de la ficha si
+            # no tiene movimientos, como siempre).
+            curso_id=_curso_perm.id if _curso_perm is not None else estudiante.curso_id,
             asignatura_id=asignatura_id,
             fecha=fecha,
             estado=estado,
@@ -14884,7 +16052,14 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
             colegio_id=current_user.colegio_id
         )
         db.add(asistencia)
-    
+
+    if _es_correccion_historica:
+        db.flush()
+        log_auditoria(db, 'corregir_asistencia_historica', 'asistencias', asistencia.id,
+                      _antes_marca, {'estado': estado, 'curso_id': asistencia.curso_id,
+                                     'fecha': fecha.isoformat(), 'estudiante_id': estudiante.id},
+                      user=current_user, request=request)
+
     db.commit()
     cache_clear_tenant(current_user.colegio_id)
     cache_clear(f'stats:{current_user.colegio_id}')
@@ -14912,7 +16087,7 @@ async def desmarcar_asistencia(estudiante_id, request: Request, db: Session = De
     # asignacion activa sobre (curso, asignatura).
     _ctx_del, _err_del = _guard_asistencia(
         db, current_user, estudiante_id=int(estudiante_id),
-        asignatura_id=asignatura_id)
+        asignatura_id=asignatura_id, fecha=fecha)
     if _err_del:
         return _err_del
 
@@ -14925,6 +16100,15 @@ async def desmarcar_asistencia(estudiante_id, request: Request, db: Session = De
         query = query.filter_by(asignatura_id=int(asignatura_id))
 
     asistencia = query.first()
+    # TRAS-1 · solo se desmarca una marca del curso de la permanencia de ese
+    # día: el docente de otro curso no puede borrar la historia del origen.
+    _curso_del = (_ctx_del or {}).get('curso')
+    if asistencia is not None and _curso_del is not None and asistencia.curso_id \
+            and asistencia.curso_id != _curso_del.id:
+        return JSONResponse({
+            'error': 'MARCA_DE_OTRO_CURSO',
+            'message': 'Esa marca pertenece a otro curso: no se borra desde aquí.',
+        }, status_code=409)
     if asistencia:
         db.delete(asistencia)
         db.commit()
@@ -14954,24 +16138,39 @@ async def get_resumen_asistencia(curso_id, request: Request, db: Session = Depen
     if not (1 <= mes <= 12):
         return JSONResponse({'error': 'mes fuera de rango (1-12)'}, status_code=400)
     
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso.id, activo=True
-    ).all()
+    # TRAS-1 · los que pertenecieron al curso ese mes, y de cada uno solo
+    # las marcas de ESTE curso dentro de su permanencia. Sin traslados ni
+    # retiros es exactamente la lista y la cuenta de siempre.
+    import permanencia as _PERM
+    import calendar as _cal
+    _ini_mes = date(ano, mes, 1)
+    _fin_mes = date(ano, mes, _cal.monthrange(ano, mes)[1])
+    def _con_mov(m):
+        return m.salio or m.primero.motivo_inicio != _PERM.INICIO or len(m.en_curso) > 1
+    _miembros = [m for m in _PERM.miembros_curso(db, curso, current_user.colegio_id)
+                 if not _con_mov(m)
+                 or any((t.desde is None or t.desde <= _fin_mes)
+                        and (t.hasta is None or t.hasta >= _ini_mes) for t in m.en_curso)]
+    _miembro_de = {m.estudiante.id: m for m in _miembros}
+    estudiantes = [m.estudiante for m in _miembros]
     if not estudiantes:
         return []
     est_ids = [e.id for e in estudiantes]
-    
+
     # Una sola query para TODAS las asistencias del mes (sin N+1)
     todas_asistencias = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
         Asistencia.estudiante_id.in_(est_ids),
         extract('month', Asistencia.fecha) == mes,
         extract('year', Asistencia.fecha) == ano
     ).all()
-    
+
     # Agrupar en memoria por estudiante
     from collections import defaultdict
     asist_por_est = defaultdict(list)
     for a in todas_asistencias:
+        _m = _miembro_de[a.estudiante_id]
+        if _con_mov(_m) and (a.curso_id not in (None, curso.id) or not _m.aplica(a.fecha)):
+            continue
         asist_por_est[a.estudiante_id].append(a)
     
     resultado = []
@@ -15037,9 +16236,17 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     
     # Incluimos retirados también — el profesor los ve con badge readonly.
     # Filtrar SOLO activos sería ocultar información que el profesor necesita.
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso.id
-    ).order_by(Estudiante.no_lista).all()
+    #
+    # TRAS-1 · Y quienes se trasladaron DESDE o HACIA este curso en el año:
+    # cada uno con su número en ESTE curso y su permanencia. Fuera de ella el
+    # día «No aplica» (solo lectura) con el aviso «Trasladado a…»,
+    # «Retirado desde…» o «Incorporado desde…». Solo se muestran las marcas
+    # de ESTE curso: el destino no ve ni toca las de la tarde.
+    import permanencia as _PERM
+    _miembros = _PERM.miembros_curso(db, curso, current_user.colegio_id)
+    _miembro_de = {m.estudiante.id: m for m in _miembros}
+    _nombre_curso = _nombre_curso_fn(db, current_user)
+    estudiantes = [m.estudiante for m in _miembros]
     # Sin estudiantes se devolvía una lista pelada, mientras el caso normal
     # devuelve un objeto. Esa incoherencia ya existía; ahora importa más, porque
     # es por aquí por donde la pantalla se entera de si puede editar. Se unifica
@@ -15058,20 +16265,30 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
         asist_query = asist_query.filter_by(asignatura_id=asignatura_id)
     else:
         asist_query = asist_query.filter(Asistencia.asignatura_id.is_(None))
-    asist_map = {a.estudiante_id: a for a in asist_query.all()}
-    
+    # TRAS-1 · solo las marcas de este curso (las demás son de otro horario).
+    asist_map = {a.estudiante_id: a for a in asist_query.all()
+                 if a.curso_id in (None, curso.id)}
+
     resultado = []
     for est in estudiantes:
         asistencia = asist_map.get(est.id)
+        _m = _miembro_de[est.id]
+        _aplica = _m.aplica(fecha)
+        _avisos = _PERM.avisos_miembro(_m, _nombre_curso)
         resultado.append({
             'estudiante': {
                 'id': est.id,
                 'nombre_completo': est.nombre_completo,
-                'no_lista': est.no_lista,
+                'no_lista': _m.no_lista,
                 # Flags de retiro: el frontend los usa para deshabilitar marcas y mostrar badge
                 'retirado': not est.activo,
                 'fecha_retiro': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
                 'motivo_retiro': est.motivo_retiro,
+                # TRAS-1 · ¿pertenece al curso ESE día? Si no, «No aplica»:
+                # ni se marca ni cuenta como ausencia ni como día esperado.
+                'aplica': _aplica,
+                'avisos': _avisos,
+                'marca_fuera_de_permanencia': bool(asistencia is not None and not _aplica),
             },
             'asistencia': {
                 'estado': asistencia.estado if asistencia else None,
@@ -15145,9 +16362,12 @@ async def vista_rapida_asistencia(curso_id: int, request: Request, db: Session =
 
     grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
     nivel = _canon_nivel(grado.nivel if grado else None)
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(
-        Estudiante.curso_id == curso.id, Estudiante.activo.is_(True),
-    ).order_by(Estudiante.no_lista).all()
+    # TRAS-1 · quienes pertenecen al curso ESE día (los activos de siempre,
+    # más quien estaba antes de trasladarse o retirarse; menos quien aún no
+    # se había incorporado). Solo cuentan las marcas de este curso.
+    import permanencia as _PERM
+    estudiantes = [m.estudiante for m in _PERM.miembros_curso(db, curso, current_user.colegio_id)
+                   if m.aplica(fecha) and (m.estudiante.activo or m.salio)]
     est_ids = [e.id for e in estudiantes] or [0]
     # Día no laborable: el de esa fecha exacta, o uno recurrente (mismo día y mes).
     no_laborable = next((d for d in tenant_filter(db.query(DiaNoLaborable), DiaNoLaborable, current_user)
@@ -15161,8 +16381,9 @@ async def vista_rapida_asistencia(curso_id: int, request: Request, db: Session =
         'dia_no_laborable': (no_laborable.nombre or 'Día no laborable') if no_laborable else None,
     }
 
-    marcas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+    marcas = [a for a in tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
         Asistencia.estudiante_id.in_(est_ids), Asistencia.fecha == fecha).all()
+        if a.curso_id in (None, curso.id)]
 
     if nivel == 'primaria':
         diarias = {a.estudiante_id: a.estado for a in marcas if a.asignatura_id is None}
@@ -15277,9 +16498,13 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     # `asignatura_id` ya viene resuelto y validado por tenant mas arriba.
     _ctx_lote, _err_lote = _guard_asistencia(
         db, current_user, estudiante_id=_primer_est, curso_id=curso_id,
-        asignatura_id=getattr(asignatura_id, 'id', asignatura_id))
+        asignatura_id=getattr(asignatura_id, 'id', asignatura_id), fecha=fecha)
     if _err_lote:
         return _err_lote
+    # TRAS-1 · el lote es de UN curso: el indicado o el de la permanencia del
+    # primer estudiante ese día. Cada estudiante debe pertenecerle ESE día.
+    if curso is None and (_ctx_lote or {}).get('curso') is not None:
+        curso = _ctx_lote.get('curso')
 
     # P3.1 — el lote de PRIMARIA queda cerrado al curso que autorizó el guard.
     #
@@ -15333,14 +16558,12 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
         estudiante = get_tenant_or_404(
             db, Estudiante, item.get('estudiante_id'), current_user, name='estudiante'
         )
-        if not estudiante.activo:
-            return JSONResponse({
-                'error': f'El estudiante {estudiante.nombre_completo} está retirado; no se puede marcar asistencia'
-            }, status_code=403)
-        if curso is not None and estudiante.curso_id != curso.id:
-            return JSONResponse({
-                'error': f'El estudiante {estudiante.nombre_completo} no pertenece al curso indicado'
-            }, status_code=400)
+        # TRAS-1 · pertenencia por PERMANENCIA en la fecha del lote (antes: el
+        # curso actual y «activo»). Fuera de ella —retirado, trasladado o aún
+        # no incorporado— el lote entero se rechaza con la explicación.
+        _err_item, _tramo_item, _ = _permanencia_asistencia(db, current_user, estudiante, curso, fecha)
+        if _err_item is not None:
+            return _err_item
         estudiantes_lote[estudiante.id] = (estudiante, estado_item)
 
     primer_est = estudiantes_lote.get(int(_primer_est))[0] if _primer_est and int(_primer_est) in estudiantes_lote else None
@@ -15370,6 +16593,14 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
             query = query.filter(Asistencia.asignatura_id.is_(None))
 
         asistencia = query.first()
+        if asistencia is not None and curso is not None and asistencia.curso_id \
+                and asistencia.curso_id != curso.id:
+            db.rollback()
+            return JSONResponse({
+                'error': 'MARCA_DE_OTRO_CURSO',
+                'message': (f'{estudiante.nombre_completo} ya tiene una marca ese día en otro '
+                            f'curso; no se sobrescribe desde aquí.'),
+            }, status_code=409)
         if asistencia:
             asistencia.estado = estado_item
             # Igual que en el alta individual: no se redefine `registrado_por`.
@@ -15377,7 +16608,7 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
             db.add(Asistencia(
                 colegio_id=current_user.colegio_id,
                 estudiante_id=estudiante.id,
-                curso_id=estudiante.curso_id,
+                curso_id=curso.id if curso is not None else estudiante.curso_id,
                 asignatura_id=asignatura_id,
                 fecha=fecha,
                 estado=estado_item,
@@ -16943,6 +18174,19 @@ def _cohorte_del_curso_en_ano(db, current_user, curso, ano):
                 .order_by(Estudiante.no_lista, Estudiante.apellido).all())
     if ano is None or curso.ano_escolar_id != ano.id:
         return actuales, None
+
+    # TRAS-1 · un RETIRADO de este curso durante el año sigue siendo parte de
+    # su lote: conserva su boletín (curso, notas y asistencia hasta el día
+    # anterior a su retiro). Quien se trasladó NO se repite aquí: su boletín
+    # de todo el año sale en el lote del curso donde está ahora.
+    _retirados = [e for e in (tenant_filter(db.query(Estudiante), Estudiante, current_user)
+                              .filter(Estudiante.curso_id == curso.id, Estudiante.activo == False)  # noqa: E712
+                              .all())
+                  if _esta_retirado(e) and e.fecha_retiro is not None
+                  and (ano.fecha_inicio is None or e.fecha_retiro >= ano.fecha_inicio)]
+    if _retirados:
+        actuales = sorted(actuales + _retirados,
+                          key=lambda e: (e.no_lista is None, e.no_lista or 0, (e.apellido or '').lower()))
 
     filas = (
         tenant_filter(db.query(HistorialAcademico), HistorialAcademico,
@@ -20655,7 +21899,10 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
     curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
     config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
     ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    estudiantes = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(curso_id=curso_id, activo=True).order_by(Estudiante.no_lista).all()
+    # TRAS-1 · la MISMA lista que la pantalla (incluye a quien se trasladó o
+    # se retiró durante el período, con su número en este curso).
+    from services.stats_service import estudiantes_del_periodo
+    estudiantes, _no_lista_periodo, _avisos_periodo = estudiantes_del_periodo(db, curso, periodo)
     
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso_id, activo=True).all()
     asignatura_ids = list(set(a.asignatura_id for a in asignaciones))
@@ -20708,7 +21955,9 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
     
     from nota_periodo import nota_del_periodo, formatear_nota, promedio_de_notas
     for est in estudiantes:
-        row = [str(est.no_lista or ''), est.nombre_completo[:25]]
+        _av = _avisos_periodo(est)
+        row = [str(_no_lista_periodo(est) or ''),
+               est.nombre_completo[:25] + (' *' if _av else '')]
         notas = []
         for asig in asignaturas:
             # Modelo NUEVO primero
@@ -20773,6 +22022,14 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
         f'(competencia más alta con valor), no el promedio de las competencias. '
         f'«Prom.» es el promedio de esas notas entre las asignaturas.',
         ParagraphStyle('Nota', parent=styles['Normal'], fontSize=7, textColor=colors.HexColor('#555555'))))
+    # TRAS-1 · el asterisco explica la permanencia (traslado, retiro o
+    # incorporación) de cada estudiante marcado. No es una nota ni un resultado.
+    _con_aviso = [(est, _avisos_periodo(est)) for est in estudiantes if _avisos_periodo(est)]
+    for _est, _av in _con_aviso:
+        elements.append(Paragraph(
+            '* %s: %s.' % (_est.nombre_completo, '; '.join(_av)),
+            ParagraphStyle('NotaTras', parent=styles['Normal'], fontSize=7,
+                           textColor=colors.HexColor('#555555'))))
     doc.build(elements)
     buffer.seek(0)
 
@@ -22478,6 +23735,12 @@ def _enriquecer_registro_primaria(db, current_user, curso, config, estudiantes_d
         fila['nacionalidad'] = (getattr(est, 'nacionalidad', '') or '').strip()
         fila['direccion'] = (est.direccion or '').strip()
         fila['condicion_entrada'] = getattr(est, 'condicion_entrada', '') or ''
+        # TRAS-1 · marca de permanencia en la casilla de dirección y, para
+        # quien salió del curso, sin X de condición (como el retiro).
+        if fila.get('marca_movimiento'):
+            fila['direccion'] = ('%s %s' % (fila['marca_movimiento'], fila['direccion'])).strip()
+        if fila.get('retirado'):
+            fila['condicion_entrada'] = ''
 
     if not calificaciones_por_area or not estudiantes_db:
         return
@@ -22506,15 +23769,17 @@ def _enriquecer_registro_primaria(db, current_user, curso, config, estudiantes_d
         for idx, comps in area_data.items():
             est = estudiantes_db[int(idx)]
             objetos = []
+            # TRAS-1 · quien salió del curso no tiene aquí calificación final.
+            _salio = est.__dict__.get('_tras_periodos_visibles') is not None
             for num in (1, 2, 3):
                 obj = califs.get((est.id, asig_id, num))
                 if obj is None:
                     continue
                 objetos.append(obj)
                 if num in comps:
-                    comps[num]['cf_oficial'] = _CP.cf_competencia(obj)
+                    comps[num]['cf_oficial'] = None if _salio else _CP.cf_competencia(obj)
             _exacto, redondeado = _CP.cf_area(objetos)
-            comps['_area'] = {'cf': redondeado}
+            comps['_area'] = {'cf': None if _salio else redondeado}
 
 
 def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_area):
@@ -22555,7 +23820,8 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
     # Antes rearmaba la CF desde `final_competencia` y llamaba a
     # `condicion_final_estudiante`. Eran dos rutas distintas hacia la misma
     # pregunta, y la del acta tampoco sabía el grado.
-    _curso_acta = getattr(estudiantes_db[0], 'curso', None)
+    _curso_acta = (estudiantes_db[0].__dict__.get('_tras_curso_registro')
+                   or getattr(estudiantes_db[0], 'curso', None))
     if _curso_acta is not None and ano_act is not None:
         _ids = list(idx_por_id.keys())
         _precarga = _precarga_curso_canonica(db, current_user, _curso_acta,
@@ -22566,6 +23832,8 @@ def _datos_acta_primaria(db, current_user, estudiantes_db, calificaciones_por_ar
             db, current_user, _ids, ano_act, RecuperacionPrimaria)
         _asist = _asistencias_estudiantes(db, current_user, _ids, ano_act)
         for est in estudiantes_db:
+            if getattr(est, '_fila_vacia', False):
+                continue
             idx = idx_por_id.get(est.id)
             if idx is None:
                 continue
@@ -22668,18 +23936,17 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
     ano_escolar = ano.nombre if ano else f"{date.today().year}-{date.today().year + 1}"
     dias_trabajados = ano.get_dias_trabajados() if ano else {}
     
-    estudiantes_db = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.no_lista).all()
-    
-    estudiantes_raw = [{
+    # TRAS-1 · activos, retirados y trasladados del curso, por su número en él.
+    estudiantes_db, _tras_info = _estudiantes_registro(db, current_user, curso)
+
+    estudiantes_raw = [_fila_registro_tras({
         'id': e.id,
         'no_lista': e.no_lista or idx + 1,
         'nombre': e.nombre_completo,
         'sexo': e.sexo or '',
         'fecha_nacimiento': e.fecha_nacimiento,
         'matricula': e.matricula or '',
-    } for idx, e in enumerate(estudiantes_db[:90])]
+    }, e, _tras_info) for idx, e in enumerate(estudiantes_db[:90])]
     
     # Cargar calificaciones primaria por área
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
@@ -22715,6 +23982,9 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
         if area_data:
             calificaciones_por_area[asignatura.nombre] = area_data
     
+    # TRAS-1 · quien salió del curso: solo los períodos que cursó en él.
+    _ocultar_periodos_primaria(calificaciones_por_area, estudiantes_db[:90])
+
     # REG-3: lo que el Registro de Primaria ya debía recibir (solo lectura).
     _enriquecer_registro_primaria(db, current_user, curso, config, estudiantes_db[:90],
                                   estudiantes_raw, colegio_info, calificaciones_por_area)
@@ -22728,7 +23998,9 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
             colegio_info, curso_info, ano_escolar,
             estudiantes_raw, calificaciones_por_area, asistencia,
             dias_trabajados, grado_numero,
-            *_datos_acta_primaria(db, current_user, estudiantes_db[:90], calificaciones_por_area)
+            *_acta_primaria_sin_salidos(
+                _datos_acta_primaria(db, current_user, estudiantes_db[:90], calificaciones_por_area),
+                estudiantes_db[:90])
         )
         pdf_bytes = aplicar_marca_borrador(pdf_bytes)
         
@@ -22830,18 +24102,17 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
     ano_escolar = ano.nombre if ano else f"{date.today().year}-{date.today().year + 1}"
     dias_trabajados = ano.get_dias_trabajados() if ano else {}
     
-    estudiantes_db = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.no_lista).all()
-    
-    estudiantes_raw = [{
+    # TRAS-1 · activos, retirados y trasladados del curso, por su número en él.
+    estudiantes_db, _tras_info = _estudiantes_registro(db, current_user, curso)
+
+    estudiantes_raw = [_fila_registro_tras({
         'id': e.id,
         'no_lista': e.no_lista or idx + 1,
         'nombre': e.nombre_completo,
         'sexo': e.sexo or '',
         'fecha_nacimiento': e.fecha_nacimiento,
         'matricula': e.matricula or '',
-    } for idx, e in enumerate(estudiantes_db[:90])]
+    }, e, _tras_info) for idx, e in enumerate(estudiantes_db[:90])]
     
     # Cargar calificaciones por área por competencia
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
@@ -22880,6 +24151,9 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
         if area_data:
             calificaciones_por_area[asignatura.nombre] = area_data
     
+    # TRAS-1 · quien salió del curso: solo los períodos que cursó en él.
+    _ocultar_periodos_primaria(calificaciones_por_area, estudiantes_db[:90])
+
     # REG-3: lo que el Registro de Primaria ya debía recibir (solo lectura).
     _enriquecer_registro_primaria(db, current_user, curso, config, estudiantes_db[:90],
                                   estudiantes_raw, colegio_info, calificaciones_por_area)
@@ -22892,7 +24166,9 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
             colegio_info, curso_info, ano_escolar,
             estudiantes_raw, calificaciones_por_area, asistencia_por_mes,
             dias_trabajados, grado_numero,
-            *_datos_acta_primaria(db, current_user, estudiantes_db[:90], calificaciones_por_area)
+            *_acta_primaria_sin_salidos(
+                _datos_acta_primaria(db, current_user, estudiantes_db[:90], calificaciones_por_area),
+                estudiantes_db[:90])
         )
         
         filename = f"Registro_Primaria_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
@@ -23007,11 +24283,10 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     
     ano_escolar = ano.nombre if ano else f"{date.today().year}-{date.today().year + 1}"
     
-    estudiantes_db = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.no_lista).all()
-    
-    estudiantes_raw = [{
+    # TRAS-1 · activos, retirados y trasladados del curso, por su número en él.
+    estudiantes_db, _tras_info = _estudiantes_registro(db, current_user, curso)
+
+    estudiantes_raw = [_fila_registro_tras({
         'id': e.id,
         'no_lista': e.no_lista or idx + 1,
         'nombre': e.nombre_completo,
@@ -23027,7 +24302,7 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
         'nacionalidad': getattr(e, 'nacionalidad', '') or '',
         'direccion': e.direccion or '',
         'condicion_entrada': getattr(e, 'condicion_entrada', 'nuevo') or 'nuevo',
-    } for idx, e in enumerate(estudiantes_db[:90])]
+    }, e, _tras_info) for idx, e in enumerate(estudiantes_db[:90])]
     # REG-2: datos que el Registro de Secundaria ya tenía en la base y no
     # recibía (apellidos/nombres, correo, Salida Optativa, situación final).
     _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
@@ -23199,11 +24474,10 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     ano_escolar = ano.nombre if ano else f"{date.today().year}-{date.today().year + 1}"
     
     # Estudiantes del curso (máximo 40)
-    estudiantes_db = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter_by(
-        curso_id=curso_id, activo=True
-    ).order_by(Estudiante.no_lista).all()
-    
-    estudiantes_raw = [{
+    # TRAS-1 · activos, retirados y trasladados del curso, por su número en él.
+    estudiantes_db, _tras_info = _estudiantes_registro(db, current_user, curso)
+
+    estudiantes_raw = [_fila_registro_tras({
         'id': e.id,
         'no_lista': e.no_lista or idx + 1,
         'nombre': e.nombre_completo,
@@ -23219,7 +24493,7 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
         'nacionalidad': getattr(e, 'nacionalidad', '') or '',
         'direccion': e.direccion or '',
         'condicion_entrada': getattr(e, 'condicion_entrada', 'nuevo') or 'nuevo',
-    } for idx, e in enumerate(estudiantes_db[:90])]
+    }, e, _tras_info) for idx, e in enumerate(estudiantes_db[:90])]
     # REG-2: datos que el Registro de Secundaria ya tenía en la base y no
     # recibía (apellidos/nombres, correo, Salida Optativa, situación final).
     _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
@@ -23459,6 +24733,189 @@ def _cargar_especificacion_curricular(db: Session, current_user, curso, grado_nu
     return salida
 
 
+# ══ TRAS-1 · QUIÉNES VAN EN EL REGISTRO DE UN CURSO ══════════════════════
+#
+# Antes: los ACTIVOS del curso actual. Un retirado desaparecía (y las filas
+# de los demás subían), un trasladado desaparecía del origen y el destino se
+# bloqueaba con sus marcas válidas de la tarde.
+#
+# Ahora: quienes pertenecieron al curso en su año (`permanencia.miembros_curso`),
+# cada uno con SU número en el curso y su permanencia:
+#   · fuera de ella, la celda de asistencia es «-» (no aplica, no cuenta);
+#   · quien salió (trasladado o retirado) conserva su fila y sus notas de los
+#     períodos que cursó allí, sin calificación final ni condición (la emite
+#     el curso donde termina el año); nunca se presenta como aprobado o
+#     reprobado por el movimiento;
+#   · en la casilla de residencia y en la de correo, la marca de texto que ya
+#     usaba el retiro: [RET dd/mm/aa], [TRAS a curso dd/mm/aa] o
+#     [INC de curso dd/mm/aa].
+#
+# Los datos de permanencia viajan como atributos transitorios del objeto (no
+# son columnas y no se guardan): `build_asistencia_registro` lee las
+# ventanas y la carga de notas los períodos visibles.
+
+def _nombre_corto_curso(curso):
+    if curso is None:
+        return ''
+    tanda = (curso.tanda.nombre if curso.tanda else '') or ''
+    grado = curso.grado.nombre if curso.grado else ''
+    return ('%s %s %s' % (grado, curso.nombre or '', tanda[:3].upper())).strip()
+
+
+def _estudiantes_registro(db, current_user, curso):
+    """`(estudiantes_db, info)` del Registro del curso. Ver el bloque TRAS-1."""
+    import permanencia as _PERM
+    miembros = _PERM.miembros_curso(db, curso, current_user.colegio_id)
+    ano = db.get(AnoEscolar, curso.ano_escolar_id) if curso.ano_escolar_id else None
+    rangos = ASIS.rangos_periodos(ano) if ano is not None else []
+    cursos = {}
+
+    def _curso(cid):
+        if cid not in cursos:
+            cursos[cid] = tenant_filter(db.query(Curso), Curso, current_user).filter_by(id=cid).first()
+        return cursos[cid]
+
+    def _f(d):
+        return d.strftime('%d/%m/%y') if d else ''
+
+    lista, info = [], {}
+    for m in miembros:
+        est = m.estudiante
+        est.__dict__['_tras_ventanas'] = m.ventanas
+        est.__dict__['_tras_curso_registro'] = curso
+        marca = None
+        if m.salio:
+            salida = m.ultimo.fecha_salida
+            est.__dict__['_tras_periodos_visibles'] = {
+                p for p, ini, _fin in rangos if salida is None or ini < salida}
+            if m.ultimo.motivo_fin == _PERM.TRASLADO:
+                marca = '[TRAS a %s %s]' % (_nombre_corto_curso(_curso(m.ultimo.curso_destino_id)), _f(salida))
+            else:
+                marca = '[RET %s]' % _f(salida)
+        else:
+            est.__dict__.pop('_tras_periodos_visibles', None)
+            # El tramo VIGENTE dice cómo está hoy en el curso: llegó por traslado
+            # (también al volver a su curso original) o se reincorporó.
+            if m.ultimo.motivo_inicio == _PERM.TRASLADO:
+                marca = '[INC de %s %s]' % (_nombre_corto_curso(_curso(m.ultimo.curso_origen_id)), _f(m.ultimo.desde))
+            elif m.ultimo.motivo_inicio == _PERM.REACTIVACION:
+                marca = '[REINC %s]' % _f(m.ultimo.desde)
+        info[est.id] = {'no_lista': m.no_lista, 'salio': m.salio, 'marca': marca}
+        lista.append(est)
+    return _con_filas_vacias(lista, info, curso), info
+
+
+class _FilaVaciaRegistro:
+    """Un número de lista que nadie tiene en el curso (un hueco).
+
+    El Registro imprime las filas por POSICIÓN y la plantilla trae los números
+    1..40 impresos: sin esta fila, el n.º 5 caería en la fila 4. Es una fila
+    sin datos: no tiene notas, asistencia ni condición, no es un estudiante y
+    no se guarda en ningún sitio.
+    """
+    _fila_vacia = True
+
+    def __init__(self, numero, curso):
+        self.id = -int(numero)            # nunca coincide con un estudiante real
+        self.no_lista = numero
+        self.nombre = self.apellido = self.nombre_completo = ''
+        self.email = self.sexo = self.cedula = self.matricula = self.direccion = ''
+        self.lugar_nacimiento = self.nacionalidad = self.condicion_entrada = self.condicion = ''
+        self.fecha_nacimiento = self.fecha_ingreso = self.fecha_retiro = None
+        self.activo = False
+        self.curso = curso
+        self.curso_id = getattr(curso, 'id', None)
+        self.colegio_id = getattr(curso, 'colegio_id', None)
+        self.intervalos_no_aplica = []
+        self._tras_curso_registro = curso
+
+
+def _con_filas_vacias(lista, info, curso):
+    """Fila = número de lista. Si hay huecos (un número que nadie tiene), se
+    intercala una fila vacía para que cada estudiante quede en la fila de SU
+    número. Sin huecos la lista es la misma de siempre. Con números repetidos o
+    sin número (datos antiguos) no se puede ubicar por número y se deja como
+    estaba (por orden)."""
+    numeros = [(info.get(e.id) or {}).get('no_lista') for e in lista]
+    if not lista or any(n is None or int(n) <= 0 for n in numeros) or len(set(numeros)) != len(numeros):
+        return lista
+    por_numero = {int(n): e for n, e in zip(numeros, lista)}
+    mayor = max(por_numero)
+    if mayor == len(lista):
+        return lista
+    return [por_numero.get(n) or _FilaVaciaRegistro(n, curso) for n in range(1, mayor + 1)]
+
+
+def _fila_registro_tras(fila, est, info):
+    """Completa la fila del generador con número y marcas de permanencia."""
+    if getattr(est, '_fila_vacia', False):
+        # Hueco de numeración: una fila sin datos, con su número.
+        fila.update({'no_lista': est.no_lista, 'fila_vacia': True, 'condicion_entrada': '',
+                     'nombre': '', 'sexo': ''})
+        return fila
+    i = info.get(est.id) or {}
+    if i.get('no_lista') is not None:
+        fila['no_lista'] = i['no_lista']
+    if i.get('salio'):
+        fila['retirado'] = True            # sin X de condición, como el retiro
+        fila['fecha_retiro'] = est.fecha_retiro.isoformat() if est.fecha_retiro else None
+    if i.get('marca'):
+        fila['marca_movimiento'] = i['marca']
+    return fila
+
+
+def _ocultar_periodos_no_cursados(calificaciones, estudiantes_db):
+    """Quien salió del curso: solo los períodos que cursó en él, y sin CF.
+
+    Las notas siguen en la base tal cual; esto solo decide qué imprime ESTE
+    Registro. El curso donde termina el año imprime todas y su calificación.
+    """
+    for idx, est in enumerate(estudiantes_db):
+        visibles = est.__dict__.get('_tras_periodos_visibles')
+        if visibles is None or idx not in calificaciones:
+            continue
+        datos = calificaciones[idx]
+        for p in (1, 2, 3, 4):
+            if p in visibles:
+                continue
+            for comp in (datos.get('competencias') or {}).values():
+                comp['p%d' % p] = None
+                comp['rp%d' % p] = None
+            if 'pc%d' % p in datos:
+                datos['pc%d' % p] = None
+        if 'promedios_competencia' in datos:
+            datos['promedios_competencia'] = {k: None for k in datos['promedios_competencia']}
+        for k in ('cf', 'cf_exacto', 'evaluacion_extra'):
+            if k in datos:
+                datos[k] = None
+    return calificaciones
+
+
+def _ocultar_periodos_primaria(calificaciones_por_area, estudiantes_db):
+    for area_data in calificaciones_por_area.values():
+        for idx, comps in area_data.items():
+            est = estudiantes_db[int(idx)]
+            visibles = est.__dict__.get('_tras_periodos_visibles')
+            if visibles is None:
+                continue
+            for comp in comps.values():
+                for p in (1, 2, 3, 4):
+                    if p not in visibles:
+                        comp['p%d' % p] = None
+                        comp['rp%d' % p] = None
+                comp['final_competencia'] = None
+    return calificaciones_por_area
+
+
+def _acta_primaria_sin_salidos(datos, estudiantes_db):
+    recuperaciones, condiciones = datos
+    for idx, est in enumerate(estudiantes_db):
+        if est.__dict__.get('_tras_periodos_visibles') is not None:
+            recuperaciones.pop(idx, None)
+            condiciones.pop(idx, None)
+    return recuperaciones, condiciones
+
+
 def _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
                                     estudiantes_db, estudiantes_raw):
     """REG-2 · Completa lo que el Registro de Secundaria ya debía recibir.
@@ -23491,7 +24948,8 @@ def _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
     situaciones = {}
     if ano is not None and estudiantes_db:
         try:
-            paquetes = _situaciones_por_estudiante(db, current_user, estudiantes_db, ano)
+            paquetes = _situaciones_por_estudiante(
+                db, current_user, [e for e in estudiantes_db if not getattr(e, '_fila_vacia', False)], ano)
             for est_id, paq in paquetes.items():
                 sit = RAC.situacion_boletin_secundaria(paq['situacion'], paq.get('diagnosticos', ()))
                 situaciones[est_id] = {'promovido': bool(sit.get('promovido')),
@@ -23506,7 +24964,10 @@ def _enriquecer_registro_secundaria(db, current_user, curso, ano, curso_info,
         fila['apellidos'] = est.apellido or ''
         fila['nombres'] = est.nombre or ''
         fila['email'] = (est.email or '').strip()
-        fila['situacion_final'] = situaciones.get(est.id)
+        # TRAS-1 · quien salió del curso no tiene aquí situación final: el
+        # traslado o el retiro no es una aprobación ni una reprobación.
+        fila['situacion_final'] = (None if est.__dict__.get('_tras_periodos_visibles') is not None
+                                   else situaciones.get(est.id))
 
 
 def _respuesta_conflicto_espec(exc):
@@ -24062,9 +25523,9 @@ def _cargar_datos_asignaturas_secundaria(db: Session, current_user, curso_id, gr
         # CF aparece SOLO cuando los 4 PC están completos.
         # Confiamos en la lógica de Calificacion.calcular_pc / calcular_cf del modelo,
         # que retorna None si faltan datos (no hay fallbacks que inventen promedios).
-        calificaciones = _calificaciones_de_asignatura(
+        calificaciones = _ocultar_periodos_no_cursados(_calificaciones_de_asignatura(
             db, current_user, asignatura, estudiantes_db,
-            _ano_registro, _extras_idx, _serial_ev)
+            _ano_registro, _extras_idx, _serial_ev), estudiantes_db)
         
         # Asistencia por materia
         asistencias_por_est = {}

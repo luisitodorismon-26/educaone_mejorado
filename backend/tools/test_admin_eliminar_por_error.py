@@ -257,8 +257,15 @@ with client:
                             and isinstance(_a.args[0], _ast.Constant)
                             and str(_a.args[0].value).startswith('estudiantes.')):
                         _con_fk.add(_n2.name)
+    # TRAS-1 · Toda tabla con FK a estudiantes está en UNA de dos listas: la del
+    # borrado (ficha creada por error) o la de las que PROTEGEN la ficha
+    # (traslados, reactivaciones, números reservados: historia real que no se
+    # borra en cascada; con filas ahí, la eliminación se rechaza). Ninguna puede
+    # quedar fuera de las dos, y ninguna en las dos a la vez.
+    _protegen = set(getattr(APP, '_MODELOS_QUE_PROTEGEN_LA_FICHA', ()))
     check('E00 la lista del borrado cubre TODAS las tablas con FK a estudiantes',
-          set(APP._MODELOS_DEL_ESTUDIANTE) == _con_fk,
+          (set(APP._MODELOS_DEL_ESTUDIANTE) | _protegen) == _con_fk
+          and not (set(APP._MODELOS_DEL_ESTUDIANTE) & _protegen),
           'faltan: %s  sobran: %s'
           % (sorted(_con_fk - set(APP._MODELOS_DEL_ESTUDIANTE)),
              sorted(set(APP._MODELOS_DEL_ESTUDIANTE) - _con_fk)))

@@ -46,10 +46,10 @@ export const TabEvaluacionesExtra: React.FC<Props> = ({ estudiantes, asignaturaI
   const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error' | 'warning'; texto: string } | null>(null);
 
   const conPendiente = estudiantes.filter(
-    e => e.evaluacion_extra?.fase_pendiente && !e.estudiante.retirado
+    e => e.evaluacion_extra?.fase_pendiente && !e.estudiante.retirado && !e.permanencia?.solo_lectura
   );
   const conResuelta = estudiantes.filter(
-    e => e.evaluacion_extra && !e.evaluacion_extra.fase_pendiente && !e.estudiante.retirado
+    e => e.evaluacion_extra && !e.evaluacion_extra.fase_pendiente && !e.estudiante.retirado && !e.permanencia?.solo_lectura
   );
 
   const guardarExtra = async (estId: number, fase: Fase) => {

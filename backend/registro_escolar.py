@@ -1292,6 +1292,56 @@ def _filas_max() -> int:
     return activa['filas'] if activa else FILAS_PLANTILLA
 
 
+# TRAS-1 · LEYENDAS DE PERMANENCIA. Van en el margen SUPERIOR de la hoja, que
+# la plantilla deja en blanco, y solo cuando el Registro tiene estudiantes con
+# retiro, traslado o reincorporación: un curso sin movimientos sale idéntico.
+LEYENDA_MARCAS = ('Marcas: [RET dd/mm/aa] retirado desde esa fecha · [TRAS a curso dd/mm/aa] '
+                  'trasladado a ese curso desde esa fecha · [INC de curso dd/mm/aa] incorporado por '
+                  'traslado desde esa fecha · [REINC dd/mm/aa] reincorporado desde esa fecha.')
+LEYENDA_NO_APLICA = ('«-» = No aplica: el estudiante no pertenecía al curso ese día (antes de su alta o '
+                     'incorporación, o después de su traslado o retiro). No cuenta como ausencia ni como '
+                     'día esperado. Los feriados y días sin clase no tienen columna.')
+
+
+def _leyenda_margen(c: canvas.Canvas, texto: str):
+    """Leyenda en el margen superior, una sola vez por hoja."""
+    _leyenda_margen_en(c, PAGE_W, PAGE_H, texto)
+
+
+def _leyenda_margen_en(c: canvas.Canvas, page_w: float, page_h: float, texto: str):
+    """Igual que `_leyenda_margen`, para una hoja de tamaño dado."""
+    if getattr(c, '_tras_leyenda', None) == texto:
+        return
+    c._tras_leyenda = texto
+    size = 6.0
+    ancho = page_w - 2 * 54
+    c.setFont(FONT_NORMAL, size)
+    c.setFillColorRGB(*AZUL)
+    palabras, lineas, actual = texto.split(), [], ''
+    for pal in palabras:
+        prueba = (actual + ' ' + pal).strip()
+        if c.stringWidth(prueba, FONT_NORMAL, size) <= ancho:
+            actual = prueba
+        else:
+            lineas.append(actual)
+            actual = pal
+    if actual:
+        lineas.append(actual)
+    y = page_h - 18
+    for ln in lineas[:3]:
+        c.drawString(54, y, ln)
+        y -= size + 1.5
+
+
+class FilaVacia(dict):
+    """TRAS-1 · Fila de un número de lista que nadie tiene (hueco). Es un dict
+    para que los recorridos por índice sigan funcionando, pero es FALSO para que
+    los `if not est: continue` de cada hoja la dejen en blanco."""
+
+    def __bool__(self):
+        return False
+
+
 def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
     """
     Dibuja la tabla de datos generales del estudiante (Pg 11).
@@ -1309,6 +1359,8 @@ def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
     }
     """
     table = _geo(ESTUDIANTES_TABLE)
+    if any(e and e.get("marca_movimiento") for e in estudiantes):
+        _leyenda_margen(c, LEYENDA_MARCAS)
     
     for i, est in enumerate(estudiantes[:_filas_max()]):
         if not est:
@@ -1354,7 +1406,11 @@ def draw_datos_estudiantes(c: canvas.Canvas, estudiantes: List[Dict]):
         
         # Lugar de residencia (con marca de RETIRADO si aplica)
         lugar = est.get("lugar_residencia", "") or ""
-        if est.get("retirado") and est.get("fecha_retiro"):
+        if est.get("marca_movimiento"):
+            # TRAS-1 · [RET dd/mm/aa], [TRAS a … dd/mm/aa], [INC de … dd/mm/aa]:
+            # la misma convención de texto que ya usaba el retiro.
+            lugar_con_marca = f"{est['marca_movimiento']} {lugar}".strip()
+        elif est.get("retirado") and est.get("fecha_retiro"):
             # Anteponer marca de retiro a la dirección. Formato compacto: "RET DD/MM/YY"
             try:
                 fr = est["fecha_retiro"]  # YYYY-MM-DD
@@ -1414,6 +1470,8 @@ def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict],
     REG-2: 1ro usa CONDICION_TABLE; 2do-6to, CONDICION_TABLE_2A6.
     """
     table = _geo(CONDICION_TABLE if grado == 1 else CONDICION_TABLE_2A6)
+    if any(e and e.get("marca_movimiento") for e in estudiantes):
+        _leyenda_margen(c, LEYENDA_MARCAS)
     # En 2do-6to las casillas miden 21 pt: la X se centra. En 1ro se conserva
     # exactamente el trazo de siempre.
     centrar = grado != 1
@@ -1432,7 +1490,10 @@ def draw_condicion_inicial(c: canvas.Canvas, estudiantes: List[Dict],
         # Correo electrónico (con marca de retiro si aplica)
         es_retirado = bool(est.get("retirado")) or str(est.get("condicion", "")).lower() == "retirado"
         correo = est.get("correo") or ""
-        if es_retirado:
+        if est.get("marca_movimiento"):
+            # TRAS-1 · misma marca que en datos generales.
+            correo = f"{est['marca_movimiento']} {correo}".strip()
+        elif es_retirado:
             try:
                 fr = est.get("fecha_retiro") or ""
                 marca_ret = f"[RET {fr[8:10]}/{fr[5:7]}]" if fr else "[RETIRADO]"
@@ -1476,6 +1537,9 @@ def draw_asistencia(c: canvas.Canvas, datos_mes: Dict, es_mes_derecho: bool = Fa
     """
     table = _geo(ASISTENCIA_TABLE)
     prefix = "mes_der" if es_mes_derecho else "mes_izq"
+    if datos_mes.get("leyenda_no_aplica") and any(
+            v == "-" for e in (datos_mes.get("asistencias") or []) if e for v in (e.get("dias") or [])):
+        _leyenda_margen(c, LEYENDA_NO_APLICA)
     # REG-2: 21 columnas por mes. Si hay más días, NO se recorta: se rechaza.
     _verificar_capacidad_mes(datos_mes, 21, contexto)
     
@@ -1592,6 +1656,9 @@ def draw_asistencia_4meses(c: canvas.Canvas, meses_pagina: List[Optional[Dict]],
         if not datos_mes:
             continue
         blk = bloques[m]
+        if datos_mes.get("leyenda_no_aplica") and any(
+                v == "-" for e in (datos_mes.get("asistencias") or []) if e for v in (e.get("dias") or [])):
+            _leyenda_margen(c, LEYENDA_NO_APLICA)
 
         if datos_mes.get("nombre_mes"):
             _draw_text(c, blk["nombre_x"], _y(t["nombre_y_plumber"]),
@@ -2386,6 +2453,12 @@ def _generar_registro_escolar(
             if any(m and "filas" in m for m in meses):
                 meses = _meses_desde_matriz(meses, len(estudiantes or []),
                                             datos_bloque.get("docente", ""), _ctx)
+            # TRAS-1 · con traslados, incorporaciones o retiros, la hoja de la
+            # optativa también explica el «-» (no aplica) en el margen superior.
+            if any(e and e.get("marca_movimiento") for e in (estudiantes or [])):
+                for _m in meses:
+                    if _m:
+                        _m["leyenda_no_aplica"] = True
             # REG-1: el índice ES el hueco (meses vacíos incluidos).
             verificar_huecos(meses_necesarios(meses), 2 * len(bloques[bloque_idx]), _ctx)
             # ROTULADO (R3.4.1 §4-§5). El template deja en blanco "SALIDA
@@ -3018,6 +3091,9 @@ def _meses_desde_matriz(matriz, num_est: int, docente: str, contexto: str) -> Li
         dias_mes = list(mes_data.get('dias', []))
         est_list = []
         for fila in (mes_data.get('filas') or [])[:num_est]:
+            if fila.get('fila_vacia'):
+                est_list.append({})          # hueco de numeración: fila en blanco
+                continue
             est_list.append({
                 "dias": [v or None for v in (fila.get('valores') or [])],
                 "total": fila.get("presentes", 0),
@@ -3106,6 +3182,10 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
     estudiantes_nuevo = []
     for idx, est in enumerate(estudiantes[:n_filas]):
         fn = est.get('fecha_nacimiento')
+        if est.get('fila_vacia'):
+            # TRAS-1 · hueco de numeración: fila en blanco con su número.
+            estudiantes_nuevo.append(FilaVacia(numero=est.get('no_lista', idx + 1)))
+            continue
         estudiantes_nuevo.append({
             "numero": est.get('no_lista', idx + 1),
             "nombre": est.get('nombre', ''),
@@ -3135,6 +3215,8 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
             "retirado": bool(est.get('retirado')) or not bool(est.get('activo', True)),
             "fecha_retiro": est.get('fecha_retiro'),
             "motivo_retiro": est.get('motivo_retiro'),
+            # TRAS-1 · marca de permanencia ([RET …], [TRAS a …], [INC de …]).
+            "marca_movimiento": est.get('marca_movimiento'),
         })
     
     asigs_minerd = ASIGNATURAS_CICLO_2 if grado_numero >= 4 else ASIGNATURAS_CICLO_1
@@ -3195,6 +3277,14 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
         if any(m for m in meses_list):
             asistencia_data[asig_key] = {"meses": meses_list}
     
+    # TRAS-1 · con estudiantes trasladados, incorporados o retirados, las hojas
+    # de asistencia que tengan «-» llevan su leyenda en el margen superior.
+    if any(e.get('marca_movimiento') for e in estudiantes_nuevo):
+        for _v in asistencia_data.values():
+            for _m in _v.get("meses") or []:
+                if _m:
+                    _m["leyenda_no_aplica"] = True
+
     # === TRADUCIR CALIFICACIONES ===
     calificaciones_data = {}
     for asig_idx, asig_nombre in enumerate(asigs_minerd):
@@ -3329,6 +3419,9 @@ def generar_registro_desde_sistema(colegio_info, curso_info, ano_escolar, estudi
     hay_dato_final = False
     for idx in range(num_est):
         est = estudiantes_nuevo[idx]
+        if isinstance(est, FilaVacia):
+            promocion_data.append(FilaVacia(numero=est.get("numero")))
+            continue
         notas = {}
         for asig_idx, asig_nombre in enumerate(asigs_minerd):
             if asig_nombre == "Salida Optativa" or asig_nombre not in asignaturas_data:

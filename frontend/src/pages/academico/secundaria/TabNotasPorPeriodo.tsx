@@ -125,7 +125,19 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
   // Renderizar una celda editable (input)
   const renderCelda = (est: EstudianteData, compNum: number, tipo: 'p' | 'rp') => {
     const valor = getValor(est, compNum, tipo);
-    const esRetirado = !!est.estudiante.retirado;
+    // TRAS-1 · quien salió del curso (trasladado o retirado), en solo lectura.
+    const esRetirado = !!est.estudiante.retirado || !!est.permanencia?.solo_lectura;
+    // TRAS-1 · nota registrada antes del traslado: protegida (permiso de Dirección).
+    const protegida = (est.permanencia?.notas_previas_traslado?.[String(compNum)] || [])
+      .includes(tipo === 'p' ? campoP : campoRP);
+    if (protegida && !esRetirado) {
+      return (
+        <span className={getNotaClass(valor)}
+              title="Registrada antes del traslado. Para corregirla hace falta el permiso temporal de corrección de Dirección.">
+          {valor ?? '—'} <span aria-hidden>🔒</span>
+        </span>
+      );
+    }
     // Si no puede editar, está retirado, o el período está cerrado → solo lectura
     if (!puedeEditar || esRetirado || periodoActivoCerrado) {
       return <span className={getNotaClass(valor)}>{valor ?? '—'}</span>;
@@ -247,13 +259,21 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
               </thead>
               <tbody>
                 {estudiantes.map((est, idx) => {
-                  const esRetirado = !!est.estudiante.retirado;
+                  const esRetirado = !!est.estudiante.retirado || !!est.permanencia?.solo_lectura;
+                  const avisos = est.permanencia?.avisos || [];
                   return (
                     <tr key={est.estudiante.id} className={`border-b ${esRetirado ? 'bg-gray-50' : 'hover:bg-gray-50'}`}>
                       <td className="px-2 py-1 text-center text-gray-500">{est.estudiante.no_lista ?? '—'}</td>
                       <td className="px-2 py-1">
-                        {est.estudiante.nombre_completo}
-                        {esRetirado && <span className="ml-1 text-xs text-red-500">(retirado)</span>}
+                        <span className={esRetirado ? 'text-gray-400' : ''}>{est.estudiante.nombre_completo}</span>
+                        {esRetirado && !avisos.length && <span className="ml-1 text-xs text-red-500">(retirado)</span>}
+                        {avisos.length > 0 && (
+                          <div className="text-[10px] text-indigo-700">
+                            {avisos.join(' · ')}
+                            {Object.keys(est.permanencia?.notas_previas_traslado || {}).length > 0
+                              && ' · 🔒 notas registradas antes del traslado'}
+                          </div>
+                        )}
                       </td>
                       {[1, 2, 3, 4].map(c => (
                         <Fragment key={c}>

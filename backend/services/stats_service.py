@@ -823,6 +823,51 @@ def get_stats_cursos(db: Session, user, periodo: int = 0, nivel: str = None) -> 
     return resultado
 
 
+def estudiantes_del_periodo(db: Session, curso, periodo: int):
+    """TRAS-1 · `(estudiantes, no_lista(est), avisos(est))` de Notas por Período.
+
+    Los activos de siempre y, además, quien se trasladó o se retiró si estuvo
+    en el curso en alguna parte del período (con su aviso «Trasladado a…» o
+    «Retirado desde…»), y quien llegó por traslado desde que llegó
+    («Incorporado desde…»). La pantalla y la tabla en PDF usan esta misma
+    lista. Un estudiante sin movimientos ni retiro entra como siempre.
+    """
+    import permanencia as _PERM
+    from asistencia_canonica import rangos_periodos as _rangos
+    _ano_c = db.get(AnoEscolar, curso.ano_escolar_id) if curso.ano_escolar_id else None
+    _rango = next(((i, f) for p, i, f in _rangos(_ano_c) if p == periodo), None) if _ano_c else None
+    _cursos_nombre = {}
+
+    def _nombre_curso(cid):
+        if cid not in _cursos_nombre:
+            _c = db.get(Curso, cid) if cid else None
+            _cursos_nombre[cid] = getattr(_c, 'nombre_completo', '') if _c else ''
+        return _cursos_nombre[cid]
+
+    def _incluye(m):
+        con_mov = m.salio or m.primero.motivo_inicio != _PERM.INICIO or len(m.en_curso) > 1
+        if not con_mov:
+            return bool(m.estudiante.activo)
+        if _rango is None:
+            return not m.salio
+        ini, fin = _rango
+        return any((t.desde is None or t.desde <= fin) and (t.hasta is None or t.hasta >= ini)
+                   for t in m.en_curso)
+
+    miembros = [m for m in _PERM.miembros_curso(db, curso, curso.colegio_id) if _incluye(m)]
+    miembro_de = {m.estudiante.id: m for m in miembros}
+
+    def no_lista(est):
+        m = miembro_de.get(est.id)
+        return (m.no_lista if m is not None else est.no_lista) or 0
+
+    def avisos(est):
+        m = miembro_de.get(est.id)
+        return _PERM.avisos_miembro(m, _nombre_curso) if m is not None else []
+
+    return [m.estudiante for m in miembros], no_lista, avisos
+
+
 def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -> dict:
     """
     Calificaciones por período. Detecta el nivel del curso y rutea a la
@@ -842,11 +887,10 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
     nivel = (grado.nivel or 'secundaria').lower() if grado else 'secundaria'
     es_primaria = nivel == 'primaria'
 
-    estudiantes = (
-        tenant_filter(db.query(Estudiante), Estudiante, user)
-        .filter_by(curso_id=curso_id, activo=True)
-        .order_by(Estudiante.no_lista).all()
-    )
+    # TRAS-1 · quienes pertenecieron al curso durante ESE período (ver
+    # `estudiantes_del_periodo`). Sin movimientos ni retiros, la lista de siempre.
+    estudiantes, _no_lista, _avisos = estudiantes_del_periodo(db, curso, periodo)
+
     est_ids = [e.id for e in estudiantes]
     if not est_ids:
         return {
@@ -891,7 +935,8 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
         result_est = []
         for est in estudiantes:
             d = {'estudiante_id': est.id, 'nombre': est.nombre_completo,
-                 'no_lista': est.no_lista or 0, 'asignaturas': {}, 'promedio': None}
+                 'no_lista': _no_lista(est), 'asignaturas': {}, 'promedio': None,
+                 'avisos': _avisos(est)}
             notas = []
             for asig in asignaturas:
                 comps = comps_por_est_asig.get((est.id, asig.id), [])
@@ -968,7 +1013,8 @@ def get_calificaciones_periodo(db: Session, user, curso_id: int, periodo: int) -
     pc_key = f'pc{periodo}'
     result_est = []
     for est in estudiantes:
-        d = {'estudiante_id': est.id, 'nombre': est.nombre_completo, 'no_lista': est.no_lista or 0, 'asignaturas': {}, 'promedio': None}
+        d = {'estudiante_id': est.id, 'nombre': est.nombre_completo, 'no_lista': _no_lista(est),
+             'asignaturas': {}, 'promedio': None, 'avisos': _avisos(est)}
         notas = []
         for asig in asignaturas:
             # Modelo nuevo primero

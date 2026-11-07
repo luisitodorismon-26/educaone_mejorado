@@ -109,7 +109,11 @@ def _evaluar_cobertura_asistencia(
     curso_id: int,
     estudiantes: List[Estudiante],
     asignatura_ids: Optional[List[int]] = None,
+    ventanas_por_est: Optional[Dict[int, list]] = None,
 ) -> Dict[str, Any]:
+    """TRAS-1 · Con `ventanas_por_est` (curso con traslados o retiros), lo
+    esperado se cuenta celda a celda: solo los días en que cada estudiante
+    PERTENECÍA al curso. Sin ese parámetro, la cuenta de siempre."""
     from registro_asistencia import build_asistencia_registro
 
     resultado = {
@@ -120,7 +124,8 @@ def _evaluar_cobertura_asistencia(
 
     objetivos = asignatura_ids if asignatura_ids else [None]
     for asig_id in objetivos:
-        matriz = build_asistencia_registro(db, curso_id, asignatura_id=asig_id, estudiantes=estudiantes)
+        matriz = build_asistencia_registro(db, curso_id, asignatura_id=asig_id, estudiantes=estudiantes,
+                                           ventanas_por_est=ventanas_por_est)
         if not matriz:
             continue
 
@@ -136,6 +141,10 @@ def _evaluar_cobertura_asistencia(
             esperado = dias_computables * len(estudiantes)
             cobertura_pct = mes.get('cobertura_registro_pct', 0.0)
             cubierto = round((esperado * cobertura_pct) / 100) if esperado else 0
+            if ventanas_por_est:
+                filas = mes.get('filas') or []
+                esperado = sum(f.get('dias_aplicables', 0) for f in filas)
+                cubierto = sum(f.get('con_dato', 0) for f in filas)
             faltante = max(esperado - cubierto, 0)
 
             resultado['total_esperado'] += esperado
@@ -150,6 +159,74 @@ def _evaluar_cobertura_asistencia(
                 })
 
     return resultado
+
+
+def _permanencia_registro(db: Session, curso, colegio_id: int):
+    """TRAS-1 · Quiénes entran en el Registro del curso y en qué días.
+
+    Devuelve `(miembros, ventanas, hay_movimientos)`:
+      · `miembros`: los activos del curso, sus retirados y quienes entraron o
+        salieron por traslado (ver `permanencia.miembros_curso`), por número;
+      · `ventanas`: `{estudiante_id: [(desde, hasta)]}` de cada uno EN ESTE curso;
+      · `hay_movimientos`: si alguno tiene retiro o traslado. Si nadie lo tiene
+        el Registro se valida exactamente como antes.
+    """
+    import permanencia as P
+    miembros = P.miembros_curso(db, curso, colegio_id)
+    ventanas = {m.estudiante.id: m.ventanas for m in miembros}
+    hay = any(m.salio or m.primero.motivo_inicio != P.INICIO or len(m.en_curso) > 1
+              for m in miembros)
+    return miembros, ventanas, hay
+
+
+def _marcas_fuera_de_permanencia(db: Session, curso_id: int, miembros) -> Dict[str, Any]:
+    """TRAS-1 · Marcas que contradicen la permanencia, SIN tocarlas.
+
+    · `inconsistentes`: marcas de OTRO curso en un día en que el estudiante
+      pertenecía a ESTE (eso sí es un error de datos);
+    · `fuera`: marcas de ESTE curso en días en que el estudiante no le
+      pertenecía (después de trasladarse o retirarse, antes de incorporarse).
+      Se ven en el Registro pero no cuentan; aquí se explican.
+    Las marcas válidas del curso anterior no son ni lo uno ni lo otro.
+    """
+    ids = [m.estudiante.id for m in miembros]
+    out = {'inconsistentes': 0, 'fuera': []}
+    if not ids:
+        return out
+    por_id = {m.estudiante.id: m for m in miembros}
+    for a in db.query(Asistencia).filter(Asistencia.estudiante_id.in_(ids)).all():
+        m = por_id[a.estudiante_id]
+        if a.curso_id is None:
+            continue
+        if a.curso_id == curso_id:
+            if not m.aplica(a.fecha):
+                out['fuera'].append(a)
+        elif m.aplica(a.fecha):
+            out['inconsistentes'] += 1
+    return out
+
+
+def _agregar_aviso_fuera_de_permanencia(r, fuera, miembros) -> None:
+    """Explica (advertencia) las marcas de este curso fuera de la permanencia.
+    No se borran, no se mueven y no se cuentan."""
+    if not fuera:
+        return
+    import permanencia as P
+    nombres = {m.estudiante.id: m.estudiante.nombre_completo for m in miembros}
+    por_est: Dict[int, list] = {}
+    for a in fuera:
+        por_est.setdefault(a.estudiante_id, []).append(a.fecha)
+    partes = []
+    for eid, fs in list(por_est.items())[:5]:
+        fs = sorted(fs)
+        txt = ', '.join(P.fmt_fecha(f) for f in fs[:3]) + ('…' if len(fs) > 3 else '')
+        partes.append('%s: %d marca(s) (%s)' % (nombres.get(eid, eid), len(fs), txt))
+    r.add_warning(
+        "Hay %d marca(s) de asistencia de este curso en días en que el estudiante "
+        "no le pertenecía (después de su traslado o retiro, o antes de "
+        "incorporarse). Se conservan y se ven en el Registro, pero no cuentan. "
+        "Revise la fecha del movimiento. %s" % (len(fuera), '; '.join(partes)))
+    r.info['marcas_fuera_de_permanencia'] = len(fuera)
 
 
 def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> ValidationResult:
@@ -218,14 +295,16 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
     r.info['dias_trabajados_configurados_total'] = _sumar_dias_trabajados(ano)
     
     # === 4. ESTUDIANTES DEL CURSO ===
-    estudiantes = db.query(Estudiante).filter_by(
-        curso_id=curso_id, activo=True
-    ).all()
-    
-    if not estudiantes:
+    # TRAS-1 · los del curso en su año: activos, retirados y quienes entraron
+    # o salieron por traslado, cada uno con su número en el curso.
+    miembros, ventanas, hay_movimientos = _permanencia_registro(db, curso, colegio_id)
+    estudiantes = [m.estudiante for m in miembros]
+    salieron = {m.estudiante.id for m in miembros if m.salio}
+
+    if not any(m.estudiante.activo for m in miembros):
         r.add_error(f"El curso '{curso.nombre_completo}' no tiene estudiantes activos")
         return r
-    
+
     # REG-43: la plantilla y su capacidad las decide el generador
     # (`seleccionar_plantilla`); aquí se adelanta su respuesta con el MISMO
     # mensaje. Antes se avisaba de que "se tomarán los primeros 40", pero el
@@ -242,9 +321,11 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
     r.info['total_estudiantes'] = len(estudiantes)
     r.info['estudiante_ids'] = [e.id for e in estudiantes]
     
-    # Validar que todos los estudiantes tengan curso_id correcto (consistencia)
-    for e in estudiantes:
-        if e.curso_id != curso_id:
+    # Validar que todos los estudiantes tengan curso_id correcto (consistencia).
+    # TRAS-1 · quien se trasladó tiene la ficha en su nuevo curso: es correcto.
+    for m in miembros:
+        e = m.estudiante
+        if e.curso_id != curso_id and m.ultimo.motivo_fin != 'traslado':
             r.add_error(f"INCONSISTENCIA: estudiante {e.nombre_completo} (id={e.id}) tiene curso_id={e.curso_id} pero lo encontramos filtrando por curso_id={curso_id}")
     
     # === 5. PROFESOR TITULAR DEL CURSO ===
@@ -308,6 +389,12 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
     # un curso moderno no puede pasar la validación por notas legacy.
     asig_nombre_by_id = {a.id: a.nombre for a in asignaturas}
     _est_ids = [e.id for e in estudiantes]
+    # TRAS-1 · contexto para el mensaje de notas faltantes de quien llegó por
+    # traslado: sus notas anteriores pueden estar en otra asignatura, y no se
+    # trasladan ni se dan por equivalentes automáticamente.
+    import permanencia as _P
+    _incorporados = {m.estudiante.id: m.primero.desde for m in miembros
+                     if m.primero.motivo_inicio == _P.TRASLADO}
     REQ = (1, 2, 3, 4)
     REQ_SET = set(REQ)
 
@@ -352,13 +439,22 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
         asig_nom = asig_nombre_by_id.get(asig_id, f"Asignatura id={asig_id}")
         incompletos: List[str] = []
         for est in estudiantes:
+            # TRAS-1 · quien salió del curso (trasladado o retirado) no recibe
+            # aquí calificación final: no se le exigen los períodos que no
+            # cursó en él. Su nota final la emite el curso donde termina.
+            if est.id in salieron:
+                continue
             by_num = _por_par.get((est.id, asig_id), {})
             faltan_comp = sorted(REQ_SET - set(by_num))
+            _ctx_tras = ((" (incorporado por traslado desde %s: sus notas anteriores "
+                          "no se trasladan ni se dan por equivalentes; requiere "
+                          "decisión de Dirección)" % _P.fmt_fecha(_incorporados[est.id]))
+                         if est.id in _incorporados else "")
             if faltan_comp:
                 _pares_incompletos += 1
                 incompletos.append(
                     f"{est.nombre_completo}: falta(n) la(s) competencia(s) "
-                    f"{', '.join(map(str, faltan_comp))}"
+                    f"{', '.join(map(str, faltan_comp))}{_ctx_tras}"
                 )
                 continue
             # Las 4 competencias distintas existen: validar cada período.
@@ -370,7 +466,7 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
                 _pares_incompletos += 1
                 incompletos.append(
                     f"{est.nombre_completo}: tiene las 4 competencias pero falta(n) "
-                    f"nota(s) del/los período(s) {', '.join(map(str, periodos_incompletos))}"
+                    f"nota(s) del/los período(s) {', '.join(map(str, periodos_incompletos))}{_ctx_tras}"
                 )
                 continue
             _pares_completos += 1
@@ -402,12 +498,21 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
             "todos los estudiantes al menos una vez. Revise captura diaria antes de imprimir."
         )
     
-    # Consistencia: asistencia apunta al curso correcto
-    asist_inconsistentes = db.query(Asistencia).filter(
-        Asistencia.estudiante_id.in_([e.id for e in estudiantes]),
-        Asistencia.curso_id != None,
-        Asistencia.curso_id != curso_id
-    ).count()
+    # Consistencia: asistencia apunta al curso correcto.
+    # TRAS-1 · con traslados o retiros, una marca de otro curso solo es
+    # inconsistente si cae en un día en que el estudiante pertenecía a ESTE;
+    # las del curso anterior, dentro de su tramo allí, son válidas. Y las de
+    # este curso fuera de la permanencia se explican sin tocarlas.
+    if hay_movimientos:
+        _fp = _marcas_fuera_de_permanencia(db, curso_id, miembros)
+        asist_inconsistentes = _fp['inconsistentes']
+        _agregar_aviso_fuera_de_permanencia(r, _fp['fuera'], miembros)
+    else:
+        asist_inconsistentes = db.query(Asistencia).filter(
+            Asistencia.estudiante_id.in_([e.id for e in estudiantes]),
+            Asistencia.curso_id != None,
+            Asistencia.curso_id != curso_id
+        ).count()
     if asist_inconsistentes > 0:
         r.add_error(
             f"INCONSISTENCIA: {asist_inconsistentes} registros de asistencia "
@@ -415,7 +520,15 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
             f"Contacte soporte técnico."
         )
 
-    cobertura = _evaluar_cobertura_asistencia(db, curso_id, estudiantes, asignatura_ids=asignatura_ids)
+    # TRAS-1 · la cobertura de quienes siguen en el curso bloquea, como
+    # siempre; la de quienes ya salieron (días sin lista antes de su traslado
+    # o retiro) se avisa sin bloquear: no se convierte en falta ni en
+    # presencia, y no impide emitir el Registro del resto.
+    _siguen = [e for e in estudiantes if e.id not in salieron]
+    _salidos = [e for e in estudiantes if e.id in salieron]
+    cobertura = _evaluar_cobertura_asistencia(
+        db, curso_id, _siguen, asignatura_ids=asignatura_ids,
+        ventanas_por_est=ventanas if hay_movimientos else None)
     r.info['asistencia_esperada_total'] = cobertura['total_esperado']
     r.info['asistencia_cubierta_total'] = cobertura['total_cubierto']
     if cobertura['total_esperado'] > 0 and cobertura['faltantes']:
@@ -424,6 +537,16 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
             r.add_error(
                 f"Asistencia incompleta en '{asig_nom}' para {item['mes']}: "
                 f"faltan {item['faltante']} de {item['esperado']} celdas esperadas"
+            )
+    if _salidos:
+        _cob_s = _evaluar_cobertura_asistencia(
+            db, curso_id, _salidos, asignatura_ids=asignatura_ids, ventanas_por_est=ventanas)
+        for item in _cob_s['faltantes'][:12]:
+            asig_nom = asig_nombre_by_id.get(item['asignatura_id'], f"Asignatura id={item['asignatura_id']}")
+            r.add_warning(
+                f"Días sin lista de estudiantes trasladados o retirados en '{asig_nom}' "
+                f"para {item['mes']}: {item['faltante']} de {item['esperado']} celdas de "
+                f"su permanencia (quedan en blanco; no cuentan como falta)"
             )
     
     return r
@@ -490,17 +613,21 @@ def validar_registro_primaria(db: Session, curso_id: int, colegio_id: int) -> Va
     r.info['dias_trabajados_configurados_total'] = _sumar_dias_trabajados(ano)
     
     # Estudiantes
-    estudiantes = db.query(Estudiante).filter_by(curso_id=curso_id, activo=True).all()
-    if not estudiantes:
+    # TRAS-1 · activos, retirados y quienes entraron o salieron por traslado.
+    miembros, ventanas, hay_movimientos = _permanencia_registro(db, curso, colegio_id)
+    estudiantes = [m.estudiante for m in miembros]
+    salieron = {m.estudiante.id for m in miembros if m.salio}
+    if not any(m.estudiante.activo for m in miembros):
         r.add_error(f"El curso '{curso.nombre_completo}' no tiene estudiantes activos")
         return r
     if len(estudiantes) > 40:
         r.add_warning(f"Curso con {len(estudiantes)} estudiantes (máximo MINERD 40)")
     r.info['total_estudiantes'] = len(estudiantes)
     
-    # Consistencia
-    for e in estudiantes:
-        if e.curso_id != curso_id:
+    # Consistencia (TRAS-1: quien se trasladó tiene la ficha en su nuevo curso)
+    for m in miembros:
+        e = m.estudiante
+        if e.curso_id != curso_id and m.ultimo.motivo_fin != 'traslado':
             r.add_error(f"INCONSISTENCIA: estudiante {e.nombre_completo} en curso_id distinto")
     
     # Profesor titular (en primaria es el profesor de aula = 1 profesor por curso)
@@ -548,9 +675,10 @@ def validar_registro_primaria(db: Session, curso_id: int, colegio_id: int) -> Va
     
     for asig_id in asignatura_ids:
         # En primaria se espera al menos calificaciones de C1, C2, C3 (3 competencias)
+        _evaluados = [e for e in estudiantes if e.id not in salieron]
         califs = db.query(CalificacionPrimaria).filter(
             CalificacionPrimaria.asignatura_id == asig_id,
-            CalificacionPrimaria.estudiante_id.in_([e.id for e in estudiantes])
+            CalificacionPrimaria.estudiante_id.in_([e.id for e in _evaluados])
         ).all()
         total_califs += len(califs)
         
@@ -562,7 +690,7 @@ def validar_registro_primaria(db: Session, curso_id: int, colegio_id: int) -> Va
             estudiantes_con_3_competencias[c.estudiante_id].add(c.competencia_numero)
         
         estudiantes_completos = sum(1 for comps in estudiantes_con_3_competencias.values() if len(comps) >= 3)
-        faltantes = len(estudiantes) - estudiantes_completos
+        faltantes = len(_evaluados) - estudiantes_completos
         
         if faltantes > 0:
             nom = asig_nombre_by_id.get(asig_id, f"Área id={asig_id}")
@@ -587,7 +715,13 @@ def validar_registro_primaria(db: Session, curso_id: int, colegio_id: int) -> Va
             "todos los estudiantes al menos una vez. Revise captura diaria antes de imprimir."
         )
 
-    cobertura = _evaluar_cobertura_asistencia(db, curso_id, estudiantes)
+    if hay_movimientos:
+        _agregar_aviso_fuera_de_permanencia(
+            r, _marcas_fuera_de_permanencia(db, curso_id, miembros)['fuera'], miembros)
+    _siguen = [e for e in estudiantes if e.id not in salieron]
+    _salidos = [e for e in estudiantes if e.id in salieron]
+    cobertura = _evaluar_cobertura_asistencia(
+        db, curso_id, _siguen, ventanas_por_est=ventanas if hay_movimientos else None)
     r.info['asistencia_esperada_total'] = cobertura['total_esperado']
     r.info['asistencia_cubierta_total'] = cobertura['total_cubierto']
     if cobertura['total_esperado'] > 0 and cobertura['faltantes']:
@@ -596,5 +730,12 @@ def validar_registro_primaria(db: Session, curso_id: int, colegio_id: int) -> Va
                 f"Asistencia incompleta en {item['mes']}: "
                 f"faltan {item['faltante']} de {item['esperado']} celdas esperadas"
             )
+    if _salidos:
+        for item in _evaluar_cobertura_asistencia(
+                db, curso_id, _salidos, ventanas_por_est=ventanas)['faltantes'][:12]:
+            r.add_warning(
+                f"Días sin lista de estudiantes trasladados o retirados en {item['mes']}: "
+                f"{item['faltante']} de {item['esperado']} celdas de su permanencia "
+                f"(quedan en blanco; no cuentan como falta)")
 
     return r

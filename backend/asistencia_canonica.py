@@ -166,6 +166,17 @@ def ventana(ano, estudiante, hoy, primera=None):
     return inicio, fin, EVALUABLE, advertencias
 
 
+def _no_aplica(estudiante, fecha):
+    """TRAS-1 · ¿Cae el día en un hueco entre un retiro y su reactivación?
+
+    Sin movimientos la lista está vacía y nada cambia.
+    """
+    for ini, fin in (getattr(estudiante, 'intervalos_no_aplica', None) or ()):
+        if ini <= fecha <= fin:
+            return True
+    return False
+
+
 def _dedup(filas, inicio, fin):
     """`{fecha: estado}` dentro de [inicio, fin], un voto por día."""
     por_dia = {}
@@ -268,6 +279,12 @@ def resolver(filas, ano, estudiante, hoy, cal=None):
     dias = {}
     d = inicio
     while d <= fin:
+        # TRAS-1 · entre un retiro y su reactivación no pertenecía a ningún
+        # curso: el día NO APLICA, tenga o no una marca (la marca se conserva
+        # en la base; simplemente no cuenta).
+        if _no_aplica(estudiante, d):
+            d += timedelta(days=1)
+            continue
         if d in marcados:
             dias[d] = marcados[d]
         elif _es_lectivo(d, cal):
@@ -348,12 +365,23 @@ def periodos_boletin(r):
     return out
 
 
-def aplica_en(ano, estudiante, fecha, primera=None):
+def aplica_en(ano, estudiante, fecha, primera=None, ventanas=None):
     """¿Ese día cuenta para este estudiante? Para el Registro Escolar.
 
     La MISMA regla que `resolver`: antes de su inicio (año o alta) y después
     del retiro, NO APLICA.
+
+    TRAS-1 · `ventanas` son los tramos `(desde, hasta)` del estudiante EN ESE
+    CURSO (None en un extremo = sin límite). Fuera de ellos —antes de
+    incorporarse por traslado, después de trasladarse o retirarse— tampoco
+    aplica. Sin `ventanas` la regla es exactamente la de antes.
     """
+    if ventanas is not None:
+        if not any((d is None or fecha >= d) and (h is None or fecha <= h)
+                   for d, h in ventanas):
+            return False
+    if _no_aplica(estudiante, fecha):
+        return False
     ano_ini = getattr(ano, 'fecha_inicio', None)
     if ano_ini is not None and fecha < inicio_estudiante(ano_ini, estudiante, primera):
         return False
