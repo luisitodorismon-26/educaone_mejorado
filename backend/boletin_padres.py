@@ -577,17 +577,31 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
         c.drawCentredString(W / 2, y, 'REPORTE DE CALIFICACIONES')
         return _ficha(y - 9) - 7
 
+    # Cabecera de las páginas siguientes: el título conserva su sitio a la
+    # derecha y el nombre del centro ocupa el resto, en las líneas que necesite
+    # (un nombre de hasta 200 caracteres no se monta sobre el título ni sale
+    # del margen). Su alto real entra en la paginación (`_inicio_tabla`).
+    TITULO_CONT = 'REPORTE DE CALIFICACIONES (continuación)'
+    LINEA_CONT = 11
+    ancho_tit_cont = c.stringWidth(TITULO_CONT, 'Helvetica-Bold', 9)
+    lineas_cont = _partir_nombre(c, nombre_colegio, ancho_util - ancho_tit_cont - 18, 'Helvetica-Bold', 9)
+    alto_cab_cont = 19 + (len(lineas_cont) - 1) * LINEA_CONT      # 19 con una línea, como antes
+
     def _cabecera_continuacion():
         """Páginas siguientes: centro, título y la identificación completa."""
         y0 = H - margin
         c.setFillColor(NAVY)
         c.setFont('Helvetica-Bold', 9)
-        c.drawString(margin, y0 - 9, nombre_colegio)
-        c.drawRightString(W - margin, y0 - 9, 'REPORTE DE CALIFICACIONES (continuación)')
+        y_l = y0 - 9
+        for linea in lineas_cont:
+            c.drawString(margin, y_l, linea)
+            y_l -= LINEA_CONT
+        c.drawRightString(W - margin, y0 - 9, TITULO_CONT)
+        y_regla = y0 - alto_cab_cont + 5
         c.setStrokeColor(NAVY)
         c.setLineWidth(0.8)
-        c.line(margin, y0 - 14, W - margin, y0 - 14)
-        return _ficha(y0 - 19) - 7
+        c.line(margin, y_regla, W - margin, y_regla)
+        return _ficha(y0 - alto_cab_cont) - 7
 
     # ─── Filas: alto de cada una (el nombre completo, en las líneas que necesite) ───
     ancho_nombre_asig = col_asig - 6          # 3 pt de margen a cada lado: nunca invade P/RP
@@ -599,7 +613,7 @@ def generar_boletin_padres(estudiante, curso, asignaturas_data, config,
     # ─── Paginación, calculada antes de dibujar ───
     def _inicio_tabla(primera):
         return (H - margin - alto_cab - 3 - 19 - 9 - alto_ficha - 7 if primera
-                else H - margin - 19 - alto_ficha - 7) - alto_cab_tabla
+                else H - margin - alto_cab_cont - alto_ficha - 7) - alto_cab_tabla
     # Las páginas intermedias llegan hasta el pie; la ÚLTIMA deja sitio para
     # asistencia, leyenda y firmas. Si lo que queda no cabe ahí, sus últimas
     # filas pasan a una página más (que repite identificación y encabezado).
