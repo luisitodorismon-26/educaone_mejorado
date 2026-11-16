@@ -40,6 +40,17 @@ self.addEventListener('fetch', (event) => {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
         }
+        // ENT1 · El respaldo sin red ('/') se guardaba solo al INSTALAR el SW y
+        // no se renovaba: tras un despliegue, un fallo de red al abrir la app
+        // arrancaba la versión de aquella instalación (reproducido: una lista
+        // de asistencia sin los avisos de traslado y con controles). Cada
+        // navegación que llega bien actualiza ese respaldo con la versión
+        // vigente. No toca sesiones, datos ni otras entradas de la caché.
+        const tipo = response.headers.get('content-type') || '';
+        if (response.ok && !response.redirected && event.request.mode === 'navigate' && tipo.includes('text/html')) {
+          const copia = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put('/', copia));
+        }
         return response;
       })
       .catch(async () => {
