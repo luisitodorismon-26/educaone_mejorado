@@ -33,12 +33,35 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   if (event.request.url.includes('/api/')) return;
 
+  // Guarda en caché SIN retrasar ni hacer fallar la respuesta: la escritura se
+  // registra con waitUntil (el navegador no termina el SW antes de acabarla) y
+  // un error de caché se absorbe aquí; la navegación sigue con su respuesta.
+  const guardarEnCache = (clave, copia) => {
+    const escritura = caches.open(CACHE_NAME)
+      .then((cache) => cache.put(clave, copia))
+      .catch(() => {});
+    try {
+      event.waitUntil(escritura);
+    } catch (e) {
+      /* el evento ya no admite extensiones: la escritura sigue por su cuenta */
+    }
+  };
+
   event.respondWith(
     fetch(event.request)
       .then((response) => {
         if (response.ok && event.request.url.includes('/assets/')) {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          guardarEnCache(event.request, response.clone());
+        }
+        // ENT1 · El respaldo sin red ('/') se guardaba solo al INSTALAR el SW y
+        // no se renovaba: tras un despliegue, un fallo de red al abrir la app
+        // arrancaba la versión de aquella instalación (reproducido: una lista
+        // de asistencia sin los avisos de traslado y con controles). Cada
+        // navegación que llega bien actualiza ese respaldo con la versión
+        // vigente. No toca sesiones, datos ni otras entradas de la caché.
+        const tipo = response.headers.get('content-type') || '';
+        if (response.ok && !response.redirected && event.request.mode === 'navigate' && tipo.includes('text/html')) {
+          guardarEnCache('/', response.clone());
         }
         return response;
       })
