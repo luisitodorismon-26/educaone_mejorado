@@ -54,22 +54,22 @@ interface SinConfirmar {
   estudianteId: number;
   nombre: string;
   pedido: string | null;          // estado pedido; null = desmarcar
-  seq: number;                    // orden de la operación (para detectar llegadas tardías)
+  seq: number;                    // identifica esta operación entre las de la misma fila
   /** Último estado de asistencia LEÍDO del servidor para esa fila (no es una
    *  confirmación). undefined = aún no leído; null = sin marca. */
   observado?: string | null;
   /** La fila del estudiante no vino en la última lectura (no es un estado de asistencia). */
   filaNoRecibida?: boolean;
 }
-/** La última operación CONFIRMADA por respuesta del servidor para una selección y estudiante. */
-interface Confirmada { pedido: string | null; seq: number; }
 const MSG_SIN_RESPUESTA = 'No se recibió respuesta del servidor: la operación puede haberse aplicado o no. Queda «sin confirmar» y se comprobará el estado al recuperar la conexión; también puede pulsar «Comprobar».';
-const idClaveEst = (clave: string, estudianteId: number) => `${clave}#${estudianteId}`;
 const idOperacion = (clave: string, estudianteId: number, seq: number) => `${clave}#${estudianteId}#${seq}`;
 const textoEstado = (e: string | null | undefined) => (e === undefined ? 'sin leer' : e === null ? 'sin marca' : e);
-/** Lo observado de un pendiente, distinguiendo «fila no recibida» del estado «ausente». */
+/** Lo observado de un pendiente, distinguiendo «fila no recibida» del estado «ausente».
+ *  Una lectura muestra el estado, no qué operación lo produjo: nunca confirma un envío. */
 const textoObservado = (p: SinConfirmar) =>
-  p.filaNoRecibida ? 'fila no recibida en la última lectura' : `servidor ahora: ${textoEstado(p.observado)}`;
+  (p.filaNoRecibida ? 'Fila no recibida en la última lectura'
+    : `El servidor muestra actualmente ${textoEstado(p.observado)}`) + '; no se pudo confirmar este envío';
+const AYUDA_QUITAR_AVISO = 'No cancela el envío ni modifica la asistencia';
 
 export const AsistenciaPage = () => {
   const { user } = useAuth();
@@ -112,7 +112,6 @@ export const AsistenciaPage = () => {
   const guardandoRef = useRef(0);             // guardados en curso
   const revalidarPendienteRef = useRef(false);
   const sinConfirmarRef = useRef<Record<string, SinConfirmar>>({});
-  const confirmadasRef = useRef<Record<string, Confirmada>>({});
   const secOperacionRef = useRef(0);
   const secAsignaturasRef = useRef(0);
 
@@ -226,58 +225,35 @@ export const AsistenciaPage = () => {
   };
 
   /** Tras leer la lista de una selección, anota lo OBSERVADO para cada operación
-   *  sin confirmar de ESA selección. Una operación solo se da por resuelta
-   *  cuando el servidor muestra exactamente lo que ELLA pidió; una fila no
-   *  recibida o un estado distinto no confirman ni descartan nada. Si una
-   *  operación anterior aparece aplicada DESPUÉS de una posterior ya confirmada
-   *  con otro valor, se avisa: llegó tarde y sobrescribió lo último pedido. */
+   *  sin confirmar de ESA selección. Una lectura muestra el estado, no qué
+   *  operación lo produjo (pudo ser este envío, otro, u otro dispositivo): no
+   *  se elimina ningún pendiente porque coincida el valor ni se atribuye el
+   *  estado a una operación. El pendiente sigue hasta una confirmación
+   *  identificable de ESA operación o hasta que la persona quite el aviso. */
   const resolverSinConfirmar = (clave: string, lista: AsistenciaItem[]) => {
     const pendientes = Object.entries(sinConfirmarRef.current).filter(([, p]) => p.clave === clave);
     if (pendientes.length === 0) return;
-    const coinciden: string[] = [];
-    const tardias: string[] = [];
     for (const [id, p] of pendientes) {
       const fila = lista.find(a => a.estudiante.id === p.estudianteId);
-      if (!fila) {
-        sinConfirmarRef.current[id] = { ...p, filaNoRecibida: true };
-        continue;
-      }
-      const observado = fila.asistencia?.estado ?? null;
-      if (observado === p.pedido) {
-        delete sinConfirmarRef.current[id];
-        const conf = confirmadasRef.current[idClaveEst(p.clave, p.estudianteId)];
-        if (conf && conf.seq > p.seq && conf.pedido !== p.pedido) {
-          tardias.push(`${p.nombre}: el servidor muestra ${textoEstado(observado)} (de una operación anterior) y lo último confirmado fue ${textoEstado(conf.pedido)}`);
-        } else {
-          coinciden.push(p.nombre);
-        }
-      } else {
-        sinConfirmarRef.current[id] = { ...p, observado, filaNoRecibida: false };
-      }
+      sinConfirmarRef.current[id] = fila
+        ? { ...p, observado: fila.asistencia?.estado ?? null, filaNoRecibida: false }
+        : { ...p, filaNoRecibida: true };
     }
     setSinConfirmar({ ...sinConfirmarRef.current });
-    // Si ya no queda ninguna pendiente de esta selección, el aviso de
-    // «sin respuesta» deja de aplicar a lo que se ve.
-    if (!Object.values(sinConfirmarRef.current).some(p => p.clave === clave)) {
-      setError(e => (e === MSG_SIN_RESPUESTA ? '' : e));
-    }
-    if (tardias.length) {
-      setError(`Una operación anterior se aplicó tarde. ${tardias.join(' · ')}. Revise y vuelva a marcar si corresponde.`);
-    }
-    if (coinciden.length) {
-      setSuccess(`✓ El servidor muestra ahora lo que se pidió para: ${coinciden.join(', ')}.`);
-      setTimeout(() => setSuccess(''), 4000);
-    }
   };
 
   /** Pendientes que siguen abiertas para una selección y estudiante. */
   const pendientesDe = (clave: string, estudianteId: number) =>
     Object.values(sinConfirmarRef.current).filter(p => p.clave === clave && p.estudianteId === estudianteId);
 
-  /** Descartar explícitamente la incertidumbre de una operación (decisión de la persona). */
-  const descartarPendiente = (p: SinConfirmar) => {
+  /** «Quitar aviso»: la persona deja de ver la incertidumbre de una operación.
+   *  No cancela el envío ni modifica la asistencia. */
+  const quitarAviso = (p: SinConfirmar) => {
     delete sinConfirmarRef.current[idOperacion(p.clave, p.estudianteId, p.seq)];
     setSinConfirmar({ ...sinConfirmarRef.current });
+    if (!Object.values(sinConfirmarRef.current).some(x => x.clave === p.clave)) {
+      setError(e => (e === MSG_SIN_RESPUESTA ? '' : e));
+    }
   };
 
   const cargarAsistencia = async () => {
@@ -429,7 +405,6 @@ export const AsistenciaPage = () => {
           ? `/asistencia/${estudianteId}?fecha=${fechaGuardado}`
           : `/asistencia/${estudianteId}?fecha=${fechaGuardado}&asignatura_id=${asignaturaId}`;
         await api.delete(delUrl);
-        confirmadasRef.current[idClaveEst(clave, estudianteId)] = { pedido: null, seq };
         const enPantalla = aplicarEnLista(null);
         avisarConfirmada(enPantalla ? '✓ Desmarcado' : `✓ Desmarcado (${fechaGuardado})`, clave, [estudianteId]);
         return;
@@ -444,7 +419,6 @@ export const AsistenciaPage = () => {
       if (!esPrimaria) payload.asignatura_id = asignaturaId;
 
       await api.post('/asistencia', payload);
-      confirmadasRef.current[idClaveEst(clave, estudianteId)] = { pedido: estado, seq };
       const enPantalla = aplicarEnLista({ estado, observacion: '', registrado_por: user?.nombre });
       avisarConfirmada(enPantalla ? '✓' : `✓ Guardado para el ${fechaGuardado}`, clave, [estudianteId]);
     } catch (err: any) {
@@ -472,7 +446,6 @@ export const AsistenciaPage = () => {
       if (!esPrimaria) payload.asignatura_id = asignaturaId;
 
       await api.post('/asistencia/masivo', payload);
-      ids.forEach(id => { confirmadasRef.current[idClaveEst(clave, id)] = { pedido: estado, seq }; });
 
       const enPantalla = claveActualRef.current === clave && listaClaveRef.current === clave;
       if (enPantalla) {
@@ -567,7 +540,7 @@ export const AsistenciaPage = () => {
               ? '📡 Sin conexión con el servidor. La lista no está confirmada y no se puede marcar; se actualizará al recuperar la conexión.'
               : estadoLista === 'error'
                 ? '⚠️ No se pudo cargar la lista para esta selección. No se puede marcar hasta cargarla.'
-                : `⏳ ${nSinConfirmar} operación(es) sin confirmar en esta fecha y materia: no llegó la respuesta del servidor. La lista muestra el estado leído ahora; la operación pudo no aplicarse o aplicarse más tarde. Vuelva a marcar si corresponde.`}
+                : `⏳ ${nSinConfirmar} operación(es) sin confirmar en esta fecha y materia: no llegó la respuesta del servidor. La lista muestra el estado leído ahora, que no confirma ningún envío: pudo no aplicarse, aplicarse más tarde o cambiar desde otro dispositivo. Vuelva a marcar si corresponde. «Quitar aviso» no cancela el envío ni modifica la asistencia.`}
           </span>
           <button onClick={() => cargarAsistencia()} disabled={saving || revalidando}
                   className="px-3 py-1.5 bg-amber-600 text-white rounded-lg text-sm disabled:opacity-50">
@@ -810,9 +783,9 @@ export const AsistenciaPage = () => {
                                 className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-900 text-[10px] font-medium rounded">
                             Sin confirmar: se pidió {p.pedido || 'desmarcar'}
                             {(p.observado !== undefined || p.filaNoRecibida) && ` · ${textoObservado(p)}`}
-                            <button type="button" onClick={() => descartarPendiente(p)}
-                                    title="Aceptar que no se puede confirmar esta operación y quitar el aviso"
-                                    className="ml-1 underline">Descartar</button>
+                            <button type="button" onClick={() => quitarAviso(p)}
+                                    title={AYUDA_QUITAR_AVISO} aria-label={`Quitar aviso. ${AYUDA_QUITAR_AVISO}`}
+                                    className="ml-1 underline">Quitar aviso</button>
                           </span>
                         ))}
                         {a.estudiante.marca_fuera_de_permanencia && (
