@@ -46,22 +46,30 @@ const sinRespuesta = (err: any) => !!err && !err.response;
 
 type EstadoLista = 'vacio' | 'cargando' | 'ok' | 'error' | 'sin_conexion';
 /** Una operación enviada cuya respuesta no llegó: puede haberse aplicado o no
- *  (incluso más tarde). Se identifica por la selección COMPLETA (usuario,
- *  colegio, curso, materia y fecha) y el estudiante: dos pendientes del mismo
- *  estudiante en fechas o materias distintas coexisten. */
+ *  (incluso más tarde). Una entrada por OPERACIÓN, ligada a la selección
+ *  COMPLETA (usuario, colegio, curso, materia y fecha) y al estudiante: un
+ *  envío nuevo no borra la incertidumbre de uno anterior. */
 interface SinConfirmar {
   clave: string;                  // selección en la que se pulsó
   estudianteId: number;
   nombre: string;
   pedido: string | null;          // estado pedido; null = desmarcar
-  /** Último estado LEÍDO del servidor para esa fila (no es una confirmación):
-   *  undefined = aún no leído; 'ausente' = la fila no vino en la lista. */
+  seq: number;                    // orden de la operación (para detectar llegadas tardías)
+  /** Último estado de asistencia LEÍDO del servidor para esa fila (no es una
+   *  confirmación). undefined = aún no leído; null = sin marca. */
   observado?: string | null;
+  /** La fila del estudiante no vino en la última lectura (no es un estado de asistencia). */
+  filaNoRecibida?: boolean;
 }
+/** La última operación CONFIRMADA por respuesta del servidor para una selección y estudiante. */
+interface Confirmada { pedido: string | null; seq: number; }
 const MSG_SIN_RESPUESTA = 'No se recibió respuesta del servidor: la operación puede haberse aplicado o no. Queda «sin confirmar» y se comprobará el estado al recuperar la conexión; también puede pulsar «Comprobar».';
-const idPendiente = (clave: string, estudianteId: number) => `${clave}#${estudianteId}`;
-const textoEstado = (e: string | null | undefined) =>
-  e === undefined ? 'sin leer' : e === 'ausente' ? 'no aparece en la lista' : e === null ? 'sin marca' : e;
+const idClaveEst = (clave: string, estudianteId: number) => `${clave}#${estudianteId}`;
+const idOperacion = (clave: string, estudianteId: number, seq: number) => `${clave}#${estudianteId}#${seq}`;
+const textoEstado = (e: string | null | undefined) => (e === undefined ? 'sin leer' : e === null ? 'sin marca' : e);
+/** Lo observado de un pendiente, distinguiendo «fila no recibida» del estado «ausente». */
+const textoObservado = (p: SinConfirmar) =>
+  p.filaNoRecibida ? 'fila no recibida en la última lectura' : `servidor ahora: ${textoEstado(p.observado)}`;
 
 export const AsistenciaPage = () => {
   const { user } = useAuth();
@@ -104,6 +112,8 @@ export const AsistenciaPage = () => {
   const guardandoRef = useRef(0);             // guardados en curso
   const revalidarPendienteRef = useRef(false);
   const sinConfirmarRef = useRef<Record<string, SinConfirmar>>({});
+  const confirmadasRef = useRef<Record<string, Confirmada>>({});
+  const secOperacionRef = useRef(0);
   const secAsignaturasRef = useRef(0);
 
   // Solo profesores pueden marcar asistencia
@@ -216,27 +226,33 @@ export const AsistenciaPage = () => {
   };
 
   /** Tras leer la lista de una selección, anota lo OBSERVADO para cada operación
-   *  sin confirmar de ESA selección. Solo se da por resuelta cuando el servidor
-   *  muestra exactamente lo pedido; una fila ausente o un estado distinto no
-   *  confirman ni descartan nada: la operación pudo no aplicarse o aplicarse
-   *  más tarde, y sigue «sin confirmar» con lo último observado. */
+   *  sin confirmar de ESA selección. Una operación solo se da por resuelta
+   *  cuando el servidor muestra exactamente lo que ELLA pidió; una fila no
+   *  recibida o un estado distinto no confirman ni descartan nada. Si una
+   *  operación anterior aparece aplicada DESPUÉS de una posterior ya confirmada
+   *  con otro valor, se avisa: llegó tarde y sobrescribió lo último pedido. */
   const resolverSinConfirmar = (clave: string, lista: AsistenciaItem[]) => {
-    const pendientes = Object.values(sinConfirmarRef.current).filter(p => p.clave === clave);
+    const pendientes = Object.entries(sinConfirmarRef.current).filter(([, p]) => p.clave === clave);
     if (pendientes.length === 0) return;
     const coinciden: string[] = [];
-    for (const p of pendientes) {
+    const tardias: string[] = [];
+    for (const [id, p] of pendientes) {
       const fila = lista.find(a => a.estudiante.id === p.estudianteId);
-      const id = idPendiente(p.clave, p.estudianteId);
       if (!fila) {
-        sinConfirmarRef.current[id] = { ...p, observado: 'ausente' };
+        sinConfirmarRef.current[id] = { ...p, filaNoRecibida: true };
         continue;
       }
       const observado = fila.asistencia?.estado ?? null;
       if (observado === p.pedido) {
         delete sinConfirmarRef.current[id];
-        coinciden.push(p.nombre);
+        const conf = confirmadasRef.current[idClaveEst(p.clave, p.estudianteId)];
+        if (conf && conf.seq > p.seq && conf.pedido !== p.pedido) {
+          tardias.push(`${p.nombre}: el servidor muestra ${textoEstado(observado)} (de una operación anterior) y lo último confirmado fue ${textoEstado(conf.pedido)}`);
+        } else {
+          coinciden.push(p.nombre);
+        }
       } else {
-        sinConfirmarRef.current[id] = { ...p, observado };
+        sinConfirmarRef.current[id] = { ...p, observado, filaNoRecibida: false };
       }
     }
     setSinConfirmar({ ...sinConfirmarRef.current });
@@ -245,19 +261,23 @@ export const AsistenciaPage = () => {
     if (!Object.values(sinConfirmarRef.current).some(p => p.clave === clave)) {
       setError(e => (e === MSG_SIN_RESPUESTA ? '' : e));
     }
+    if (tardias.length) {
+      setError(`Una operación anterior se aplicó tarde. ${tardias.join(' · ')}. Revise y vuelva a marcar si corresponde.`);
+    }
     if (coinciden.length) {
       setSuccess(`✓ El servidor muestra ahora lo que se pidió para: ${coinciden.join(', ')}.`);
       setTimeout(() => setSuccess(''), 4000);
     }
   };
 
-  /** Una operación nueva sobre la misma selección y estudiante reemplaza a la pendiente. */
-  const olvidarPendiente = (clave: string, estudianteId: number) => {
-    const id = idPendiente(clave, estudianteId);
-    if (sinConfirmarRef.current[id]) {
-      delete sinConfirmarRef.current[id];
-      setSinConfirmar({ ...sinConfirmarRef.current });
-    }
+  /** Pendientes que siguen abiertas para una selección y estudiante. */
+  const pendientesDe = (clave: string, estudianteId: number) =>
+    Object.values(sinConfirmarRef.current).filter(p => p.clave === clave && p.estudianteId === estudianteId);
+
+  /** Descartar explícitamente la incertidumbre de una operación (decisión de la persona). */
+  const descartarPendiente = (p: SinConfirmar) => {
+    delete sinConfirmarRef.current[idOperacion(p.clave, p.estudianteId, p.seq)];
+    setSinConfirmar({ ...sinConfirmarRef.current });
   };
 
   const cargarAsistencia = async () => {
@@ -342,13 +362,24 @@ export const AsistenciaPage = () => {
     }
   };
 
+  /** Confirmación de un guardado. Si para esos estudiantes queda una operación
+   *  ANTERIOR sin confirmar, se dice: no se muestra todo resuelto. */
+  const avisarConfirmada = (texto: string, clave: string, ids: number[]) => {
+    const conPendiente = ids.flatMap(id => pendientesDe(clave, id)).map(p => p.nombre);
+    const unicos = [...new Set(conPendiente)];
+    setSuccess(unicos.length
+      ? `${texto}. Atención: queda una operación anterior sin confirmar para ${unicos.join(', ')}; podría aplicarse más tarde.`
+      : texto);
+    setTimeout(() => setSuccess(''), unicos.length ? 6000 : 1500);
+  };
+
   /** Error de un guardado: rechazo del servidor (se muestra y se recarga) o
    *  respuesta perdida (queda «sin confirmar» y se comprueba con el servidor). */
-  const trasErrorDeGuardado = (err: any, clave: string, marcas: Array<[number, string | null]>) => {
+  const trasErrorDeGuardado = (err: any, clave: string, seq: number, marcas: Array<[number, string | null]>) => {
     if (sinRespuesta(err)) {
       for (const [estId, pedido] of marcas) {
         const nombre = asistencias.find(a => a.estudiante.id === estId)?.estudiante.nombre_completo || `#${estId}`;
-        sinConfirmarRef.current[idPendiente(clave, estId)] = { clave, estudianteId: estId, nombre, pedido };
+        sinConfirmarRef.current[idOperacion(clave, estId, seq)] = { clave, estudianteId: estId, nombre, pedido, seq };
       }
       setSinConfirmar({ ...sinConfirmarRef.current });
       setError(MSG_SIN_RESPUESTA);
@@ -378,7 +409,9 @@ export const AsistenciaPage = () => {
     const clave = claveSeleccion;
     const fechaGuardado = fecha;
     setError('');
-    olvidarPendiente(clave, estudianteId);
+    // Cada operación tiene su número; un envío nuevo NO borra la
+    // incertidumbre de uno anterior (podría aplicarse más tarde).
+    const seq = ++secOperacionRef.current;
     iniciarGuardado();
     const asistenciaActual = asistencias.find(a => a.estudiante.id === estudianteId);
     const desmarcar = asistenciaActual?.asistencia?.estado === estado;
@@ -396,9 +429,9 @@ export const AsistenciaPage = () => {
           ? `/asistencia/${estudianteId}?fecha=${fechaGuardado}`
           : `/asistencia/${estudianteId}?fecha=${fechaGuardado}&asignatura_id=${asignaturaId}`;
         await api.delete(delUrl);
+        confirmadasRef.current[idClaveEst(clave, estudianteId)] = { pedido: null, seq };
         const enPantalla = aplicarEnLista(null);
-        setSuccess(enPantalla ? '✓ Desmarcado' : `✓ Desmarcado (${fechaGuardado})`);
-        setTimeout(() => setSuccess(''), 1500);
+        avisarConfirmada(enPantalla ? '✓ Desmarcado' : `✓ Desmarcado (${fechaGuardado})`, clave, [estudianteId]);
         return;
       }
 
@@ -411,11 +444,11 @@ export const AsistenciaPage = () => {
       if (!esPrimaria) payload.asignatura_id = asignaturaId;
 
       await api.post('/asistencia', payload);
+      confirmadasRef.current[idClaveEst(clave, estudianteId)] = { pedido: estado, seq };
       const enPantalla = aplicarEnLista({ estado, observacion: '', registrado_por: user?.nombre });
-      setSuccess(enPantalla ? '✓' : `✓ Guardado para el ${fechaGuardado}`);
-      setTimeout(() => setSuccess(''), 1500);
+      avisarConfirmada(enPantalla ? '✓' : `✓ Guardado para el ${fechaGuardado}`, clave, [estudianteId]);
     } catch (err: any) {
-      trasErrorDeGuardado(err, clave, [[estudianteId, desmarcar ? null : estado]]);
+      trasErrorDeGuardado(err, clave, seq, [[estudianteId, desmarcar ? null : estado]]);
     } finally {
       terminarGuardado();
     }
@@ -431,7 +464,7 @@ export const AsistenciaPage = () => {
     setError('');
     // TRAS-1 · solo quienes pertenecen al curso ese día.
     const ids = asistencias.filter(a => a.estudiante.aplica !== false).map(a => a.estudiante.id);
-    ids.forEach(id => olvidarPendiente(clave, id));
+    const seq = ++secOperacionRef.current;
 
     try {
       const data = ids.map(id => ({ estudiante_id: id, curso_id: cursoId, estado }));
@@ -439,19 +472,18 @@ export const AsistenciaPage = () => {
       if (!esPrimaria) payload.asignatura_id = asignaturaId;
 
       await api.post('/asistencia/masivo', payload);
+      ids.forEach(id => { confirmadasRef.current[idClaveEst(clave, id)] = { pedido: estado, seq }; });
 
-      if (claveActualRef.current === clave && listaClaveRef.current === clave) {
+      const enPantalla = claveActualRef.current === clave && listaClaveRef.current === clave;
+      if (enPantalla) {
         setAsistencias(prev => prev.map(a => a.estudiante.aplica === false ? a : ({
           ...a,
           asistencia: { estado, observacion: '', registrado_por: user?.nombre }
         })));
-        setSuccess(`✓ Todos ${estado}`);
-      } else {
-        setSuccess(`✓ Todos ${estado} (${fechaGuardado})`);
       }
-      setTimeout(() => setSuccess(''), 2000);
+      avisarConfirmada(enPantalla ? `✓ Todos ${estado}` : `✓ Todos ${estado} (${fechaGuardado})`, clave, ids);
     } catch (err: any) {
-      trasErrorDeGuardado(err, clave, ids.map(id => [id, estado] as [number, string]));
+      trasErrorDeGuardado(err, clave, seq, ids.map(id => [id, estado] as [number, string]));
     } finally {
       terminarGuardado();
     }
@@ -479,12 +511,12 @@ export const AsistenciaPage = () => {
   // última comprobación falló, se sigue viendo, pero sin controles.
   const tablaDeLaSeleccion = seleccionCompleta && listaClave === claveSeleccion && estadoLista !== 'cargando';
   // Pendientes de ESTA selección (las de otras fechas o materias se muestran aparte).
-  const pendientesSel: Record<number, SinConfirmar> = {};
+  const pendientesSel: Record<number, SinConfirmar[]> = {};
   const pendientesOtras: SinConfirmar[] = [];
-  for (const p of Object.values(sinConfirmar)) {
-    if (p.clave === claveSeleccion) pendientesSel[p.estudianteId] = p; else pendientesOtras.push(p);
+  for (const p of Object.values(sinConfirmar).sort((x, y) => x.seq - y.seq)) {
+    if (p.clave === claveSeleccion) (pendientesSel[p.estudianteId] ||= []).push(p); else pendientesOtras.push(p);
   }
-  const nSinConfirmar = Object.keys(pendientesSel).length;
+  const nSinConfirmar = Object.values(pendientesSel).reduce((n, l) => n + l.length, 0);
   const describirSeleccion = (clave: string) => {
     const [, , , materia, f] = clave.split('|');
     const nombreMateria = materia === 'P' ? 'asistencia diaria'
@@ -546,7 +578,8 @@ export const AsistenciaPage = () => {
       {pendientesOtras.length > 0 && (
         <div role="status" className="p-2 bg-amber-50 border border-amber-200 text-amber-900 rounded-lg text-sm">
           ⏳ También hay operaciones sin confirmar en otras selecciones:{' '}
-          {pendientesOtras.map(p => `${p.nombre} (${describirSeleccion(p.clave)}: se pidió ${p.pedido || 'desmarcar'})`).join(' · ')}.
+          {pendientesOtras.map(p => `${p.nombre} (${describirSeleccion(p.clave)}: se pidió ${p.pedido || 'desmarcar'}`
+            + `${p.observado !== undefined || p.filaNoRecibida ? '; ' + textoObservado(p) : ''})`).join(' · ')}.
           Se comprobarán al abrir esa fecha y materia.
         </div>
       )}
@@ -771,14 +804,17 @@ export const AsistenciaPage = () => {
                             Pertenecía ese día
                           </span>
                         )}
-                        {pendientesSel[a.estudiante.id] && (
-                          <span title="Se envió, pero no llegó la respuesta del servidor; lo observado no confirma la operación"
-                                className="inline-block px-2 py-0.5 bg-amber-100 text-amber-900 text-[10px] font-medium rounded">
-                            Sin confirmar: se pidió {pendientesSel[a.estudiante.id].pedido || 'desmarcar'}
-                            {pendientesSel[a.estudiante.id].observado !== undefined &&
-                              ` · servidor ahora: ${textoEstado(pendientesSel[a.estudiante.id].observado)}`}
+                        {(pendientesSel[a.estudiante.id] || []).map(p => (
+                          <span key={p.seq} data-pendiente={p.seq}
+                                title="Se envió, pero no llegó la respuesta del servidor; lo observado no confirma la operación"
+                                className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-900 text-[10px] font-medium rounded">
+                            Sin confirmar: se pidió {p.pedido || 'desmarcar'}
+                            {(p.observado !== undefined || p.filaNoRecibida) && ` · ${textoObservado(p)}`}
+                            <button type="button" onClick={() => descartarPendiente(p)}
+                                    title="Aceptar que no se puede confirmar esta operación y quitar el aviso"
+                                    className="ml-1 underline">Descartar</button>
                           </span>
-                        )}
+                        ))}
                         {a.estudiante.marca_fuera_de_permanencia && (
                           <span title="Esta marca existe pero cae fuera de su permanencia: se conserva y no cuenta"
                                 className="inline-block px-2 py-0.5 bg-amber-100 text-amber-800 text-[10px] font-medium rounded">
