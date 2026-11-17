@@ -19,7 +19,13 @@ interface Estudiante {
   nombre_completo: string;
   no_lista: number;
   matricula: string;
+  activo?: boolean;
+  condicion?: string | null;
+  fecha_retiro?: string | null;
 }
+
+/** ENT-A · retirado = inactivo con condición «retirado» (no un egresado). */
+const esRetiradoEst = (e?: Estudiante | null) => !!e && e.activo === false && e.condicion === 'retirado';
 
 interface CompetenciaDetalle {
   numero: number;
@@ -243,6 +249,13 @@ export const BoletinesPage = () => {
   const boletinRef = useRef<HTMLDivElement>(null);
 
   const esProfesor = user?.role === 'profesor';
+  // ENT-A · Retirados: se incluyen a petición, identificados como «Retirado».
+  // Ver e imprimir sus boletines no los reactiva ni necesita permiso de
+  // corrección. Al llegar desde Estudiantes → Retirados, la URL trae el curso,
+  // el estudiante y `retirados=1`.
+  const enlace = useRef(new URLSearchParams(window.location.search));
+  const [incluirRetirados, setIncluirRetirados] = useState(enlace.current.get('retirados') === '1');
+  const estudiantePendiente = useRef<number | null>(Number(enlace.current.get('estudiante_id')) || null);
 
   useEffect(() => {
     cargarDatosIniciales();
@@ -250,7 +263,7 @@ export const BoletinesPage = () => {
 
   useEffect(() => {
     if (cursoId) cargarEstudiantes();
-  }, [cursoId, anoId]);
+  }, [cursoId, anoId, incluirRetirados]);
 
   // Al cambiar de año se recargan los cursos de ESE año y se limpia todo lo
   // que colgaba del anterior. Si no, el curso de B seguiría seleccionado
@@ -306,6 +319,25 @@ export const BoletinesPage = () => {
         setCursos(cursosRes.data || []);
       }
       setColegio(colegioRes.data);
+      // ENT-A · Enlace desde Estudiantes → Retirados: curso (y su año) preseleccionado.
+      const cursoEnlace = Number(enlace.current.get('curso_id')) || null;
+      if (cursoEnlace && !esProfesor) {
+        let lista: Curso[] = cursosRes.data || [];
+        let anoDelCurso = anoInicial;
+        if (!lista.find(c => c.id === cursoEnlace)) {
+          for (const a of listaAnos.filter(x => x.id !== anoInicial)) {
+            const r = await api.get('/cursos', { params: { ano_id: a.id } }).catch(() => ({ data: [] }));
+            if ((r.data || []).find((c: Curso) => c.id === cursoEnlace)) {
+              lista = r.data; anoDelCurso = a.id; break;
+            }
+          }
+        }
+        if (lista.find(c => c.id === cursoEnlace)) {
+          setAnoId(anoDelCurso);
+          setCursos(lista);
+          setCursoId(cursoEnlace);
+        }
+      }
     } catch (err) {
       console.error('Error cargando datos:', err);
     } finally {
@@ -317,12 +349,13 @@ export const BoletinesPage = () => {
     try {
       // Con el año, el backend devuelve la COHORTE de ese curso en ese año:
       // incluye a los promovidos, que ya no están físicamente en él.
-      const res = await api.get('/estudiantes', {
-        params: anoId ? { curso_id: cursoId, ano_id: anoId }
-                      : { curso_id: cursoId },
-      });
+      const params: Record<string, any> = anoId ? { curso_id: cursoId, ano_id: anoId } : { curso_id: cursoId };
+      if (incluirRetirados) params.incluir_retirados = true;
+      const res = await api.get('/estudiantes', { params });
       setEstudiantes(res.data);
-      setEstudianteId(null);
+      const pendiente = estudiantePendiente.current;
+      estudiantePendiente.current = null;
+      setEstudianteId(pendiente && (res.data || []).some((e: Estudiante) => e.id === pendiente) ? pendiente : null);
       setBoletin(null);
     } catch (err) {
       console.error('Error cargando estudiantes:', err);
@@ -431,7 +464,10 @@ export const BoletinesPage = () => {
             label="Estudiante"
             value={estudianteId?.toString() || ''}
             onChange={(e) => setEstudianteId(e.target.value ? parseInt(e.target.value) : null)}
-            options={estudiantes.map(e => ({ value: e.id, label: `${e.no_lista}. ${e.nombre_completo}` }))}
+            options={estudiantes.map(e => ({
+              value: e.id,
+              label: `${e.no_lista}. ${e.nombre_completo}${esRetiradoEst(e) ? ' — Retirado' : ''}`,
+            }))}
             placeholder="Seleccione estudiante"
             disabled={!cursoId}
           />
@@ -441,6 +477,21 @@ export const BoletinesPage = () => {
             </Button>
           </div>
         </div>
+        <label className="mt-3 inline-flex items-center gap-2 text-sm text-gray-700">
+          <input type="checkbox" checked={incluirRetirados}
+                 onChange={e => setIncluirRetirados(e.target.checked)} />
+          Incluir estudiantes retirados de este curso y año
+        </label>
+        {esRetiradoEst(estudiantes.find(e => e.id === estudianteId)) && (
+          <div className="mt-2">
+            <Alert variant="info">
+              Estudiante <strong>retirado</strong>
+              {estudiantes.find(e => e.id === estudianteId)?.fecha_retiro
+                ? ` (último día: ${estudiantes.find(e => e.id === estudianteId)!.fecha_retiro!.split('-').reverse().join('/')})` : ''}.
+              Sus boletines se consultan e imprimen con las notas conservadas, sin reactivarlo.
+            </Alert>
+          </div>
+        )}
         {cursoId && (
           <div className="mt-3 pt-3 border-t">
             <p className="text-sm text-gray-600 mb-2">

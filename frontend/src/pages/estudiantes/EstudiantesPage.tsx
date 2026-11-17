@@ -10,6 +10,8 @@ import { filterByNivel } from '../../hooks/useFiltroCascada';
 import { EstudianteKPIs } from './EstudianteKPIs';
 import { labelCurso } from '../../utils/labelCurso';
 import { MovimientoEstudianteModal, HistorialCursos, TipoMovimiento } from './MovimientoEstudianteModal';
+import { PermisoCorreccionModal } from './PermisoCorreccionModal';
+import { useNavigate } from 'react-router-dom';
 
 interface Estudiante {
   id: number;
@@ -121,6 +123,9 @@ export const EstudiantesPage = () => {
   const [confirmaId, setConfirmaId] = useState('');
   const [eliminando, setEliminando] = useState(false);
   const canEliminarPorError = user?.role === 'direccion';
+  // ENT-A · boletines y notas de retirados sin reactivarlos.
+  const navigate = useNavigate();
+  const [permisoPara, setPermisoPara] = useState<Estudiante | null>(null);
   const [importCursoId, setImportCursoId] = useState<number | ''>('');
   const [importing, setImporting] = useState(false);
   const [importPreview, setImportPreview] = useState<{ validas: number; errores: string[] } | null>(null);
@@ -667,6 +672,8 @@ export const EstudiantesPage = () => {
         </div>
       )}
 
+      <PermisoCorreccionModal estudiante={permisoPara} onClose={() => setPermisoPara(null)} />
+
       {/* Vista de Estudiantes Retirados */}
       {activeTab === 'retirados' && canManageRetirados ? (
         <div className="bg-white rounded-lg border shadow-sm overflow-hidden">
@@ -697,7 +704,30 @@ export const EstudiantesPage = () => {
                           {est.condicion}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-center space-x-2">
+                      <td className="px-4 py-3 text-center">
+                        {/* ENT-A · en pantallas pequeñas las acciones se apilan
+                            (con cuatro botones la columna quedaba cortada). */}
+                        <div className="flex flex-col sm:flex-row sm:flex-wrap sm:justify-center gap-1 sm:gap-2 min-w-[150px]">
+                        {/* ENT-A · Ver e imprimir sus boletines SIN reactivarlo. */}
+                        {est.curso_id && (
+                          <button
+                            onClick={() => navigate(`/boletines?curso_id=${est.curso_id}&estudiante_id=${est.id}&retirados=1`)}
+                            className="px-3 py-1 bg-blue-600 text-white text-sm rounded hover:bg-blue-700"
+                            title="Ver e imprimir sus boletines; no lo reactiva"
+                          >
+                            📄 Ver boletines
+                          </button>
+                        )}
+                        {/* ENT-A · Solo Dirección concede el permiso temporal de corrección. */}
+                        {canEliminarPorError && est.curso_id && (
+                          <button
+                            onClick={() => setPermisoPara(est)}
+                            className="px-3 py-1 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700"
+                            title="Permitir a un docente completar o corregir sus notas sin reactivarlo"
+                          >
+                            ✏️ Permiso de corrección
+                          </button>
+                        )}
                         <button
                           onClick={() => handleReactivar(est.id)}
                           className="px-3 py-1 bg-emerald-600 text-white text-sm rounded hover:bg-emerald-700"
@@ -716,6 +746,7 @@ export const EstudiantesPage = () => {
                             🗑️ Eliminar por error
                           </button>
                         )}
+                        </div>
                       </td>
                     </tr>
                   ))}

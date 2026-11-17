@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, Fragment } from 'react';
+import { useState, useCallback, useMemo, useEffect, Fragment } from 'react';
 import api from '../../../services/api';
 import { Save, BookOpen } from 'lucide-react';
 import { Button, Alert } from '../../../components/ui';
@@ -20,16 +20,41 @@ interface Props {
   puedeEditar: boolean;
   onReload: () => Promise<void>;
   periodosCerrados?: Record<string, boolean>;
+  /** ENT-A · curso desde el que se edita: el servidor autoriza con ESTE curso. */
+  cursoId?: number;
+  /** ENT-A · informa al padre de lo pendiente y de si se está guardando. */
+  onEstadoEdicion?: (e: { pendientes: number; guardando: boolean }) => void;
+}
+
+/** ENT-A · Quita SOLO las casillas guardadas cuyo valor sigue siendo el que se
+ *  envió. Lo escrito después (o lo que no se guardó) se conserva. */
+function quitarGuardadas<T extends Record<string, Record<string, number | null | undefined>>>(
+  prev: T, guardadas: Record<string, Record<string, number | null | undefined>>): T {
+  const out: Record<string, Record<string, number | null | undefined>> = {};
+  for (const [k, campos] of Object.entries(prev)) {
+    const env = guardadas[k] || {};
+    const resto = Object.fromEntries(Object.entries(campos).filter(([c, v]) => !(c in env && env[c] === v)));
+    if (Object.keys(resto).length) out[k] = resto;
+  }
+  return out as T;
 }
 
 // clave: "estudianteId-competenciaNumero" → { p?: valor, rp?: valor }
+// ENT-A · La clave incluye el PERÍODO: lo escrito y no guardado se conserva, y
+// no debe pasar a otro período al cambiar de pestaña.
+// clave: "estudianteId-competenciaNumero-periodo"
 type EditadasState = Record<string, { p?: number | null; rp?: number | null }>;
 
-export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, periodosCerrados = {} }) => {
+export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, periodosCerrados = {}, cursoId, onEstadoEdicion }) => {
   const [periodoActivo, setPeriodoActivo] = useState<number>(1);
   const [editadas, setEditadas] = useState<EditadasState>({});
   const [saving, setSaving] = useState(false);
   const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error' | 'warning'; texto: string } | null>(null);
+
+  // ENT-A · el padre sabe si hay cambios sin guardar o un guardado en curso.
+  const nPendientes = Object.values(editadas).reduce((n, c) => n + Object.keys(c).length, 0);
+  useEffect(() => { onEstadoEdicion?.({ pendientes: nPendientes, guardando: saving }); }, [nPendientes, saving]);
+  useEffect(() => () => onEstadoEdicion?.({ pendientes: 0, guardando: false }), []);
 
   // ¿El período activo está cerrado? → bloquea las casillas
   const periodoActivoCerrado = !!periodosCerrados[`p${periodoActivo}`];
@@ -40,17 +65,17 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
 
   // Obtener valor actual (editado o del backend) de un estudiante/competencia
   const getValor = useCallback((est: EstudianteData, compNum: number, tipo: 'p' | 'rp'): number | null => {
-    const key = `${est.estudiante.id}-${compNum}`;
+    const key = `${est.estudiante.id}-${compNum}-${periodoActivo}`;
     const ed = editadas[key];
     if (ed && tipo in ed) return (tipo === 'p' ? ed.p : ed.rp) ?? null;
     const comp = est.competencias[compNum];
     if (!comp) return null;
     return (comp[tipo === 'p' ? campoP : campoRP]) ?? null;
-  }, [editadas, campoP, campoRP]);
+  }, [editadas, campoP, campoRP, periodoActivo]);
 
   // Registrar un cambio en una celda
   const onChangeCelda = useCallback((estId: number, compNum: number, tipo: 'p' | 'rp', valorStr: string) => {
-    const key = `${estId}-${compNum}`;
+    const key = `${estId}-${compNum}-${periodoActivo}`;
     let valor: number | null = null;
     if (valorStr !== '') {
       const parsed = parseFloat(valorStr);
@@ -62,7 +87,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       ...prev,
       [key]: { ...prev[key], [tipo]: valor },
     }));
-  }, []);
+  }, [periodoActivo]);
 
   // Guardar todos los cambios
   const guardar = async () => {
@@ -73,15 +98,21 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
     }
     setSaving(true);
     setMensaje(null);
-    const errores: string[] = [];
-    const avisosCierre: string[] = [];
+    // ENT-A · Cada casilla queda GUARDADA, IGNORADA (período cerrado sin
+    // permiso vigente) o RECHAZADA (error del servidor). Solo se limpian las
+    // guardadas; las demás se conservan en pantalla, en SU período.
+    const enviadasGuardadas: EditadasState = {};
+    let guardadas = 0;
+    const ignoradas: string[] = [];
+    const rechazadas: string[] = [];
+    const nombreDe = (id: number) => estudiantes.find(e => e.estudiante.id === id)?.estudiante.nombre_completo || `#${id}`;
 
     try {
-      // Agrupar por estudiante+competencia y enviar solo el período activo
       for (const key of keys) {
-        const [estIdStr, compNumStr] = key.split('-');
+        const [estIdStr, compNumStr, perStr] = key.split('-');
         const estId = parseInt(estIdStr);
         const compNum = parseInt(compNumStr);
+        const per = parseInt(perStr);
         const cambios = editadas[key];
 
         const payload: Record<string, unknown> = {
@@ -89,31 +120,35 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
           asignatura_id: asignaturaId,
           competencia_numero: compNum,
         };
-        // Solo mandamos el P/RP del período activo
-        if ('p' in cambios) payload[campoP] = cambios.p;
-        if ('rp' in cambios) payload[campoRP] = cambios.rp;
+        if (cursoId) payload.curso_id = cursoId;
+        // El P/RP del período en que se escribió (no el de la pestaña actual)
+        if ('p' in cambios) payload[`p${per}`] = cambios.p;
+        if ('rp' in cambios) payload[`rp${per}`] = cambios.rp;
+        const n = Object.keys(cambios).length;
 
         try {
           const res = await api.post('/calificaciones-secundaria', payload);
-          // Si el backend avisa que el período estaba cerrado
-          if (res.data?.periodos_cerrados_ignorados?.length > 0) {
-            avisosCierre.push(res.data.message);
+          const ign: number[] = res.data?.periodos_cerrados_ignorados || [];
+          if (ign.includes(per)) {
+            ignoradas.push(`${nombreDe(estId)} C${compNum} P${per}`);
+          } else {
+            guardadas += n;
+            enviadasGuardadas[key] = { ...cambios };
           }
         } catch (err: unknown) {
-          const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'error';
-          errores.push(`Est ${estId}: ${msg}`);
+          const d = (err as { response?: { data?: { error?: string; message?: string } } })?.response?.data;
+          rechazadas.push(`${nombreDe(estId)} C${compNum} P${per}: ${String(d?.message || d?.error || 'sin respuesta del servidor').replace(/\.$/, '')}`);
         }
       }
 
-      if (errores.length > 0) {
-        setMensaje({ tipo: 'error', texto: `Errores: ${errores.slice(0, 3).join('; ')}` });
-      } else if (avisosCierre.length > 0) {
-        setMensaje({ tipo: 'warning', texto: avisosCierre[0] });
-      } else {
-        setMensaje({ tipo: 'success', texto: 'Notas guardadas correctamente' });
-      }
+      const partes = [`${guardadas} nota(s) guardada(s).`];
+      if (ignoradas.length) partes.push(`No se guardaron (período cerrado sin permiso vigente): ${ignoradas.join('; ')}.`);
+      if (rechazadas.length) partes.push(`Rechazadas por el servidor: ${rechazadas.join('; ')}.`);
+      if (ignoradas.length || rechazadas.length) partes.push('Lo escrito se conserva en pantalla, marcado «sin guardar».');
+      setMensaje({ tipo: rechazadas.length ? 'error' : ignoradas.length ? 'warning' : 'success', texto: partes.join(' ') });
 
-      setEditadas({});
+      // Solo se limpia lo guardado (y si no se tocó después de enviarlo).
+      setEditadas(prev => quitarGuardadas(prev, enviadasGuardadas));
       await onReload();
     } catch {
       setMensaje({ tipo: 'error', texto: 'Error al guardar las notas' });
@@ -130,7 +165,15 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
     // TRAS-1 · nota registrada antes del traslado: protegida (permiso de Dirección).
     const protegida = (est.permanencia?.notas_previas_traslado?.[String(compNum)] || [])
       .includes(tipo === 'p' ? campoP : campoRP);
-    if (protegida && !esRetirado) {
+    // ENT-A · quien salió del curso queda en solo lectura SALVO las casillas que
+    // el servidor autoriza a este docente (permiso de corrección de Dirección).
+    // (también un período CERRADO con permiso temporal: el período sigue cerrado
+    // y solo se abren estas casillas, mientras el permiso esté vigente).
+    const autorizada = puedeEditar
+      && (est.permanencia?.campos_autorizados || []).includes(tipo === 'p' ? campoP : campoRP);
+    // ENT-A · lo escrito que aún no se guardó (ignorado, rechazado o sin enviar).
+    const sinGuardar = tipo in (editadas[`${est.estudiante.id}-${compNum}-${periodoActivo}`] || {});
+    if (protegida && !esRetirado && !autorizada) {
       return (
         <span className={getNotaClass(valor)}
               title="Registrada antes del traslado. Para corregirla hace falta el permiso temporal de corrección de Dirección.">
@@ -139,7 +182,18 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       );
     }
     // Si no puede editar, está retirado, o el período está cerrado → solo lectura
-    if (!puedeEditar || esRetirado || periodoActivoCerrado) {
+    // (salvo una casilla autorizada por el servidor para corrección).
+    if (!autorizada && (!puedeEditar || esRetirado || periodoActivoCerrado)) {
+      if (sinGuardar) {
+        const guardado = est.competencias[compNum]?.[tipo === 'p' ? campoP : campoRP] ?? null;
+        return (
+          <span data-sin-guardar="si"
+                title={`Escrito sin guardar: ${valor ?? '—'}. En el servidor: ${guardado ?? '—'}. Esta casilla ya no admite cambios.`}
+                className="inline-block px-1 border border-dashed border-amber-500 rounded bg-amber-50 text-amber-900">
+            {valor ?? '—'} ✎
+          </span>
+        );
+      }
       return <span className={getNotaClass(valor)}>{valor ?? '—'}</span>;
     }
     // Regla MINERD: RP solo se habilita si el P del mismo período existe y es < 70
@@ -165,7 +219,13 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
         max={100}
         value={valor ?? ''}
         onChange={e => onChangeCelda(est.estudiante.id, compNum, tipo, e.target.value)}
-        className={`w-14 px-1 py-1 text-center border rounded text-sm ${tipo === 'rp' ? 'bg-amber-50' : ''}`}
+        disabled={saving}
+        title={sinGuardar ? 'Escrito sin guardar' : autorizada ? 'Corrección autorizada por Dirección (permiso temporal)' : undefined}
+        data-autorizada={autorizada ? 'si' : undefined}
+        data-sin-guardar={sinGuardar ? 'si' : undefined}
+        className={`w-14 px-1 py-1 text-center border rounded text-sm ${
+          sinGuardar ? 'border-dashed border-amber-500 bg-amber-50'
+            : autorizada ? 'border-indigo-400 ring-1 ring-indigo-200' : tipo === 'rp' ? 'bg-amber-50' : ''}`}
       />
     );
   };
@@ -178,7 +238,12 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
 
       {/* Acción guardar */}
       {totalEditados > 0 && puedeEditar && (
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" disabled={saving} onClick={() => {
+            if (window.confirm(`¿Descartar ${nPendientes} cambio(s) sin guardar? No se puede deshacer.`)) { setEditadas({}); setMensaje(null); }
+          }}>
+            Descartar lo no guardado
+          </Button>
           <Button onClick={guardar} loading={saving} icon={<Save size={16} />} variant="success">
             Guardar ({totalEditados})
           </Button>
@@ -225,6 +290,12 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
               <p className="text-xs text-red-700">
                 Este período está cerrado y no se puede editar. Use "Solicitar Corrección" si necesita cambiar una nota.
               </p>
+              {estudiantes.some(e => (e.permanencia?.campos_autorizados || []).includes(campoP)) && puedeEditar && (
+                <p className="text-xs text-indigo-800 font-medium mt-1">
+                  ✏️ Tiene un permiso temporal de corrección de Dirección: solo las casillas marcadas pueden
+                  corregirse mientras el permiso esté vigente. El período sigue cerrado.
+                </p>
+              )}
             </div>
           ) : (
             <div className="mb-3 px-3 py-2 bg-blue-50 border-l-4 border-blue-500 rounded">
@@ -267,6 +338,13 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                       <td className="px-2 py-1">
                         <span className={esRetirado ? 'text-gray-400' : ''}>{est.estudiante.nombre_completo}</span>
                         {esRetirado && !avisos.length && <span className="ml-1 text-xs text-red-500">(retirado)</span>}
+                        {esRetirado && (est.permanencia?.campos_autorizados || []).length > 0 && puedeEditar && (
+                          <div className="text-[10px] text-indigo-800 font-medium">
+                            ✏️ Corrección autorizada por Dirección:{' '}
+                            {[...new Set((est.permanencia!.campos_autorizados || []).map(c => 'P' + c.replace(/[^0-9]/g, '')))].join(', ')}
+                            {' '}· sigue {avisos.some(a => a.startsWith('Retirado')) || est.estudiante.retirado ? 'retirado' : 'fuera del curso'}
+                          </div>
+                        )}
                         {avisos.length > 0 && (
                           <div className="text-[10px] text-indigo-700">
                             {avisos.join(' · ')}
