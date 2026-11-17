@@ -10509,7 +10509,9 @@ async def guardar_calificacion(request: Request, db: Session = Depends(get_db), 
                 PermisoTemporalCalificacion.activo == True,
                 PermisoTemporalCalificacion.fecha_fin > now_rd(),
                 (PermisoTemporalCalificacion.periodo == periodo_editando) | (PermisoTemporalCalificacion.periodo.is_(None)),
-                (PermisoTemporalCalificacion.asignatura_id == asignatura.id) | (PermisoTemporalCalificacion.asignatura_id.is_(None))
+                (PermisoTemporalCalificacion.asignatura_id == asignatura.id) | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+                # ENT-A · del curso del estudiante, o general (sin curso).
+                (PermisoTemporalCalificacion.curso_id == estudiante.curso_id) | (PermisoTemporalCalificacion.curso_id.is_(None)),
             ).first()
             
             if not permiso:
@@ -10943,6 +10945,7 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
     # si el docente envía P1 (cerrado) y P2 (abierto), P2 se guarda. Cambiar eso
     # sería inventar una política distinta a la del resto del sistema.
     periodos_cerrados_ignorados = []
+    _curso_del_permiso = _curso_nota or estudiante_obj.curso_id
 
     def _periodo_esta_cerrado(num_periodo):
         """True si el período está cerrado Y el profesor no tiene permiso temporal."""
@@ -10956,6 +10959,10 @@ async def save_calificacion_primaria(request: Request, db: Session = Depends(get
             PermisoTemporalCalificacion.fecha_fin > now_rd(),
             (PermisoTemporalCalificacion.periodo == num_periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
             (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+            # ENT-A · el permiso es del CURSO de la nota (o general, sin curso,
+            # si así lo concedió Dirección). Antes no se miraba el curso: un
+            # permiso del curso B abría el período cerrado del curso A.
+            (PermisoTemporalCalificacion.curso_id == _curso_del_permiso) | (PermisoTemporalCalificacion.curso_id.is_(None)),
         ).first()
         return permiso is None  # cerrado y sin permiso → bloqueado
 
@@ -11322,6 +11329,7 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
         extra = extras_by_est.get(est.id)
         
         _m = _miembros.get(est.id)
+        _campos_aut = []
         if _m is not None and _m.salio:
             # TRAS-1 · En el curso que dejó (trasladado o retirado) se ven solo
             # los períodos que cursó en él y SIN promedio ni calificación final:
@@ -11339,6 +11347,8 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
                 competencias_data[_num] = _cd
             pcs = {k: (v if int(k[-1]) in _visibles else None) for k, v in pcs.items()}
             cf, literal, extra = None, None, None
+            # ENT-A · lo que el servidor permite completar o corregir aquí.
+            _campos_aut = _campos_autorizados_correccion(db, current_user, curso_id, asignatura_id, _visibles)
         resultado.append({
             'estudiante': {
                 'id': est.id,
@@ -11351,6 +11361,9 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
                 'solo_lectura': bool(_m is not None and _m.salio),
                 'avisos': _PERM.avisos_miembro(_m, _nombre_curso) if _m is not None else [],
                 'notas_previas_traslado': {str(k): sorted(v) for k, v in (_previas.get(est.id) or {}).items()},
+                # ENT-A · casillas autorizadas por el permiso de corrección
+                # de Dirección para ESTE docente (vacío: todo en solo lectura).
+                'campos_autorizados': _campos_aut,
             },
             'competencias': competencias_data,
             'pc_por_periodo': pcs,            # PC1, PC2, PC3, PC4
@@ -11719,6 +11732,26 @@ def _permiso_correccion(db, current_user, curso_id, asignatura_id, periodo):
     ).first()
 
 
+def _campos_autorizados_correccion(db, current_user, curso_id, asignatura_id, periodos):
+    """ENT-A · Casillas que ESTE docente puede completar o corregir para quien
+    salió del curso (retirado o trasladado). Misma regla que aplica el guardado
+    (`_autorizar_nota_permanencia`): asignación activa a ese curso y asignatura,
+    y permiso temporal de corrección de Dirección vigente para (curso,
+    asignatura, período) —o general—. Solo en los períodos que cursó aquí.
+    Consultar e imprimir no lo necesitan."""
+    if current_user.role != 'profesor':
+        return []
+    asignado = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        profesor_id=current_user.id, curso_id=curso_id, asignatura_id=asignatura_id, activo=True).first()
+    if asignado is None:
+        return []
+    campos = []
+    for p in sorted(periodos):
+        if _permiso_correccion(db, current_user, curso_id, asignatura_id, p) is not None:
+            campos += ['p%d' % p, 'rp%d' % p]
+    return campos
+
+
 def _autorizar_nota_permanencia(db, current_user, est, asignatura_id, data, modelo, competencia_numero):
     """`(error, curso_de_la_nota, permisos_usados)` para guardar una nota.
 
@@ -11917,6 +11950,7 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
     # (no se guarda) y se guardan los abiertos. El profesor puede usar
     # "Solicitar Corrección" para editar un período cerrado con permiso temporal.
     periodos_cerrados_ignorados = []
+    _curso_del_permiso = _curso_nota or estudiante_obj.curso_id
     def _periodo_esta_cerrado(num_periodo):
         """True si el período está cerrado Y el profesor no tiene permiso temporal."""
         if not getattr(ano, f'p{num_periodo}_cerrado', False):
@@ -11927,7 +11961,9 @@ async def save_calificacion_secundaria(request: Request, db: Session = Depends(g
             PermisoTemporalCalificacion.activo == True,
             PermisoTemporalCalificacion.fecha_fin > now_rd(),
             (PermisoTemporalCalificacion.periodo == num_periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
-            (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None))
+            (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+            # ENT-A · el permiso es del CURSO de la nota (o general, sin curso).
+            (PermisoTemporalCalificacion.curso_id == _curso_del_permiso) | (PermisoTemporalCalificacion.curso_id.is_(None)),
         ).first()
         return permiso is None  # cerrado y sin permiso → bloqueado
 
@@ -19136,7 +19172,7 @@ def _asignacion_exacta_activa(db, current_user, curso_id, asignatura_id):
     ).first()
 
 
-def _periodo_cerrado_para_docente(db, current_user, ano, periodo, asignatura_id):
+def _periodo_cerrado_para_docente(db, current_user, ano, periodo, asignatura_id, curso_id):
     """True si el período está cerrado y el profesor no tiene permiso temporal.
 
     Misma política que ya aplica la escritura de calificaciones de Primaria.
@@ -19153,6 +19189,8 @@ def _periodo_cerrado_para_docente(db, current_user, ano, periodo, asignatura_id)
         PermisoTemporalCalificacion.fecha_fin > now_rd(),
         (PermisoTemporalCalificacion.periodo == periodo) | (PermisoTemporalCalificacion.periodo.is_(None)),
         (PermisoTemporalCalificacion.asignatura_id == asignatura_id) | (PermisoTemporalCalificacion.asignatura_id.is_(None)),
+        # ENT-A · del curso de la recuperación, o general (sin curso).
+        (PermisoTemporalCalificacion.curso_id == curso_id) | (PermisoTemporalCalificacion.curso_id.is_(None)),
     ).first()
     return permiso is None
 
@@ -19368,7 +19406,7 @@ async def crear_recuperacion_cualitativa(
     if not ano:
         return JSONResponse({'error': 'No hay año escolar activo'}, status_code=404)
 
-    if _periodo_cerrado_para_docente(db, current_user, ano, limpio['periodo'], asignatura_id):
+    if _periodo_cerrado_para_docente(db, current_user, ano, limpio['periodo'], asignatura_id, estudiante.curso_id):
         return JSONResponse({
             'error': (f"El período P{limpio['periodo']} está cerrado. Solicite una corrección "
                       f"a Dirección si necesita registrarlo.")}, status_code=403)
@@ -19437,7 +19475,7 @@ def _intervencion_editable(db, id, current_user, periodos_extra=()):
         }, status_code=403)
 
     for p in sorted({fila.periodo} | {x for x in periodos_extra if x}):
-        if _periodo_cerrado_para_docente(db, current_user, ano, p, fila.asignatura_id):
+        if _periodo_cerrado_para_docente(db, current_user, ano, p, fila.asignatura_id, fila.curso_id):
             return None, JSONResponse({
                 'error': (f'El período P{p} está cerrado. Solicite una corrección a '
                           f'Dirección si necesita modificarlo.')}, status_code=403)

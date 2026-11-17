@@ -60,6 +60,9 @@ export interface EstudianteData {
     solo_lectura: boolean;
     avisos: string[];
     notas_previas_traslado: Record<string, string[]>;
+    /** ENT-A · casillas (p1, rp1…) que el servidor autoriza a ESTE docente a
+     *  completar o corregir, por permiso temporal de corrección de Dirección. */
+    campos_autorizados?: string[];
   };
   competencias: Record<number, CompetenciaSec>;
   pc_por_periodo: { pc1: number | null; pc2: number | null; pc3: number | null; pc4: number | null };

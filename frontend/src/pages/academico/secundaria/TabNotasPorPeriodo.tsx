@@ -130,6 +130,10 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
     // TRAS-1 · nota registrada antes del traslado: protegida (permiso de Dirección).
     const protegida = (est.permanencia?.notas_previas_traslado?.[String(compNum)] || [])
       .includes(tipo === 'p' ? campoP : campoRP);
+    // ENT-A · quien salió del curso queda en solo lectura SALVO las casillas que
+    // el servidor autoriza a este docente (permiso de corrección de Dirección).
+    const autorizada = esRetirado && puedeEditar
+      && (est.permanencia?.campos_autorizados || []).includes(tipo === 'p' ? campoP : campoRP);
     if (protegida && !esRetirado) {
       return (
         <span className={getNotaClass(valor)}
@@ -139,7 +143,8 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       );
     }
     // Si no puede editar, está retirado, o el período está cerrado → solo lectura
-    if (!puedeEditar || esRetirado || periodoActivoCerrado) {
+    // (salvo una casilla autorizada por el servidor para corrección).
+    if (!autorizada && (!puedeEditar || esRetirado || periodoActivoCerrado)) {
       return <span className={getNotaClass(valor)}>{valor ?? '—'}</span>;
     }
     // Regla MINERD: RP solo se habilita si el P del mismo período existe y es < 70
@@ -165,7 +170,10 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
         max={100}
         value={valor ?? ''}
         onChange={e => onChangeCelda(est.estudiante.id, compNum, tipo, e.target.value)}
-        className={`w-14 px-1 py-1 text-center border rounded text-sm ${tipo === 'rp' ? 'bg-amber-50' : ''}`}
+        title={autorizada ? 'Corrección autorizada por Dirección (permiso temporal)' : undefined}
+        data-autorizada={autorizada ? 'si' : undefined}
+        className={`w-14 px-1 py-1 text-center border rounded text-sm ${
+          autorizada ? 'border-indigo-400 ring-1 ring-indigo-200' : tipo === 'rp' ? 'bg-amber-50' : ''}`}
       />
     );
   };
@@ -267,6 +275,13 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
                       <td className="px-2 py-1">
                         <span className={esRetirado ? 'text-gray-400' : ''}>{est.estudiante.nombre_completo}</span>
                         {esRetirado && !avisos.length && <span className="ml-1 text-xs text-red-500">(retirado)</span>}
+                        {(est.permanencia?.campos_autorizados || []).length > 0 && puedeEditar && (
+                          <div className="text-[10px] text-indigo-800 font-medium">
+                            ✏️ Corrección autorizada por Dirección:{' '}
+                            {[...new Set((est.permanencia!.campos_autorizados || []).map(c => 'P' + c.replace(/[^0-9]/g, '')))].join(', ')}
+                            {' '}· sigue {avisos.some(a => a.startsWith('Retirado')) || est.estudiante.retirado ? 'retirado' : 'fuera del curso'}
+                          </div>
+                        )}
                         {avisos.length > 0 && (
                           <div className="text-[10px] text-indigo-700">
                             {avisos.join(' · ')}

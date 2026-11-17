@@ -122,6 +122,9 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
   const renderCelda = (est: EstudianteData, compNum: number, campo: CampoEditable, isRP: boolean) => {
     const val = getValor(est, compNum, campo);
     const esRetirado = !!est.estudiante.retirado || !!est.permanencia?.solo_lectura;
+    // ENT-A · quien salió del curso queda en solo lectura SALVO las casillas que
+    // el servidor autoriza a este docente (permiso de corrección de Dirección).
+    const autorizada = esRetirado && puedeEditar && (est.permanencia?.campos_autorizados || []).includes(campo);
     const cellKey = `${est.estudiante.id}-${compNum}-${campo}`;
     // TRAS-1 · nota registrada antes del traslado: se ve, pero no se
     // sobrescribe sin el permiso temporal de corrección de Dirección.
@@ -152,7 +155,8 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
     }
 
     // Si no puede editar, está retirado, o el período está cerrado → solo lectura
-    if (!puedeEditar || esRetirado || periodoCerrado) {
+    // (salvo una casilla autorizada por el servidor para corrección).
+    if (!autorizada && (!puedeEditar || esRetirado || periodoCerrado)) {
       return (
         <span className={`inline-block w-16 text-center text-sm ${
           esRetirado ? (val !== null ? 'text-gray-500' : 'text-gray-300') :
@@ -191,8 +195,10 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
         step={0.01}
         value={val ?? ''}
         onChange={e => handleNotaChange(est.estudiante.id, compNum, campo, e.target.value)}
+        title={autorizada ? 'Corrección autorizada por Dirección (permiso temporal)' : undefined}
+        data-autorizada={autorizada ? 'si' : undefined}
         className={`w-16 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 ${
-          isRP ? 'bg-amber-50 border-amber-200' : ''
+          autorizada ? 'border-indigo-400 ring-1 ring-indigo-200' : isRP ? 'bg-amber-50 border-amber-200' : ''
         }`}
       />
     );
@@ -308,6 +314,14 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
                             </span>
                           )}
                         </div>
+                        {(est.permanencia?.campos_autorizados || []).length > 0 && puedeEditar && (
+                          <div className="text-[10px] text-indigo-800 font-medium">
+                            ✏️ Corrección autorizada por Dirección:{' '}
+                            {[...new Set((est.permanencia!.campos_autorizados || []).map(c => 'P' + c.replace(/[^0-9]/g, '')))].join(', ')}
+                            {' '}· el estudiante sigue {est.estudiante.retirado || (est.permanencia?.avisos || []).some(a => a.startsWith('Retirado'))
+                              ? 'retirado' : 'fuera del curso'}
+                          </div>
+                        )}
                         {(est.permanencia?.avisos || []).length > 0 && (
                           <div className="text-[10px] text-indigo-700">
                             {est.permanencia!.avisos.join(' · ')}
