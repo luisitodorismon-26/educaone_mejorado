@@ -11289,7 +11289,14 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
         asignatura_id=asignatura_id, ano_escolar_id=ano.id
     ).filter(EvaluacionExtraSecundaria.estudiante_id.in_([e.id for e in estudiantes])).all()
     extras_by_est = {e.estudiante_id: e for e in extras}
-    
+
+    # ENT-A · Casillas de períodos CERRADOS que este docente puede corregir por un
+    # permiso temporal vigente de este curso y asignatura (o general). El período
+    # NO se reabre: solo esas casillas, y solo mientras el permiso esté vigente.
+    _campos_cerrados_autorizados = _campos_autorizados_correccion(
+        db, current_user, curso_id, asignatura_id,
+        {p_ for p_ in (1, 2, 3, 4) if getattr(ano, 'p%d_cerrado' % p_, False)})
+
     resultado = []
     for est in estudiantes:
         comps = by_est.get(est.id, {})
@@ -11335,8 +11342,8 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
             # los períodos que cursó en él y SIN promedio ni calificación final:
             # su resultado lo emite el curso donde termina el año. Las notas
             # siguen intactas en la base; el destino las muestra todas.
-            _salida = _m.ultimo.fecha_salida
-            _visibles = {p_ for p_, ini_, _f in ASIS.rangos_periodos(ano) if _salida is None or ini_ < _salida}
+            # ENT-A · la misma regla que aplica el guardado.
+            _visibles = _periodos_cursados_en_curso(db, est, ano, curso_id) or set()
             for _num, _cd in competencias_data.items():
                 _cd = dict(_cd)
                 for p_ in (1, 2, 3, 4):
@@ -11349,6 +11356,11 @@ async def get_calificaciones_secundaria(curso_id: int, asignatura_id: int,
             cf, literal, extra = None, None, None
             # ENT-A · lo que el servidor permite completar o corregir aquí.
             _campos_aut = _campos_autorizados_correccion(db, current_user, curso_id, asignatura_id, _visibles)
+        else:
+            # ENT-A · En un período CERRADO el permiso temporal es una excepción
+            # para todo el curso (asignatura y período): el período sigue
+            # cerrado y solo esas casillas quedan autorizadas, como al guardar.
+            _campos_aut = _campos_cerrados_autorizados
         resultado.append({
             'estudiante': {
                 'id': est.id,
@@ -11732,6 +11744,20 @@ def _permiso_correccion(db, current_user, curso_id, asignatura_id, periodo):
     ).first()
 
 
+def _periodos_cursados_en_curso(db, est, ano, curso_id):
+    """ENT-A · Períodos que el estudiante cursó en ESE curso este año: los que
+    empiezan antes de su salida de él (todos si sigue). None si nunca perteneció.
+    Es la MISMA regla para la pantalla (qué se muestra y qué casillas se
+    autorizan) y para el guardado (qué se acepta)."""
+    import permanencia as _PERM
+    tramos = [t for t in _PERM.tramos_de(db, est, ano.id) if t.curso_id == curso_id]
+    if not tramos:
+        return None
+    ultimo = max(tramos, key=lambda t: (t.desde or date.min))
+    salida = ultimo.fecha_salida
+    return {p for p, ini, _f in ASIS.rangos_periodos(ano) if salida is None or ini < salida}
+
+
 def _campos_autorizados_correccion(db, current_user, curso_id, asignatura_id, periodos):
     """ENT-A · Casillas que ESTE docente puede completar o corregir para quien
     salió del curso (retirado o trasladado). Misma regla que aplica el guardado
@@ -11805,10 +11831,58 @@ def _autorizar_nota_permanencia(db, current_user, est, asignatura_id, data, mode
 
     nombre_curso = _nombre_curso_fn(db, current_user)
 
+    def _fuera_de_permanencia(curso_id):
+        """ENT-A · 403 si se cambia un período que el estudiante no cursó en ese
+        curso (misma regla que `campos_autorizados` de la pantalla)."""
+        if ano is None or not cambiados:
+            return None
+        cursados = _periodos_cursados_en_curso(db, est, ano, curso_id)
+        if cursados is None:
+            return None
+        fuera = sorted({int(c[-1]) for c in cambiados if int(c[-1]) not in cursados})
+        if not fuera:
+            return None
+        return JSONResponse({
+            'error': 'PERIODO_FUERA_DE_PERMANENCIA',
+            'message': ('El estudiante no cursó %s en %s: esas notas no se completan ni se corrigen '
+                        'desde este curso.' % (', '.join('P%d' % p for p in fuera), nombre_curso(curso_id))),
+            'periodos': fuera,
+        }, status_code=403)
+
+    # ENT-A · La pantalla indica desde qué curso se edita (`curso_id`). Si es un
+    # curso ANTERIOR del estudiante, se autoriza con ESE curso —asignación y
+    # permiso de corrección de ese curso—, igual que las casillas que la
+    # pantalla habilitó; no con el curso actual.
+    try:
+        curso_ctx = int(data.get('curso_id')) if data.get('curso_id') not in (None, '') else None
+    except (TypeError, ValueError):
+        curso_ctx = None
+    if curso_ctx is not None and curso_ctx != est.curso_id and ano is not None:
+        if not any(t.curso_id == curso_ctx for t in _PERM.tramos_de(db, est, ano.id)):
+            return JSONResponse({'error': 'El estudiante no perteneció a ese curso en este año escolar.'},
+                                status_code=403), None, []
+        if not _asignado(curso_ctx):
+            return JSONResponse({
+                'error': 'No tienes asignada esta asignatura en ese curso.'}, status_code=403), None, []
+        if not cambiados:
+            return None, curso_ctx, []
+        err = _fuera_de_permanencia(curso_ctx)
+        if err is not None:
+            return err, None, []
+        err, usados = _exigir_permiso(
+            curso_ctx, cambiados, 'NOTA_DE_CURSO_ANTERIOR',
+            ('El estudiante ya no pertenece a %s. Sus notas se conservan; para corregir '
+             'una de ese curso hace falta el permiso temporal de corrección de Dirección.'
+             % nombre_curso(curso_ctx)), 403)
+        return err, curso_ctx, usados
+
     if _asignado(est.curso_id):
         if not est.activo:
             if not cambiados:
                 return None, est.curso_id, []
+            err = _fuera_de_permanencia(est.curso_id)
+            if err is not None:
+                return err, None, []
             err, usados = _exigir_permiso(
                 est.curso_id, cambiados, 'Estudiante retirado: no se pueden modificar sus calificaciones',
                 ('Estudiante retirado: sus notas se conservan. Para una corrección histórica '
@@ -11843,6 +11917,9 @@ def _autorizar_nota_permanencia(db, current_user, est, asignatura_id, data, mode
             if t.curso_id and t.curso_id != est.curso_id and _asignado(t.curso_id):
                 if not cambiados:
                     return None, t.curso_id, []
+                err = _fuera_de_permanencia(t.curso_id)
+                if err is not None:
+                    return err, None, []
                 err, usados = _exigir_permiso(
                     t.curso_id, cambiados, 'NOTA_DE_CURSO_ANTERIOR',
                     ('El estudiante ya no pertenece a %s. Sus notas se conservan; para corregir '

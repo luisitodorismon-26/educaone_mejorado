@@ -22,11 +22,13 @@ interface Props {
   onReload: () => Promise<void>;
   onAbrirFicha?: (estudianteId: number) => void;
   periodosCerrados?: Record<string, boolean>;
+  /** ENT-A · curso desde el que se edita: el servidor autoriza con ESTE curso. */
+  cursoId?: number;
 }
 
 type EditadasState = Record<string, Partial<Record<CampoEditable, number | null>>>;
 
-export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, onAbrirFicha, periodosCerrados = {} }) => {
+export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, onAbrirFicha, periodosCerrados = {}, cursoId }) => {
   const [competenciaActiva, setCompetenciaActiva] = useState<number>(1);
   const [editadas, setEditadas] = useState<EditadasState>({});
   const [saving, setSaving] = useState(false);
@@ -96,6 +98,7 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
             estudiante_id: estId,
             asignatura_id: asignaturaId,
             competencia_numero: compNum,
+            ...(cursoId ? { curso_id: cursoId } : {}),
             ...cambios,
           });
           exitos++;
@@ -124,7 +127,9 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
     const esRetirado = !!est.estudiante.retirado || !!est.permanencia?.solo_lectura;
     // ENT-A · quien salió del curso queda en solo lectura SALVO las casillas que
     // el servidor autoriza a este docente (permiso de corrección de Dirección).
-    const autorizada = esRetirado && puedeEditar && (est.permanencia?.campos_autorizados || []).includes(campo);
+    // (también un período CERRADO con permiso temporal: sigue cerrado y solo
+    // se abren estas casillas, mientras el permiso esté vigente).
+    const autorizada = puedeEditar && (est.permanencia?.campos_autorizados || []).includes(campo);
     const cellKey = `${est.estudiante.id}-${compNum}-${campo}`;
     // TRAS-1 · nota registrada antes del traslado: se ve, pero no se
     // sobrescribe sin el permiso temporal de corrección de Dirección.
@@ -145,7 +150,7 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
       rpDeshabilitado = pVal === null || pVal >= 70;
     }
 
-    if (protegida && !esRetirado) {
+    if (protegida && !esRetirado && !autorizada) {
       return (
         <span title="Registrada antes del traslado. Para corregirla hace falta el permiso temporal de corrección de Dirección."
               className={`inline-block w-16 text-center text-sm ${isRP ? 'text-amber-700' : 'text-gray-700'} ${getNotaClass(val)}`}>
@@ -314,7 +319,7 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
                             </span>
                           )}
                         </div>
-                        {(est.permanencia?.campos_autorizados || []).length > 0 && puedeEditar && (
+                        {esRetirado && (est.permanencia?.campos_autorizados || []).length > 0 && puedeEditar && (
                           <div className="text-[10px] text-indigo-800 font-medium">
                             ✏️ Corrección autorizada por Dirección:{' '}
                             {[...new Set((est.permanencia!.campos_autorizados || []).map(c => 'P' + c.replace(/[^0-9]/g, '')))].join(', ')}

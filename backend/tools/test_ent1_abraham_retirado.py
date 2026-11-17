@@ -52,8 +52,9 @@ add(M.ConfiguracionColegio(colegio_id=col.id, nombre=col.nombre, regional='10', 
 otro = add(M.Colegio(nombre='Otro Colegio', codigo='SOTRO', activo=True))
 ano = add(M.AnoEscolar(colegio_id=col.id, nombre='2026-2027', activo=True, fecha_inicio=dt.date(2026, 8, 24),
                        fecha_fin=dt.date(2027, 6, 30), periodo_activo=2, p1_cerrado=True,
-                       p1_inicio=dt.date(2026, 8, 24), p1_fin=dt.date(2026, 10, 30),
-                       p2_inicio=dt.date(2026, 11, 2), p2_fin=dt.date(2027, 1, 29),
+                       p1_inicio=dt.date(2026, 8, 24), p1_fin=dt.date(2026, 10, 23),
+                       # P2 empieza ANTES del retiro (02/11): el retirado cursó parte de P2.
+                       p2_inicio=dt.date(2026, 10, 26), p2_fin=dt.date(2027, 1, 29),
                        p3_inicio=dt.date(2027, 2, 1), p3_fin=dt.date(2027, 4, 16),
                        p4_inicio=dt.date(2027, 4, 19), p4_fin=dt.date(2027, 6, 30)))
 g = add(M.Grado(colegio_id=col.id, nombre='5to Secundaria', nivel='secundaria', orden=5, activo=True))

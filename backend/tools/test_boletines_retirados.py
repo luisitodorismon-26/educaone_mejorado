@@ -7,6 +7,10 @@ cerrado filtrado por curso. Datos SINTÉTICOS (SQLite temporal).
   G  guardado de una casilla autorizada / no autorizada; el estudiante sigue retirado
   L  lista de Boletines con retirados (cohorte del curso y año)
   I  impresión sin permiso de corrección; otro colegio
+  W  escritura directa de un período que NO cursó: rechazada igual que en pantalla
+  T  traslado con el mismo docente en origen y destino, permiso SOLO del origen
+  Z  período cerrado: el permiso no lo reabre; solo las casillas autorizadas
+  R  permiso revocado o vencido: ya no se aceptan cambios (pantalla y guardado)
 
 Uso (desde backend/):  python tools/test_boletines_retirados.py
 """
@@ -83,17 +87,22 @@ def est(nombre, cur, n):
 
 
 RET = est('Retirado', SA, 1)            # se retira desde el 16/11: cursó P1 y parte de P2
+TRA = est('Trasladado', SA, 3)           # se traslada de A a B desde el 16/11
 ACT = est('ActivoA', SA, 2)
 ACTB = est('ActivoB', SB, 1)
 PRA, PRB = est('PrimA', PA, 1), est('PrimB', PB, 1)
 add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=RET.id, asignatura_id=art.id, ano_escolar_id=ano.id,
                              competencia_numero=1, p1=60))
-for e in (ACT, ACTB):
+for e in (ACT, ACTB, TRA):
     add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=e.id, asignatura_id=art.id, ano_escolar_id=ano.id,
                                  competencia_numero=1, p1=60))
 for e in (PRA, PRB):
     add(M.CalificacionPrimaria(colegio_id=col.id, estudiante_id=e.id, asignatura_id=len_.id, ano_escolar_id=ano.id,
                                competencia_numero=1, p1=60))
+SC = add(M.Curso(colegio_id=col.id, nombre='C', grado_id=gs.id, ano_escolar_id=ano.id, activo=True))
+add(M.AsignacionProfesor(colegio_id=col.id, profesor_id=prof.id, curso_id=SC.id, asignatura_id=art.id,
+                         ano_escolar_id=ano.id, activo=True))
+SC_INEXISTENTE = SC.id                    # curso al que el trasladado nunca perteneció
 db.commit()
 TOK = {k: create_token(u) for k, u in (('dir', dire), ('sec', secre), ('prof', prof), ('prof2', prof_otro),
                                        ('dir_otro', dir_otro))}
@@ -243,6 +252,92 @@ st, js = req('POST', '/api/periodos/permiso-temporal', 'sec',
              {'profesor_id': prof.id, 'curso_id': SA.id, 'asignatura_id': art.id, 'periodo': 2, 'horas': 24})
 check('I7 Secretaría no concede permisos (403)', st == 403, st)
 check('I8 tras imprimir, el estudiante sigue retirado y sin cambios', ficha(RET.id) == base)
+
+
+print('\n== W. Escritura directa de un período que NO cursó (P4) ==')
+limpiar_permisos()
+permiso(prof, SA, art, 4)
+check('W0 la pantalla no ofrece P4 (C7)', campos('prof') == [], campos('prof'))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': RET.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p4': 90, 'curso_id': SA.id})
+check('W1 la API también lo rechaza (403 PERIODO_FUERA_DE_PERMANENCIA) y P4 sigue vacío',
+      st == 403 and js.get('error') == 'PERIODO_FUERA_DE_PERMANENCIA' and nota(M.CalificacionSecundaria, RET.id, 'p4') is None,
+      (st, js))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': RET.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p4': 90})
+check('W2 igual sin indicar el curso', st == 403 and nota(M.CalificacionSecundaria, RET.id, 'p4') is None, (st, js))
+check('W3 la ficha del retirado sigue igual', ficha(RET.id) == base)
+limpiar_permisos()
+
+
+def campos_de(k, curso, eid):
+    st, js = req('GET', '/api/calificaciones-secundaria/curso/%d/asignatura/%d' % (curso.id, art.id), k)
+    fila = next((x for x in js.get('calificaciones', []) if x['estudiante']['id'] == eid), None) if st == 200 else None
+    return fila['permanencia']['campos_autorizados'] if fila else ('HTTP', st)
+
+
+print('\n== T. Traslado: mismo docente en origen (A) y destino (B), permiso SOLO del origen ==')
+st, js = req('POST', '/api/estudiantes/%d/traslado' % TRA.id, 'dir', {'curso_destino_id': SB.id, 'desde': '2026-11-16'})
+check('T0 traslado A -> B desde 16/11', st == 200, js)
+base_t = ficha(TRA.id)
+permiso(prof, SA, art, 2)
+check('T1 pantalla del ORIGEN: P2 y RP2 autorizadas', campos_de('prof', SA, TRA.id) == ['p2', 'rp2'], campos_de('prof', SA, TRA.id))
+check('T2 pantalla del DESTINO: ninguna casilla por ese permiso (es del origen)', campos_de('prof', SB, TRA.id) == [],
+      campos_de('prof', SB, TRA.id))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': TRA.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p2': 72, 'curso_id': SA.id})
+check('T3 guardado desde el ORIGEN usa el mismo curso autorizado: P2 = 72', st == 200
+      and nota(M.CalificacionSecundaria, TRA.id, 'p2') == 72, (st, js))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': TRA.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p1': 65, 'curso_id': SA.id})
+check('T4 desde el origen, P1 (sin permiso de P1): rechazado y P1 intacto', st == 403
+      and nota(M.CalificacionSecundaria, TRA.id, 'p1') == 60, (st, js))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': TRA.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p1': 66, 'curso_id': SB.id})
+check('T5 desde el DESTINO, P1 cerrado y sin permiso del destino: no se acepta (P1 intacto)',
+      nota(M.CalificacionSecundaria, TRA.id, 'p1') == 60, (st, js))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': TRA.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p2': 73, 'curso_id': SC_INEXISTENTE})
+check('T6 un curso al que nunca perteneció: 403', st == 403 and nota(M.CalificacionSecundaria, TRA.id, 'p2') == 72, (st, js))
+check('T7 el trasladado conserva su ficha, curso y movimiento', ficha(TRA.id) == base_t)
+limpiar_permisos()
+
+print('\n== Z. Período CERRADO (P1): el permiso no lo reabre ==')
+check('Z0 sin permiso: un activo no tiene casillas autorizadas en P1', campos_de('prof', SA, ACT.id) == [], campos_de('prof', SA, ACT.id))
+pz = permiso(prof, SA, art, 1)
+check('Z1 con permiso de P1 de su curso: P1 y RP1 autorizadas para el activo', campos_de('prof', SA, ACT.id) == ['p1', 'rp1'],
+      campos_de('prof', SA, ACT.id))
+db.expire_all()
+check('Z2 el período sigue CERRADO (el permiso no lo reabre)', db.get(M.AnoEscolar, ano.id).p1_cerrado is True)
+st, js = req('GET', '/api/calificaciones-secundaria/curso/%d/asignatura/%d' % (SA.id, art.id), 'prof')
+check('Z3 la pantalla recibe el período como cerrado', st == 200 and js.get('periodos_cerrados', {}).get('p1') is True,
+      js.get('periodos_cerrados'))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': ACT.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p1': 67, 'curso_id': SA.id})
+check('Z4 guardado de la casilla autorizada: P1 = 67', st == 200 and nota(M.CalificacionSecundaria, ACT.id) == 67, (st, js))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': ACTB.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p1': 68, 'curso_id': SB.id})
+check('Z5 el mismo docente en OTRO curso (B): P1 sigue cerrado', nota(M.CalificacionSecundaria, ACTB.id) != 68, (st, js))
+
+print('\n== R. Permiso REVOCADO o VENCIDO ==')
+st, js = req('DELETE', '/api/periodos/permiso-temporal/%d' % pz, 'dir')
+check('R0 Dirección revoca el permiso', st == 200, (st, js))
+check('R1 pantalla: ya no hay casillas autorizadas', campos_de('prof', SA, ACT.id) == [], campos_de('prof', SA, ACT.id))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': ACT.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p1': 69, 'curso_id': SA.id})
+check('R2 guardado: el P1 cerrado ya no cambia (sigue 67) y se informa', nota(M.CalificacionSecundaria, ACT.id) == 67
+      and (js.get('periodos_cerrados_ignorados') or st != 200), (st, js))
+pv = permiso(prof, SA, art, 2)
+db.query(M.PermisoTemporalCalificacion).filter_by(id=pv).update({'fecha_fin': dt.datetime(2020, 1, 1)})
+db.commit()
+check('R3 permiso VENCIDO: la pantalla del retirado no ofrece casillas', campos('prof') == [], campos('prof'))
+st, js = req('POST', '/api/calificaciones-secundaria', 'prof',
+             {'estudiante_id': RET.id, 'asignatura_id': art.id, 'competencia_numero': 1, 'p2': 50, 'curso_id': SA.id})
+check('R4 permiso VENCIDO: el guardado del retirado se rechaza (403) y P2 sigue en 75', st == 403
+      and nota(M.CalificacionSecundaria, RET.id, 'p2') == 75, (st, js))
+st, js = req('GET', '/api/boletines/estudiante/%d/pdf' % RET.id, 'dir')
+check('R5 imprimir el boletín no requiere permiso', st == 200 and js.get('_pdf'), st)
+check('R6 el retirado sigue igual', ficha(RET.id) == base)
 
 ok = sum(1 for _, x in RES if x)
 print('\nRESULTADO ENT-A BOLETINES RETIRADOS: %d PASARON / %d FALLARON' % (ok, len(RES) - ok))
