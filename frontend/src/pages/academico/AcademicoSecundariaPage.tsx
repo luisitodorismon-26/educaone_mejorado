@@ -38,6 +38,23 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
   const [modoNotas, setModoNotas] = useState<'competencia' | 'periodo'>('periodo');
   // Estado de cierre de períodos (para bloquear casillas de períodos cerrados)
   const [periodosCerrados, setPeriodosCerrados] = useState<Record<string, boolean>>({ p1: false, p2: false, p3: false, p4: false });
+  // ENT-A · cambios de notas sin guardar y guardado en curso (los informa la vista).
+  const [edicion, setEdicion] = useState<{ pendientes: number; guardando: boolean }>({ pendientes: 0, guardando: false });
+  // Cerrar o recargar el navegador con cambios sin guardar: el navegador avisa.
+  useEffect(() => {
+    if (edicion.pendientes === 0 && !edicion.guardando) return;
+    const avisar = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', avisar);
+    return () => window.removeEventListener('beforeunload', avisar);
+  }, [edicion.pendientes, edicion.guardando]);
+  /** ¿Se puede dejar la vista actual? Durante un guardado, no; con cambios sin
+   *  guardar, solo si la persona lo confirma (si no, se queda). */
+  const puedeDejarNotas = () => {
+    if (edicion.guardando) return false;
+    if (edicion.pendientes === 0) return true;
+    return window.confirm(`Hay ${edicion.pendientes} cambio(s) de notas sin guardar. Si continúa, se perderán.\n\n` +
+      'Pulse «Cancelar» para quedarse y guardarlos.');
+  };
 
   useEffect(() => {
     if (cursoId && asignaturaId) cargar();
@@ -68,6 +85,7 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
   const conCF = estudiantes.filter(e => e.cf !== null && !e.estudiante.retirado && !e.permanencia?.solo_lectura).length;
 
   const abrirFicha = (estudianteId: number) => {
+    if (!puedeDejarNotas()) return;
     navigate(`/academico/estudiante/${estudianteId}/asignatura/${asignaturaId}`);
   };
 
@@ -127,7 +145,7 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
           >
             Planilla
           </Button>
-          <Button variant="secondary" onClick={onVolver}>Volver</Button>
+          <Button variant="secondary" disabled={edicion.guardando} onClick={() => { if (puedeDejarNotas()) onVolver(); }}>Volver</Button>
         </div>
       </div>
 
@@ -135,7 +153,8 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
         {tabs.map(t => (
           <button
             key={t.id}
-            onClick={() => setTab(t.id)}
+            onClick={() => { if (t.id === tab || puedeDejarNotas()) setTab(t.id); }}
+            disabled={edicion.guardando && t.id !== tab}
             className={`px-4 py-2.5 text-sm font-medium flex items-center gap-2 border-b-2 transition-colors whitespace-nowrap ${
               tab === t.id
                 ? 'border-blue-600 text-blue-700'
@@ -159,7 +178,8 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
             {/* Selector de modo de carga: Por Período (predeterminado) / Por Competencia */}
             <div className="flex gap-2 bg-gray-100 p-1 rounded-lg w-fit">
               <button
-                onClick={() => setModoNotas('periodo')}
+                onClick={() => { if (modoNotas === 'periodo' || puedeDejarNotas()) setModoNotas('periodo'); }}
+                disabled={edicion.guardando && modoNotas !== 'periodo'}
                 className={`px-4 py-2 rounded-md text-sm font-medium transition ${
                   modoNotas === 'periodo'
                     ? 'bg-white text-blue-700 shadow-sm'
@@ -169,7 +189,8 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
                 Por Período
               </button>
               <button
-                onClick={() => setModoNotas('competencia')}
+                onClick={() => { if (modoNotas === 'competencia' || puedeDejarNotas()) setModoNotas('competencia'); }}
+                disabled={edicion.guardando && modoNotas !== 'competencia'}
                 className={`px-4 py-2 rounded-md text-sm font-medium transition ${
                   modoNotas === 'competencia'
                     ? 'bg-white text-blue-700 shadow-sm'
@@ -189,6 +210,7 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
                 onAbrirFicha={abrirFicha}
                 periodosCerrados={periodosCerrados}
                 cursoId={cursoId}
+                onEstadoEdicion={setEdicion}
               />
             ) : (
               <TabNotasPorPeriodo
@@ -198,6 +220,7 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
                 onReload={cargar}
                 periodosCerrados={periodosCerrados}
                 cursoId={cursoId}
+                onEstadoEdicion={setEdicion}
               />
             )}
           </div>

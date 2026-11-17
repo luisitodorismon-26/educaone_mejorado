@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, Fragment } from 'react';
+import { useState, useCallback, useMemo, useEffect, Fragment } from 'react';
 import api from '../../../services/api';
 import { Save, BookOpen } from 'lucide-react';
 import { Button, Alert } from '../../../components/ui';
@@ -22,6 +22,21 @@ interface Props {
   periodosCerrados?: Record<string, boolean>;
   /** ENT-A · curso desde el que se edita: el servidor autoriza con ESTE curso. */
   cursoId?: number;
+  /** ENT-A · informa al padre de lo pendiente y de si se está guardando. */
+  onEstadoEdicion?: (e: { pendientes: number; guardando: boolean }) => void;
+}
+
+/** ENT-A · Quita SOLO las casillas guardadas cuyo valor sigue siendo el que se
+ *  envió. Lo escrito después (o lo que no se guardó) se conserva. */
+function quitarGuardadas<T extends Record<string, Record<string, number | null | undefined>>>(
+  prev: T, guardadas: Record<string, Record<string, number | null | undefined>>): T {
+  const out: Record<string, Record<string, number | null | undefined>> = {};
+  for (const [k, campos] of Object.entries(prev)) {
+    const env = guardadas[k] || {};
+    const resto = Object.fromEntries(Object.entries(campos).filter(([c, v]) => !(c in env && env[c] === v)));
+    if (Object.keys(resto).length) out[k] = resto;
+  }
+  return out as T;
 }
 
 // clave: "estudianteId-competenciaNumero" → { p?: valor, rp?: valor }
@@ -30,11 +45,16 @@ interface Props {
 // clave: "estudianteId-competenciaNumero-periodo"
 type EditadasState = Record<string, { p?: number | null; rp?: number | null }>;
 
-export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, periodosCerrados = {}, cursoId }) => {
+export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId, puedeEditar, onReload, periodosCerrados = {}, cursoId, onEstadoEdicion }) => {
   const [periodoActivo, setPeriodoActivo] = useState<number>(1);
   const [editadas, setEditadas] = useState<EditadasState>({});
   const [saving, setSaving] = useState(false);
   const [mensaje, setMensaje] = useState<{ tipo: 'success' | 'error' | 'warning'; texto: string } | null>(null);
+
+  // ENT-A · el padre sabe si hay cambios sin guardar o un guardado en curso.
+  const nPendientes = Object.values(editadas).reduce((n, c) => n + Object.keys(c).length, 0);
+  useEffect(() => { onEstadoEdicion?.({ pendientes: nPendientes, guardando: saving }); }, [nPendientes, saving]);
+  useEffect(() => () => onEstadoEdicion?.({ pendientes: 0, guardando: false }), []);
 
   // ¿El período activo está cerrado? → bloquea las casillas
   const periodoActivoCerrado = !!periodosCerrados[`p${periodoActivo}`];
@@ -81,7 +101,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
     // ENT-A · Cada casilla queda GUARDADA, IGNORADA (período cerrado sin
     // permiso vigente) o RECHAZADA (error del servidor). Solo se limpian las
     // guardadas; las demás se conservan en pantalla, en SU período.
-    const pendientes: EditadasState = {};
+    const enviadasGuardadas: EditadasState = {};
     let guardadas = 0;
     const ignoradas: string[] = [];
     const rechazadas: string[] = [];
@@ -110,13 +130,12 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
           const res = await api.post('/calificaciones-secundaria', payload);
           const ign: number[] = res.data?.periodos_cerrados_ignorados || [];
           if (ign.includes(per)) {
-            pendientes[key] = cambios;
             ignoradas.push(`${nombreDe(estId)} C${compNum} P${per}`);
           } else {
             guardadas += n;
+            enviadasGuardadas[key] = { ...cambios };
           }
         } catch (err: unknown) {
-          pendientes[key] = cambios;
           const d = (err as { response?: { data?: { error?: string; message?: string } } })?.response?.data;
           rechazadas.push(`${nombreDe(estId)} C${compNum} P${per}: ${String(d?.message || d?.error || 'sin respuesta del servidor').replace(/\.$/, '')}`);
         }
@@ -128,7 +147,8 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       if (ignoradas.length || rechazadas.length) partes.push('Lo escrito se conserva en pantalla, marcado «sin guardar».');
       setMensaje({ tipo: rechazadas.length ? 'error' : ignoradas.length ? 'warning' : 'success', texto: partes.join(' ') });
 
-      setEditadas(pendientes);
+      // Solo se limpia lo guardado (y si no se tocó después de enviarlo).
+      setEditadas(prev => quitarGuardadas(prev, enviadasGuardadas));
       await onReload();
     } catch {
       setMensaje({ tipo: 'error', texto: 'Error al guardar las notas' });
@@ -199,6 +219,7 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
         max={100}
         value={valor ?? ''}
         onChange={e => onChangeCelda(est.estudiante.id, compNum, tipo, e.target.value)}
+        disabled={saving}
         title={sinGuardar ? 'Escrito sin guardar' : autorizada ? 'Corrección autorizada por Dirección (permiso temporal)' : undefined}
         data-autorizada={autorizada ? 'si' : undefined}
         data-sin-guardar={sinGuardar ? 'si' : undefined}
@@ -218,7 +239,9 @@ export const TabNotasPorPeriodo: React.FC<Props> = ({ estudiantes, asignaturaId,
       {/* Acción guardar */}
       {totalEditados > 0 && puedeEditar && (
         <div className="flex justify-end gap-2">
-          <Button variant="secondary" onClick={() => { setEditadas({}); setMensaje(null); }} disabled={saving}>
+          <Button variant="secondary" disabled={saving} onClick={() => {
+            if (window.confirm(`¿Descartar ${nPendientes} cambio(s) sin guardar? No se puede deshacer.`)) { setEditadas({}); setMensaje(null); }
+          }}>
             Descartar lo no guardado
           </Button>
           <Button onClick={guardar} loading={saving} icon={<Save size={16} />} variant="success">
