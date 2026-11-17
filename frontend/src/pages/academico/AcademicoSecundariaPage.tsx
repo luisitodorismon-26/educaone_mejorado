@@ -71,7 +71,10 @@ export const AcademicoSecundariaPage: React.FC<Props> = ({ cursoId, asignaturaId
     navigate(`/academico/estudiante/${estudianteId}/asignatura/${asignaturaId}`);
   };
 
-  if (loading) return <div className="flex justify-center py-10"><Spinner /></div>;
+  // ENT-A · El indicador solo en la carga INICIAL. En una recarga (tras guardar)
+  // la tabla sigue montada: si se desmontara, se perderían el resultado del
+  // guardado y lo escrito que no se pudo guardar.
+  if (loading && estudiantes.length === 0) return <div className="flex justify-center py-10"><Spinner /></div>;
 
   const tabs: Array<{ id: TabId; label: string; icon: React.ReactNode; badge?: number; badgeColor?: string }> = [
     { id: 'notas', label: 'Notas regulares', icon: <BookOpen size={16} /> },

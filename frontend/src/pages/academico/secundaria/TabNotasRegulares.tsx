@@ -84,9 +84,17 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
       return;
     }
     setSaving(true);
-    let errores = 0;
-    let exitos = 0;
-    const mensajesError: string[] = [];
+    // ENT-A · Cada casilla termina en uno de tres estados: GUARDADA, IGNORADA
+    // (período cerrado sin permiso vigente: el servidor responde 200 y la
+    // indica en `periodos_cerrados_ignorados`) o RECHAZADA (error del
+    // servidor; no se guarda nada de esa petición). Las ignoradas y las
+    // rechazadas se CONSERVAN en pantalla para que el docente no pierda lo
+    // escrito; solo se limpian las guardadas.
+    const pendientes: EditadasState = {};
+    let guardadas = 0;
+    const ignoradas: string[] = [];
+    const rechazadas: string[] = [];
+    const nombreDe = (id: number) => estudiantes.find(e => e.estudiante.id === id)?.estudiante.nombre_completo || `#${id}`;
     try {
       for (const k of claves) {
         const [estIdStr, compNumStr] = k.split('-');
@@ -94,28 +102,33 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
         const compNum = parseInt(compNumStr);
         const cambios = editadas[k];
         try {
-          await api.post('/calificaciones-secundaria', {
+          const res = await api.post('/calificaciones-secundaria', {
             estudiante_id: estId,
             asignatura_id: asignaturaId,
             competencia_numero: compNum,
             ...(cursoId ? { curso_id: cursoId } : {}),
             ...cambios,
           });
-          exitos++;
+          const ign: number[] = res.data?.periodos_cerrados_ignorados || [];
+          const quedan = Object.fromEntries(Object.entries(cambios)
+            .filter(([campo]) => ign.includes(Number(campo.replace(/[^0-9]/g, ''))))) as EditadasState[string];
+          guardadas += Object.keys(cambios).length - Object.keys(quedan).length;
+          if (Object.keys(quedan).length > 0) {
+            pendientes[k] = quedan;
+            ignoradas.push(`${nombreDe(estId)} C${compNum} ${Object.keys(quedan).map(c => c.toUpperCase()).join('/')}`);
+          }
         } catch (err: any) {
-          errores++;
-          const msg = err.response?.data?.error || 'Error desconocido';
-          mensajesError.push(`Est ${estId} C${compNum}: ${msg}`);
+          pendientes[k] = cambios;
+          const msg = err.response?.data?.message || err.response?.data?.error || 'sin respuesta del servidor';
+          rechazadas.push(`${nombreDe(estId)} C${compNum}: ${String(msg).replace(/\.$/, '')}`);
         }
       }
-      if (errores === 0) {
-        setMensaje({ tipo: 'success', texto: `${exitos} calificación(es) guardada(s)` });
-      } else if (exitos > 0) {
-        setMensaje({ tipo: 'warning', texto: `${exitos} guardadas, ${errores} fallaron: ${mensajesError.slice(0, 2).join('; ')}` });
-      } else {
-        setMensaje({ tipo: 'error', texto: `Error al guardar: ${mensajesError.slice(0, 2).join('; ')}` });
-      }
-      setEditadas({});
+      const partes = [`${guardadas} nota(s) guardada(s).`];
+      if (ignoradas.length) partes.push(`No se guardaron (período cerrado sin permiso vigente): ${ignoradas.join('; ')}.`);
+      if (rechazadas.length) partes.push(`Rechazadas por el servidor: ${rechazadas.join('; ')}.`);
+      if (ignoradas.length || rechazadas.length) partes.push('Lo escrito se conserva en pantalla, marcado «sin guardar».');
+      setMensaje({ tipo: rechazadas.length ? 'error' : ignoradas.length ? 'warning' : 'success', texto: partes.join(' ') });
+      setEditadas(pendientes);
       await onReload();
     } finally {
       setSaving(false);
@@ -131,6 +144,8 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
     // se abren estas casillas, mientras el permiso esté vigente).
     const autorizada = puedeEditar && (est.permanencia?.campos_autorizados || []).includes(campo);
     const cellKey = `${est.estudiante.id}-${compNum}-${campo}`;
+    // ENT-A · lo escrito que aún no se guardó (ignorado, rechazado o sin enviar).
+    const sinGuardar = campo in (editadas[keyCelda(est.estudiante.id, compNum)] || {});
     // TRAS-1 · nota registrada antes del traslado: se ve, pero no se
     // sobrescribe sin el permiso temporal de corrección de Dirección.
     const protegida = (est.permanencia?.notas_previas_traslado?.[String(compNum)] || []).includes(campo);
@@ -162,6 +177,16 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
     // Si no puede editar, está retirado, o el período está cerrado → solo lectura
     // (salvo una casilla autorizada por el servidor para corrección).
     if (!autorizada && (!puedeEditar || esRetirado || periodoCerrado)) {
+      if (sinGuardar) {
+        const guardado = est.competencias[compNum]?.[campo] ?? null;
+        return (
+          <span data-sin-guardar="si"
+                title={`Escrito sin guardar: ${val ?? '—'}. En el servidor: ${guardado ?? '—'}. Esta casilla ya no admite cambios.`}
+                className="inline-block w-16 text-center text-sm border border-dashed border-amber-500 rounded bg-amber-50 text-amber-900">
+            {val !== null ? val : '—'} ✎
+          </span>
+        );
+      }
       return (
         <span className={`inline-block w-16 text-center text-sm ${
           esRetirado ? (val !== null ? 'text-gray-500' : 'text-gray-300') :
@@ -200,10 +225,12 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
         step={0.01}
         value={val ?? ''}
         onChange={e => handleNotaChange(est.estudiante.id, compNum, campo, e.target.value)}
-        title={autorizada ? 'Corrección autorizada por Dirección (permiso temporal)' : undefined}
+        title={sinGuardar ? 'Escrito sin guardar' : autorizada ? 'Corrección autorizada por Dirección (permiso temporal)' : undefined}
         data-autorizada={autorizada ? 'si' : undefined}
+        data-sin-guardar={sinGuardar ? 'si' : undefined}
         className={`w-16 px-1 py-1 text-center border rounded text-sm focus:ring-1 focus:ring-blue-400 ${
-          autorizada ? 'border-indigo-400 ring-1 ring-indigo-200' : isRP ? 'bg-amber-50 border-amber-200' : ''
+          sinGuardar ? 'border-dashed border-amber-500 bg-amber-50'
+            : autorizada ? 'border-indigo-400 ring-1 ring-indigo-200' : isRP ? 'bg-amber-50 border-amber-200' : ''
         }`}
       />
     );
@@ -223,7 +250,10 @@ export const TabNotasRegulares: React.FC<Props> = ({ estudiantes, asignaturaId, 
 
       {/* Acción guardar */}
       {Object.keys(editadas).length > 0 && puedeEditar && (
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => { setEditadas({}); setMensaje(null); }} disabled={saving}>
+            Descartar lo no guardado
+          </Button>
           <Button onClick={guardar} loading={saving} icon={<Save size={16} />} variant="success">
             Guardar ({Object.keys(editadas).length})
           </Button>
