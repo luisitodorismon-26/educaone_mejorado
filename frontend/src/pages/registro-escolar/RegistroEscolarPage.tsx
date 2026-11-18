@@ -7,6 +7,8 @@ interface ValidationResult {
   valid: boolean;
   errors: string[];
   warnings: string[];
+  /** Avisos que no impiden imprimir (p. ej. asignatura sin horario en el sistema). */
+  avisos?: string[];
   info: Record<string, unknown>;
 }
 
@@ -401,6 +403,17 @@ export const RegistroEscolarPage = () => {
                   <h4 className="font-medium text-amber-800 mb-2">Advertencias</h4>
                   <ul className="space-y-1 text-sm text-amber-700">
                     {preview.validacion.warnings.map((item, index) => (
+                      <li key={index}>• {item}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {(preview.validacion.avisos?.length ?? 0) > 0 && (
+                <div className="bg-sky-50 border border-sky-200 rounded-lg p-4" data-avisos-registro>
+                  <h4 className="font-medium text-sky-800 mb-2">Avisos (no impiden imprimir)</h4>
+                  <ul className="space-y-1 text-sm text-sky-700">
+                    {preview.validacion.avisos!.map((item, index) => (
                       <li key={index}>• {item}</li>
                     ))}
                   </ul>
