@@ -522,9 +522,21 @@ MOV_AB = [(m.id, m.tipo, m.fecha_efectiva) for m in db.query(M.MovimientoEstudia
           .order_by(M.MovimientoEstudiante.secuencia)]
 check('B0 historia como la real: retiro → reactivación administrativa → marcas → nuevo retiro',
       (st1, st2, st3) == (200, 200, 200) and [t for _i, t, _f in MOV_AB] == ['reactivacion', 'retiro'], (st1, st2, st3, MOV_AB))
-st, cv = req('GET', '/api/estudiantes/%d/retiro/corregir/vista-previa?desde=2026-10-17' % AB.id, 'dir')
-check('B1 vista previa: deja sin efecto la reactivación administrativa y el segundo retiro',
-      st == 200 and [m['tipo'] for m in cv['deja_sin_efecto']] == ['reactivacion', 'retiro'], cv)
+st, js = req('GET', '/api/estudiantes/%d/retiro/corregir/vista-previa?desde=2026-10-17' % AB.id, 'dir')
+check('B1a sin indicar la reactivación administrativa: no se deja sin efecto nada automáticamente '
+      '(400 FECHA_ANTERIOR_AL_REGRESO)', st == 400 and js.get('error') == 'FECHA_ANTERIOR_AL_REGRESO', js)
+REAC_AB = MOV_AB[0][0]
+st, cv = req('GET', '/api/estudiantes/%d/retiro/corregir/vista-previa?desde=2026-10-17&reactivacion_administrativa_id=%d'
+             % (AB.id, REAC_AB), 'dir')
+check('B1 con la reactivación administrativa indicada: deja sin efecto SOLO esa reactivación y el retiro posterior',
+      st == 200 and [m['id'] for m in cv['deja_sin_efecto']] == [MOV_AB[0][0], MOV_AB[1][0]]
+      and cv['reactivacion_administrativa']['id'] == REAC_AB, cv)
+st, js = req('GET', '/api/estudiantes/%d/retiro/corregir/vista-previa?desde=2026-11-06&reactivacion_administrativa_id=%d'
+             % (AB.id, REAC_AB), 'dir')
+check('B1b fecha posterior a la reactivación administrativa: rechazada', st == 400
+      and js.get('error') == 'FECHA_POSTERIOR_A_LA_REACTIVACION', js)
+check('B1 la vista previa trae TODAS las marcas afectadas con fecha, materia, estado y autor',
+      all(x['fecha'] and x['asignatura'] and x['estado'] and x['registrado_por_nombre'] for x in cv['conflictos']))
 check('B1 marcas del periodo administrativo (5, 9 y 11/11) a anular, con huella',
       sorted(x['fecha'] for x in cv['conflictos']) == ['2026-11-05', '2026-11-09', '2026-11-11'])
 check('B1 P2 dejaría de ser cursado y se muestran sus notas registradas (P2=85)',
@@ -532,7 +544,12 @@ check('B1 P2 dejaría de ser cursado y se muestran sus notas registradas (P2=85)
                                                           for n in cv['notas_en_esos_periodos']), cv)
 body = {'desde': '2026-10-17', 'motivo': 'La reactivación fue administrativa (notas); no volvió a clases',
         'anular_marcas_posteriores': True, 'motivo_anulacion': 'Listas pasadas sin que asistiera',
-        'huella_vista_previa': cv['huella']}
+        'huella_vista_previa': cv['huella'], 'reactivacion_administrativa_id': REAC_AB}
+st, js = req('POST', '/api/estudiantes/%d/retiro/corregir' % AB.id, 'dir', dict(body, confirmar_periodos_no_cursados=True))
+check('B2a sin confirmar expresamente la reactivación administrativa: 409, nada cambia',
+      st == 409 and js.get('error') == 'CONFIRMAR_REACTIVACION_ADMINISTRATIVA'
+      and db.query(M.MovimientoEstudiante).filter_by(estudiante_id=AB.id).count() == 2, js)
+body['confirmar_reactivacion_administrativa'] = True
 st, js = req('POST', '/api/estudiantes/%d/retiro/corregir' % AB.id, 'dir', body)
 check('B2 sin confirmar los períodos que dejan de cursarse: 409, nada cambia',
       st == 409 and js.get('error') == 'PERIODOS_DEJAN_DE_CURSARSE'
@@ -553,6 +570,49 @@ cal_ab = db.query(M.CalificacionSecundaria).filter_by(estudiante_id=AB.id, compe
 check('B4 notas conservadas tal cual (P1=80, P2=85 en la base)', (cal_ab.p1, cal_ab.p2) == (80, 85))
 st, js = req('POST', '/api/estudiantes/%d/retiro/corregir' % AB.id, 'dir', dict(body, confirmar_periodos_no_cursados=True))
 check('B5 repetir la corrección: no hay nada que corregir (misma fecha)', st in (400, 409), js)
+
+# ═════════════ RG. Regreso REAL: se conserva ═════════════
+print('\n== RG. Retiro → regreso real → retiro: corregir solo el último retiro ==')
+RG = est('Regreso', SA, 9)
+for i, f in enumerate(dias(D(2026, 10, 1), D(2026, 10, 16))):
+    add(M.Asistencia(colegio_id=col.id, estudiante_id=RG.id, curso_id=SA.id, asignatura_id=art.id, fecha=f,
+                     estado=ESTADOS[i % len(ESTADOS)], registrado_por=prof.id))
+db.commit()
+s1, _ = req('POST', '/api/estudiantes/%d/retiro' % RG.id, 'dir', {'desde': '2026-10-17', 'motivo': 'Viaje'})
+s2, _ = req('POST', '/api/estudiantes/%d/reactivar' % RG.id, 'dir', {'desde': '2026-11-02', 'motivo': 'Regresó a clases'})
+# Tras su regreso real, el docente pasa lista con normalidad.
+for i, f in enumerate(dias(D(2026, 11, 2), D(2026, 11, 17))):
+    add(M.Asistencia(colegio_id=col.id, estudiante_id=RG.id, curso_id=SA.id, asignatura_id=art.id, fecha=f,
+                     estado=ESTADOS[i % len(ESTADOS)], registrado_por=prof.id))
+db.commit()
+_st, pv = req('GET', '/api/estudiantes/%d/movimiento/preparar?tipo=retiro&desde=2026-11-16' % RG.id, 'dir')
+s3, _ = req('POST', '/api/estudiantes/%d/retiro' % RG.id, 'dir', {
+    'desde': '2026-11-16', 'motivo': 'Se fue', 'anular_marcas_posteriores': True, 'motivo_anulacion': 'no vino',
+    'huella_vista_previa': pv['anulacion']['huella']})
+MOV_RG = [m.id for m in db.query(M.MovimientoEstudiante).filter_by(estudiante_id=RG.id)
+          .order_by(M.MovimientoEstudiante.secuencia)]
+check('RG0 historia: retiro 17/10 (en la ficha) → regreso real 02/11 → retiro 16/11',
+      (s1, s2, s3) == (200, 200, 200) and len(MOV_RG) == 2, (s1, s2, s3, MOV_RG))
+st, js = req('GET', '/api/estudiantes/%d/retiro/corregir/vista-previa?desde=2026-10-30' % RG.id, 'dir')
+check('RG1 sin indicarlo, no se puede «borrar» el regreso real: fecha anterior al regreso → 400',
+      st == 400 and js.get('error') == 'FECHA_ANTERIOR_AL_REGRESO', js)
+st, cv = req('GET', '/api/estudiantes/%d/retiro/corregir/vista-previa?desde=2026-11-12' % RG.id, 'dir')
+check('RG2 corregir al 12/11: deja sin efecto SOLO el último retiro; el primer retiro y el regreso se conservan',
+      st == 200 and [m['id'] for m in cv['deja_sin_efecto']] == [MOV_RG[1]] and cv['reactivacion_administrativa'] is None
+      and sorted(x['fecha'] for x in cv['conflictos']) == ['2026-11-12', '2026-11-13'], cv)
+st, js = req('POST', '/api/estudiantes/%d/retiro/corregir' % RG.id, 'dir', {
+    'desde': '2026-11-12', 'motivo': 'Último día real 11/11', 'anular_marcas_posteriores': True,
+    'motivo_anulacion': 'no vino', 'huella_vista_previa': cv['huella']})
+db.expire_all()
+movs_rg = db.query(M.MovimientoEstudiante).filter_by(estudiante_id=RG.id).order_by(M.MovimientoEstudiante.secuencia).all()
+tr_rg = PERM.tramos_de(db, db.get(M.Estudiante, RG.id), ano.id)
+check('RG3 corregida: el primer retiro y el regreso siguen CON efecto; dos tramos (hasta 16/10 y 02/11–11/11)',
+      st == 200 and PERM.ids_sin_efecto(movs_rg) == {MOV_RG[1]}
+      and [(t.desde, t.hasta) for t in tr_rg] == [(None, D(2026, 10, 16)), (D(2026, 11, 2), D(2026, 11, 11))],
+      (st, js, [(t.desde, t.hasta) for t in tr_rg]))
+c_rg = canonica(RG)
+check('RG4 su asistencia del regreso (02–11/11) sigue contando', any(D(2026, 11, 2) <= f <= D(2026, 11, 11)
+                                                                    for f in c_rg['dias']))
 
 # ═════════════ K. Notas ═════════════
 print('\n== K. Notas: pendiente de período cursado sí; no cursado no ==')
@@ -706,6 +766,102 @@ else:
           db.query(M.MovimientoEstudiante).filter_by(estudiante_id=E3.id).count() == 1
           and db.query(M.AnulacionAsistencia).filter_by(estudiante_id=E3.id).count() == 1
           and all(v[0] == 200 for v in out.values()), out)
+
+    # ── Reversión frente a crear vacaciones y frente a «No hubo clase» ──
+    # Un curso propio (SC) con un único estudiante por caso y marcas en fechas
+    # donde nadie más tiene listas: así el único conflicto posible es la marca
+    # que se revierte. Anulada por retiro desde el 18/11 y luego la fecha se
+    # corrige al 20/11: esas marcas quedan dentro de la permanencia y son
+    # revertibles (no se restauran solas).
+    SC = add(M.Curso(colegio_id=col.id, nombre='C', grado_id=gs.id, ano_escolar_id=ano.id, activo=True))
+    add(M.AsignacionProfesor(colegio_id=col.id, profesor_id=prof.id, curso_id=SC.id, asignatura_id=art.id,
+                             ano_escolar_id=ano.id, activo=True))
+    for dia in ('Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes'):
+        add(M.Horario(colegio_id=col.id, profesor_id=prof.id, curso_id=SC.id, asignatura_id=art.id, dia=dia,
+                      hora_inicio='10:00', hora_fin='11:00', tipo_bloque='clase', activo=True))
+    db.commit()
+
+    def revertible(nombre, n, fecha):
+        e = add(M.Estudiante(colegio_id=col.id, nombre=nombre, apellido='Sint', matricula='RETR-' + nombre,
+                             curso_id=SC.id, no_lista=n, activo=True, condicion='activo', fecha_ingreso=D(2026, 8, 20)))
+        a = add(M.Asistencia(colegio_id=col.id, estudiante_id=e.id, curso_id=SC.id, asignatura_id=art.id,
+                             fecha=fecha, estado='presente', registrado_por=prof.id))
+        db.commit()
+        _s, p_ = req('GET', '/api/estudiantes/%d/movimiento/preparar?tipo=retiro&desde=%s' % (e.id, fecha.isoformat()),
+                     'dir')
+        s1_, _ = req('POST', '/api/estudiantes/%d/retiro' % e.id, 'dir', {
+            'desde': fecha.isoformat(), 'motivo': 'x', 'anular_marcas_posteriores': True, 'motivo_anulacion': 'x',
+            'huella_vista_previa': p_['anulacion']['huella']})
+        s2_, _ = req('POST', '/api/estudiantes/%d/retiro/corregir' % e.id, 'dir',
+                     {'desde': (fecha + dt.timedelta(days=2)).isoformat(), 'motivo': 'fecha real posterior'})
+        return e, a.id, (s1_, s2_)
+
+    _orig_cr = APP._conflictos_reversion
+    _orig_bc = APP._bloquear_colegio
+
+    def _cr_lento(*a, **k):
+        r_ = _orig_cr(*a, **k)
+        time.sleep(1.5)            # la reversión ya revisó conflictos y aún no escribe
+        return r_
+
+    def carrera(control, e, aid, otra):
+        APP._conflictos_reversion = _cr_lento
+        if control:
+            APP._bloquear_colegio = lambda *a, **k: None
+        try:
+            out = {}
+            ta = threading.Thread(target=_req_hilo, args=('POST', '/api/estudiantes/%d/anulaciones/revertir' % e.id,
+                                                          'dir', {'asistencia_ids': [aid], 'motivo': 'sí vino'},
+                                                          out, 'rev'))
+            tb = threading.Thread(target=_req_hilo, args=otra + (out, 'otra'))
+            ta.start()
+            time.sleep(0.5)
+            tb.start()
+            ta.join()
+            tb.join()
+            db.expire_all()
+            revertida = db.query(M.AsistenciaAnulada).filter(M.AsistenciaAnulada.asistencia_id == aid,
+                                                             M.AsistenciaAnulada.revertida_en.isnot(None)).count() == 1
+            return revertida, out
+        finally:
+            APP._conflictos_reversion = _orig_cr
+            APP._bloquear_colegio = _orig_bc
+
+    # X4 · vacaciones que cubren el día de la marca revertida.
+    # Fechas sin ninguna otra lista en el colegio (X1/X2 dejan marcas el 18/11).
+    for control, nombre, n, f in ((True, 'RevVacC', 21, D(2026, 11, 20)), (False, 'RevVacR', 22, D(2026, 11, 24))):
+        e, aid, sts = revertible(nombre, n, f)
+        rev, out = carrera(control, e, aid, ('POST', '/api/vacaciones', 'dir',
+                                             {'nombre': 'Vac %s' % nombre, 'fecha_inicio': f.isoformat(),
+                                              'fecha_fin': f.isoformat()}))
+        vac = db.query(M.RangoVacaciones).filter(M.RangoVacaciones.nombre == 'Vac %s' % nombre,
+                                                 M.RangoVacaciones.activo == True).count() == 1  # noqa: E712
+        if control:
+            print('    CONTROL sin bloqueo: marca revertida=%s y vacaciones creadas=%s' % (rev, vac))
+            check('X4 CONTROL: sin el bloqueo SÍ aparece la carrera (marca revertida dentro de unas vacaciones)',
+                  sts == (200, 200) and rev and vac, (sts, out))
+        else:
+            check('X4 reversión y vacaciones del mismo día a la vez: nunca ambas (las vacaciones esperan el bloqueo '
+                  'del colegio y ven la marca: 409)', sts == (200, 200) and rev and not vac
+                  and out['otra'][0] == 409, (sts, rev, vac, out))
+        # se quitan para no interferir con lo siguiente (datos sintéticos)
+        for r_ in db.query(M.RangoVacaciones).filter(M.RangoVacaciones.nombre == 'Vac %s' % nombre).all():
+            req('DELETE', '/api/vacaciones/%d' % r_.id, 'dir')
+
+    # X5 · «No hubo clase» de esa clase ese día.
+    for control, nombre, n, f in ((True, 'RevS1C', 23, D(2026, 11, 16)), (False, 'RevS1R', 24, D(2026, 11, 17))):
+        e, aid, sts = revertible(nombre, n, f)
+        rev, out = carrera(control, e, aid, ('POST', '/api/sesiones-no-impartidas', 'prof', {
+            'curso_id': SC.id, 'asignatura_id': art.id, 'fecha': f.isoformat(), 'motivo_codigo': 'SUSP_CURSO'}))
+        s1 = db.query(M.SesionNoImpartida).filter_by(curso_id=SC.id, asignatura_id=art.id, fecha=f, activo=True).count() == 1
+        if control:
+            print('    CONTROL sin bloqueo: marca revertida=%s y «No hubo clase»=%s' % (rev, s1))
+            check('X5 CONTROL: sin el bloqueo SÍ aparece la carrera (marca revertida en una clase «no impartida»)',
+                  sts == (200, 200) and rev and s1, (sts, out))
+        else:
+            check('X5 reversión y «No hubo clase» de esa clase a la vez: nunca ambas (la declaración espera el '
+                  'bloqueo del colegio y ve la marca: 409)', sts == (200, 200) and rev and not s1
+                  and out['otra'][0] == 409, (sts, rev, s1, out))
 
 print('\nRESULTADO RET-R RETIRO RETROACTIVO (%s): %d PASARON / %d FALLARON'
       % (engine.dialect.name, sum(1 for _, ok in RES if ok), sum(1 for _, ok in RES if not ok)))

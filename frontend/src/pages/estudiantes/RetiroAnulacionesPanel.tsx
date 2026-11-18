@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import api from '../../services/api';
 import { Button, Input } from '../../components/ui';
+import { TablaMarcas } from './MovimientoEstudianteModal';
 
 // ════════════════════════════════════════════════════════════════════
 // RET-R · Solo Dirección. Marcas anuladas por retiro (historial), su reversión
@@ -32,12 +33,21 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
   const [anular, setAnular] = useState(false);
   const [motivoAnul, setMotivoAnul] = useState('');
   const [confirmarPeriodos, setConfirmarPeriodos] = useState(false);
+  // Reactivación que Dirección declara SOLO administrativa (delimita qué queda sin efecto).
+  const [reacAdmin, setReacAdmin] = useState('');
+  const [confirmarAdmin, setConfirmarAdmin] = useState(false);
+  const [candidatas, setCandidatas] = useState<any[]>([]);
   const secRef = useRef(0);
   const solicitud = useRef('');
 
   const cargar = () => api.get(`/estudiantes/${estudianteId}/anulaciones`)
     .then(r => setAnuladas(r.data.anuladas || [])).catch(() => setAnuladas(null));
-  useEffect(() => { setSel([]); setPv(null); setDesde(''); cargar(); }, [estudianteId]);
+  useEffect(() => {
+    setSel([]); setPv(null); setDesde(''); setReacAdmin(''); cargar();
+    // Reactivaciones vigentes del año (las que podrían haber sido solo administrativas).
+    api.get(`/estudiantes/${estudianteId}/movimientos`).then(r => setCandidatas(
+      (r.data.movimientos || []).filter((m: any) => m.tipo === 'reactivacion' && !m.sin_efecto))).catch(() => setCandidatas([]));
+  }, [estudianteId]);
 
   const revertir = async () => {
     if (!sel.length || !motivoRev.trim()) return;
@@ -52,12 +62,14 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
     } finally { setOcupado(false); }
   };
 
-  const revisarCorreccion = async (fecha: string) => {
+  const revisarCorreccion = async (fecha: string, reac: string = reacAdmin) => {
     const sec = ++secRef.current;
-    setPv(null); setAnular(false); setConfirmarPeriodos(false); setMsg(null);
+    setPv(null); setAnular(false); setConfirmarPeriodos(false); setConfirmarAdmin(false); setMsg(null);
     if (!fecha) return;
     try {
-      const r = await api.get(`/estudiantes/${estudianteId}/retiro/corregir/vista-previa?desde=${fecha}`);
+      const q = new URLSearchParams({ desde: fecha });
+      if (reac) q.set('reactivacion_administrativa_id', reac);
+      const r = await api.get(`/estudiantes/${estudianteId}/retiro/corregir/vista-previa?${q.toString()}`);
       if (sec !== secRef.current) return;                 // respuesta de otra fecha: se descarta
       setPv(r.data);
       solicitud.current = `corr-${estudianteId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -67,7 +79,7 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
   };
 
   const corregir = async () => {
-    if (!pv || pv.desde !== desde) return;
+    if (!pv || pv.desde !== desde || String(pv.reactivacion_administrativa?.id || '') !== reacAdmin) return;
     setOcupado(true); setMsg(null);
     try {
       const body: any = { desde: pv.desde, motivo: motivoCorr.trim(), client_request_id: solicitud.current };
@@ -76,6 +88,10 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
         body.huella_vista_previa = pv.huella;
       }
       if (pv.notas_en_esos_periodos.length) body.confirmar_periodos_no_cursados = confirmarPeriodos;
+      if (pv.reactivacion_administrativa) {
+        body.reactivacion_administrativa_id = pv.reactivacion_administrativa.id;
+        body.confirmar_reactivacion_administrativa = confirmarAdmin;
+      }
       await api.post(`/estudiantes/${estudianteId}/retiro/corregir`, body);
       setMsg({ ok: true, text: `Fecha de retiro corregida: retirado desde el ${fmt(pv.desde)}.` });
       setPv(null); setDesde(''); setMotivoCorr(''); cargar(); onCambio?.();
@@ -88,6 +104,8 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
   if (anuladas === null) return null;                     // sin permiso (no es Dirección) o error
   const vigentes = anuladas.filter(a => !a.revertida_en);
   const puedeCorregir = !!pv && pv.desde === desde && motivoCorr.trim().length > 0
+    && String(pv.reactivacion_administrativa?.id || '') === reacAdmin
+    && (!pv.reactivacion_administrativa || confirmarAdmin)
     && (!pv.conflictos.length || (anular && motivoAnul.trim().length > 0))
     && (!pv.notas_en_esos_periodos.length || confirmarPeriodos);
 
@@ -158,6 +176,20 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
                    onChange={e => { setDesde(e.target.value); revisarCorreccion(e.target.value); }} />
             <Input label="Motivo de la corrección *" value={motivoCorr} onChange={e => setMotivoCorr(e.target.value)} />
           </div>
+          {candidatas.length > 0 && (
+            <div className="mt-2">
+              <label className="block text-xs font-medium text-gray-700 mb-1">
+                ¿Alguna reactivación fue solo administrativa (no volvió a clases)?
+              </label>
+              <select className="w-full border rounded px-2 py-1.5 text-sm" value={reacAdmin} data-reac-admin
+                      onChange={e => { setReacAdmin(e.target.value); revisarCorreccion(desde, e.target.value); }}>
+                <option value="">No: solo corregir el retiro vigente (los regresos reales se conservan)</option>
+                {candidatas.map((m: any) => (
+                  <option key={m.id} value={m.id}>Reactivación desde {fmt(m.desde)}{m.motivo ? ` (${m.motivo})` : ''}</option>
+                ))}
+              </select>
+            </div>
+          )}
           {pv && pv.desde === desde && (
             <div className="mt-2 space-y-2 text-xs" data-vista-previa-correccion>
               <p>Último día de pertenencia: <strong>{fmt(pv.ultimo_dia)}</strong> (antes: {fmt(pv.fecha_retiro_actual)}).</p>
@@ -165,10 +197,18 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
                 <p>Quedarán <strong>sin efecto</strong> (se conservan en el historial): {pv.deja_sin_efecto.map((m: any) =>
                   `${m.tipo} desde ${fmt(m.desde)}`).join(', ')}.</p>
               )}
+              {pv.reactivacion_administrativa && (
+                <label className="flex gap-2 bg-white border border-amber-300 rounded p-2">
+                  <input type="checkbox" checked={confirmarAdmin} onChange={e => setConfirmarAdmin(e.target.checked)} />
+                  <span>Confirmo que la reactivación desde {fmt(pv.reactivacion_administrativa.desde)} fue solo
+                    administrativa: no volvió a clases.</span>
+                </label>
+              )}
               {pv.conflictos.length > 0 && (
                 <div className="bg-white border border-red-200 rounded p-2">
                   <p className="font-medium text-red-800">{pv.conflictos.length} marca(s) quedarían fuera de su permanencia</p>
                   <p>{Object.entries(pv.resumen.por_estado).map(([k, v]) => `${k}: ${v}`).join(' · ')}</p>
+                  <TablaMarcas marcas={pv.conflictos} />
                   <label className="flex gap-2 mt-1"><input type="checkbox" checked={anular}
                     onChange={e => setAnular(e.target.checked)} /> Confirmo su anulación.</label>
                   {anular && <Input label="Motivo de la anulación *" value={motivoAnul}
@@ -176,8 +216,11 @@ export function RetiroAnulacionesPanel({ estudianteId, retirado, onCambio }:
                 </div>
               )}
               {pv.anuladas_que_quedarian_dentro.length > 0 && (
-                <p className="text-amber-800">{pv.anuladas_que_quedarian_dentro.length} marca(s) anulada(s) quedarían dentro
-                  de su permanencia: <strong>no se restauran solas</strong>; puede revertirlas después, una a una.</p>
+                <div className="text-amber-800">
+                  <p>{pv.anuladas_que_quedarian_dentro.length} marca(s) anulada(s) quedarían dentro
+                    de su permanencia: <strong>no se restauran solas</strong>; puede revertirlas después, una a una.</p>
+                  <TablaMarcas marcas={pv.anuladas_que_quedarian_dentro} />
+                </div>
               )}
               {pv.notas_en_esos_periodos.length > 0 && (
                 <div className="bg-white border border-amber-300 rounded p-2">

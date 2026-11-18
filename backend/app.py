@@ -8522,6 +8522,10 @@ async def revertir_anulaciones(id: int, request: Request, db: Session = Depends(
                             status_code=400)
     ids = sorted({int(i) for i in ids})
     _bloquear_ficha(db, est)
+    # El MISMO bloqueo del colegio que las escrituras de asistencia (compartido):
+    # crear vacaciones y declarar «No hubo clase» lo toman exclusivo, así que
+    # o entran antes (y aquí se ven como conflicto) o esperan a esta reversión.
+    _bloquear_colegio(db, est.colegio_id, compartido=True)
     ano = _ano_activo_colegio(db, current_user)
     vig = _anuladas_vigentes(db, [est.id])
     no_anuladas = [i for i in ids if i not in vig]
@@ -8562,7 +8566,7 @@ def _periodos_cursados_tramos(tramos, curso_id, ano):
     return {p for p, ini, _f in ASIS.rangos_periodos(ano) if salida is None or ini < salida}
 
 
-def _analisis_correccion_retiro(db, current_user, est, ano, desde):
+def _analisis_correccion_retiro(db, current_user, est, ano, desde, reactivacion_administrativa_id=None):
     """`(error, analisis)` de corregir el «retirado desde» a `desde`. Solo lee."""
     import types as _types
     import permanencia as PERM
@@ -8579,18 +8583,62 @@ def _analisis_correccion_retiro(db, current_user, est, ano, desde):
         return _respuesta_movimiento_error('MISMA_FECHA', 'Esa ya es su fecha de retiro.', 400), None
     movs = PERM.movimientos_por_estudiante(db, current_user.colegio_id, ano.id, [est.id]).get(est.id, [])
     sin_efecto = PERM.ids_sin_efecto(movs)
-    vigentes = [m for m in movs if m.id not in sin_efecto]
-    traslados = [m for m in vigentes if m.tipo == PERM.TRASLADO]
-    ult_tras = max(traslados, key=lambda m: m.secuencia) if traslados else None
-    # La cadena que se reemplaza: retiros, reactivaciones y correcciones
-    # posteriores al último traslado. Los traslados no se tocan.
-    cadena = [m for m in vigentes if m.tipo in (PERM.RETIRO, PERM.REACTIVACION, PERM.CORRECCION)
-              and (ult_tras is None or m.secuencia > ult_tras.secuencia)]
-    if ult_tras is not None and desde <= ult_tras.fecha_efectiva:
-        return _respuesta_movimiento_error(
-            'FECHA_ANTERIOR_AL_TRASLADO',
-            'Llegó a su curso actual por traslado el %s: la fecha debe ser posterior (los traslados '
-            'no se modifican).' % ult_tras.fecha_efectiva.strftime('%d/%m/%Y'), 400), None
+    vigentes = sorted((m for m in movs if m.id not in sin_efecto), key=lambda m: m.secuencia)
+    _RET = (PERM.RETIRO, PERM.CORRECCION)
+    _INICIA = (PERM.TRASLADO, PERM.REACTIVACION)
+    _f = lambda d: d.strftime('%d/%m/%Y')  # noqa: E731
+    # Reactivaciones posteriores al último traslado: las únicas que Dirección
+    # puede declarar «solo administrativas» (para completar notas, sin regreso).
+    _ult_tras = max((m for m in vigentes if m.tipo == PERM.TRASLADO), key=lambda m: m.secuencia, default=None)
+    candidatas = [m for m in vigentes if m.tipo == PERM.REACTIVACION
+                  and (_ult_tras is None or m.secuencia > _ult_tras.secuencia)]
+    reac_admin = None
+    if reactivacion_administrativa_id in (None, ''):
+        # Sin indicación expresa SOLO se reemplaza el retiro vigente (el último).
+        # Los retiros y regresos reales anteriores se conservan con efecto: la
+        # fecha no puede ser anterior al inicio de su tramo actual.
+        ult_ret = vigentes[-1] if vigentes and vigentes[-1].tipo in _RET else None
+        cadena = [ult_ret] if ult_ret is not None else []
+        _inicio = max((m for m in vigentes if m.tipo in _INICIA), key=lambda m: m.secuencia, default=None)
+        if _inicio is not None and desde <= _inicio.fecha_efectiva:
+            if _inicio.tipo == PERM.TRASLADO:
+                return _respuesta_movimiento_error(
+                    'FECHA_ANTERIOR_AL_TRASLADO',
+                    'Llegó a su curso actual por traslado el %s: la fecha debe ser posterior (los traslados '
+                    'no se modifican).' % _f(_inicio.fecha_efectiva), 400), None
+            return _respuesta_movimiento_error(
+                'FECHA_ANTERIOR_AL_REGRESO',
+                'Fue reactivado (regresó) el %s: la fecha debe ser posterior. Ese regreso y lo anterior se '
+                'conservan. Si esa reactivación fue solo administrativa (p. ej. para completar notas) y no '
+                'volvió a clases, indíquelo expresamente.' % _f(_inicio.fecha_efectiva), 400), None
+    else:
+        try:
+            _rid = int(reactivacion_administrativa_id)
+        except (TypeError, ValueError):
+            _rid = None
+        reac_admin = next((m for m in candidatas if m.id == _rid), None)
+        if reac_admin is None:
+            return _respuesta_movimiento_error(
+                'REACTIVACION_NO_VALIDA',
+                'Esa reactivación no está vigente en su curso actual (o es anterior a un traslado).', 400), None
+        # Delimitado: el retiro que la precede (si es un movimiento; un retiro
+        # anterior a la tabla vive en el detalle de la propia reactivación),
+        # la reactivación y lo posterior. Nada más.
+        _previos = [m for m in vigentes if m.secuencia < reac_admin.secuencia]
+        _ret_prev = _previos[-1] if _previos and _previos[-1].tipo in _RET else None
+        cadena = ([_ret_prev] if _ret_prev else []) + [m for m in vigentes if m.secuencia >= reac_admin.secuencia]
+        _inicio = max((m for m in _previos if m.tipo in _INICIA), key=lambda m: m.secuencia, default=None)
+        if _inicio is not None and desde <= _inicio.fecha_efectiva:
+            return _respuesta_movimiento_error(
+                'FECHA_ANTERIOR_AL_TRAMO',
+                'Su tramo anterior a esa reactivación empezó el %s: la fecha debe ser posterior.'
+                % _f(_inicio.fecha_efectiva), 400), None
+        if desde > reac_admin.fecha_efectiva:
+            return _respuesta_movimiento_error(
+                'FECHA_POSTERIOR_A_LA_REACTIVACION',
+                'Si la reactivación del %s fue solo administrativa, su último día real es anterior a ella: '
+                'la fecha debe ser como máximo el %s.' % (_f(reac_admin.fecha_efectiva),
+                                                          _f(reac_admin.fecha_efectiva)), 400), None
     ficticia = _types.SimpleNamespace(
         id=-1, tipo=PERM.CORRECCION, secuencia=max([m.secuencia for m in movs] or [0]) + 1,
         fecha_efectiva=desde, curso_origen_id=est.curso_id, no_lista_origen=est.no_lista,
@@ -8645,6 +8693,8 @@ def _analisis_correccion_retiro(db, current_user, est, ano, desde):
         'desde': desde.isoformat(), 'ultimo_dia': (desde - timedelta(days=1)).isoformat(),
         'fecha_retiro_actual': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
         'deja_sin_efecto': [_movimiento_dict(m, nombre_curso) for m in cadena],
+        'reactivacion_administrativa': _movimiento_dict(reac_admin, nombre_curso) if reac_admin else None,
+        'reactivaciones_candidatas': [_movimiento_dict(m, nombre_curso) for m in candidatas],
         'conflictos': conflictos, 'huella': _huella_marcas(conflictos),
         'resumen': _resumen_marcas_anular(conflictos),
         'anuladas_que_quedarian_dentro': anuladas_dentro,
@@ -8652,6 +8702,10 @@ def _analisis_correccion_retiro(db, current_user, est, ano, desde):
         'periodos_que_dejan_de_cursarse': perdidos, 'notas_en_esos_periodos': notas_perdidas,
         '_cadena': cadena,
     }
+
+
+def fmt_fecha_rd(iso):
+    return '/'.join(reversed(str(iso)[:10].split('-'))) if iso else ''
 
 
 def _publico_correccion(an):
@@ -8669,7 +8723,8 @@ async def vista_previa_corregir_retiro(id: int, request: Request, db: Session = 
     ano = _ano_activo_colegio(db, current_user)
     if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
         return _respuesta_movimiento_error('SIN_ANO_ACTIVO', 'No hay un año escolar activo con fechas.', 400)
-    err, an = _analisis_correccion_retiro(db, current_user, est, ano, desde)
+    err, an = _analisis_correccion_retiro(db, current_user, est, ano, desde,
+                                          request.query_params.get('reactivacion_administrativa_id'))
     return err if err is not None else _publico_correccion(an)
 
 
@@ -8699,7 +8754,9 @@ async def corregir_retiro(id: int, request: Request, db: Session = Depends(get_d
     solicitud = {'tipo': 'correccion', 'estudiante_id': est.id, 'desde': desde.isoformat(), 'motivo': motivo[:300],
                  'anular': data.get('anular_marcas_posteriores') is True,
                  'huella': data.get('huella_vista_previa') or None,
-                 'confirmar_periodos': data.get('confirmar_periodos_no_cursados') is True}
+                 'confirmar_periodos': data.get('confirmar_periodos_no_cursados') is True,
+                 'reactivacion_administrativa_id': data.get('reactivacion_administrativa_id') or None,
+                 'confirmar_reactivacion_administrativa': data.get('confirmar_reactivacion_administrativa') is True}
     nombre_curso = _nombre_curso_fn(db, current_user)
 
     def _previo():
@@ -8726,10 +8783,21 @@ async def corregir_retiro(id: int, request: Request, db: Session = Depends(get_d
     ano = _ano_activo_colegio(db, current_user)
     if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
         return _respuesta_movimiento_error('SIN_ANO_ACTIVO', 'No hay un año escolar activo con fechas.', 400)
-    err, an = _analisis_correccion_retiro(db, current_user, est, ano, desde)
+    err, an = _analisis_correccion_retiro(db, current_user, est, ano, desde,
+                                          data.get('reactivacion_administrativa_id'))
     if err is not None:
         db.rollback()
         return err
+    if an['reactivacion_administrativa'] and data.get('confirmar_reactivacion_administrativa') is not True:
+        db.rollback()
+        return JSONResponse({
+            'error': 'CONFIRMAR_REACTIVACION_ADMINISTRATIVA',
+            'message': ('Confirme expresamente que la reactivación del %s fue solo administrativa (no volvió a '
+                        'clases). Quedarán sin efecto, sin borrarse: %s.'
+                        % (fmt_fecha_rd(an['reactivacion_administrativa']['desde']),
+                           ', '.join('%s desde %s' % (m['tipo'], fmt_fecha_rd(m['desde']))
+                                     for m in an['deja_sin_efecto']))),
+            **_publico_correccion(an)}, status_code=409)
     if an['conflictos']:
         if data.get('anular_marcas_posteriores') is not True:
             db.rollback()
@@ -8761,6 +8829,7 @@ async def corregir_retiro(id: int, request: Request, db: Session = Depends(get_d
         tipo=PERM.CORRECCION, secuencia=secuencia, fecha_efectiva=desde,
         curso_origen_id=est.curso_id, no_lista_origen=est.no_lista, motivo=motivo[:300],
         detalle=_json.dumps({'deja_sin_efecto': [m.id for m in an['_cadena']],
+                             'reactivacion_administrativa_id': (an['reactivacion_administrativa'] or {}).get('id'),
                              'fecha_retiro_anterior': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
                              'periodos_que_dejan_de_cursarse': an['periodos_que_dejan_de_cursarse'],
                              'solicitud': solicitud}, default=str),
@@ -17805,6 +17874,10 @@ async def crear_sesion_no_impartida(
     horario = bloques[0] if len(bloques) == 1 else None
 
     # --- S1 §7, dirección A: no conviven con asistencia ----------------------
+    # RET-R · exclusivo sobre el colegio, como crear vacaciones: una reversión de
+    # anulación (que toma el compartido, igual que pasar lista) entra antes y su
+    # marca se ve aquí, o espera a que esta declaración termine y la ve allí.
+    _bloquear_colegio(db, curso.colegio_id, compartido=False)
     marcas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
         Asistencia.curso_id == curso.id,
         Asistencia.asignatura_id == asignatura.id,

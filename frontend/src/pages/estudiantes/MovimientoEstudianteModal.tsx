@@ -46,6 +46,36 @@ const TITULOS: Record<TipoMovimiento, string> = {
 
 const fmt = (iso?: string | null) => (iso ? iso.split('-').reverse().join('/') : '—');
 
+/** RET-R · TODAS las marcas afectadas (sin tope), con fecha, curso, materia,
+ *  estado y autor. Se desplaza dentro de su caja. */
+export function TablaMarcas({ marcas }: {
+  marcas: Array<{ asistencia_id: number; fecha: string; curso?: string | null; asignatura?: string | null;
+                  estado: string; registrado_por_nombre?: string | null }> }) {
+  return (
+    <div className="mt-2 max-h-64 overflow-auto border border-gray-200 rounded bg-white" data-tabla-marcas>
+      <table className="w-full text-xs text-gray-800">
+        <thead className="sticky top-0 bg-gray-50 text-left text-gray-600">
+          <tr><th className="px-2 py-1">Fecha</th><th className="px-2 py-1">Curso</th>
+            <th className="px-2 py-1">Materia</th><th className="px-2 py-1">Estado</th>
+            <th className="px-2 py-1">Registró</th></tr>
+        </thead>
+        <tbody>
+          {marcas.map(c => (
+            <tr key={c.asistencia_id} className="border-t border-gray-100">
+              <td className="px-2 py-1 whitespace-nowrap">{fmt(c.fecha)}</td>
+              <td className="px-2 py-1">{c.curso || '—'}</td>
+              <td className="px-2 py-1">{c.asignatura || 'General'}</td>
+              <td className="px-2 py-1">{c.estado}</td>
+              <td className="px-2 py-1">{c.registrado_por_nombre || '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="px-2 py-1 text-[11px] text-gray-500 border-t">{marcas.length} marca(s) en total.</p>
+    </div>
+  );
+}
+
 export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }: Props) {
   const [prep, setPrep] = useState<any>(null);
   const [destino, setDestino] = useState<string>('');
@@ -265,13 +295,7 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
               corrigen: elija una fecha coherente con ellas o pida al docente que las corrija si son erróneas.
               {tipo === 'retiro' && anulacion?.puede_anular
                 ? ' Si su último día real fue el anterior a esa fecha, Dirección puede confirmar abajo su anulación.' : ''}</p>
-            <ul className="text-xs mt-2 max-h-32 overflow-auto list-disc list-inside">
-              {conflictos.slice(0, 30).map(c => (
-                <li key={c.asistencia_id}>{fmt(c.fecha)} · {c.curso}{c.asignatura ? ` · ${c.asignatura}` : ''} · {c.estado}
-                  {c.registrado_por_nombre ? ` · registró ${c.registrado_por_nombre}` : ''}</li>
-              ))}
-              {conflictos.length > 30 && <li className="list-none italic">… y {conflictos.length - 30} más</li>}
-            </ul>
+            <TablaMarcas marcas={conflictos} />
             {fechaSugerida ? (
               <button type="button" onClick={() => setDesde(fechaSugerida)}
                       className="mt-2 text-xs font-medium text-blue-700 underline">
