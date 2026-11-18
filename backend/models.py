@@ -1947,6 +1947,56 @@ class DiaNoLaborable(Base):
             'recurrente': self.recurrente
         }
 
+
+class RangoVacaciones(Base):
+    """
+    ENT-B · Vacaciones por RANGO (fecha inicial y final, ambas incluidas).
+
+    Reutiliza el calendario existente: al confirmar se crea un `DiaNoLaborable`
+    (tipo 'vacaciones') por cada fecha del rango que aún no fuera no laborable,
+    así que la asistencia canónica, los boletines y el Registro ya los excluyen
+    de los días esperados sin tocar sus plantillas. Esta fila es la cabecera:
+    lo que Dirección configuró, y la única que BLOQUEA pasar asistencia.
+
+    Un `DiaNoLaborable` suelto (feriado, o 'vacaciones' de un solo día creado
+    antes) sigue sin bloquear, como decidió S1 §3.
+
+    No se borra nunca: al quitar el rango se desactivan la cabecera y SOLO los
+    días que ella creó (`dias_creados`), y quedan quién y cuándo.
+    """
+    __tablename__ = 'rangos_vacaciones'
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=True)
+    nombre = Column(String(100), nullable=False)
+    fecha_inicio = Column(Date, nullable=False)
+    fecha_fin = Column(Date, nullable=False)
+    activo = Column(Boolean, default=True, nullable=False)
+    # JSON: ids de los DiaNoLaborable que creó este rango (no los que ya había).
+    dias_creados = Column(Text, default='[]')
+    creado_por = Column(Integer, ForeignKey('usuarios.id'))
+    creado_en = Column(DateTime, default=datetime.utcnow)
+    quitado_por = Column(Integer, ForeignKey('usuarios.id'))
+    quitado_en = Column(DateTime)
+
+    def ids_dias_creados(self):
+        import json as _json
+        try:
+            return [int(i) for i in _json.loads(self.dias_creados or '[]')]
+        except (ValueError, TypeError):
+            return []
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'nombre': self.nombre,
+            'fecha_inicio': self.fecha_inicio.isoformat() if self.fecha_inicio else None,
+            'fecha_fin': self.fecha_fin.isoformat() if self.fecha_fin else None,
+            'activo': bool(self.activo),
+            'dias': ((self.fecha_fin - self.fecha_inicio).days + 1) if self.fecha_inicio and self.fecha_fin else 0,
+            'creado_en': self.creado_en.isoformat() if self.creado_en else None,
+        }
+
 # ============== SESIÓN NO IMPARTIDA (S1) ==============
 
 # Catálogo de motivos. Constante del sistema, como `salidas_optativas.py`: la

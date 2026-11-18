@@ -54,7 +54,7 @@ from models import (
     Asignatura, Curso, Estudiante, AsignacionProfesor, Horario, Calificacion,
     Asistencia, ReporteConducta, CasoPsicologia, Mensaje, Comunicado,
     PlantillaMensaje, HistorialAcademico, LogAcceso, LogAuditoria,
-    SolicitudEdicionNota, BloqueHorario, DiaNoLaborable, Usuario,
+    SolicitudEdicionNota, BloqueHorario, DiaNoLaborable, RangoVacaciones, Usuario,
     NotaPersonal, EvaluacionProfesor, ConfigEvalInterna, EvalInternaEstudiante,
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
     HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
@@ -15796,7 +15796,7 @@ def _guard_lectura_asistencia_primaria(db, curso, current_user):
     }, status_code=403)
 
 
-def _respuesta_asistencia_curso(db, curso, asistencias, current_user):
+def _respuesta_asistencia_curso(db, curso, asistencias, current_user, fecha=None):
     """El cuerpo de `GET /api/asistencia/curso/{id}`, con el permiso resuelto.
 
     La pantalla necesita saber si puede editar, y la autoridad es el servidor:
@@ -15825,10 +15825,14 @@ def _respuesta_asistencia_curso(db, curso, asistencias, current_user):
             puede = current_user.id in titulares
             motivo = None if puede else 'no_titular'
 
+    # ENT-B · si la fecha cae en vacaciones, la pantalla lo muestra y no deja
+    # marcar (el servidor rechaza igual cualquier escritura).
+    _vac = _vacaciones_en_fecha(db, curso.colegio_id, fecha) if fecha is not None else None
     return {
         'asistencias': asistencias,
         'puede_editar': puede,
         'motivo_solo_lectura': motivo,
+        'vacaciones': _vac.to_dict() if _vac is not None else None,
     }
 
 
@@ -16286,6 +16290,11 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
             db, Asignatura, asignatura_id, current_user, name='asignatura'
         ).id
     
+    # ENT-B · dentro de un rango de vacaciones no se pasa lista.
+    _vac = _bloqueo_por_vacaciones(db, estudiante.colegio_id, fecha)
+    if _vac is not None:
+        return _vac
+
     # S1 §7: esta clase no puede estar declarada NO IMPARTIDA en esta fecha.
     # Nota: NO se consulta DiaNoLaborable aqui. Un feriado del calendario del
     # centro sigue sin impedir pasar lista; solo lo impide la declaracion
@@ -16386,6 +16395,10 @@ async def desmarcar_asistencia(estudiante_id, request: Request, db: Session = De
         asignatura_id=asignatura_id, fecha=fecha)
     if _err_del:
         return _err_del
+    # ENT-B · tampoco se desmarca dentro de un rango de vacaciones.
+    _vac = _bloqueo_por_vacaciones(db, current_user.colegio_id, fecha)
+    if _vac is not None:
+        return _vac
 
     query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
         estudiante_id=int(estudiante_id), fecha=fecha
@@ -16549,7 +16562,7 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     # la forma: el cuerpo siempre es un objeto con las mismas claves. El
     # frontend ya leía `res.data.asistencias || []`, así que no cambia para él.
     if not estudiantes:
-        return _respuesta_asistencia_curso(db, curso, [], current_user)
+        return _respuesta_asistencia_curso(db, curso, [], current_user, fecha=fecha)
     est_ids = [e.id for e in estudiantes]
     
     # Una sola query para todas las asistencias (sin N+1)
@@ -16593,7 +16606,7 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
             } if asistencia else None
         })
 
-    return _respuesta_asistencia_curso(db, curso, resultado, current_user)
+    return _respuesta_asistencia_curso(db, curso, resultado, current_user, fecha=fecha)
 
 _DIAS_HORARIO = ('Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo')
 _ESTADOS_VISTA = ('presente', 'ausente', 'tardanza', 'excusa')
@@ -16890,6 +16903,12 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     primer_est = estudiantes_lote.get(int(_primer_est))[0] if _primer_est and int(_primer_est) in estudiantes_lote else None
     if primer_est and primer_est.curso_id:
         assert_nivel_curso_activo(db, current_user, primer_est.curso_id)
+
+    # ENT-B · dentro de un rango de vacaciones no se pasa lista (el lote entero).
+    _vac = _bloqueo_por_vacaciones(db, current_user.colegio_id, fecha)
+    if _vac is not None:
+        db.rollback()
+        return _vac
 
     # S1 §7, igual que el alta individual. Se comprueba ANTES de escribir nada,
     # para que el lote no entre a medias. El curso canonico es el del lote si
@@ -22916,10 +22935,15 @@ async def get_dias_no_laborables(request: Request, db: Session = Depends(get_db)
     dias = tenant_filter(db.query(DiaNoLaborable), DiaNoLaborable, current_user).filter_by(activo=True).all()
     
     # Filtrar por año o recurrentes
+    # ENT-B · los días creados por un rango de vacaciones llevan su id: la
+    # pantalla los agrupa bajo el rango en lugar de listarlos sueltos.
+    _de_rango = _dias_de_rangos_activos(db, current_user)
     resultado = []
     for d in dias:
         if d.recurrente or (d.ano_escolar_id == ano_activo.id if ano_activo else True):
-            resultado.append(d.to_dict())
+            fila = d.to_dict()
+            fila['rango_vacaciones_id'] = _de_rango.get(d.id)
+            resultado.append(fila)
     
     return resultado
 
@@ -22956,6 +22980,39 @@ async def crear_dia_no_laborable(request: Request, db: Session = Depends(get_db)
 async def eliminar_dia_no_laborable(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Eliminar día no laborable"""
     dia = get_tenant_or_404(db, DiaNoLaborable, id, current_user, name='dianolaborable')
+    # ENT-B · Exclusivo, igual que crear un rango: o el rango se crea antes (y
+    # aquí se ve y se rechaza), o este día se quita antes (y el rango, al no
+    # verlo, crea su propio día). Nunca queda una fecha del rango sin cobertura.
+    _bloquear_colegio(db, dia.colegio_id or current_user.colegio_id, compartido=False)
+    db.refresh(dia)
+    # Un día de un rango de vacaciones se quita con su rango: suelto, dejaría
+    # el día contando como lectivo con la asistencia aún bloqueada.
+    if _dias_de_rangos_activos(db, current_user).get(dia.id):
+        db.rollback()
+        return JSONResponse({'error': 'DIA_DE_RANGO',
+                             'message': 'Ese día pertenece a un rango de vacaciones: quite el rango completo.'},
+                            status_code=409)
+    # Un día que YA existía cuando se creó un rango activo que lo contiene (el
+    # rango no creó el suyo para no duplicar la fecha): quitarlo dejaría esa
+    # fecha del rango contando como día de clase. Se rechaza mientras el
+    # rango siga vigente. Un recurrente cuenta si su día y mes caen en el rango.
+    if dia.activo and dia.fecha:
+        for r in tenant_filter(db.query(RangoVacaciones), RangoVacaciones, current_user).filter(
+                RangoVacaciones.activo == True).all():  # noqa: E712
+            n = (r.fecha_fin - r.fecha_inicio).days + 1
+            fechas = [r.fecha_inicio + timedelta(days=i) for i in range(n)]
+            cubre = (any((f.month, f.day) == (dia.fecha.month, dia.fecha.day) for f in fechas) if dia.recurrente
+                     else r.fecha_inicio <= dia.fecha <= r.fecha_fin)
+            if cubre:
+                db.rollback()
+                return JSONResponse({
+                    'error': 'DIA_EN_RANGO_VIGENTE',
+                    'message': (f'«{dia.nombre}» cae dentro de las vacaciones «{r.nombre}» '
+                                f'({_fmt_rd(r.fecha_inicio)} - {_fmt_rd(r.fecha_fin)}). Mientras ese rango siga '
+                                'vigente no se puede quitar: esa fecha quedaría contando como día de clase. '
+                                'Quite primero el rango si corresponde.'),
+                    'vacaciones': r.to_dict(),
+                }, status_code=409)
     dia.activo = False
     db.commit()
     return {'message': 'Día eliminado'}
@@ -22981,9 +23038,13 @@ async def cargar_feriados_rd(request: Request, db: Session = Depends(get_db), cu
     ]
     
     agregados = 0
+    # ENT-B · un día creado por un rango de vacaciones no cuenta como «ya
+    # existe»: si no, al quitar el rango ese feriado faltaría en el calendario.
+    _de_rango = set(_dias_de_rangos_activos(db, current_user))
     for fecha_str, nombre in feriados_rd:
         fecha = datetime.strptime(fecha_str, '%Y-%m-%d').date()
-        existe = tenant_filter(db.query(DiaNoLaborable), DiaNoLaborable, current_user).filter_by(fecha=fecha, activo=True).first()
+        existe = next((d for d in tenant_filter(db.query(DiaNoLaborable), DiaNoLaborable, current_user)
+                       .filter_by(fecha=fecha, activo=True).all() if d.id not in _de_rango), None)
         if not existe:
             dia = DiaNoLaborable(fecha=fecha, nombre=nombre, tipo='feriado', recurrente=True, colegio_id=current_user.colegio_id)
             db.add(dia)
@@ -22991,6 +23052,274 @@ async def cargar_feriados_rd(request: Request, db: Session = Depends(get_db), cu
     
     db.commit()
     return {'message': f'{agregados} feriados agregados'}
+
+# ============== VACACIONES POR RANGO (ENT-B) ==============
+#
+# Dirección configura nombre, fecha inicial y fecha final (ambas incluidas).
+# Se reutiliza el calendario existente: cada fecha del rango que aún no era
+# no laborable recibe su `DiaNoLaborable` (tipo 'vacaciones'), y así la
+# asistencia canónica, los boletines y el Registro ya la sacan de los días
+# esperados con sus plantillas de siempre. La cabecera `RangoVacaciones` es la
+# que BLOQUEA pasar asistencia; un feriado suelto sigue sin bloquear (S1 §3).
+#
+# Nada de lo registrado se toca: si hay asistencia dentro del rango, la
+# operación se detiene y la lista. «No hubo clase» (S1) se conserva.
+#
+# Concurrencia: crear un rango toma la fila del colegio con FOR UPDATE; pasar
+# asistencia la toma con FOR SHARE antes de comprobar el rango. En PostgreSQL
+# o una lista entra antes (y el rango ve su marca y se detiene), o el rango
+# entra antes (y la lista ve el rango y se rechaza). SQLite serializa las
+# escrituras por su cuenta.
+
+def _bloquear_colegio(db, colegio_id, compartido):
+    if not colegio_id:
+        return
+    q = db.query(Colegio).filter(Colegio.id == colegio_id)
+    (q.with_for_update(read=True) if compartido else q.with_for_update()).populate_existing().first()
+
+
+def _vacaciones_en_fecha(db, colegio_id, fecha):
+    """El rango de vacaciones ACTIVO que contiene `fecha`, o None."""
+    if not colegio_id or fecha is None:
+        return None
+    return db.query(RangoVacaciones).filter(
+        RangoVacaciones.colegio_id == colegio_id,
+        RangoVacaciones.activo == True,  # noqa: E712
+        RangoVacaciones.fecha_inicio <= fecha,
+        RangoVacaciones.fecha_fin >= fecha,
+    ).order_by(RangoVacaciones.fecha_inicio).first()
+
+
+def _fmt_rd(f):
+    return f.strftime('%d/%m/%Y') if f else ''
+
+
+def _bloqueo_por_vacaciones(db, colegio_id, fecha):
+    """409 si `fecha` cae en un rango de vacaciones del colegio; si no, None.
+
+    Toma antes la fila del colegio en modo compartido (ver arriba)."""
+    _bloquear_colegio(db, colegio_id, compartido=True)
+    rango = _vacaciones_en_fecha(db, colegio_id, fecha)
+    if rango is None:
+        return None
+    return JSONResponse({
+        'error': 'VACACIONES',
+        'message': (f'Del {_fmt_rd(rango.fecha_inicio)} al {_fmt_rd(rango.fecha_fin)} es «{rango.nombre}»: '
+                    'no se registra asistencia en esas fechas.'),
+        'vacaciones': rango.to_dict(),
+    }, status_code=409)
+
+
+def _validar_rango_vacaciones(db, current_user, data):
+    """(error, nombre, inicio, fin, ano). Sin escribir nada."""
+    if not isinstance(data, dict):
+        return JSONResponse({'error': 'Body debe ser un objeto JSON'}, status_code=400), None, None, None, None
+    nombre = (data.get('nombre') or '').strip()
+    if not nombre:
+        return JSONResponse({'error': 'El nombre es requerido'}, status_code=400), None, None, None, None
+    if len(nombre) > 100:
+        return JSONResponse({'error': 'El nombre admite hasta 100 caracteres'}, status_code=400), None, None, None, None
+    try:
+        inicio = datetime.strptime(str(data.get('fecha_inicio') or ''), '%Y-%m-%d').date()
+        fin = datetime.strptime(str(data.get('fecha_fin') or ''), '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return (JSONResponse({'error': 'Fecha inicial y final requeridas (YYYY-MM-DD)'}, status_code=400),
+                None, None, None, None)
+    if fin < inicio:
+        return (JSONResponse({'error': 'La fecha final no puede ser anterior a la inicial'}, status_code=400),
+                None, None, None, None)
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
+        return (JSONResponse({'error': 'El año escolar activo no tiene fecha de inicio y fin: '
+                                       'configúrelas en Períodos antes de registrar vacaciones.'}, status_code=409),
+                None, None, None, None)
+    if inicio < ano.fecha_inicio or fin > ano.fecha_fin:
+        return (JSONResponse({'error': (f'El rango debe quedar dentro del año escolar activo '
+                                        f'({_fmt_rd(ano.fecha_inicio)} - {_fmt_rd(ano.fecha_fin)}).')},
+                             status_code=400), None, None, None, None)
+    return None, nombre, inicio, fin, ano
+
+
+def _analisis_vacaciones(db, current_user, nombre, inicio, fin, ano):
+    """Lo que se mostraría antes de confirmar. Solo lee."""
+    cid = current_user.colegio_id
+    fechas = [inicio + timedelta(days=i) for i in range((fin - inicio).days + 1)]
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+    sab = bool(getattr(config, 'permite_sabado', False)) if config else False
+    dom = bool(getattr(config, 'permite_domingo', False)) if config else False
+
+    existentes = {}
+    for d in db.query(DiaNoLaborable).filter(DiaNoLaborable.colegio_id == cid,
+                                             DiaNoLaborable.activo == True).all():  # noqa: E712
+        if not d.fecha:
+            continue
+        if d.recurrente:
+            for f in fechas:
+                if (f.month, f.day) == (d.fecha.month, d.fecha.day):
+                    existentes.setdefault(f, d)
+        elif inicio <= d.fecha <= fin and d.ano_escolar_id in (None, ano.id):
+            existentes.setdefault(d.fecha, d)
+
+    def habil(f):
+        return not ((f.weekday() == 5 and not sab) or (f.weekday() == 6 and not dom))
+
+    lectivos_excluidos = [f for f in fechas if habil(f) and f not in existentes]
+
+    marcas = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+        Asistencia.fecha >= inicio, Asistencia.fecha <= fin).all()
+    grupos = {}
+    for a in marcas:
+        grupos.setdefault((a.fecha, a.curso_id), 0)
+        grupos[(a.fecha, a.curso_id)] += 1
+    cursos = {c.id: c for c in tenant_filter(db.query(Curso), Curso, current_user).filter(
+        Curso.id.in_([k[1] for k in grupos if k[1]] or [0])).all()}
+    conflictos = [{'fecha': f.isoformat(), 'curso_id': c,
+                   'curso': (cursos[c].nombre_completo if c in cursos else 'Sin curso'), 'marcas': n}
+                  for (f, c), n in sorted(grupos.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0))]
+
+    solapes = [r.to_dict() for r in db.query(RangoVacaciones).filter(
+        RangoVacaciones.colegio_id == cid, RangoVacaciones.activo == True,  # noqa: E712
+        RangoVacaciones.fecha_inicio <= fin, RangoVacaciones.fecha_fin >= inicio).all()]
+    identico = next((r for r in solapes if r['nombre'] == nombre and r['fecha_inicio'] == inicio.isoformat()
+                     and r['fecha_fin'] == fin.isoformat()), None)
+
+    sni = tenant_filter(db.query(SesionNoImpartida), SesionNoImpartida, current_user).filter(
+        SesionNoImpartida.fecha >= inicio, SesionNoImpartida.fecha <= fin,
+        SesionNoImpartida.activo == True).count()  # noqa: E712
+
+    return {
+        'nombre': nombre,
+        'fecha_inicio': inicio.isoformat(),
+        'fecha_fin': fin.isoformat(),
+        'dias_calendario': len(fechas),
+        'dias_lectivos_excluidos': len(lectivos_excluidos),
+        'ya_no_laborables': [{'fecha': f.isoformat(), 'nombre': d.nombre, 'tipo': d.tipo}
+                             for f, d in sorted(existentes.items())],
+        'conflictos_asistencia': conflictos,
+        'total_marcas': len(marcas),
+        'solapes': [r for r in solapes if r is not identico],
+        'ya_registrado': identico,
+        'sesiones_no_impartidas': sni,
+        'puede_confirmar': not marcas and not [r for r in solapes if r is not identico],
+        '_existentes': existentes,
+        '_fechas': fechas,
+    }
+
+
+def _publico(analisis):
+    return {k: v for k, v in analisis.items() if not k.startswith('_')}
+
+
+@app.get("/api/vacaciones")
+async def listar_vacaciones(request: Request, db: Session = Depends(get_db),
+                            current_user: Usuario = Depends(get_current_user)):
+    """Rangos de vacaciones activos del colegio (los ve todo el personal)."""
+    filas = tenant_filter(db.query(RangoVacaciones), RangoVacaciones, current_user).filter(
+        RangoVacaciones.activo == True).order_by(RangoVacaciones.fecha_inicio).all()  # noqa: E712
+    return [r.to_dict() for r in filas]
+
+
+@app.post("/api/vacaciones/vista-previa")
+async def vista_previa_vacaciones(request: Request, db: Session = Depends(get_db),
+                                  current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """El rango y sus conflictos ANTES de confirmar. No escribe nada."""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido (se espera JSON)'}, status_code=400)
+    err, nombre, inicio, fin, ano = _validar_rango_vacaciones(db, current_user, data)
+    if err is not None:
+        return err
+    return _publico(_analisis_vacaciones(db, current_user, nombre, inicio, fin, ano))
+
+
+@app.post("/api/vacaciones")
+async def crear_vacaciones(request: Request, db: Session = Depends(get_db),
+                           current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Confirma un rango. Se detiene (sin tocar nada) si hay asistencia
+    registrada o si se solapa con otro rango. Repetir la misma petición no
+    duplica: devuelve el rango ya registrado."""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'Body inválido (se espera JSON)'}, status_code=400)
+    err, nombre, inicio, fin, ano = _validar_rango_vacaciones(db, current_user, data)
+    if err is not None:
+        return err
+    # Exclusivo: a partir de aquí nadie pasa lista en este colegio ni crea
+    # otro rango hasta el commit.
+    _bloquear_colegio(db, current_user.colegio_id, compartido=False)
+    an = _analisis_vacaciones(db, current_user, nombre, inicio, fin, ano)
+    if an['ya_registrado'] and not an['solapes']:
+        db.rollback()
+        return {'message': 'Ese rango ya estaba registrado; no se duplicó.',
+                'ya_existia': True, 'vacaciones': an['ya_registrado']}
+    if an['total_marcas']:
+        db.rollback()
+        return JSONResponse({
+            'error': 'ASISTENCIA_REGISTRADA',
+            'message': (f'Hay {an["total_marcas"]} marca(s) de asistencia entre el {_fmt_rd(inicio)} y el '
+                        f'{_fmt_rd(fin)}. No se registró el rango y no se modificó ninguna marca.'),
+            'analisis': _publico(an),
+        }, status_code=409)
+    if an['solapes'] or an['ya_registrado']:
+        db.rollback()
+        otros = an['solapes'] or [an['ya_registrado']]
+        return JSONResponse({
+            'error': 'SOLAPAMIENTO',
+            'message': 'El rango se solapa con: ' + '; '.join(
+                f'«{r["nombre"]}» ({r["fecha_inicio"]} a {r["fecha_fin"]})' for r in otros) + '. No se registró.',
+            'analisis': _publico(an),
+        }, status_code=409)
+
+    creados = []
+    for f in an['_fechas']:
+        if f in an['_existentes']:
+            continue   # ya era no laborable: no se duplica la fecha
+        d = DiaNoLaborable(colegio_id=current_user.colegio_id, fecha=f, nombre=nombre, tipo='vacaciones',
+                           recurrente=False, ano_escolar_id=ano.id, activo=True)
+        db.add(d)
+        creados.append(d)
+    db.flush()
+    rango = RangoVacaciones(colegio_id=current_user.colegio_id, ano_escolar_id=ano.id, nombre=nombre,
+                            fecha_inicio=inicio, fecha_fin=fin, activo=True,
+                            dias_creados=_json.dumps([d.id for d in creados]), creado_por=current_user.id)
+    db.add(rango)
+    db.commit()
+    cache_clear_tenant(current_user.colegio_id)
+    return JSONResponse({'message': 'Vacaciones registradas', 'vacaciones': rango.to_dict(),
+                         'dias_creados': len(creados)}, status_code=201)
+
+
+@app.delete("/api/vacaciones/{rango_id}")
+async def quitar_vacaciones(rango_id: int, request: Request, db: Session = Depends(get_db),
+                            current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """Quita un rango: lo desactiva junto con los días que ÉL creó. No borra."""
+    rango = get_tenant_or_404(db, RangoVacaciones, rango_id, current_user, name='vacaciones')
+    if not rango.activo:
+        return {'message': 'El rango ya estaba quitado', 'vacaciones': rango.to_dict()}
+    _bloquear_colegio(db, current_user.colegio_id, compartido=False)
+    ids = rango.ids_dias_creados()
+    if ids:
+        for d in db.query(DiaNoLaborable).filter(DiaNoLaborable.id.in_(ids),
+                                                 DiaNoLaborable.colegio_id == rango.colegio_id).all():
+            d.activo = False
+    rango.activo = False
+    rango.quitado_por = current_user.id
+    rango.quitado_en = datetime.utcnow()
+    db.commit()
+    cache_clear_tenant(current_user.colegio_id)
+    return {'message': 'Vacaciones quitadas', 'vacaciones': rango.to_dict()}
+
+
+def _dias_de_rangos_activos(db, current_user):
+    """{id de DiaNoLaborable: id del rango activo que lo creó}."""
+    out = {}
+    for r in tenant_filter(db.query(RangoVacaciones), RangoVacaciones, current_user).filter(
+            RangoVacaciones.activo == True).all():  # noqa: E712
+        for i in r.ids_dias_creados():
+            out[i] = r.id
+    return out
 
 # ============== ASIGNACIONES POR CURSO ==============
 
