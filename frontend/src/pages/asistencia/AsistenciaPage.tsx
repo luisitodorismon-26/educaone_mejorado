@@ -87,6 +87,9 @@ export const AsistenciaPage = () => {
   const [buscarEstudiante, setBuscarEstudiante] = useState('');
   // S1: la sesion declarada NO impartida de esta clase y fecha, si existe.
   const [sesionNI, setSesionNI] = useState<SesionNI | null>(null);
+  // ENT-B · rango de vacaciones que contiene la fecha elegida (lo dice el servidor).
+  const [vacaciones, setVacaciones] =
+    useState<{ nombre: string; fecha_inicio: string; fecha_fin: string } | null>(null);
   const niveles = useNivelesActivos();
   const [nivelFiltro, setNivelFiltro] = useState<Nivel | 'todos'>('todos');
   // Lo que el servidor responde sobre si este usuario puede editar ESTE curso.
@@ -139,7 +142,8 @@ export const AsistenciaPage = () => {
   // errores. `puedeEditar` NO se toca: el panel de S1 sigue siendo suyo.
   // ENT1 · tampoco se marca sobre una lista que no es la de la selección
   // actual, mientras se revalida o sin conexión.
-  const puedeMarcar = puedeEditar && !sesionNI && listaValida && !revalidando && enLinea;
+  // ENT-B · dentro de un rango de vacaciones tampoco (el servidor responde 409).
+  const puedeMarcar = puedeEditar && !sesionNI && !vacaciones && listaValida && !revalidando && enLinea;
 
   // Cargar cursos según rol
   useEffect(() => {
@@ -300,6 +304,7 @@ export const AsistenciaPage = () => {
         motivo: res.data.motivo_solo_lectura ?? null,
       });
       setSesionNI(sni);
+      setVacaciones(res.data.vacaciones || null);
       setListaClave(clave);
       listaClaveRef.current = clave;
       setEstadoLista('ok');
@@ -311,6 +316,7 @@ export const AsistenciaPage = () => {
       if (!mismaLista) {
         setAsistencias([]);
         setSesionNI(null);
+        setVacaciones(null);
       }
       // Si la lista que se ve es de esta selección se conserva a la vista,
       // pero no se marca sobre ella hasta comprobarla de nuevo.
@@ -652,6 +658,17 @@ export const AsistenciaPage = () => {
             <p className="text-sm text-gray-600">
               📋 <strong>{asignaturaSeleccionada?.nombre}</strong> — {new Date(fecha + 'T12:00:00').toLocaleDateString('es-DO', { weekday: 'long', day: 'numeric', month: 'long' })}
             </p>
+          </div>
+        )}
+
+        {/* ENT-B · vacaciones: no se pasa lista en esta fecha. */}
+        {vacaciones && tablaDeLaSeleccion && (
+          <div role="status" data-vacaciones
+               className="mt-3 p-3 rounded-lg border border-blue-200 bg-blue-50 text-sm text-blue-800">
+            🏖️ <strong>{vacaciones.nombre}</strong> (del{' '}
+            {new Date(vacaciones.fecha_inicio + 'T12:00:00').toLocaleDateString('es-DO', { day: 'numeric', month: 'long' })} al{' '}
+            {new Date(vacaciones.fecha_fin + 'T12:00:00').toLocaleDateString('es-DO', { day: 'numeric', month: 'long', year: 'numeric' })}):
+            no se registra asistencia en esta fecha y no cuenta como día de clase.
           </div>
         )}
 

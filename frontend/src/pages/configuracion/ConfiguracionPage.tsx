@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { Modal, Button, Input, Select, Alert } from '../../components/ui';
 import { SalidaOptativaSection } from './SalidaOptativaSection';
+import { VacacionesRangoSection } from './VacacionesRangoSection';
 import { labelCurso } from '../../utils/labelCurso';
 
 interface ConfigColegio {
@@ -1037,12 +1038,17 @@ export const ConfiguracionPage = () => {
               <Button onClick={openFeriadoModal}>+ Agregar</Button>
             </div>
           </div>
-          
-          {feriados.length === 0 ? (
-            <p className="text-gray-500 text-center py-8">No hay días no laborables configurados</p>
+
+          {/* ENT-B · vacaciones por rango; sus días se ven bajo el rango, no sueltos. */}
+          <VacacionesRangoSection onCambio={loadData} />
+
+          {feriados.filter(f => !f.rango_vacaciones_id).length === 0 ? (
+            <p className="text-gray-500 text-center py-8">
+              {feriados.some(f => f.rango_vacaciones_id) ? 'No hay otros días no laborables configurados' : 'No hay días no laborables configurados'}
+            </p>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-              {feriados.sort((a, b) => a.fecha.localeCompare(b.fecha)).map(f => (
+              {feriados.filter(f => !f.rango_vacaciones_id).sort((a, b) => a.fecha.localeCompare(b.fecha)).map(f => (
                 <div key={f.id} className={`p-3 rounded-lg border flex justify-between items-center ${
                   f.tipo === 'feriado' ? 'bg-green-50 border-green-200' :
                   f.tipo === 'vacaciones' ? 'bg-blue-50 border-blue-200' :
