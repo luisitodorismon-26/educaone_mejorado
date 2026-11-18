@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import api from '../../services/api';
 import { Button, Input, Alert } from '../../components/ui';
 
@@ -31,11 +31,27 @@ export const VacacionesRangoSection: React.FC<{ onCambio: () => void }> = ({ onC
   const [ocupado, setOcupado] = useState(false);
   const [msg, setMsg] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
 
+  // Cada revisión tiene su número; cambiar el formulario también lo avanza.
+  // Una respuesta que llega con un número viejo se descarta.
+  const secRef = useRef(0);
+  const confirmandoRef = useRef(false);
+  const claveDe = (x: { nombre: string; fecha_inicio: string; fecha_fin: string }) =>
+    [x.nombre.trim(), x.fecha_inicio, x.fecha_fin].join('|');
+  // La vista previa solo vale para el contenido EXACTO que se revisó (el que
+  // devolvió el servidor) y mientras el formulario siga diciendo lo mismo.
+  const vigente = !!analisis && claveDe(analisis) === claveDe(form);
+
   const cargar = () => api.get('/vacaciones').then(r => setRangos(r.data || [])).catch(() => setRangos([]));
   useEffect(() => { cargar(); }, []);
 
   // Cambiar el formulario invalida la revisión anterior: hay que revisar de nuevo.
-  const cambiar = (k: keyof typeof form, v: string) => { setForm(f => ({ ...f, [k]: v })); setAnalisis(null); };
+  const cambiar = (k: keyof typeof form, v: string) => {
+    secRef.current += 1;
+    setForm(f => ({ ...f, [k]: v }));
+    setAnalisis(null);
+    // Una revisión pendiente ya es obsoleta: no debe impedir revisar lo nuevo.
+    if (!confirmandoRef.current) setOcupado(false);
+  };
 
   const revisar = async () => {
     setMsg(null);
@@ -43,32 +59,43 @@ export const VacacionesRangoSection: React.FC<{ onCambio: () => void }> = ({ onC
       setMsg({ type: 'error', text: 'Indique nombre, fecha inicial y fecha final.' });
       return;
     }
+    const sec = ++secRef.current;
+    const enviado = { nombre: form.nombre.trim(), fecha_inicio: form.fecha_inicio, fecha_fin: form.fecha_fin };
+    setAnalisis(null);
     setOcupado(true);
     try {
-      const r = await api.post('/vacaciones/vista-previa', form);
+      const r = await api.post('/vacaciones/vista-previa', enviado);
+      if (sec !== secRef.current) return;      // respuesta de una revisión anterior
       setAnalisis(r.data);
     } catch (e: any) {
+      if (sec !== secRef.current) return;
       setAnalisis(null);
       setMsg({ type: 'error', text: errorDe(e, 'No se pudo revisar el rango') });
-    } finally { setOcupado(false); }
+    } finally { if (sec === secRef.current) setOcupado(false); }
   };
 
   const confirmar = async () => {
-    if (!analisis || !analisis.puede_confirmar || ocupado) return;
+    if (!analisis || !vigente || !analisis.puede_confirmar || ocupado) return;
+    // Se confirma EXACTAMENTE el rango mostrado, no lo que diga el formulario.
+    const mostrado = { nombre: analisis.nombre, fecha_inicio: analisis.fecha_inicio, fecha_fin: analisis.fecha_fin };
+    const sec = ++secRef.current;
+    confirmandoRef.current = true;
     setOcupado(true);
     setMsg(null);
     try {
-      const r = await api.post('/vacaciones', form);
-      setMsg({ type: 'success', text: r.data?.ya_existia ? 'Ese rango ya estaba registrado; no se duplicó.' : `Vacaciones registradas: ${form.nombre.trim()}.` });
+      const r = await api.post('/vacaciones', mostrado);
+      setMsg({ type: 'success', text: r.data?.ya_existia ? 'Ese rango ya estaba registrado; no se duplicó.' : `Vacaciones registradas: ${mostrado.nombre}.` });
       setAnalisis(null);
-      setForm({ nombre: '', fecha_inicio: '', fecha_fin: '' });
+      if (sec === secRef.current) setForm({ nombre: '', fecha_inicio: '', fecha_fin: '' });
       cargar(); onCambio();
     } catch (e: any) {
       // Si algo cambió desde la revisión (una lista pasada, otro rango), se
-      // muestra el análisis actualizado que devuelve el servidor.
-      if (e?.response?.data?.analisis) setAnalisis(e.response.data.analisis);
+      // muestra el análisis actualizado que devuelve el servidor, solo si el
+      // formulario no cambió mientras tanto.
+      if (sec === secRef.current && e?.response?.data?.analisis) setAnalisis(e.response.data.analisis);
+      else setAnalisis(null);
       setMsg({ type: 'error', text: errorDe(e, 'No se pudo registrar el rango') });
-    } finally { setOcupado(false); }
+    } finally { confirmandoRef.current = false; setOcupado(false); }
   };
 
   const quitar = async (r: Rango) => {
@@ -104,7 +131,7 @@ export const VacacionesRangoSection: React.FC<{ onCambio: () => void }> = ({ onC
         <Button variant="secondary" onClick={revisar} loading={ocupado && !analisis}>Revisar rango</Button>
       </div>
 
-      {analisis && (
+      {analisis && vigente && (
         <div className="mt-4 border rounded-lg bg-white p-4 space-y-3" data-vista-previa>
           <p className="text-sm">
             <strong>{analisis.nombre}</strong>: del <strong>{fmt(analisis.fecha_inicio)}</strong> al{' '}
@@ -144,7 +171,7 @@ export const VacacionesRangoSection: React.FC<{ onCambio: () => void }> = ({ onC
           )}
           <div className="flex gap-2 justify-end">
             <Button variant="secondary" onClick={() => setAnalisis(null)} disabled={ocupado}>Cancelar</Button>
-            <Button onClick={confirmar} disabled={!analisis.puede_confirmar || ocupado} loading={ocupado}>
+            <Button onClick={confirmar} disabled={!vigente || !analisis.puede_confirmar || ocupado} loading={ocupado}>
               Confirmar vacaciones
             </Button>
           </div>

@@ -22980,12 +22980,39 @@ async def crear_dia_no_laborable(request: Request, db: Session = Depends(get_db)
 async def eliminar_dia_no_laborable(id, request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion'))):
     """Eliminar día no laborable"""
     dia = get_tenant_or_404(db, DiaNoLaborable, id, current_user, name='dianolaborable')
-    # ENT-B · un día de un rango de vacaciones se quita con su rango: suelto,
-    # dejaría el día contando como lectivo con la asistencia aún bloqueada.
+    # ENT-B · Exclusivo, igual que crear un rango: o el rango se crea antes (y
+    # aquí se ve y se rechaza), o este día se quita antes (y el rango, al no
+    # verlo, crea su propio día). Nunca queda una fecha del rango sin cobertura.
+    _bloquear_colegio(db, dia.colegio_id or current_user.colegio_id, compartido=False)
+    db.refresh(dia)
+    # Un día de un rango de vacaciones se quita con su rango: suelto, dejaría
+    # el día contando como lectivo con la asistencia aún bloqueada.
     if _dias_de_rangos_activos(db, current_user).get(dia.id):
+        db.rollback()
         return JSONResponse({'error': 'DIA_DE_RANGO',
                              'message': 'Ese día pertenece a un rango de vacaciones: quite el rango completo.'},
                             status_code=409)
+    # Un día que YA existía cuando se creó un rango activo que lo contiene (el
+    # rango no creó el suyo para no duplicar la fecha): quitarlo dejaría esa
+    # fecha del rango contando como día de clase. Se rechaza mientras el
+    # rango siga vigente. Un recurrente cuenta si su día y mes caen en el rango.
+    if dia.activo and dia.fecha:
+        for r in tenant_filter(db.query(RangoVacaciones), RangoVacaciones, current_user).filter(
+                RangoVacaciones.activo == True).all():  # noqa: E712
+            n = (r.fecha_fin - r.fecha_inicio).days + 1
+            fechas = [r.fecha_inicio + timedelta(days=i) for i in range(n)]
+            cubre = (any((f.month, f.day) == (dia.fecha.month, dia.fecha.day) for f in fechas) if dia.recurrente
+                     else r.fecha_inicio <= dia.fecha <= r.fecha_fin)
+            if cubre:
+                db.rollback()
+                return JSONResponse({
+                    'error': 'DIA_EN_RANGO_VIGENTE',
+                    'message': (f'«{dia.nombre}» cae dentro de las vacaciones «{r.nombre}» '
+                                f'({_fmt_rd(r.fecha_inicio)} - {_fmt_rd(r.fecha_fin)}). Mientras ese rango siga '
+                                'vigente no se puede quitar: esa fecha quedaría contando como día de clase. '
+                                'Quite primero el rango si corresponde.'),
+                    'vacaciones': r.to_dict(),
+                }, status_code=409)
     dia.activo = False
     db.commit()
     return {'message': 'Día eliminado'}

@@ -13,6 +13,9 @@
   D  días esperados: asistencia canónica, resumen por períodos, boletín y Registro
   Q  quitar el rango: desactiva solo lo que creó; nada se borra
   F  «Cargar Feriados RD» no queda oculto por un rango
+  E  revisión 2: un día no laborable que YA existía dentro de un rango vigente
+     no se quita (su fecha quedaría contando como día de clase); también si
+     se quita a la vez que se crea el rango (X4, PostgreSQL)
   O  otro colegio: ni ve ni se ve afectado
   X  concurrencia real (solo PostgreSQL temporal): reintentos y solapes
      simultáneos, y rango frente a una lista que se pasa a la vez
@@ -275,6 +278,30 @@ st, js = req('DELETE', '/api/dias-no-laborables/%d' % uno['id'], 'dir')
 check('R un día del rango no se quita suelto (409 DIA_DE_RANGO)', st == 409 and js.get('error') == 'DIA_DE_RANGO'
       and huella() == h1, js)
 
+
+def cubierto(f):
+    """¿Hay un día no laborable ACTIVO del colegio en esa fecha (exacto o recurrente)?"""
+    db.expire_all()
+    return any(d.fecha == f or (d.recurrente and (d.fecha.month, d.fecha.day) == (f.month, f.day))
+               for d in db.query(M.DiaNoLaborable).filter_by(colegio_id=col.id, activo=True).all() if d.fecha)
+
+
+print('\n== E. Día no laborable preexistente dentro de un rango vigente ==')
+st, js = req('DELETE', '/api/dias-no-laborables/%d' % FER.id, 'dir')
+db.expire_all()
+check('E quitar el feriado del 11/11 (existía antes del rango) -> 409 DIA_EN_RANGO_VIGENTE con mensaje claro',
+      st == 409 and js.get('error') == 'DIA_EN_RANGO_VIGENTE' and 'Vacaciones sinteticas' in js.get('message', '')
+      and 'Quite primero el rango' in js.get('message', ''), js)
+check('E el feriado sigue activo y el 11/11 sigue cubierto; nada cambió',
+      db.get(M.DiaNoLaborable, FER.id).activo and cubierto(D(2026, 11, 11)) and huella() == h1)
+st, js = req('DELETE', '/api/dias-no-laborables/%d' % FER2.id, 'dir')
+db.expire_all()
+check('E un feriado FUERA de todo rango (16/11) se sigue quitando como siempre',
+      st == 200 and not db.get(M.DiaNoLaborable, FER2.id).activo, js)
+db.get(M.DiaNoLaborable, FER2.id).activo = True     # se restaura: lo usan las secciones siguientes
+db.commit()
+h1 = huella()
+
 # ═════════════ A. Asistencia bloqueada en el servidor ═════════════
 print('\n== A. Asistencia bloqueada en el servidor ==')
 h1 = huella()
@@ -428,11 +455,18 @@ db.expire_all()
 nav = [d for d in db.query(M.DiaNoLaborable).filter_by(colegio_id=col.id, fecha=D(2026, 12, 25), activo=True).all()]
 check('F el feriado de Navidad se carga aunque el rango cubra el 25/12 (no queda oculto por el rango)',
       st == 200 and any(d.tipo == 'feriado' and d.recurrente for d in nav), [(d.tipo, d.nombre) for d in nav])
+NAV = next(d for d in nav if d.tipo == 'feriado' and d.recurrente)
+st, js = req('DELETE', '/api/dias-no-laborables/%d' % NAV.id, 'dir')
+check('E un feriado RECURRENTE (25/12) dentro de un rango vigente tampoco se quita (409)',
+      st == 409 and js.get('error') == 'DIA_EN_RANGO_VIGENTE' and db.get(M.DiaNoLaborable, NAV.id).activo, js)
 st, js = req('DELETE', '/api/vacaciones/%d' % RNAV, 'dir')
 db.expire_all()
 check('F al quitar el rango, el feriado de Navidad sigue en el calendario',
       st == 200 and db.query(M.DiaNoLaborable).filter_by(colegio_id=col.id, fecha=D(2026, 12, 25), tipo='feriado',
                                                          activo=True).count() == 1)
+st, js = req('DELETE', '/api/dias-no-laborables/%d' % NAV.id, 'dir')
+db.expire_all()
+check('E sin rango vigente, ese feriado vuelve a poder quitarse (200)', st == 200 and not db.get(M.DiaNoLaborable, NAV.id).activo, js)
 
 # ═════════════ O. Otro colegio ═════════════
 print('\n== O. Otro colegio ==')
@@ -502,23 +536,42 @@ else:
             db.expire_all()
             n3r = len(rangos_activos('Car %s' % tag))
             n3a = db.query(M.Asistencia).filter_by(estudiante_id=E2.id, fecha=dt.date.fromisoformat(fecha)).count()
-            return (n1, out1), (n2, out2), (n3r, n3a, out3)
+            # X4 · el rango se crea (lento entre comprobar y escribir) y, a la
+            # vez, se quita un feriado que ya existía dentro de él.
+            fx = dt.date(2027, 3, 10) if control else dt.date(2027, 3, 17)
+            fer = M.DiaNoLaborable(colegio_id=col.id, fecha=fx, nombre='Feriado X4 %s' % tag, tipo='feriado',
+                                   recurrente=False, ano_escolar_id=ano.id, activo=True)
+            db.add(fer)
+            db.commit()
+            out4 = correr([('POST', '/api/vacaciones', 'dir', {'nombre': 'Del %s' % tag,
+                                                               'fecha_inicio': (fx - dt.timedelta(days=2)).isoformat(),
+                                                               'fecha_fin': (fx + dt.timedelta(days=2)).isoformat()}),
+                           ('DELETE', '/api/dias-no-laborables/%d' % fer.id, 'dir', None)], pausa=0.4)
+            db.expire_all()
+            n4r = len(rangos_activos('Del %s' % tag))
+            hueco = n4r == 1 and not cubierto(fx)
+            return (n1, out1), (n2, out2), (n3r, n3a, out3), (n4r, hueco, out4)
         finally:
             APP._analisis_vacaciones = _orig_an
             APP._bloquear_colegio = _orig_bloq
 
-    (c1, o1), (c2, o2), (c3r, c3a, o3) = escenario(control=True)
-    print('    CONTROL sin bloqueo: reintentos -> %d rangos; solapes -> %d; rango+lista -> rango %d, marcas %d'
-          % (c1, c2, c3r, c3a))
+    (c1, o1), (c2, o2), (c3r, c3a, o3), (c4r, c4h, o4) = escenario(control=True)
+    print('    CONTROL sin bloqueo: reintentos -> %d rangos; solapes -> %d; rango+lista -> rango %d, marcas %d; '
+          'rango+quitar feriado -> fecha sin cobertura: %s' % (c1, c2, c3r, c3a, c4h))
+    check('X4 CONTROL: sin el bloqueo, quitar el feriado mientras se crea el rango SÍ deja la fecha sin cobertura',
+          c4h, o4)
     check('X CONTROL: sin el bloqueo la prueba SÍ detecta la carrera (duplicado, solape o rango con marca)',
           c1 > 1 or c2 > 1 or (c3r and c3a), (o1, o2, o3))
-    (c1, o1), (c2, o2), (c3r, c3a, o3) = escenario(control=False)
+    (c1, o1), (c2, o2), (c3r, c3a, o3), (c4r, c4h, o4) = escenario(control=False)
     check('X 3 confirmaciones idénticas a la vez -> 1 rango (las otras: «ya estaba registrado»)',
           c1 == 1 and sorted(v[0] for v in o1.values()) == [200, 200, 201], o1)
     check('X 2 rangos solapados a la vez -> 1 rango; el otro 409 SOLAPAMIENTO',
           c2 == 1 and sorted(v[0] for v in o2.values()) == [201, 409], o2)
     check('X rango y lista del mismo día a la vez -> nunca ambos (o el rango y ninguna marca, o la marca y ningún rango)',
           (c3r, c3a) in ((1, 0), (0, 1)), (c3r, c3a, o3))
+    check('X4 crear el rango y quitar a la vez un feriado que ya existía dentro -> la fecha nunca queda sin cobertura '
+          '(el rango entra y el borrado espera y se rechaza con 409)',
+          c4r == 1 and not c4h and sorted(v[0] for v in o4.values()) == [201, 409], (c4r, c4h, o4))
 
 print('\nRESULTADO ENT-B VACACIONES POR RANGO (%s): %d PASARON / %d FALLARON'
       % (engine.dialect.name, sum(1 for _, ok in RES if ok), sum(1 for _, ok in RES if not ok)))
