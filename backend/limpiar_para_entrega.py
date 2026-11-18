@@ -81,6 +81,8 @@ if resp != 'SI':
 # Orden de borrado: primero los hijos (dependen de estudiante/curso), luego padres.
 # Modelos que dependen de estudiante_id:
 dependientes_estudiante = [
+    # RET-R · las anulaciones antes que las asistencias que referencian.
+    'AsistenciaAnulada', 'AnulacionAsistencia',
     'Asistencia', 'Calificacion', 'CalificacionPrimaria', 'CalificacionSecundaria',
     'CasoPsicologia', 'EvalInternaEstudiante', 'EvaluacionExtraSecundaria',
     'HistorialAcademico', 'HistorialComunicacionPadres', 'HistorialReportePadres',
@@ -98,7 +100,9 @@ def borrar_todos(nombre):
     if m is None or not hasattr(m, '__table__'):
         return
     try:
-        n = db.query(m).delete()
+        # RET-R · `incluir_anuladas`: sin él, el filtro global dejaría las
+        # asistencias anuladas sin borrar.
+        n = db.query(m).execution_options(incluir_anuladas=True).delete()
         borrados[nombre] = n
     except Exception as e:
         print(f"  (aviso: no se pudo borrar {nombre}: {e})")

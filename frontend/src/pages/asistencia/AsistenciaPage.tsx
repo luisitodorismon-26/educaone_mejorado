@@ -21,6 +21,8 @@ interface Estudiante {
   aplica?: boolean;
   avisos?: string[];
   marca_fuera_de_permanencia?: boolean;
+  // RET-R · marca anulada por retiro ese día (no cuenta; solo lectura).
+  asistencia_anulada?: { estado_original: string; motivo: string | null; anulada_en: string | null } | null;
 }
 
 interface Asignatura {
@@ -778,6 +780,13 @@ export const AsistenciaPage = () => {
                         {noAplica && (
                           <span className="inline-block px-2 py-0.5 bg-gray-600 text-white text-[10px] font-medium rounded uppercase tracking-wide">
                             No aplica
+                          </span>
+                        )}
+                        {a.estudiante.asistencia_anulada && (
+                          <span data-anulada
+                                title={`Anulada por retiro${a.estudiante.asistencia_anulada.motivo ? `: ${a.estudiante.asistencia_anulada.motivo}` : ''}`}
+                                className="inline-block px-2 py-0.5 bg-gray-100 text-gray-500 border border-gray-300 text-[10px] rounded line-through">
+                            {a.estudiante.asistencia_anulada.estado_original} · anulada por retiro
                           </span>
                         )}
                         {esRetirado && !noAplica && a.estudiante.aplica === undefined && (

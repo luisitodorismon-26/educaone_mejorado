@@ -10,6 +10,7 @@ import { filterByNivel } from '../../hooks/useFiltroCascada';
 import { EstudianteKPIs } from './EstudianteKPIs';
 import { labelCurso } from '../../utils/labelCurso';
 import { MovimientoEstudianteModal, HistorialCursos, TipoMovimiento } from './MovimientoEstudianteModal';
+import { RetiroAnulacionesPanel } from './RetiroAnulacionesPanel';
 import { PermisoCorreccionModal } from './PermisoCorreccionModal';
 import { useNavigate } from 'react-router-dom';
 
@@ -126,6 +127,9 @@ export const EstudiantesPage = () => {
   // ENT-A · boletines y notas de retirados sin reactivarlos.
   const navigate = useNavigate();
   const [permisoPara, setPermisoPara] = useState<Estudiante | null>(null);
+  // RET-R · asistencias anuladas, reversión y corrección de la fecha de retiro.
+  const [retiroPara, setRetiroPara] = useState<Estudiante | null>(null);
+  const [retiroVersion, setRetiroVersion] = useState(0);   // refresca el historial tras un cambio
   const [importCursoId, setImportCursoId] = useState<number | ''>('');
   const [importing, setImporting] = useState(false);
   const [importPreview, setImportPreview] = useState<{ validas: number; errores: string[] } | null>(null);
@@ -673,6 +677,16 @@ export const EstudiantesPage = () => {
       )}
 
       <PermisoCorreccionModal estudiante={permisoPara} onClose={() => setPermisoPara(null)} />
+      <Modal isOpen={!!retiroPara} onClose={() => setRetiroPara(null)} size="xl"
+             title={`Retiro y asistencias anuladas · ${retiroPara?.nombre_completo || ''}`}>
+        {retiroPara && (
+          <div className="space-y-3">
+            <HistorialCursos key={retiroVersion} estudianteId={retiroPara.id} />
+            <RetiroAnulacionesPanel estudianteId={retiroPara.id} retirado
+                                    onCambio={() => { setRetiroVersion(v => v + 1); loadData(); }} />
+          </div>
+        )}
+      </Modal>
 
       {/* Vista de Estudiantes Retirados */}
       {activeTab === 'retirados' && canManageRetirados ? (
@@ -726,6 +740,16 @@ export const EstudiantesPage = () => {
                             title="Permitir a un docente completar o corregir sus notas sin reactivarlo"
                           >
                             ✏️ Permiso de corrección
+                          </button>
+                        )}
+                        {/* RET-R · Solo Dirección: anuladas, reversión y corrección de la fecha. */}
+                        {canEliminarPorError && (
+                          <button
+                            onClick={() => setRetiroPara(est)}
+                            className="px-3 py-1 bg-amber-600 text-white text-sm rounded hover:bg-amber-700"
+                            title="Ver asistencias anuladas, revertirlas o corregir la fecha de retiro"
+                          >
+                            🗓️ Retiro y anuladas
                           </button>
                         )}
                         <button
@@ -1052,6 +1076,10 @@ export const EstudiantesPage = () => {
             
             {/* TRAS-1 · historial de cursos del año (traslados, retiros, reactivaciones) */}
             <HistorialCursos estudianteId={showDetalle.id} />
+            {/* RET-R · anuladas por retiro, reversión y corrección de fecha (solo Dirección) */}
+            {canEliminarPorError && (
+              <RetiroAnulacionesPanel estudianteId={showDetalle.id} retirado={!showDetalle.activo} />
+            )}
 
             {/* Banner prominente de retiro: visible al inicio del modal */}
             {!showDetalle.activo && (
