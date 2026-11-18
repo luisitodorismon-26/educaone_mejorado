@@ -614,6 +614,61 @@ c_rg = canonica(RG)
 check('RG4 su asistencia del regreso (02–11/11) sigue contando', any(D(2026, 11, 2) <= f <= D(2026, 11, 11)
                                                                     for f in c_rg['dias']))
 
+# ═════════════ HM. Historial mixto: administrativa, luego regreso real ═════════════
+print('\n== HM. Retiro → reactivación administrativa → retiro → regreso real → retiro ==')
+HM = est('Mixto', SA, 10)
+add(M.CalificacionSecundaria(colegio_id=col.id, estudiante_id=HM.id, asignatura_id=art.id, ano_escolar_id=ano.id,
+                             competencia_numero=1, p1=75, p2=88))
+for i, f in enumerate(dias(D(2026, 10, 1), D(2026, 10, 16))):
+    add(M.Asistencia(colegio_id=col.id, estudiante_id=HM.id, curso_id=SA.id, asignatura_id=art.id, fecha=f,
+                     estado=ESTADOS[i % len(ESTADOS)], registrado_por=prof.id))
+db.commit()
+h = [req('POST', '/api/estudiantes/%d/retiro' % HM.id, 'dir', {'desde': '2026-10-17', 'motivo': 'Se fue'})[0],
+     req('POST', '/api/estudiantes/%d/reactivar' % HM.id, 'dir', {'desde': '2026-10-26',
+                                                                 'motivo': 'Solo para completar notas'})[0],
+     req('POST', '/api/estudiantes/%d/retiro' % HM.id, 'dir', {'desde': '2026-10-28', 'motivo': 'Notas listas'})[0],
+     req('POST', '/api/estudiantes/%d/reactivar' % HM.id, 'dir', {'desde': '2026-11-02', 'motivo': 'Regresó a clases'})[0]]
+for i, f in enumerate(dias(D(2026, 11, 2), D(2026, 11, 17))):       # regreso real: asiste
+    add(M.Asistencia(colegio_id=col.id, estudiante_id=HM.id, curso_id=SA.id, asignatura_id=art.id, fecha=f,
+                     estado=ESTADOS[i % len(ESTADOS)], registrado_por=prof.id))
+db.commit()
+_st, pv = req('GET', '/api/estudiantes/%d/movimiento/preparar?tipo=retiro&desde=2026-11-16' % HM.id, 'dir')
+h.append(req('POST', '/api/estudiantes/%d/retiro' % HM.id, 'dir', {
+    'desde': '2026-11-16', 'motivo': 'Se fue', 'anular_marcas_posteriores': True, 'motivo_anulacion': 'no vino',
+    'huella_vista_previa': pv['anulacion']['huella']})[0])
+
+
+def foto_hm():
+    db.expire_all()
+    return (
+        [(m.id, m.tipo, m.secuencia, m.fecha_efectiva, m.detalle) for m in db.query(M.MovimientoEstudiante)
+         .filter_by(estudiante_id=HM.id).order_by(M.MovimientoEstudiante.secuencia)],
+        marcas_crudas(HM.id),
+        sorted((a.asistencia_id, a.revertida_en) for a in db.query(M.AsistenciaAnulada).join(M.AnulacionAsistencia)
+               .filter(M.AnulacionAsistencia.estudiante_id == HM.id)),
+        [(c.competencia_numero, c.p1, c.p2) for c in db.query(M.CalificacionSecundaria).filter_by(estudiante_id=HM.id)],
+        db.get(M.Estudiante, HM.id).fecha_retiro,
+    )
+
+
+FOTO_HM = foto_hm()
+movs_hm = [m for m in FOTO_HM[0]]
+reacs = [m[0] for m in movs_hm if m[1] == 'reactivacion']
+check('HM0 historia registrada: 5 pasos (el primer retiro en la ficha) y dos reactivaciones',
+      h == [200] * 5 and [m[1] for m in movs_hm] == ['reactivacion', 'retiro', 'reactivacion', 'retiro'], (h, movs_hm))
+st, js = req('GET', '/api/estudiantes/%d/retiro/corregir/vista-previa?desde=2026-10-17&reactivacion_administrativa_id=%d'
+             % (HM.id, reacs[0]), 'dir')
+check('HM1 vista previa con la PRIMERA reactivación (administrativa) y un regreso real después: rechazada '
+      '(409 HISTORIAL_REQUIERE_REVISION), sin anular en bloque',
+      st == 409 and js.get('error') == 'HISTORIAL_REQUIERE_REVISION' and 'revisión individual' in js.get('message', ''), js)
+st, js = req('POST', '/api/estudiantes/%d/retiro/corregir' % HM.id, 'dir', {
+    'desde': '2026-10-17', 'motivo': 'x', 'reactivacion_administrativa_id': reacs[0],
+    'confirmar_reactivacion_administrativa': True, 'anular_marcas_posteriores': True, 'motivo_anulacion': 'x',
+    'huella_vista_previa': 'x', 'confirmar_periodos_no_cursados': True})
+check('HM2 confirmar igualmente: 409 HISTORIAL_REQUIERE_REVISION', st == 409
+      and js.get('error') == 'HISTORIAL_REQUIERE_REVISION', js)
+check('HM3 no cambió nada: movimientos, marcas, anulaciones, notas y fecha de retiro idénticos', foto_hm() == FOTO_HM)
+
 # ═════════════ K. Notas ═════════════
 print('\n== K. Notas: pendiente de período cursado sí; no cursado no ==')
 st, js = req('POST', '/api/periodos/permiso-temporal', 'dir', {'profesor_id': prof.id, 'curso_id': SA.id,

@@ -8621,6 +8621,18 @@ def _analisis_correccion_retiro(db, current_user, est, ano, desde, reactivacion_
             return _respuesta_movimiento_error(
                 'REACTIVACION_NO_VALIDA',
                 'Esa reactivación no está vigente en su curso actual (o es anterior a un traslado).', 400), None
+        # Si DESPUÉS hay otra reactivación vigente (p. ej. un regreso real), lo
+        # posterior no es una sola cadena administrativa: ese historial se revisa
+        # caso por caso y no se deja sin efecto en bloque.
+        _reac_posterior = next((m for m in vigentes if m.tipo == PERM.REACTIVACION
+                                and m.secuencia > reac_admin.secuencia), None)
+        if _reac_posterior is not None:
+            return _respuesta_movimiento_error(
+                'HISTORIAL_REQUIERE_REVISION',
+                'Después de la reactivación del %s hay otra reactivación vigente (desde el %s), que puede '
+                'corresponder a un regreso real. Este historial requiere revisión individual: no se dejan sin '
+                'efecto varios movimientos en bloque. No se cambió nada.'
+                % (_f(reac_admin.fecha_efectiva), _f(_reac_posterior.fecha_efectiva)), 409), None
         # Delimitado: el retiro que la precede (si es un movimiento; un retiro
         # anterior a la tabla vive en el detalle de la propia reactivación),
         # la reactivación y lo posterior. Nada más.
