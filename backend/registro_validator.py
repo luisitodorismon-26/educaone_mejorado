@@ -703,9 +703,10 @@ def validar_registro_primaria(db: Session, curso_id: int, colegio_id: int) -> Va
     # Sin horario en el sistema ya no se bloquea: se avisa (ver Secundaria).
     r.info['curso_sin_horario'] = not horarios
     if not horarios:
-        r.add_aviso("El curso no tiene horario configurado. El Registro imprime las marcas reales en sus "
-                    "fechas, pero no puede determinar los días de clase esperados: no se completan días "
-                    "sin lista y el porcentaje de asistencia queda sin calcular.")
+        r.add_aviso("El curso no tiene horario configurado. Las hojas mensuales imprimen las marcas reales "
+                    "en sus fechas, sin completar días sin lista y sin porcentaje. El porcentaje anual del "
+                    "Acta no depende del horario: se calcula con el calendario escolar y solo aparece si la "
+                    "asistencia está completa en todos los días de clase.")
     
     # Calificaciones primaria (por competencia)
     asignaturas = db.query(Asignatura).filter(Asignatura.id.in_(asignatura_ids)).all()
