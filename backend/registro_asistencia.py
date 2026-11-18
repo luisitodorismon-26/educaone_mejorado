@@ -475,8 +475,12 @@ def build_asistencia_registro(
             # ese estudiante; con huecos no se imprime (None): ni un 0 que diga
             # «no vino nunca» ni un 100 sacado de pocos días.
             cobertura_completa = esperadas_est > 0 and con_dato == esperadas_est
+            # Sin horario no se sabe qué días había clase: las columnas son solo
+            # las fechas con alguna marca real, así que un porcentaje sobre ellas
+            # afirmaría una asistencia que no se puede determinar. Se deja sin
+            # calcular (las marcas y sus conteos sí se imprimen).
             porcentaje = (round(((presentes + tardanzas) / con_dato) * 100, 1)
-                          if cobertura_completa else None)
+                          if cobertura_completa and dias_horario else None)
             filas.append({
                 'no': est_index[est.id],
                 'estudiante_id': est.id,
@@ -518,6 +522,8 @@ def build_asistencia_registro(
             },
             'filas': filas,
             'fuente_dias': fuente,
+            # False = sin horario: los días esperados no se pueden determinar.
+            'asistencia_esperada_determinada': bool(dias_horario),
             'dias_horario': sorted(dias_horario),
             'dias_con_registro': dias_con_registro,
             'dias_trabajados_configurados': cfg_mes,

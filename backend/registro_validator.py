@@ -26,6 +26,10 @@ class ValidationResult:
     def __init__(self):
         self.errors: List[str] = []        # Bloquean generación
         self.warnings: List[str] = []       # No bloquean, pero se reportan
+        # Advertencias que NO piden confirmación (`?force=true`) para imprimir:
+        # limitaciones conocidas que se dejan explícitas, como una asignatura
+        # cuyo horario se maneja fuera del sistema.
+        self.avisos: List[str] = []
         self.info: Dict[str, Any] = {}      # Datos auxiliares (ej: profesor titular encontrado)
     
     def add_error(self, msg: str):
@@ -33,6 +37,9 @@ class ValidationResult:
     
     def add_warning(self, msg: str):
         self.warnings.append(msg)
+
+    def add_aviso(self, msg: str):
+        self.avisos.append(msg)
     
     @property
     def is_valid(self) -> bool:
@@ -44,6 +51,7 @@ class ValidationResult:
             'valid': self.is_valid,
             'errors': self.errors,
             'warnings': self.warnings,
+            'avisos': self.avisos,
             'info': self.info,
         }
 
@@ -390,10 +398,19 @@ def validar_registro_secundaria(db: Session, curso_id: int, colegio_id: int) -> 
         tipo_bloque='clase',
     ).all()
     horarios_por_asig = {h.asignatura_id for h in horarios if h.asignatura_id}
+    # Una asignatura sin horario en el sistema (su docente lo maneja aparte) ya
+    # no impide imprimir: se avisa, y el generador imprime solo sus marcas
+    # reales en sus fechas, sin inventar días esperados ni porcentajes.
+    _sin_horario = []
     for asig_id in asignatura_ids:
         if asig_id not in horarios_por_asig:
             nom = next((a.nombre for a in asignaturas if a.id == asig_id), f"Asignatura id={asig_id}")
-            r.add_error(f"La asignatura '{nom}' no tiene horario configurado para este curso")
+            _sin_horario.append(nom)
+            r.add_aviso(
+                f"La asignatura '{nom}' no tiene horario configurado para este curso. El Registro "
+                "imprime sus marcas reales en sus fechas, pero no puede determinar los días de clase "
+                "esperados: no se completan días sin lista y su porcentaje de asistencia queda sin calcular.")
+    r.info['asignaturas_sin_horario'] = sorted(_sin_horario)
     
     # === 7. CALIFICACIONES por asignatura (modelo académico REAL: CalificacionSecundaria) ===
     #
@@ -683,8 +700,12 @@ def validar_registro_primaria(db: Session, curso_id: int, colegio_id: int) -> Va
         activo=True,
         tipo_bloque='clase',
     ).all()
+    # Sin horario en el sistema ya no se bloquea: se avisa (ver Secundaria).
+    r.info['curso_sin_horario'] = not horarios
     if not horarios:
-        r.add_error("El curso no tiene horario configurado")
+        r.add_aviso("El curso no tiene horario configurado. El Registro imprime las marcas reales en sus "
+                    "fechas, pero no puede determinar los días de clase esperados: no se completan días "
+                    "sin lista y el porcentaje de asistencia queda sin calcular.")
     
     # Calificaciones primaria (por competencia)
     asignaturas = db.query(Asignatura).filter(Asignatura.id.in_(asignatura_ids)).all()
