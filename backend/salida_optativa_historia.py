@@ -122,10 +122,11 @@ def historia_academica(db, curso, asignatura_id: Optional[int]) -> List[dict]:
     # Asistencia POR ASIGNATURA. El `isnot(None)` es la regla de §7: la
     # asistencia general del curso (asignatura_id NULL) no es historia de
     # ninguna materia y no debe bloquear nada.
+    # RET-R · las anuladas también son historia que protege (`incluir_anuladas`).
     _añadir('asistencias', db.query(Asistencia.id).filter(
         Asistencia.curso_id == curso.id,
         Asistencia.asignatura_id == asignatura_id,
-        Asistencia.asignatura_id.isnot(None)))
+        Asistencia.asignatura_id.isnot(None)).execution_options(incluir_anuladas=True))
 
     return encontrado
 

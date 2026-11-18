@@ -36,6 +36,12 @@ TRASLADO = 'traslado'
 RETIRO = 'retiro'
 REACTIVACION = 'reactivacion'
 TIPOS = (TRASLADO, RETIRO, REACTIVACION)
+# RET-R · Corrección de la fecha de retiro. Actúa como el retiro REAL (su
+# `fecha_efectiva` es «retirado desde») y deja SIN EFECTO —sin borrarlos— los
+# retiros y reactivaciones que reemplaza (`detalle.deja_sin_efecto`): p. ej. una
+# reactivación solo administrativa para completar notas, que no fue un regreso
+# a clases. Se registra por su propia ruta, no por `preparar`/`TIPOS`.
+CORRECCION = 'correccion'
 
 INICIO = 'inicio'
 
@@ -88,6 +94,8 @@ def construir_tramos(estudiante, movimientos) -> List[Tramo]:
     implícito de la ficha.
     """
     movs = sorted(movimientos or (), key=lambda m: (m.secuencia, m.id or 0))
+    sin_efecto = ids_sin_efecto(movs)
+    movs = [m for m in movs if m.id not in sin_efecto]
     if not movs:
         # Solo cuenta para quien está realmente INACTIVO: una ficha activa con
         # una `fecha_retiro` antigua (dato heredado) sigue perteneciendo a su
@@ -119,7 +127,7 @@ def construir_tramos(estudiante, movimientos) -> List[Tramo]:
                 tramos.append(actual)
             actual = Tramo(m.curso_destino_id, m.no_lista_destino, m.fecha_efectiva,
                            None, TRASLADO, None, curso_origen_id=m.curso_origen_id)
-        elif m.tipo == RETIRO:
+        elif m.tipo in (RETIRO, CORRECCION):
             if actual is not None:
                 actual.hasta = m.fecha_efectiva - timedelta(days=1)
                 actual.motivo_fin = RETIRO
@@ -133,6 +141,19 @@ def construir_tramos(estudiante, movimientos) -> List[Tramo]:
     if actual is not None:
         tramos.append(actual)
     return tramos
+
+
+def ids_sin_efecto(movimientos) -> set:
+    """Ids de los movimientos que una corrección posterior deja sin efecto."""
+    out = set()
+    for m in movimientos or ():
+        if getattr(m, 'tipo', None) == CORRECCION:
+            for i in (m.get_detalle() or {}).get('deja_sin_efecto') or ():
+                try:
+                    out.add(int(i))
+                except (TypeError, ValueError):
+                    pass
+    return out
 
 
 def tramos_en_curso(tramos: List[Tramo], curso_id) -> List[Tramo]:

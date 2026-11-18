@@ -23,7 +23,20 @@ interface Conflicto {
   asignatura: string | null;
   estado: string;
   explicacion: string;
+  registrado_por_nombre?: string | null;
 }
+
+// RET-R · vista previa de la anulación (la devuelve el servidor).
+interface Anulacion {
+  puede_anular: boolean;
+  huella: string;
+  resumen: { total: number; por_estado: Record<string, number>; hay_presencias: boolean;
+             primera_fecha: string | null; ultima_fecha: string | null };
+}
+
+const ETIQUETA_ESTADO: Record<string, string> = {
+  presente: 'Presentes', ausente: 'Ausentes', tardanza: 'Tardanzas', excusa: 'Excusas',
+};
 
 const TITULOS: Record<TipoMovimiento, string> = {
   traslado: 'Trasladar de curso o tanda',
@@ -43,6 +56,10 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
   const [fechaSugerida, setFechaSugerida] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [guardando, setGuardando] = useState(false);
+  // RET-R · anulación expresa de las marcas posteriores (solo Dirección).
+  const [anulacion, setAnulacion] = useState<Anulacion | null>(null);
+  const [anular, setAnular] = useState(false);
+  const [motivoAnulacion, setMotivoAnulacion] = useState('');
   // Una solicitud por apertura: el doble clic o el reintento no duplican.
   const solicitud = useRef<string>('');
 
@@ -53,7 +70,7 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
       : `mov-${estudiante.id}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     setPrep(null); setDestino(''); setNumero(''); setMotivo('');
     setConflictos([]); setFechaSugerida(null); setError('');
-    setDesde('');
+    setDesde(''); setAnulacion(null); setAnular(false); setMotivoAnulacion('');
   }, [estudiante?.id, tipo]);
 
   useEffect(() => {
@@ -68,6 +85,9 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
         setPrep(r.data);
         setConflictos(r.data.conflictos || []);
         setFechaSugerida(r.data.fecha_sugerida || null);
+        // Otra fecha = otra vista previa: la confirmación anterior no vale.
+        setAnulacion(r.data.anulacion || null);
+        setAnular(false);
         // Reactivar: la primera fecha válida (nunca dentro del retiro).
         if (tipo === 'reactivacion' && r.data.desde_sugerido && !desde) setDesde(r.data.desde_sugerido);
         if (r.data.destino && !numero) setNumero(String(r.data.destino.numero_propuesto));
@@ -82,9 +102,13 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
     if (tipo === 'traslado' && (!destino || !numero)) return false;
     // Una fecha que contradice marcas existentes no se puede confirmar: el
     // servidor la rechaza para no dejar ninguna asistencia fuera de cuenta.
-    if (conflictos.length > 0) return false;
+    // RET-R · salvo en un retiro, si Dirección confirma expresamente su
+    // anulación y escribe el motivo.
+    if (conflictos.length > 0) {
+      return tipo === 'retiro' && !!anulacion?.puede_anular && anular && motivoAnulacion.trim().length > 0;
+    }
     return true;
-  }, [desde, destino, numero, conflictos, tipo]);
+  }, [desde, destino, numero, conflictos, tipo, anulacion, anular, motivoAnulacion]);
 
   if (!estudiante) return null;
 
@@ -98,6 +122,11 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
         r = await api.post(`/estudiantes/${estudiante.id}/traslado`,
           { ...body, curso_destino_id: Number(destino), no_lista: Number(numero) });
       } else if (tipo === 'retiro') {
+        if (conflictos.length > 0 && anular && anulacion) {
+          body.anular_marcas_posteriores = true;
+          body.motivo_anulacion = motivoAnulacion.trim();
+          body.huella_vista_previa = anulacion.huella;
+        }
         r = await api.post(`/estudiantes/${estudiante.id}/retiro`, body);
       } else {
         if (numero) body.no_lista = Number(numero);
@@ -109,6 +138,13 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
       if (d.error === 'CONFLICTOS_CON_LA_FECHA') {
         setConflictos(d.conflictos || []);
         setFechaSugerida(d.fecha_sugerida || null);
+      }
+      if (d.error === 'VISTA_PREVIA_CAMBIO') {
+        // Algo cambió entre la vista previa y la confirmación: se muestra la
+        // nueva y hay que volver a confirmarla.
+        setConflictos(d.conflictos || []);
+        setAnulacion(a => (a ? { ...a, huella: d.huella, resumen: d.resumen } : a));
+        setAnular(false);
       }
       if (d.numero_propuesto && tipo !== 'retiro') setNumero(String(d.numero_propuesto));
       setError(d.message || d.error || 'No se pudo registrar el movimiento');
@@ -158,8 +194,17 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
         )}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <Input type="date" label="Desde qué día *" value={desde} onChange={e => setDesde(e.target.value)}
-                 min={prep?.ano_escolar?.inicio || undefined} max={prep?.ano_escolar?.fin || undefined} />
+          <div>
+            <Input type="date" label={tipo === 'retiro' ? 'Retirado desde (inclusive) *' : 'Desde qué día *'}
+                   value={desde} onChange={e => setDesde(e.target.value)}
+                   min={prep?.ano_escolar?.inicio || undefined} max={prep?.ano_escolar?.fin || undefined} />
+            {tipo === 'retiro' && prep?.ultimo_dia && (
+              <p className="text-xs text-gray-600 mt-1" data-ultimo-dia>
+                Último día de pertenencia: <strong>{fmt(prep.ultimo_dia)}</strong>. Desde {fmt(desde)} ya no
+                corresponde asistencia («No aplica»).
+              </p>
+            )}
+          </div>
           {(tipo === 'traslado' || tipo === 'reactivacion') && (
             <Input type="number" min={1}
                    label={tipo === 'traslado' ? 'Número de lista en el destino *' : 'Número de lista (si el suyo está ocupado)'}
@@ -217,11 +262,15 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
             <p className="font-medium">{conflictos.length} marca(s) de asistencia contradicen esa fecha</p>
             <p className="text-xs mt-1">Con esta fecha esas marcas quedarían fuera de su permanencia y dejarían de
               contar en porcentajes y documentos, así que no se registra el movimiento. Las marcas no se borran ni se
-              corrigen: elija una fecha coherente con ellas o pida al docente que las corrija si son erróneas.</p>
+              corrigen: elija una fecha coherente con ellas o pida al docente que las corrija si son erróneas.
+              {tipo === 'retiro' && anulacion?.puede_anular
+                ? ' Si su último día real fue el anterior a esa fecha, Dirección puede confirmar abajo su anulación.' : ''}</p>
             <ul className="text-xs mt-2 max-h-32 overflow-auto list-disc list-inside">
               {conflictos.slice(0, 30).map(c => (
-                <li key={c.asistencia_id}>{fmt(c.fecha)} · {c.curso}{c.asignatura ? ` · ${c.asignatura}` : ''} · {c.estado}</li>
+                <li key={c.asistencia_id}>{fmt(c.fecha)} · {c.curso}{c.asignatura ? ` · ${c.asignatura}` : ''} · {c.estado}
+                  {c.registrado_por_nombre ? ` · registró ${c.registrado_por_nombre}` : ''}</li>
               ))}
+              {conflictos.length > 30 && <li className="list-none italic">… y {conflictos.length - 30} más</li>}
             </ul>
             {fechaSugerida ? (
               <button type="button" onClick={() => setDesde(fechaSugerida)}
@@ -231,6 +280,40 @@ export function MovimientoEstudianteModal({ estudiante, tipo, onClose, onDone }:
             ) : (
               <p className="mt-2 text-xs font-medium">Hay marcas en los dos cursos que se superponen: no existe una
                 fecha que respete todas. Deben corregirse antes de registrar el movimiento.</p>
+            )}
+          </div>
+        )}
+
+        {tipo === 'retiro' && conflictos.length > 0 && anulacion?.puede_anular && (
+          <div className="bg-amber-50 border border-amber-300 rounded-lg p-3 text-amber-900" data-anulacion>
+            <p className="font-medium">Retiro con fecha real: anular las {anulacion.resumen.total} marca(s) posteriores</p>
+            <p className="text-xs mt-1">
+              Si su último día real fue el {fmt(prep?.ultimo_dia)}, estas marcas no deben contar. No se borran:
+              conservan su contenido, autor y fecha, y queda registrado quién las anuló, cuándo y por qué. Dejan de
+              contar en estadísticas, porcentajes, boletines y Registro. Una reactivación no las restaura.
+            </p>
+            <div className="flex flex-wrap gap-2 mt-2 text-xs">
+              {Object.entries(anulacion.resumen.por_estado).map(([k, v]) => (
+                <span key={k} className="px-2 py-0.5 rounded bg-white border border-amber-200">
+                  {ETIQUETA_ESTADO[k] || k}: <strong>{v}</strong>
+                </span>
+              ))}
+            </div>
+            {anulacion.resumen.hay_presencias && (
+              <p className="text-xs mt-2 font-medium text-red-700" role="alert">
+                Hay días con el estudiante presente o con tardanza después de esa fecha. ¿Seguro que la fecha es correcta?
+              </p>
+            )}
+            <label className="flex items-start gap-2 mt-2 text-xs">
+              <input type="checkbox" className="mt-0.5" checked={anular} onChange={e => setAnular(e.target.checked)} />
+              <span>Confirmo que estas {anulacion.resumen.total} marca(s) deben anularse por el retiro.</span>
+            </label>
+            {anular && (
+              <div className="mt-2">
+                <Input label="Motivo de la anulación *" value={motivoAnulacion}
+                       onChange={e => setMotivoAnulacion(e.target.value)}
+                       placeholder="Ej. dejó de asistir el 16/10; las listas siguientes se pasaron por error" />
+              </div>
             )}
           </div>
         )}
@@ -280,7 +363,10 @@ export function HistorialCursos({ estudianteId }: { estudianteId: number }) {
         ))}
       </ul>
       <p className="text-[11px] text-gray-500 mt-1">
-        Registrado por: {datos.movimientos.map((m: any) => `${m.tipo} ${fmt(m.desde)} (${(m.registrado_en || '').slice(0, 16).replace('T', ' ')})`).join(' · ')}
+        Registrado: {datos.movimientos.map((m: any) =>
+          `${m.tipo === 'correccion' ? 'corrección del retiro (desde)' : m.tipo} ${fmt(m.desde)} `
+          + `(${(m.registrado_en || '').slice(0, 16).replace('T', ' ')})`
+          + (m.sin_efecto ? ' — sin efecto por corrección' : '')).join(' · ')}
       </p>
     </div>
   );

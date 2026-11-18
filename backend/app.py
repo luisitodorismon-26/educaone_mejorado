@@ -55,6 +55,7 @@ from models import (
     Asistencia, ReporteConducta, CasoPsicologia, Mensaje, Comunicado,
     PlantillaMensaje, HistorialAcademico, LogAcceso, LogAuditoria,
     SolicitudEdicionNota, BloqueHorario, DiaNoLaborable, RangoVacaciones, Usuario,
+    AnulacionAsistencia, AsistenciaAnulada,
     NotaPersonal, EvaluacionProfesor, ConfigEvalInterna, EvalInternaEstudiante,
     PermisoTemporalCalificacion, ComunicadoLeido, HistorialReportePadres,
     HistorialComunicacionPadres, IndicadorLogro, IndicadorLogroSeleccion,
@@ -7321,10 +7322,11 @@ _MODELOS_DEL_ESTUDIANTE = (
 # rechaza la operación con un mensaje claro y la ficha sigue entera. (Un primer
 # retiro sin trayectoria no crea fila aquí: queda en la propia ficha, así que
 # una ficha creada por error y retirada sigue siendo eliminable.)
-_MODELOS_QUE_PROTEGEN_LA_FICHA = ('MovimientoEstudiante', 'ReservaNumeroLista')
+# RET-R · las anulaciones de asistencia también son historia que protege la ficha.
+_MODELOS_QUE_PROTEGEN_LA_FICHA = ('MovimientoEstudiante', 'ReservaNumeroLista', 'AnulacionAsistencia')
 ERROR_ELIMINAR_CON_TRAYECTORIA = 'FICHA_CON_TRAYECTORIA'
 _MENSAJE_CON_TRAYECTORIA = (
-    'Esta ficha tiene traslados, reactivaciones o un número de lista reservado: '
+    'Esta ficha tiene traslados, reactivaciones, un número de lista reservado o asistencias anuladas por retiro: '
     'es la historia real de un estudiante, no una ficha creada por error. No se '
     'elimina. Si el estudiante ya no asiste, déjelo retirado.')
 
@@ -7357,7 +7359,8 @@ def _impacto_eliminacion(db, current_user, estudiante):
         if modelo is None:
             continue
         n = (tenant_filter(db.query(modelo), modelo, current_user)
-             .filter(modelo.estudiante_id == estudiante.id).count())
+             .filter(modelo.estudiante_id == estudiante.id)
+             .execution_options(incluir_anuladas=True).count())
         if n:
             conteos[modelo.__tablename__] = n
     return conteos
@@ -7532,6 +7535,7 @@ async def eliminar_estudiante_por_error(id: int, request: Request,
                 continue
             (tenant_filter(db.query(modelo), modelo, current_user)
              .filter(modelo.estudiante_id == est.id)
+             .execution_options(incluir_anuladas=True)
              .delete(synchronize_session=False))
 
         db.delete(est)
@@ -8253,6 +8257,7 @@ def _conflictos_movimiento(db, current_user, est, tipo, desde, curso_origen_id, 
         q = q.filter(Asistencia.fecha >= ano.fecha_inicio, Asistencia.fecha <= ano.fecha_fin)
     nombre_curso = _nombre_curso_fn(db, current_user)
     asigs = {}
+    autores = {}
     out = []
 
     # La permanencia ANTES y la que quedaría DESPUÉS del movimiento. Una marca
@@ -8293,16 +8298,502 @@ def _conflictos_movimiento(db, current_user, est, tipo, desde, curso_origen_id, 
             if a.asignatura_id and a.asignatura_id not in asigs:
                 _as = db.get(Asignatura, a.asignatura_id)
                 asigs[a.asignatura_id] = _as.nombre if _as else ''
+            if a.registrado_por and a.registrado_por not in autores:
+                _u = db.get(Usuario, a.registrado_por)
+                autores[a.registrado_por] = _u.nombre_completo if _u else None
             out.append({
                 'asistencia_id': a.id,
                 'fecha': a.fecha.isoformat(),
                 'curso_id': a.curso_id,
                 'curso': nombre_curso(a.curso_id),
+                'asignatura_id': a.asignatura_id,
                 'asignatura': asigs.get(a.asignatura_id) if a.asignatura_id else None,
                 'estado': a.estado,
+                'registrado_por': a.registrado_por,
+                'registrado_por_nombre': autores.get(a.registrado_por),
                 'explicacion': motivo,
             })
     return out
+
+
+# ============== RET-R · RETIRO RETROACTIVO Y ANULACIÓN DE ASISTENCIA ==============
+#
+# Último día real: 16. Retirado desde el 17 aunque se registre semanas después.
+# Las marcas desde el 17 se ANULAN solo con la confirmación expresa de Dirección
+# (motivo + la huella de la vista previa que vio): no se borran ni se editan; la
+# anulación vive en `anulaciones_asistencia`/`asistencias_anuladas` y el filtro
+# global de models.py las excluye de todo cálculo. Una reactivación no las
+# restaura; solo una reversión explícita, con vista previa y conflictos.
+
+ERROR_MARCA_ANULADA = 'MARCA_ANULADA'
+
+
+def _huella_marcas(conflictos):
+    """Huella del conjunto exacto de marcas mostrado en la vista previa."""
+    import hashlib as _hl
+    import json as _js
+    filas = sorted((c['asistencia_id'], c['fecha'], c.get('curso_id'), c.get('asignatura_id'),
+                    c['estado'], c.get('registrado_por')) for c in conflictos)
+    return _hl.sha256(_js.dumps(filas, default=str).encode()).hexdigest()
+
+
+def _resumen_marcas_anular(conflictos):
+    por_estado = {e: 0 for e in ('presente', 'ausente', 'tardanza', 'excusa')}
+    for c in conflictos:
+        por_estado[c['estado']] = por_estado.get(c['estado'], 0) + 1
+    fechas = sorted(c['fecha'] for c in conflictos)
+    return {
+        'total': len(conflictos), 'por_estado': por_estado,
+        'primera_fecha': fechas[0] if fechas else None, 'ultima_fecha': fechas[-1] if fechas else None,
+        'cursos': sorted({c['curso'] for c in conflictos if c.get('curso')}),
+        'hay_presencias': bool(por_estado.get('presente') or por_estado.get('tardanza')),
+    }
+
+
+def _q_asistencia_con_anuladas(db, current_user):
+    """`Asistencia` del colegio INCLUYENDO las anuladas (historial, vistas
+    previas y protecciones). Nunca para contar asistencia."""
+    return tenant_filter(db.query(Asistencia), Asistencia, current_user).execution_options(
+        incluir_anuladas=True)
+
+
+def _anuladas_vigentes(db, estudiante_ids):
+    """`{asistencia_id: AsistenciaAnulada}` vigentes de esos estudiantes."""
+    ids = list(estudiante_ids or [])
+    if not ids:
+        return {}
+    filas = (db.query(AsistenciaAnulada)
+             .join(Asistencia, Asistencia.id == AsistenciaAnulada.asistencia_id)
+             .filter(Asistencia.estudiante_id.in_(ids), AsistenciaAnulada.revertida_en.is_(None))
+             .execution_options(incluir_anuladas=True).all())
+    return {f.asistencia_id: f for f in filas}
+
+
+def _marca_anulada_en(db, current_user, estudiante_id, fecha, asignatura_id):
+    """La marca ANULADA de ese (estudiante, fecha, materia), o None. Se mira antes
+    de escribir: una anulada no se edita ni se desmarca, y otra marca ese mismo
+    día y materia chocaría con la unicidad."""
+    q = _q_asistencia_con_anuladas(db, current_user).filter(
+        Asistencia.estudiante_id == int(estudiante_id), Asistencia.fecha == fecha)
+    q = (q.filter(Asistencia.asignatura_id == int(asignatura_id)) if asignatura_id
+         else q.filter(Asistencia.asignatura_id.is_(None)))
+    for a in q.all():
+        if a.id in _anuladas_vigentes(db, [a.estudiante_id]):
+            return a
+    return None
+
+
+def _respuesta_marca_anulada(a):
+    return JSONResponse({
+        'error': ERROR_MARCA_ANULADA,
+        'message': ('La marca del %s de este estudiante está ANULADA por su retiro: no se edita, '
+                    'no se desmarca ni se registra otra ese día. Dirección puede revertir la '
+                    'anulación desde la ficha del estudiante.' % a.fecha.strftime('%d/%m/%Y')),
+        'asistencia_id': a.id,
+    }, status_code=409)
+
+
+def _crear_anulacion(db, current_user, est, ano, desde, motivo, huella, conflictos, movimiento_id):
+    """Anula EXACTAMENTE las marcas de `conflictos`. No toca la fila original."""
+    import json as _js
+    anul = AnulacionAsistencia(
+        colegio_id=current_user.colegio_id, ano_escolar_id=ano.id, estudiante_id=est.id,
+        movimiento_id=movimiento_id, fecha_efectiva=desde, motivo=motivo[:300], huella_vista_previa=huella,
+        resumen=_js.dumps(_resumen_marcas_anular(conflictos), default=str), registrado_por=current_user.id)
+    db.add(anul)
+    db.flush()
+    originales = {a.id: a for a in _q_asistencia_con_anuladas(db, current_user).filter(
+        Asistencia.id.in_([c['asistencia_id'] for c in conflictos] or [0])).all()}
+    for c in conflictos:
+        a = originales[c['asistencia_id']]
+        db.add(AsistenciaAnulada(anulacion_id=anul.id, asistencia_id=a.id, estado_original=a.estado,
+                                 fecha_original=a.fecha, registrado_por_original=a.registrado_por))
+    db.flush()
+    return anul
+
+
+def _validar_anulacion(current_user, conflictos, motivo_anulacion, huella_vista):
+    """None si la confirmación es válida; si no, la respuesta de error."""
+    if getattr(current_user, 'role', None) not in ('direccion', 'superadmin'):
+        return JSONResponse({'error': 'SOLO_DIRECCION',
+                             'message': 'Solo Dirección puede anular marcas de asistencia.'}, status_code=403)
+    if not (motivo_anulacion or '').strip():
+        return JSONResponse({'error': 'MOTIVO_REQUERIDO',
+                             'message': 'Escriba el motivo de la anulación.'}, status_code=400)
+    if not huella_vista or huella_vista != _huella_marcas(conflictos):
+        return JSONResponse({
+            'error': 'VISTA_PREVIA_CAMBIO',
+            'message': ('Las marcas afectadas cambiaron desde la vista previa (se registró, cambió o '
+                        'desmarcó alguna). No se aplicó nada: revise la vista previa actualizada.'),
+            'conflictos': conflictos, 'huella': _huella_marcas(conflictos),
+            'resumen': _resumen_marcas_anular(conflictos),
+        }, status_code=409)
+    return None
+
+
+def _historial_anuladas(db, current_user, est):
+    """Las marcas anuladas del estudiante, con su anulación y reversión. Lectura."""
+    filas = (db.query(AsistenciaAnulada, AnulacionAsistencia)
+             .join(AnulacionAsistencia, AnulacionAsistencia.id == AsistenciaAnulada.anulacion_id)
+             .filter(AnulacionAsistencia.estudiante_id == est.id,
+                     AnulacionAsistencia.colegio_id == est.colegio_id)
+             .order_by(AsistenciaAnulada.fecha_original).all())
+    if not filas:
+        return []
+    marcas = {a.id: a for a in _q_asistencia_con_anuladas(db, current_user).filter(
+        Asistencia.id.in_([f.asistencia_id for f, _c in filas])).all()}
+    nombre_curso = _nombre_curso_fn(db, current_user)
+    out = []
+    for f, cab in filas:
+        a = marcas.get(f.asistencia_id)
+        _as = db.get(Asignatura, a.asignatura_id) if a is not None and a.asignatura_id else None
+        out.append({
+            'asistencia_id': f.asistencia_id, 'anulacion_id': cab.id,
+            'fecha': f.fecha_original.isoformat(), 'estado': f.estado_original,
+            'curso': nombre_curso(a.curso_id) if a is not None else None,
+            'asignatura': _as.nombre if _as else None,
+            'registrado_por': f.registrado_por_original,
+            'anulada_en': cab.registrado_en.isoformat() if cab.registrado_en else None,
+            'anulada_por': cab.registrado_por, 'motivo': cab.motivo,
+            'retiro_desde': cab.fecha_efectiva.isoformat() if cab.fecha_efectiva else None,
+            'revertida_en': f.revertida_en.isoformat() if f.revertida_en else None,
+            'revertida_por': f.revertida_por, 'motivo_reversion': f.motivo_reversion,
+        })
+    return out
+
+
+def _conflictos_reversion(db, current_user, est, ano, marca):
+    """Por qué NO se puede revertir esta anulación ahora (lista vacía = se puede).
+    Revertir solo devuelve la marca a los cálculos: debe tener sentido hoy."""
+    import permanencia as PERM
+    out = []
+    if ano is None or not (ano.fecha_inicio <= marca.fecha <= ano.fecha_fin):
+        out.append({'codigo': 'FUERA_DEL_ANO', 'mensaje': 'La fecha no está en el año escolar activo.'})
+        return out
+    tramos = PERM.tramos_de(db, est, ano.id)
+    if not any(t.curso_id == marca.curso_id and t.contiene(marca.fecha) for t in tramos):
+        out.append({'codigo': 'FUERA_DE_PERMANENCIA',
+                    'mensaje': ('Ese día no pertenece al curso según su permanencia actual (retiro o '
+                                'traslado): seguiría sin contar. Corrija primero la fecha de retiro.')})
+    if _vacaciones_en_fecha(db, est.colegio_id, marca.fecha) is not None:
+        out.append({'codigo': 'VACACIONES', 'mensaje': 'Ese día está dentro de unas vacaciones.'})
+    if marca.asignatura_id and _sesion_no_impartida_vigente(
+            db, colegio_id=est.colegio_id, curso_id=marca.curso_id,
+            asignatura_id=marca.asignatura_id, fecha=marca.fecha) is not None:
+        out.append({'codigo': 'NO_HUBO_CLASE', 'mensaje': 'Esa clase está registrada como «No hubo clase».'})
+    q = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter(
+        Asistencia.estudiante_id == est.id, Asistencia.fecha == marca.fecha, Asistencia.id != marca.id)
+    q = (q.filter(Asistencia.asignatura_id == marca.asignatura_id) if marca.asignatura_id
+         else q.filter(Asistencia.asignatura_id.is_(None)))
+    if q.first() is not None:
+        out.append({'codigo': 'OTRA_MARCA', 'mensaje': 'Ya hay otra marca válida ese día y materia.'})
+    return out
+
+
+@app.get("/api/estudiantes/{id}/anulaciones")
+async def listar_anulaciones_estudiante(id: int, db: Session = Depends(get_db),
+                                       current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """RET-R · Marcas anuladas del estudiante y, para cada vigente, si hoy se
+    podría revertir (vista previa de la reversión). Solo lectura."""
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    ano = _ano_activo_colegio(db, current_user)
+    filas = _historial_anuladas(db, current_user, est)
+    marcas = {a.id: a for a in _q_asistencia_con_anuladas(db, current_user).filter(
+        Asistencia.id.in_([f['asistencia_id'] for f in filas] or [0])).all()}
+    for f in filas:
+        f['conflictos_reversion'] = ([] if f['revertida_en'] else
+                                     _conflictos_reversion(db, current_user, est, ano, marcas[f['asistencia_id']]))
+    return {'estudiante_id': est.id, 'anuladas': filas}
+
+
+@app.post("/api/estudiantes/{id}/anulaciones/revertir")
+async def revertir_anulaciones(id: int, request: Request, db: Session = Depends(get_db),
+                               current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """RET-R · Revierte SOLO las marcas elegidas, con motivo. Todo o nada: si una
+    tiene conflicto, no se revierte ninguna. Nunca es automático."""
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    data = await _cuerpo_json(request)
+    ids = data.get('asistencia_ids')
+    motivo = (data.get('motivo') or '').strip()
+    if not isinstance(ids, list) or not ids or not all(str(i).isdigit() for i in ids):
+        return JSONResponse({'error': 'Indique asistencia_ids (lista de ids).'}, status_code=400)
+    if not motivo:
+        return JSONResponse({'error': 'MOTIVO_REQUERIDO', 'message': 'Escriba el motivo de la reversión.'},
+                            status_code=400)
+    ids = sorted({int(i) for i in ids})
+    _bloquear_ficha(db, est)
+    ano = _ano_activo_colegio(db, current_user)
+    vig = _anuladas_vigentes(db, [est.id])
+    no_anuladas = [i for i in ids if i not in vig]
+    if no_anuladas:
+        db.rollback()
+        return JSONResponse({'error': 'NO_ANULADAS',
+                             'message': 'Estas marcas no están anuladas (o ya se revirtieron): %s.' % no_anuladas,
+                             'asistencia_ids': no_anuladas}, status_code=409)
+    marcas = {a.id: a for a in _q_asistencia_con_anuladas(db, current_user).filter(
+        Asistencia.id.in_(ids), Asistencia.estudiante_id == est.id).all()}
+    conflictos = {i: _conflictos_reversion(db, current_user, est, ano, marcas[i]) for i in ids}
+    conflictos = {i: c for i, c in conflictos.items() if c}
+    if conflictos:
+        db.rollback()
+        return JSONResponse({'error': 'CONFLICTOS_REVERSION',
+                             'message': 'No se revirtió ninguna marca: hay conflictos.',
+                             'conflictos': {str(k): v for k, v in conflictos.items()}}, status_code=409)
+    ahora = now_rd()
+    for i in ids:
+        vig[i].revertida_en = ahora
+        vig[i].revertida_por = current_user.id
+        vig[i].motivo_reversion = motivo[:300]
+    log_auditoria(db, 'revertir_anulacion_asistencia', 'asistencias_anuladas', est.id, None,
+                  {'asistencia_ids': ids, 'motivo': motivo}, user=current_user, request=request)
+    db.commit()
+    cache_clear_tenant(current_user.colegio_id)
+    cache_clear(f'stats:{current_user.colegio_id}')
+    return {'message': 'Anulación revertida', 'asistencia_ids': ids}
+
+
+def _periodos_cursados_tramos(tramos, curso_id, ano):
+    """Misma regla que `_periodos_cursados_en_curso` (ENT-A), con tramos dados."""
+    propios = [t for t in tramos if t.curso_id == curso_id]
+    if not propios:
+        return set()
+    ultimo = max(propios, key=lambda t: (t.desde or date.min))
+    salida = ultimo.fecha_salida
+    return {p for p, ini, _f in ASIS.rangos_periodos(ano) if salida is None or ini < salida}
+
+
+def _analisis_correccion_retiro(db, current_user, est, ano, desde):
+    """`(error, analisis)` de corregir el «retirado desde» a `desde`. Solo lee."""
+    import types as _types
+    import permanencia as PERM
+    if est.activo or not _esta_retirado(est):
+        return _respuesta_movimiento_error(
+            'NO_ESTA_RETIRADO', 'Solo se corrige la fecha de un estudiante que está retirado.'), None
+    if est.curso is None or est.curso.ano_escolar_id != ano.id:
+        return _respuesta_movimiento_error('CURSO_DE_OTRO_ANO',
+                                           'El curso del estudiante no es del año escolar activo.'), None
+    if not (ano.fecha_inicio <= desde <= ano.fecha_fin):
+        return _respuesta_movimiento_error('FECHA_FUERA_DEL_ANO', 'La fecha debe estar dentro del año escolar.',
+                                           400), None
+    if est.fecha_retiro is not None and desde == est.fecha_retiro + timedelta(days=1):
+        return _respuesta_movimiento_error('MISMA_FECHA', 'Esa ya es su fecha de retiro.', 400), None
+    movs = PERM.movimientos_por_estudiante(db, current_user.colegio_id, ano.id, [est.id]).get(est.id, [])
+    sin_efecto = PERM.ids_sin_efecto(movs)
+    vigentes = [m for m in movs if m.id not in sin_efecto]
+    traslados = [m for m in vigentes if m.tipo == PERM.TRASLADO]
+    ult_tras = max(traslados, key=lambda m: m.secuencia) if traslados else None
+    # La cadena que se reemplaza: retiros, reactivaciones y correcciones
+    # posteriores al último traslado. Los traslados no se tocan.
+    cadena = [m for m in vigentes if m.tipo in (PERM.RETIRO, PERM.REACTIVACION, PERM.CORRECCION)
+              and (ult_tras is None or m.secuencia > ult_tras.secuencia)]
+    if ult_tras is not None and desde <= ult_tras.fecha_efectiva:
+        return _respuesta_movimiento_error(
+            'FECHA_ANTERIOR_AL_TRASLADO',
+            'Llegó a su curso actual por traslado el %s: la fecha debe ser posterior (los traslados '
+            'no se modifican).' % ult_tras.fecha_efectiva.strftime('%d/%m/%Y'), 400), None
+    ficticia = _types.SimpleNamespace(
+        id=-1, tipo=PERM.CORRECCION, secuencia=max([m.secuencia for m in movs] or [0]) + 1,
+        fecha_efectiva=desde, curso_origen_id=est.curso_id, no_lista_origen=est.no_lista,
+        curso_destino_id=None, no_lista_destino=None,
+        get_detalle=lambda: {'deja_sin_efecto': [m.id for m in cadena]})
+    antes = PERM.construir_tramos(est, movs)
+    despues = PERM.construir_tramos(est, list(movs) + [ficticia])
+
+    def _cubre(tramos, curso_id, f):
+        return any(t.curso_id == curso_id and t.contiene(f) for t in tramos)
+
+    nombre_curso = _nombre_curso_fn(db, current_user)
+    anuladas = _anuladas_vigentes(db, [est.id])
+    conflictos, anuladas_dentro = [], []
+    asigs, autores = {}, {}
+    for a in _q_asistencia_con_anuladas(db, current_user).filter(
+            Asistencia.estudiante_id == est.id, Asistencia.fecha >= ano.fecha_inicio,
+            Asistencia.fecha <= ano.fecha_fin).order_by(Asistencia.fecha).all():
+        if a.asignatura_id and a.asignatura_id not in asigs:
+            _as = db.get(Asignatura, a.asignatura_id)
+            asigs[a.asignatura_id] = _as.nombre if _as else ''
+        if a.registrado_por and a.registrado_por not in autores:
+            _u = db.get(Usuario, a.registrado_por)
+            autores[a.registrado_por] = _u.nombre_completo if _u else None
+        fila = {'asistencia_id': a.id, 'fecha': a.fecha.isoformat(), 'curso_id': a.curso_id,
+                'curso': nombre_curso(a.curso_id), 'asignatura_id': a.asignatura_id,
+                'asignatura': asigs.get(a.asignatura_id), 'estado': a.estado,
+                'registrado_por': a.registrado_por, 'registrado_por_nombre': autores.get(a.registrado_por)}
+        if a.id in anuladas:
+            if _cubre(despues, a.curso_id, a.fecha):
+                anuladas_dentro.append(fila)       # se informa; NO se restaura
+        elif _cubre(antes, a.curso_id, a.fecha) and not _cubre(despues, a.curso_id, a.fecha):
+            conflictos.append(fila)
+    # Períodos: la regla de ENT-A no cambia; se MUESTRA qué cambiaría y qué
+    # notas ya registradas hay en los períodos que dejarían de ser cursados.
+    per_antes = _periodos_cursados_tramos(antes, est.curso_id, ano)
+    per_despues = _periodos_cursados_tramos(despues, est.curso_id, ano)
+    perdidos = sorted(per_antes - per_despues)
+    notas_perdidas = []
+    if perdidos:
+        for modelo in (CalificacionSecundaria, CalificacionPrimaria):
+            for c in tenant_filter(db.query(modelo), modelo, current_user).filter(
+                    modelo.estudiante_id == est.id, modelo.ano_escolar_id == ano.id).all():
+                for p in perdidos:
+                    for campo in ('p%d' % p, 'rp%d' % p):
+                        if getattr(c, campo, None) is not None:
+                            _as = db.get(Asignatura, c.asignatura_id)
+                            notas_perdidas.append({'asignatura': _as.nombre if _as else None,
+                                                   'competencia': c.competencia_numero, 'periodo': p,
+                                                   'campo': campo, 'valor': getattr(c, campo)})
+    return None, {
+        'desde': desde.isoformat(), 'ultimo_dia': (desde - timedelta(days=1)).isoformat(),
+        'fecha_retiro_actual': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
+        'deja_sin_efecto': [_movimiento_dict(m, nombre_curso) for m in cadena],
+        'conflictos': conflictos, 'huella': _huella_marcas(conflictos),
+        'resumen': _resumen_marcas_anular(conflictos),
+        'anuladas_que_quedarian_dentro': anuladas_dentro,
+        'periodos_cursados_antes': sorted(per_antes), 'periodos_cursados_despues': sorted(per_despues),
+        'periodos_que_dejan_de_cursarse': perdidos, 'notas_en_esos_periodos': notas_perdidas,
+        '_cadena': cadena,
+    }
+
+
+def _publico_correccion(an):
+    return {k: v for k, v in an.items() if not k.startswith('_')}
+
+
+@app.get("/api/estudiantes/{id}/retiro/corregir/vista-previa")
+async def vista_previa_corregir_retiro(id: int, request: Request, db: Session = Depends(get_db),
+                                       current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """RET-R · Qué cambiaría al corregir el «retirado desde». Solo lectura."""
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    desde = _parse_fecha_movimiento(request.query_params.get('desde'))
+    if desde in (None, 'invalida'):
+        return JSONResponse({'error': 'desde (YYYY-MM-DD) es requerido'}, status_code=400)
+    ano = _ano_activo_colegio(db, current_user)
+    if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
+        return _respuesta_movimiento_error('SIN_ANO_ACTIVO', 'No hay un año escolar activo con fechas.', 400)
+    err, an = _analisis_correccion_retiro(db, current_user, est, ano, desde)
+    return err if err is not None else _publico_correccion(an)
+
+
+@app.post("/api/estudiantes/{id}/retiro/corregir")
+async def corregir_retiro(id: int, request: Request, db: Session = Depends(get_db),
+                          current_user: Usuario = Depends(RolesRequired('direccion'))):
+    """RET-R · Corrige el «retirado desde» de un retirado. Registra un movimiento
+    `correccion` que deja SIN EFECTO (sin borrarlos) los retiros y reactivaciones
+    que reemplaza —p. ej. una reactivación solo administrativa para completar
+    notas—. Las marcas que quedarían fuera se anulan con la misma confirmación
+    que el retiro. Nada se restaura solo. Body: {desde, motivo,
+    anular_marcas_posteriores?, motivo_anulacion?, huella_vista_previa?,
+    confirmar_periodos_no_cursados?, client_request_id?}"""
+    import json as _json
+    import permanencia as PERM
+    from sqlalchemy.exc import IntegrityError as _IE
+    est = get_tenant_or_404(db, Estudiante, id, current_user, name='estudiante')
+    data = await _cuerpo_json(request)
+    desde = _parse_fecha_movimiento(data.get('desde'))
+    if desde in (None, 'invalida'):
+        return JSONResponse({'error': 'desde (YYYY-MM-DD) es requerido'}, status_code=400)
+    motivo = (data.get('motivo') or '').strip()
+    if not motivo:
+        return JSONResponse({'error': 'MOTIVO_REQUERIDO', 'message': 'Escriba el motivo de la corrección.'},
+                            status_code=400)
+    crid = (str(data.get('client_request_id') or '').strip()[:64] or None)
+    solicitud = {'tipo': 'correccion', 'estudiante_id': est.id, 'desde': desde.isoformat(), 'motivo': motivo[:300],
+                 'anular': data.get('anular_marcas_posteriores') is True,
+                 'huella': data.get('huella_vista_previa') or None,
+                 'confirmar_periodos': data.get('confirmar_periodos_no_cursados') is True}
+    nombre_curso = _nombre_curso_fn(db, current_user)
+
+    def _previo():
+        if not crid:
+            return None
+        previo = db.query(MovimientoEstudiante).filter_by(colegio_id=current_user.colegio_id,
+                                                          client_request_id=crid).first()
+        if previo is None:
+            return None
+        if previo.tipo == PERM.CORRECCION and previo.get_detalle().get('solicitud') == solicitud:
+            return {'message': 'Corrección ya registrada (reintento)', 'reintento': True,
+                    'movimiento': _movimiento_dict(previo, nombre_curso)}
+        return _respuesta_movimiento_error('SOLICITUD_REPETIDA_DISTINTA',
+                                           'Esa solicitud ya se usó con otro contenido. No se registró nada.')
+
+    r = _previo()
+    if r is not None:
+        return r
+    _bloquear_ficha(db, est)
+    r = _previo()
+    if r is not None:
+        db.rollback()
+        return r
+    ano = _ano_activo_colegio(db, current_user)
+    if ano is None or not ano.fecha_inicio or not ano.fecha_fin:
+        return _respuesta_movimiento_error('SIN_ANO_ACTIVO', 'No hay un año escolar activo con fechas.', 400)
+    err, an = _analisis_correccion_retiro(db, current_user, est, ano, desde)
+    if err is not None:
+        db.rollback()
+        return err
+    if an['conflictos']:
+        if data.get('anular_marcas_posteriores') is not True:
+            db.rollback()
+            return JSONResponse({'error': ERROR_CONFLICTOS_FECHA,
+                                 'message': ('Hay %d marca(s) que quedarían fuera de su permanencia. Para '
+                                             'corregir la fecha, Dirección debe confirmar su anulación.'
+                                             % len(an['conflictos'])),
+                                 **_publico_correccion(an)}, status_code=409)
+        _e = _validar_anulacion(current_user, an['conflictos'], data.get('motivo_anulacion'),
+                                data.get('huella_vista_previa'))
+        if _e is not None:
+            db.rollback()
+            return _e
+    if an['notas_en_esos_periodos'] and data.get('confirmar_periodos_no_cursados') is not True:
+        db.rollback()
+        return JSONResponse({
+            'error': 'PERIODOS_DEJAN_DE_CURSARSE',
+            'message': ('Con esta fecha, el/los período(s) %s dejarían de ser cursados en este curso. Sus '
+                        'notas se CONSERVAN en la base, pero el boletín y el Registro no las imprimen como '
+                        'cursadas y no se pueden editar. Confírmelo expresamente o elija otra fecha.'
+                        % ', '.join('P%d' % p for p in an['periodos_que_dejan_de_cursarse'])),
+            **_publico_correccion(an)}, status_code=409)
+    secuencia = (db.query(func.max(MovimientoEstudiante.secuencia)).filter(
+        MovimientoEstudiante.estudiante_id == est.id,
+        MovimientoEstudiante.ano_escolar_id == ano.id).scalar() or 0) + 1
+    antes = est.to_dict()
+    mov = MovimientoEstudiante(
+        colegio_id=current_user.colegio_id, ano_escolar_id=ano.id, estudiante_id=est.id,
+        tipo=PERM.CORRECCION, secuencia=secuencia, fecha_efectiva=desde,
+        curso_origen_id=est.curso_id, no_lista_origen=est.no_lista, motivo=motivo[:300],
+        detalle=_json.dumps({'deja_sin_efecto': [m.id for m in an['_cadena']],
+                             'fecha_retiro_anterior': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
+                             'periodos_que_dejan_de_cursarse': an['periodos_que_dejan_de_cursarse'],
+                             'solicitud': solicitud}, default=str),
+        registrado_por=current_user.id, client_request_id=crid)
+    db.add(mov)
+    try:
+        db.flush()
+        anul = None
+        if an['conflictos']:
+            anul = _crear_anulacion(db, current_user, est, ano, desde, data.get('motivo_anulacion'),
+                                    an['huella'], an['conflictos'], mov.id)
+        est.fecha_retiro = desde - timedelta(days=1)
+        est.__dict__.pop('_tras_intervalos_no_aplica', None)
+        db.info.pop('_tras_movs_por_colegio', None)
+        log_auditoria(db, 'corregir_retiro', 'estudiantes', est.id, antes,
+                      dict(est.to_dict(), movimiento_id=mov.id, solicitud=solicitud,
+                           anulacion_id=anul.id if anul else None),
+                      user=current_user, request=request)
+        db.commit()
+    except _IE:
+        db.rollback()
+        r = _previo()
+        if r is not None:
+            return r
+        return _respuesta_movimiento_error('MOVIMIENTO_CONCURRENTE',
+                                           'Otro movimiento de este estudiante se registró al mismo tiempo.')
+    cache_clear_tenant(current_user.colegio_id)
+    cache_clear(f'cursos:{current_user.colegio_id}')
+    cache_clear(f'stats:{current_user.colegio_id}')
+    db.refresh(mov)
+    return {'message': 'Fecha de retiro corregida', 'movimiento': _movimiento_dict(mov, nombre_curso),
+            'fecha_retiro': est.fecha_retiro.isoformat(),
+            'anulacion': ({'id': anul.id, 'marcas': len(an['conflictos'])} if anul else None)}
 
 
 def _fecha_sugerida_conflictos(tipo, conflictos, est, destino):
@@ -8509,7 +9000,11 @@ async def historial_movimientos_estudiante(id: int, db: Session = Depends(get_db
         'estudiante_id': est.id,
         'ano_escolar': ano.nombre if ano else None,
         'tramos': [_tramo_dict(t, nombre_curso) for t in tramos],
-        'movimientos': [_movimiento_dict(m, nombre_curso) for m in movs],
+        # RET-R · los movimientos que una corrección dejó sin efecto se
+        # conservan y se muestran como tales (no se borran).
+        'movimientos': [dict(_movimiento_dict(m, nombre_curso),
+                             sin_efecto=m.id in PERM.ids_sin_efecto(movs))
+                        for m in movs],
     }
 
 
@@ -8589,11 +9084,22 @@ async def preparar_movimiento_estudiante(id: int, request: Request, db: Session 
             _dest = (tenant_filter(db.query(Curso), Curso, current_user).filter_by(id=destino_id).first()
                      if destino_id else None)
             out['fecha_sugerida'] = _fecha_sugerida_conflictos(tipo, out['conflictos'], est, _dest)
+        if tipo == 'retiro':
+            # RET-R · vista previa de la anulación: todas las marcas desde «desde»
+            # (presentes, ausentes, tardanzas y excusas), su resumen y la huella
+            # que la confirmación debe repetir. Solo lectura.
+            out['ultimo_dia'] = (desde - timedelta(days=1)).isoformat()
+            out['anulacion'] = {
+                'puede_anular': getattr(current_user, 'role', None) in ('direccion', 'superadmin'),
+                'huella': _huella_marcas(out['conflictos']),
+                'resumen': _resumen_marcas_anular(out['conflictos']),
+            }
     return out
 
 
 def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_destino_id=None,
-                          no_lista=None, motivo=None, client_request_id=None):
+                          no_lista=None, motivo=None, client_request_id=None,
+                          anular=False, motivo_anulacion=None, huella_vista=None):
     """El núcleo común de traslado, retiro y reactivación. Ver el bloque TRAS-1."""
     import json as _json
     import permanencia as PERM
@@ -8610,6 +9116,11 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
         'no_lista': int(no_lista) if str(no_lista or '').strip().isdigit() else None,
         'motivo': (str(motivo).strip()[:300] or None) if motivo else None,
     }
+    if anular:
+        # RET-R · solo cuando se pide: las solicitudes de siempre conservan su huella.
+        huella_solicitud['anular_marcas_posteriores'] = True
+        huella_solicitud['huella_vista_previa'] = huella_vista or None
+        huella_solicitud['motivo_anulacion'] = (str(motivo_anulacion or '').strip()[:300] or None)
 
     def _es_reintento(previo):
         return (previo.estudiante_id == est.id and previo.tipo == tipo
@@ -8757,6 +9268,17 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
                 'FECHA_ANTERIOR_AL_RETIRO',
                 'Su último día antes del retiro fue el %s: la reactivación debe ser posterior.'
                 % est.fecha_retiro.strftime('%d/%m/%Y'), 400)
+        # RET-R · una reactivación NO restaura marcas anuladas. Si empezara antes
+        # o el mismo día que la última anulada, esos días volverían a esperarse
+        # con una marca que no cuenta y que no se puede volver a pasar.
+        _ult_anulada = max((a.fecha_original for a in _anuladas_vigentes(db, [est.id]).values()),
+                           default=None)
+        if _ult_anulada is not None and desde <= _ult_anulada:
+            return _respuesta_movimiento_error(
+                'FECHA_CON_MARCAS_ANULADAS',
+                'Tiene marcas de asistencia anuladas hasta el %s. Reactívelo desde un día posterior; '
+                'si alguna anulación fue un error, Dirección debe revertirla antes (no se restauran '
+                'solas).' % _ult_anulada.strftime('%d/%m/%Y'), 400)
         numero_destino = est.no_lista
         if no_lista not in (None, ''):
             try:
@@ -8780,7 +9302,7 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
                     {n: e for n, e in ocupados.items() if e != est.id}))
         movs_previos = PERM.movimientos_por_estudiante(
             db, current_user.colegio_id, ano.id, [est.id]).get(est.id, [])
-        if not any(m.tipo == 'retiro' for m in movs_previos):
+        if not any(m.tipo in ('retiro', PERM.CORRECCION) for m in movs_previos):
             # Retiro anterior a TRAS-1: se guarda aquí lo que reactivar borraba.
             detalle['retiro_previo'] = {
                 'fecha_retiro': est.fecha_retiro.isoformat() if est.fecha_retiro else None,
@@ -8802,10 +9324,19 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
     # permanencia, el movimiento se RECHAZA con la lista y una fecha coherente
     # sugerida. Nada se borra, mueve ni corrige.
     conflictos = []
+    anular_conflictos = None
     if tipo in ('traslado', 'retiro', 'reactivacion'):
         conflictos = _conflictos_movimiento(db, current_user, est, tipo, desde, est.curso_id,
                                             destino.id if destino else None, ano)
-        if conflictos:
+        if tipo == 'retiro' and anular:
+            # RET-R · confirmación expresa: Dirección, motivo y la MISMA huella de
+            # la vista previa (calculada aquí con la ficha ya bloqueada).
+            _err_an = _validar_anulacion(current_user, conflictos, motivo_anulacion, huella_vista)
+            if _err_an is not None:
+                db.rollback()
+                return _err_an
+            anular_conflictos = conflictos
+        elif conflictos:
             return JSONResponse({
                 'error': ERROR_CONFLICTOS_FECHA,
                 'message': ('Hay %d marca(s) de asistencia que contradicen esa fecha. No se registra '
@@ -8815,6 +9346,10 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
                             % len(conflictos)),
                 'conflictos': conflictos,
                 'fecha_sugerida': _fecha_sugerida_conflictos(tipo, conflictos, est, destino),
+                # RET-R · alternativa: Dirección puede anularlas con confirmación.
+                **({'puede_anular': getattr(current_user, 'role', None) in ('direccion', 'superadmin'),
+                    'huella': _huella_marcas(conflictos), 'resumen': _resumen_marcas_anular(conflictos)}
+                   if tipo == 'retiro' else {}),
             }, status_code=409)
     if tipo == 'traslado':
         detalle['notas_previas'] = _instantanea_notas(db, current_user, est, ano)
@@ -8824,7 +9359,7 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
     # representa entero (curso, número, fecha, motivo y autor), como siempre.
     # No hace falta una fila de movimiento, y así una ficha creada por error y
     # retirada sigue pudiéndose eliminar sin dejar huérfanos.
-    if tipo == 'retiro' and not PERM.movimientos_por_estudiante(
+    if tipo == 'retiro' and not anular_conflictos and not PERM.movimientos_por_estudiante(
             db, current_user.colegio_id, ano.id, [est.id]).get(est.id):
         try:
             db.query(Estudiante).filter(Estudiante.id == est.id).with_for_update().first()
@@ -8951,6 +9486,10 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
         if detalle.get('reservas_omitidas'):
             mov.detalle = _json.dumps(detalle, default=str)
         db.flush()
+        _anulacion = None
+        if anular_conflictos:
+            _anulacion = _crear_anulacion(db, current_user, est, ano, desde, motivo_anulacion,
+                                          _huella_marcas(anular_conflictos), anular_conflictos, mov.id)
         est.__dict__.pop('_tras_intervalos_no_aplica', None)
         db.info.pop('_tras_movs_por_colegio', None)
         log_auditoria(db, {'traslado': 'trasladar', 'retiro': 'retirar',
@@ -8988,6 +9527,9 @@ def _registrar_movimiento(db, request, current_user, est, tipo, *, desde, curso_
                     'reactivacion': 'Estudiante reactivado'}[tipo],
         'movimiento': _movimiento_dict(mov, nombre_curso),
     }
+    if anular_conflictos:
+        respuesta['anulacion'] = {'id': _anulacion.id, 'marcas': len(anular_conflictos),
+                                  'resumen': _resumen_marcas_anular(anular_conflictos)}
     if tipo == 'retiro':
         respuesta['fecha_retiro'] = est.fecha_retiro.isoformat()
     return respuesta
@@ -9091,7 +9633,10 @@ async def retirar_estudiante_desde(id: int, request: Request, db: Session = Depe
     return _registrar_movimiento(
         db, request, current_user, est, 'retiro', desde=desde,
         motivo=data.get('motivo') or data.get('motivo_retiro'),
-        client_request_id=data.get('client_request_id'))
+        client_request_id=data.get('client_request_id'),
+        anular=data.get('anular_marcas_posteriores') is True,
+        motivo_anulacion=data.get('motivo_anulacion'),
+        huella_vista=data.get('huella_vista_previa'))
 
 
 @app.delete("/api/estudiantes/{id}")
@@ -16294,6 +16839,10 @@ async def registrar_asistencia(request: Request, db: Session = Depends(get_db), 
     _vac = _bloqueo_por_vacaciones(db, estudiante.colegio_id, fecha)
     if _vac is not None:
         return _vac
+    # RET-R · una marca anulada no se edita ni se reemplaza.
+    _anul = _marca_anulada_en(db, current_user, estudiante.id, fecha, asignatura_id)
+    if _anul is not None:
+        return _respuesta_marca_anulada(_anul)
 
     # S1 §7: esta clase no puede estar declarada NO IMPARTIDA en esta fecha.
     # Nota: NO se consulta DiaNoLaborable aqui. Un feriado del calendario del
@@ -16399,6 +16948,10 @@ async def desmarcar_asistencia(estudiante_id, request: Request, db: Session = De
     _vac = _bloqueo_por_vacaciones(db, current_user.colegio_id, fecha)
     if _vac is not None:
         return _vac
+    # RET-R · ni una marca anulada.
+    _anul = _marca_anulada_en(db, current_user, int(estudiante_id), fecha, asignatura_id)
+    if _anul is not None:
+        return _respuesta_marca_anulada(_anul)
 
     query = tenant_filter(db.query(Asistencia), Asistencia, current_user).filter_by(
         estudiante_id=int(estudiante_id), fecha=fecha
@@ -16577,6 +17130,23 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
     # TRAS-1 · solo las marcas de este curso (las demás son de otro horario).
     asist_map = {a.estudiante_id: a for a in asist_query.all()
                  if a.curso_id in (None, curso.id)}
+    # RET-R · la marca ANULADA de ese día se muestra aparte, solo de lectura.
+    _anuladas_dia = {}
+    _an_vig = _anuladas_vigentes(db, est_ids)
+    if _an_vig:
+        _q_an = _q_asistencia_con_anuladas(db, current_user).filter(
+            Asistencia.id.in_(list(_an_vig)), Asistencia.fecha == fecha)
+        _q_an = (_q_an.filter(Asistencia.asignatura_id == asignatura_id) if asignatura_id
+                 else _q_an.filter(Asistencia.asignatura_id.is_(None)))
+        for _a in _q_an.all():
+            _an = _an_vig[_a.id]
+            _cab = db.get(AnulacionAsistencia, _an.anulacion_id)
+            _anuladas_dia[_a.estudiante_id] = {
+                'estado_original': _a.estado, 'registrado_por': _a.registrado_por,
+                'anulada_en': _cab.registrado_en.isoformat() if _cab and _cab.registrado_en else None,
+                'anulada_por': _cab.registrado_por if _cab else None,
+                'motivo': _cab.motivo if _cab else None,
+            }
 
     resultado = []
     for est in estudiantes:
@@ -16598,6 +17168,8 @@ async def get_asistencia_curso(curso_id, request: Request, db: Session = Depends
                 'aplica': _aplica,
                 'avisos': _avisos,
                 'marca_fuera_de_permanencia': bool(asistencia is not None and not _aplica),
+                # RET-R · marca anulada por retiro (no cuenta; solo lectura).
+                'asistencia_anulada': _anuladas_dia.get(est.id),
             },
             'asistencia': {
                 'estado': asistencia.estado if asistencia else None,
@@ -16909,6 +17481,12 @@ async def registrar_asistencia_masivo(request: Request, db: Session = Depends(ge
     if _vac is not None:
         db.rollback()
         return _vac
+    # RET-R · ninguna marca del lote sobre una anulada (el lote entero se rechaza).
+    for _eid in estudiantes_lote:
+        _anul = _marca_anulada_en(db, current_user, _eid, fecha, asignatura_id)
+        if _anul is not None:
+            db.rollback()
+            return _respuesta_marca_anulada(_anul)
 
     # S1 §7, igual que el alta individual. Se comprueba ANTES de escribir nada,
     # para que el lote no entre a medias. El curso canonico es el del lote si
@@ -20816,6 +21394,8 @@ async def get_historial_estudiante(id, db: Session = Depends(get_db), current_us
             'graves': sum(1 for r in conducta if r.get('gravedad') == 'grave'),
         },
         'asistencia': asistencia,
+        # RET-R · anuladas por retiro: historia, no asistencia (no cuentan arriba).
+        'asistencias_anuladas': _historial_anuladas(db, current_user, estudiante),
         'psicologia': psicologia,
         'psicologia_resumen': {
             'total': len(psicologia),
@@ -23783,7 +24363,7 @@ async def guardar_asignaciones_curso(curso_id, request: Request, db: Session = D
             Asistencia.colegio_id == current_user.colegio_id,
             Asistencia.curso_id == curso.id,
             Asistencia.asignatura_id == fila.asignatura_id,
-        ).count()
+        ).execution_options(incluir_anuladas=True).count()
         fila.activo = False
 
     db.commit()

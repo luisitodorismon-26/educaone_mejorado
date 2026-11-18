@@ -1652,6 +1652,99 @@ class Asistencia(Base):
     asignatura = relationship('Asignatura', backref='asistencias')
 
 
+# ============== ANULACIÓN DE ASISTENCIA POR RETIRO RETROACTIVO (RET-R) ==============
+#
+# Si el último día real del estudiante fue el 16 y Dirección lo retira «desde el
+# 17» semanas después, las marcas registradas desde el 17 se ANULAN: no se
+# borran ni se editan —la fila de `asistencias` conserva estado, observación,
+# curso, materia, fecha y autor—; la anulación queda aparte, con quién, cuándo y
+# por qué. Dos tablas NUEVAS; `asistencias` no se toca.
+#
+# EXCLUSIÓN CENTRAL: el filtro `_excluir_asistencias_anuladas` (abajo) quita las
+# anuladas de TODA consulta ORM de `Asistencia` —lecturas, conteos, relaciones,
+# joins, alias, UPDATE y DELETE—. Solo las ven las consultas que lo piden con
+# `.execution_options(incluir_anuladas=True)`: historial, vistas previas y las
+# protecciones que impiden borrar historia. Fuera del ORM (SQL directo, Core o
+# `relación.any()`) el filtro no llega: está prohibido leer `asistencias` así
+# (`tools/test_retiro_retroactivo.py` lo comprueba en el código).
+
+class AnulacionAsistencia(Base):
+    """Una confirmación de Dirección: las marcas de un estudiante desde
+    `fecha_efectiva` que quedan anuladas por su retiro (o por la corrección de
+    la fecha de su retiro)."""
+    __tablename__ = 'anulaciones_asistencia'
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=False, index=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'), nullable=False, index=True)
+    movimiento_id = Column(Integer, ForeignKey('movimientos_estudiante.id'), nullable=True, index=True)
+    fecha_efectiva = Column(Date, nullable=False)          # «retirado desde», inclusive
+    motivo = Column(String(300), nullable=False)
+    huella_vista_previa = Column(String(64), nullable=False)
+    resumen = Column(Text, default='{}')                   # JSON: conteos por estado, fechas, cursos
+    registrado_por = Column(Integer, ForeignKey('usuarios.id'), nullable=False)
+    registrado_en = Column(DateTime, default=_now_dr, nullable=False)
+
+    def to_dict(self):
+        import json as _json
+        try:
+            resumen = _json.loads(self.resumen or '{}')
+        except (ValueError, TypeError):
+            resumen = {}
+        return {
+            'id': self.id, 'estudiante_id': self.estudiante_id, 'movimiento_id': self.movimiento_id,
+            'fecha_efectiva': self.fecha_efectiva.isoformat() if self.fecha_efectiva else None,
+            'motivo': self.motivo, 'registrado_por': self.registrado_por,
+            'registrado_en': self.registrado_en.isoformat() if self.registrado_en else None,
+            'resumen': resumen,
+        }
+
+
+class AsistenciaAnulada(Base):
+    """Una marca anulada. La marca original NO se modifica: aquí solo se anota
+    que no cuenta, con una copia defensiva de lo que era. Una reversión
+    explícita la marca `revertida_*` (la fila no se borra)."""
+    __tablename__ = 'asistencias_anuladas'
+    id = Column(Integer, primary_key=True)
+    anulacion_id = Column(Integer, ForeignKey('anulaciones_asistencia.id'), nullable=False, index=True)
+    asistencia_id = Column(Integer, ForeignKey('asistencias.id'), nullable=False, index=True)
+    estado_original = Column(String(10), nullable=False)
+    fecha_original = Column(Date, nullable=False)
+    registrado_por_original = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    revertida_en = Column(DateTime, nullable=True)
+    revertida_por = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    motivo_reversion = Column(String(300), nullable=True)
+
+    __table_args__ = (
+        # Una marca está anulada a lo sumo UNA vez a la vez.
+        Index('uq_asistencia_anulada_vigente', 'asistencia_id', unique=True,
+              postgresql_where=text('revertida_en IS NULL'),
+              sqlite_where=text('revertida_en IS NULL')),
+    )
+
+
+def _criterio_no_anulada(cls):
+    from sqlalchemy import exists, and_
+    return ~exists().where(and_(AsistenciaAnulada.asistencia_id == cls.id,
+                                AsistenciaAnulada.revertida_en.is_(None)))
+
+
+def _instalar_filtro_anuladas():
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session as _Session, with_loader_criteria
+
+    @event.listens_for(_Session, 'do_orm_execute')
+    def _excluir_asistencias_anuladas(estado):
+        if estado.execution_options.get('incluir_anuladas'):
+            return
+        if estado.is_select or estado.is_update or estado.is_delete:
+            estado.statement = estado.statement.options(
+                with_loader_criteria(Asistencia, _criterio_no_anulada, include_aliases=True))
+
+
+_instalar_filtro_anuladas()
+
+
 class AlertaAtendida(Base):
     """v2.14: registro de alertas del dashboard atendidas por dirección.
 
