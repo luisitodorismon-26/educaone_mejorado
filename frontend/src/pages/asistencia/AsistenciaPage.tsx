@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, Fragment } from 'react';
 import { useRefrescoEnVivo } from '../../hooks/useRefrescoEnVivo';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
@@ -89,6 +89,8 @@ export const AsistenciaPage = () => {
   const [buscarEstudiante, setBuscarEstudiante] = useState('');
   // S1: la sesion declarada NO impartida de esta clase y fecha, si existe.
   const [sesionNI, setSesionNI] = useState<SesionNI | null>(null);
+  // Fila compacta: estudiante cuyo «Ver detalle» está abierto (solo presentación).
+  const [detalleAbierto, setDetalleAbierto] = useState<number | null>(null);
   // ENT-B · rango de vacaciones que contiene la fecha elegida (lo dice el servidor).
   const [vacaciones, setVacaciones] =
     useState<{ nombre: string; fecha_inicio: string; fecha_fin: string } | null>(null);
@@ -138,6 +140,8 @@ export const AsistenciaPage = () => {
     ? [user?.id ?? '', (user as any)?.colegio_id ?? '', cursoId, esPrimaria ? 'P' : asignaturaId, fecha].join('|')
     : '';
   claveActualRef.current = claveSeleccion;
+  // Fila compacta: otra lista (curso, materia o fecha) = ningún detalle abierto.
+  useEffect(() => { setDetalleAbierto(null); }, [claveSeleccion]);
   const listaValida = seleccionCompleta && estadoLista === 'ok' && listaClave === claveSeleccion;
   // S1: mientras la clase este declarada NO impartida, no se pasa lista. El
   // backend ya lo rechaza; esto evita que el profesor lo descubra a base de
@@ -767,68 +771,66 @@ export const AsistenciaPage = () => {
                   const noAplica = a.estudiante.aplica === false;
                   const esRetirado = noAplica || (!!a.estudiante.retirado && a.estudiante.aplica === undefined);
                   const avisos = a.estudiante.avisos || [];
+                  // FILA COMPACTA · la etiqueta es su situación ACTUAL; «No aplica»
+                  // (columna Asistencia) es la del curso y la fecha elegidos.
+                  const etiqueta = a.estudiante.retirado ? 'Retirado'
+                    : (avisos.length > 0 && avisos[avisos.length - 1].startsWith('Trasladado a') ? 'Trasladado' : null);
+                  const tieneDetalle = avisos.length > 0 || !!a.estudiante.asistencia_anulada
+                    || !!a.estudiante.marca_fuera_de_permanencia
+                    || (!!a.estudiante.retirado && !!(a.estudiante.fecha_retiro || a.estudiante.motivo_retiro));
+                  const abierto = detalleAbierto === a.estudiante.id;
                   return (
-                  <tr key={a.estudiante.id} className={esRetirado ? 'bg-gray-50' : 'hover:bg-gray-50'}>
-                    <td className={`px-2 sm:px-4 py-2 font-medium text-xs ${esRetirado ? 'text-gray-400 line-through' : 'text-gray-500'}`}>
+                  <Fragment key={a.estudiante.id}>
+                  <tr className={noAplica || esRetirado ? 'bg-gray-50' : 'hover:bg-gray-50'} data-fila-estudiante={a.estudiante.id}>
+                    <td className={`pl-2 pr-0.5 sm:px-4 py-2 font-medium text-xs ${noAplica || esRetirado ? 'text-gray-400' : 'text-gray-500'}`}>
                       {a.estudiante.no_lista || idx + 1}
                     </td>
-                    <td className="px-2 sm:px-4 py-2 max-w-[120px] sm:max-w-none">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className={`font-medium text-xs sm:text-sm block truncate sm:whitespace-normal ${esRetirado ? 'text-gray-400 line-through' : 'text-gray-800'}`}>
-                          {a.estudiante.nombre_completo}
-                        </span>
-                        {noAplica && (
-                          <span className="inline-block px-2 py-0.5 bg-gray-600 text-white text-[10px] font-medium rounded uppercase tracking-wide">
-                            No aplica
-                          </span>
-                        )}
-                        {a.estudiante.asistencia_anulada && (
-                          <span data-anulada
-                                title={`Anulada por retiro${a.estudiante.asistencia_anulada.motivo ? `: ${a.estudiante.asistencia_anulada.motivo}` : ''}`}
-                                className="inline-block px-2 py-0.5 bg-gray-100 text-gray-500 border border-gray-300 text-[10px] rounded line-through">
-                            {a.estudiante.asistencia_anulada.estado_original} · anulada por retiro
-                          </span>
-                        )}
-                        {esRetirado && !noAplica && a.estudiante.aplica === undefined && (
-                          <span
-                            title={a.estudiante.motivo_retiro || 'Estudiante retirado'}
-                            className="inline-block px-2 py-0.5 bg-gray-700 text-white text-[10px] font-medium rounded uppercase tracking-wide"
-                          >
-                            RETIRADO {a.estudiante.fecha_retiro ? a.estudiante.fecha_retiro.slice(5).replace('-','/') : ''}
-                          </span>
-                        )}
-                        {!noAplica && avisos.length > 0 && a.estudiante.aplica === true && (
-                          <span title="En la fecha consultada pertenecía a este curso; su situación actual se indica debajo"
-                                className="inline-block px-2 py-0.5 bg-indigo-50 text-indigo-800 border border-indigo-200 text-[10px] font-medium rounded">
-                            Pertenecía ese día
-                          </span>
-                        )}
-                        {(pendientesSel[a.estudiante.id] || []).map(p => (
-                          <span key={p.seq} data-pendiente={p.seq}
-                                title="Se envió, pero no llegó la respuesta del servidor; lo observado no confirma la operación"
-                                className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-900 text-[10px] font-medium rounded">
-                            Sin confirmar: se pidió {p.pedido || 'desmarcar'}
-                            {(p.observado !== undefined || p.filaNoRecibida) && ` · ${textoObservado(p)}`}
-                            <button type="button" onClick={() => quitarAviso(p)}
-                                    title={AYUDA_QUITAR_AVISO} aria-label={`Quitar aviso. ${AYUDA_QUITAR_AVISO}`}
-                                    className="ml-1 underline">Quitar aviso</button>
-                          </span>
-                        ))}
-                        {a.estudiante.marca_fuera_de_permanencia && (
-                          <span title="Esta marca existe pero cae fuera de su permanencia: se conserva y no cuenta"
-                                className="inline-block px-2 py-0.5 bg-amber-100 text-amber-800 text-[10px] font-medium rounded">
-                            Marca fuera de permanencia: {a.asistencia?.estado}
-                          </span>
-                        )}
-                      </div>
-                      {avisos.length > 0 && (
-                        <div className="text-[10px] sm:text-xs text-indigo-700 mt-0.5">
-                          <span className="font-semibold">Situación actual:</span> {avisos.join(' · ')}
+                    <td className="pl-1 pr-1 sm:px-4 py-2 max-w-[130px] sm:max-w-none">
+                      <span className={`font-medium text-xs sm:text-sm block truncate ${noAplica || esRetirado ? 'text-gray-500' : 'text-gray-800'}`}
+                            title={a.estudiante.nombre_completo}>
+                        {a.estudiante.nombre_completo}
+                      </span>
+                      {(etiqueta || tieneDetalle) && (
+                        <div className="flex items-center gap-x-1 sm:gap-x-2 mt-0.5 whitespace-nowrap">
+                          {etiqueta && (
+                            <span data-etiqueta={etiqueta}
+                                  className={`inline-block px-1 sm:px-1.5 py-px text-[10px] font-medium rounded ${
+                                    etiqueta === 'Retirado' ? 'bg-gray-200 text-gray-700' : 'bg-amber-100 text-amber-800'}`}>
+                              {etiqueta}
+                            </span>
+                          )}
+                          {tieneDetalle && (
+                            <button type="button" data-ver-detalle aria-expanded={abierto}
+                                    onClick={() => setDetalleAbierto(abierto ? null : a.estudiante.id)}
+                                    className="text-[10px] sm:text-[11px] text-blue-600 hover:underline py-1 -my-1 whitespace-nowrap">
+                              {abierto ? 'Cerrar detalle' : 'Ver detalle'}
+                            </button>
+                          )}
                         </div>
                       )}
+                      {/* Avisos de guardado pendiente: siempre a la vista, nunca en el detalle. */}
+                      {(pendientesSel[a.estudiante.id] || []).map(p => (
+                        <span key={p.seq} data-pendiente={p.seq}
+                              title="Se envió, pero no llegó la respuesta del servidor; lo observado no confirma la operación"
+                              className="mt-1 inline-flex flex-wrap items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-900 text-[10px] font-medium rounded">
+                          Sin confirmar: se pidió {p.pedido || 'desmarcar'}
+                          {(p.observado !== undefined || p.filaNoRecibida) && ` · ${textoObservado(p)}`}
+                          <button type="button" onClick={() => quitarAviso(p)}
+                                  title={AYUDA_QUITAR_AVISO} aria-label={`Quitar aviso. ${AYUDA_QUITAR_AVISO}`}
+                                  className="ml-1 underline">Quitar aviso</button>
+                        </span>
+                      ))}
                     </td>
+                    {noAplica ? (
+                      <td className="px-1 sm:px-4 py-2 text-center">
+                        <span data-no-aplica title={`No pertenecía a este curso el ${fecha.split('-').reverse().join('/')}`}
+                              className="inline-block px-3 py-1.5 bg-gray-200 text-gray-600 text-xs sm:text-sm rounded-full">
+                          No aplica
+                        </span>
+                      </td>
+                    ) : (
                     <td className="px-1 sm:px-4 py-2">
-                      <div className="flex justify-center gap-1 sm:gap-2">
+                      <div className="flex justify-center gap-0.5 sm:gap-2">
                         {estados.map(e => (
                           <button
                             key={e.val}
@@ -853,11 +855,58 @@ export const AsistenciaPage = () => {
                         ))}
                       </div>
                     </td>
+                    )}
                   </tr>
+                  {abierto && (
+                    <tr className="bg-gray-50" data-detalle-estudiante={a.estudiante.id}>
+                      <td></td>
+                      <td colSpan={2} className="px-2 sm:px-4 pb-3 pt-0 text-[11px] sm:text-xs text-gray-700 whitespace-normal break-words">
+                        <ul className="space-y-1 border-l-2 border-gray-300 pl-3">
+                          <li>
+                            <span className="font-semibold">Ese día ({fecha.split('-').reverse().join('/')}):</span>{' '}
+                            {noAplica ? 'No aplica: no pertenecía a este curso.'
+                              : esRetirado ? 'Bloqueado: estudiante retirado.'
+                              : 'Pertenecía a este curso en la fecha seleccionada.'}
+                          </li>
+                          {avisos.length > 0 && (
+                            <li><span className="font-semibold">Movimientos:</span> {avisos.join(' · ')}</li>
+                          )}
+                          {a.estudiante.retirado && (a.estudiante.fecha_retiro || a.estudiante.motivo_retiro) && (
+                            <li>
+                              <span className="font-semibold">Retiro:</span>
+                              {a.estudiante.fecha_retiro ? ` último día ${a.estudiante.fecha_retiro.split('-').reverse().join('/')}` : ''}
+                              {a.estudiante.motivo_retiro ? ` · ${a.estudiante.motivo_retiro}` : ''}
+                            </li>
+                          )}
+                          {a.estudiante.asistencia_anulada && (
+                            <li data-anulada>
+                              <span className="font-semibold">Marca anulada por retiro:</span>{' '}
+                              <span className="line-through">{a.estudiante.asistencia_anulada.estado_original}</span>
+                              {a.estudiante.asistencia_anulada.motivo ? ` · ${a.estudiante.asistencia_anulada.motivo}` : ''}
+                              {' '}(se conserva y no cuenta)
+                            </li>
+                          )}
+                          {a.estudiante.marca_fuera_de_permanencia && (
+                            <li>
+                              <span className="font-semibold">Marca fuera de permanencia:</span> {a.asistencia?.estado}
+                              {' '}(se conserva y no cuenta)
+                            </li>
+                          )}
+                        </ul>
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                   );
                 })}
               </tbody>
             </table>
+            {asistencias.some(a => (a.estudiante.avisos || []).length > 0 || a.estudiante.asistencia_anulada
+                                   || a.estudiante.marca_fuera_de_permanencia) && (
+              <p className="text-[11px] sm:text-xs text-gray-500 italic text-center py-2 border-t">
+                ⓘ Fechas, movimientos y marcas anuladas: en «Ver detalle» de cada estudiante.
+              </p>
+            )}
           </>)}
         </div>
       )}
