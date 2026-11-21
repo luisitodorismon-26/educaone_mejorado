@@ -866,7 +866,7 @@ export const AsistenciaPage = () => {
                             <span className="font-semibold">Ese día ({fecha.split('-').reverse().join('/')}):</span>{' '}
                             {noAplica ? 'No aplica: no pertenecía a este curso.'
                               : esRetirado ? 'Bloqueado: estudiante retirado.'
-                              : 'Pertenecía a este curso; su asistencia se registra con normalidad.'}
+                              : 'Pertenecía a este curso en la fecha seleccionada.'}
                           </li>
                           {avisos.length > 0 && (
                             <li><span className="font-semibold">Movimientos:</span> {avisos.join(' · ')}</li>
