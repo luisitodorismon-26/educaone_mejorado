@@ -12331,8 +12331,8 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
     
     tipo = 'individual' if estudiante_id else 'curso'
     filename = f"Reporte_Periodo{periodo_rep}_{tipo}_{(curso.nombre or 'curso').replace(' ', '_')}.pdf"
-    return StreamingResponse(buffer, media_type='application/pdf',
-                             headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+    return Response(content=buffer.getvalue(), media_type='application/pdf',
+                    headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
 
@@ -18326,7 +18326,7 @@ async def generar_boletin_pdf(id, request: Request, ano_id: int | None = None, d
         }, status_code=500)
 
     filename = f"Reporte_Calificaciones_{estudiante.nombre_completo.replace(' ', '_')}.pdf"
-    return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+    return Response(content=buffer.getvalue(), media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
 @app.get("/api/boletines/curso/{curso_id}/pdf")
@@ -18415,7 +18415,7 @@ async def generar_boletines_curso_pdf(curso_id, ano_id: int | None = None, db: S
     writer.write(out)
     out.seek(0)
     filename = f"Boletines_Padres_{curso.nombre.replace(' ', '_')}.pdf"
-    return StreamingResponse(out, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+    return Response(content=out.getvalue(), media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
 
@@ -20537,8 +20537,8 @@ async def boletin_primaria_estudiante_pdf(
         return JSONResponse({'error': 'No se encontró la plantilla oficial de ese grado.'}, status_code=500)
 
     nombre_archivo = f"Informe_Aprendizaje_{(estudiante.nombre_completo or 'estudiante').replace(' ', '_')}.pdf"
-    return StreamingResponse(buf, media_type='application/pdf',
-                             headers={'Content-Disposition': f'attachment; filename="{nombre_archivo}"'})
+    return Response(content=buf.getvalue(), media_type='application/pdf',
+                    headers={'Content-Disposition': f'attachment; filename="{nombre_archivo}"'})
 
 
 @app.get("/api/boletines-primaria/curso/{curso_id}/pdf")
@@ -20602,8 +20602,8 @@ async def boletin_primaria_curso_pdf(
     writer.write(out)
     out.seek(0)
     nombre_archivo = f"Informes_Aprendizaje_{(curso.nombre or 'curso').replace(' ', '_')}.pdf"
-    return StreamingResponse(out, media_type='application/pdf',
-                             headers={'Content-Disposition': f'attachment; filename="{nombre_archivo}"'})
+    return Response(content=out.getvalue(), media_type='application/pdf',
+                    headers={'Content-Disposition': f'attachment; filename="{nombre_archivo}"'})
 
 
 @app.get("/api/boletines/estudiante/{id}/pdf-minerd-v2")
@@ -20762,8 +20762,8 @@ async def generar_boletin_minerd_v2(
         }, status_code=500)
     
     nombre_archivo = f"Boletin_MINERD_{estudiante.nombre}_{estudiante.apellido}".replace(' ', '_')
-    return StreamingResponse(
-        buffer,
+    return Response(
+        content=buffer.getvalue(),
         media_type='application/pdf',
         headers={'Content-Disposition': f'attachment; filename="{nombre_archivo}.pdf"'}
     )
@@ -20915,8 +20915,8 @@ async def generar_boletines_curso_minerd_v2(
     if errores_individuales:
         # Header informativo (visible en Network tab del navegador) — algunos pudieron generarse
         headers_resp['X-Errores'] = f'{len(errores_individuales)} estudiantes con error'
-    return StreamingResponse(
-        out,
+    return Response(
+        content=out.getvalue(),
         media_type='application/pdf',
         headers=headers_resp
     )
@@ -22885,8 +22885,8 @@ async def get_tarjetas_notas_periodo(request: Request, db: Session = Depends(get
         prefix = "Reporte_Padres" if simple else "Tarjetas_Notas"
         filename = f"{prefix}_P{periodo}_{curso_nombre}.pdf"
         
-        return StreamingResponse(
-            buffer,
+        return Response(
+            content=buffer.getvalue(),
             media_type='application/pdf',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
@@ -23048,7 +23048,7 @@ async def get_calificaciones_por_periodo_pdf(request: Request, db: Session = Dep
     buffer.seek(0)
 
     filename = f"Notas_P{periodo}_{curso_nombre.replace(' ', '_')}.pdf"
-    return StreamingResponse(buffer, media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+    return Response(content=buffer.getvalue(), media_type='application/pdf', headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
 @app.get("/api/calificaciones/resumen-curso/{curso_id}")
@@ -23403,8 +23403,8 @@ async def get_cuadro_honor_pdf(request: Request, db: Session = Depends(get_db), 
     c.showPage()
     c.save()
     buffer.seek(0)
-    return StreamingResponse(buffer, media_type='application/pdf',
-                             headers={'Content-Disposition': 'attachment; filename="Cuadro_de_Honor.pdf"'})
+    return Response(content=buffer.getvalue(), media_type='application/pdf',
+                    headers={'Content-Disposition': 'attachment; filename="Cuadro_de_Honor.pdf"'})
 
 
 @app.get("/api/estadisticas/cursos")
@@ -25329,8 +25329,8 @@ async def preview_pdf_primaria(curso_id: int, request: Request,
         pdf_bytes = aplicar_marca_borrador(pdf_bytes)
         
         filename = f"BORRADOR_Registro_Primaria_{curso.nombre_completo.replace(' ', '_')}.pdf"
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
+        return Response(
+            content=pdf_bytes,
             media_type='application/pdf',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
@@ -25496,8 +25496,8 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
         )
         
         filename = f"Registro_Primaria_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
+        return Response(
+            content=pdf_bytes,
             media_type='application/pdf',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
@@ -25685,8 +25685,8 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
         
         filename = f"BORRADOR_Registro_Secundaria_{curso.nombre_completo.replace(' ', '_')}.pdf"
         
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
+        return Response(
+            content=pdf_bytes,
             media_type='application/pdf',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
@@ -25861,8 +25861,8 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
         
         filename = f"Registro_Escolar_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
         
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
+        return Response(
+            content=pdf_bytes,
             media_type='application/pdf',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
@@ -27182,8 +27182,8 @@ async def generar_registro_escolar(curso_id, db: Session = Depends(get_db), curr
         # Crear nombre del archivo
         filename = f"Registro_Escolar_{curso.nombre_completo.replace(' ', '_')}_{ano_escolar}.pdf"
         
-        return StreamingResponse(
-            io.BytesIO(pdf_bytes),
+        return Response(
+            content=pdf_bytes,
             media_type='application/pdf',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
