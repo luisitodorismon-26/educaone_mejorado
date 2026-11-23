@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, Fragment } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import api from '../../services/api';
+import { mensajeDeError } from '../../utils/errorServidor';
 import { ArrowLeft, BookOpen, AlertTriangle, CheckCircle, FileText, Download, Save, CalendarCheck } from 'lucide-react';
 import { Button, Alert, Spinner } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
@@ -241,15 +242,13 @@ export const FichaEstudianteAsignatura: React.FC = () => {
       link.click();
       window.URL.revokeObjectURL(link.href);
     } catch (err: any) {
-      // v2.13.9: extraer mensaje real del blob si aplica
-      let mensajeError = err?.message || 'Error descargando boletín';
-      if (err?.response?.data instanceof Blob) {
-        try {
-          const texto = await err.response.data.text();
-          const json = JSON.parse(texto);
-          mensajeError = json.error || json.detail || texto;
-        } catch { /* no era JSON */ }
-      }
+      // Error del servidor o sin respuesta: mensajeDeError (lee el Blob, no
+      // reproduce los 5xx, distingue conexión). El Error propio de arriba (200
+      // que no es PDF) conserva su texto, como antes.
+      const porDefecto = 'No se pudo generar el boletín MINERD.';
+      const mensajeError = err?.isAxiosError
+        ? await mensajeDeError(err, { porDefecto })
+        : (err?.message || porDefecto);
       setMensaje({ tipo: 'error', texto: mensajeError });
     } finally {
       setDescargandoPDF(false);
@@ -323,7 +322,7 @@ export const FichaEstudianteAsignatura: React.FC = () => {
         <span className="text-gray-800 font-medium">{estudianteInfo.nombre_completo}</span>
       </div>
 
-      {mensaje && <Alert variant={mensaje.tipo} onClose={() => setMensaje(null)}>{mensaje.texto}</Alert>}
+      {mensaje && <Alert variant={mensaje.tipo} onClose={() => setMensaje(null)}><span className="whitespace-pre-line" data-mensaje-ficha>{mensaje.texto}</span></Alert>}
 
       {/* Cabecera del estudiante */}
       <div className="bg-white rounded-xl shadow-sm border p-5">

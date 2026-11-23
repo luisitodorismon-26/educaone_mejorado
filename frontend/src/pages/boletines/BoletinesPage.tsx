@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, Fragment } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
+import { mensajeDeError } from '../../utils/errorServidor';
 import { FileText, Download, Printer, Search, Users, GraduationCap, Calendar } from 'lucide-react';
 import { Select, Button, Spinner, Alert } from '../../components/ui';
 import { labelCurso } from '../../utils/labelCurso';
@@ -208,7 +209,9 @@ export const BoletinesPage = () => {
   const esPrimaria = (cursoActual?.nivel || '').toLowerCase() === 'primaria';
 
   // Descarga un PDF validando que el servidor no haya devuelto un error JSON
-  const descargarPDF = async (url: string, filename: string, msgError: string) => {
+  // `explicacionServidor`: solo las descargas MINERD v2 lo activan (mensajeDeError).
+  // Las de Primaria y padres siguen exactamente como antes.
+  const descargarPDF = async (url: string, filename: string, msgError: string, explicacionServidor = false) => {
     try {
       // ENTREGA-1.1 · El año se añade AQUÍ, no en cada botón. Son seis
       // descargas distintas y bastaba con olvidar una para que ese PDF
@@ -235,7 +238,9 @@ export const BoletinesPage = () => {
       window.URL.revokeObjectURL(dlUrl);
     } catch (err: any) {
       console.error('Error descargando PDF:', err);
-      setError(err?.response?.data?.error || msgError);
+      setError(explicacionServidor
+        ? await mensajeDeError(err, { porDefecto: msgError })
+        : (err?.response?.data?.error || msgError));
     }
   };
   const [estudianteId, setEstudianteId] = useState<number | null>(null);
@@ -433,7 +438,7 @@ export const BoletinesPage = () => {
         </Alert>
       )}
 
-      {error && <Alert variant="error" onClose={() => setError(null)}>{error}</Alert>}
+      {error && <Alert variant="error" onClose={() => setError(null)}><span className="whitespace-pre-line" data-error-boletines>{error}</span></Alert>}
 
       <div className="bg-white rounded-xl shadow-sm border p-4">
         <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
@@ -530,7 +535,8 @@ export const BoletinesPage = () => {
                     onClick={() => descargarPDF(
                       `/boletines/curso/${cursoId}/pdf-minerd-v2`,
                       `Boletines_MINERD_${(cursoActual?.nombre_completo || 'Curso').replace(/ /g, '_')}.pdf`,
-                      'Error al generar boletines MINERD del curso'
+                      'Error al generar boletines MINERD del curso',
+                      true,
                     )}
                   >
                     📄 Boletines MINERD (Curso)
@@ -714,7 +720,8 @@ export const BoletinesPage = () => {
                 onClick={() => descargarPDF(
                   `/boletines/estudiante/${estudianteId}/pdf-minerd-v2`,
                   `Boletin_MINERD_${(boletin.estudiante.nombre || 'estudiante').replace(/ /g, '_')}.pdf`,
-                  'Error al generar el boletín MINERD'
+                  'Error al generar el boletín MINERD',
+                  true,
                 )}
               >
                 📄 Boletín MINERD Oficial

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import api from '../../../services/api';
+import { mensajeDeError } from '../../../utils/errorServidor';
 import { FileText, Download, FileStack, AlertCircle } from 'lucide-react';
 import { Button, Alert } from '../../../components/ui';
 import { EstudianteData } from './tipos';
@@ -23,23 +24,12 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
   const [generandoCurso, setGenerandoCurso] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // v2.13.9: helper que extrae el mensaje de error real cuando el response es blob.
-  // Sin esto, los errores 400/500 del backend se mostraban como "Error generando
-  // boletín" genérico porque axios trataba el blob como Blob sin parsear JSON.
-  const extraerErrorDeBlob = async (err: any): Promise<string> => {
-    const blob = err?.response?.data;
-    if (blob instanceof Blob) {
-      try {
-        const texto = await blob.text();
-        const json = JSON.parse(texto);
-        return json.error || json.detail || texto;
-      } catch {
-        // No era JSON
-        return 'Error generando boletín. Verificá que el estudiante tenga las 4 competencias completas.';
-      }
-    }
-    return err?.response?.data?.error || err?.message || 'Error generando boletín';
-  };
+  // Error de una descarga MINERD. Si vino del servidor (o no hubo respuesta),
+  // mensajeDeError lee `mensaje`/`error`/`detail` también dentro del Blob, no
+  // reproduce el cuerpo de los 5xx y distingue un fallo de conexión. Si es el
+  // Error que lanza descargarPDF ante un 200 que no es PDF, se conserva su texto.
+  const mensajeErrorBoletin = async (err: any, porDefecto: string): Promise<string> =>
+    err?.isAxiosError ? mensajeDeError(err, { porDefecto }) : (err?.message || porDefecto);
 
   const descargarPDF = async (url: string, nombre: string) => {
     const res = await api.get(url, { responseType: 'blob' });
@@ -70,9 +60,7 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
         `Boletin_${nombre.replace(/\s+/g, '_')}.pdf`
       );
     } catch (err: any) {
-      // v2.13.9: extraer mensaje real del blob si aplica
-      const mensaje = await extraerErrorDeBlob(err);
-      setError(mensaje);
+      setError(await mensajeErrorBoletin(err, 'No se pudo generar el boletín MINERD del estudiante.'));
     } finally {
       setGenerandoId(null);
     }
@@ -87,8 +75,7 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
         `Boletines_${nombreCurso.replace(/\s+/g, '_')}.pdf`
       );
     } catch (err: any) {
-      const mensaje = await extraerErrorDeBlob(err);
-      setError(mensaje);
+      setError(await mensajeErrorBoletin(err, 'No se pudieron generar los boletines MINERD del curso.'));
     } finally {
       setGenerandoCurso(false);
     }
@@ -98,7 +85,7 @@ export const TabBoletin: React.FC<Props> = ({ estudiantes, cursoId, nombreCurso 
 
   return (
     <div className="space-y-4">
-      {error && <Alert variant="error" onClose={() => setError(null)}>{error}</Alert>}
+      {error && <Alert variant="error" onClose={() => setError(null)}><span className="whitespace-pre-line" data-error-boletin>{error}</span></Alert>}
 
       {/* Generación masiva */}
       <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl p-5">
