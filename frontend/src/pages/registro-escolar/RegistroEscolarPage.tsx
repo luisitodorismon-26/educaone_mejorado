@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { labelCurso } from '../../utils/labelCurso';
+import { mensajeDeError } from '../../utils/errorServidor';
 
 interface ValidationResult {
   valid: boolean;
@@ -112,6 +113,15 @@ interface PreviewData {
   };
 }
 
+// Acción recomendada para los bloqueos de plantilla conocidos. El mensaje del
+// servidor ya dice QUÉ no cabe; esto solo añade DÓNDE revisarlo. No desbloquea nada.
+const ACCIONES_REGISTRO: Record<string, string> = {
+  DIAS_EXCEDEN_PLANTILLA:
+    'Revise los días de clase y la asistencia de ese mes. El Registro no se imprime hasta que quepan en la hoja.',
+  ESTUDIANTES_EXCEDEN_PLANTILLA:
+    'Revise la lista de estudiantes del curso. El Registro no se imprime con estudiantes fuera de la hoja.',
+};
+
 const formatMeses = (dias: Record<string, number>) =>
   Object.entries(dias || {})
     .filter(([, valor]) => typeof valor === 'number' && valor > 0)
@@ -136,8 +146,8 @@ export const RegistroEscolarPage = () => {
     try {
       const res = await api.get('/cursos');
       setCursos(res.data || []);
-    } catch {
-      setError('Error al cargar cursos');
+    } catch (err) {
+      setError(await mensajeDeError(err, { porDefecto: 'No se pudieron cargar los cursos.' }));
     }
   };
 
@@ -153,7 +163,10 @@ export const RegistroEscolarPage = () => {
       const res = await api.get(`/registros/preview/${cursoId}`);
       setPreview(res.data);
     } catch (err: any) {
-      setError(err.response?.data?.error || 'Error al cargar vista previa del registro');
+      setError(await mensajeDeError(err, {
+        porDefecto: 'No se pudo cargar el diagnóstico del registro.',
+        accionesPorMotivo: ACCIONES_REGISTRO,
+      }));
     } finally {
       setLoading(false);
     }
@@ -182,19 +195,11 @@ export const RegistroEscolarPage = () => {
 
       setSuccess('Registro generado exitosamente');
     } catch (err: any) {
-      const blob = err?.response?.data;
-      if (blob instanceof Blob) {
-        const text = await blob.text();
-        try {
-          const parsed = JSON.parse(text);
-          const detalle = parsed.detalle?.join?.(' | ');
-          setError(parsed.error ? `${parsed.error}${detalle ? `: ${detalle}` : ''}` : 'Error al generar el PDF');
-        } catch {
-          setError('Error al generar el PDF');
-        }
-      } else {
-        setError(err.response?.data?.error || 'Error al generar el PDF');
-      }
+      // Se pidió un PDF: si el servidor lo rechaza, su explicación llega en JSON dentro de un Blob.
+      setError(await mensajeDeError(err, {
+        porDefecto: 'El servidor no generó el registro oficial.',
+        accionesPorMotivo: ACCIONES_REGISTRO,
+      }));
     } finally {
       setGenerating(false);
     }
@@ -223,18 +228,10 @@ export const RegistroEscolarPage = () => {
 
       setSuccess('Vista previa (BORRADOR) generada — no apta para entrega oficial');
     } catch (err: any) {
-      const blob = err?.response?.data;
-      if (blob instanceof Blob) {
-        const text = await blob.text();
-        try {
-          const parsed = JSON.parse(text);
-          setError(parsed.error || 'Error al generar la vista previa');
-        } catch {
-          setError('Error al generar la vista previa');
-        }
-      } else {
-        setError(err.response?.data?.error || 'Error al generar la vista previa');
-      }
+      setError(await mensajeDeError(err, {
+        porDefecto: 'El servidor no generó la vista previa.',
+        accionesPorMotivo: ACCIONES_REGISTRO,
+      }));
     } finally {
       setGenerating(false);
     }
@@ -268,7 +265,7 @@ export const RegistroEscolarPage = () => {
 
       {error && (
         <div className="p-3 bg-red-100 border border-red-300 text-red-700 rounded-lg flex justify-between gap-3">
-          <span>{error}</span>
+          <span className="whitespace-pre-line" role="alert" data-error-registro>{error}</span>
           <button onClick={() => setError('')} className="font-bold">×</button>
         </div>
       )}
