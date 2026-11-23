@@ -2,6 +2,16 @@ import { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { useRefrescoEnVivo } from '../../hooks/useRefrescoEnVivo';
+import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
+import { AvisoEnvio, ResultadoConsultaLista } from '../../components/AvisoEnvio';
+import { exigirLista } from '../../utils/consultaVigente';
+
+// El masivo se guarda en una sola transacción y notifica a cada destinatario
+// después: si se guardó, ya está en todas las bandejas y algunos pueden haber
+// recibido además el aviso. Reenviarlo lo duplicaría para todos.
+const NOTA_MASIVO =
+  'En un envío a todo un rol, si se guardó, el mensaje ya está en la bandeja de los destinatarios ' +
+  'y algunos pueden haber recibido además la notificación. Volver a enviarlo lo duplicaría para todos.';
 
 interface Usuario {
   id: number;
@@ -54,7 +64,11 @@ export const ComunicacionPage = () => {
   const [modalType, setModalType] = useState<'mensaje' | 'comunicado' | 'ver' | 'responder' | 'editarComunicado'>('mensaje');
   const [selectedItem, setSelectedItem] = useState<any>(null);
   const [saving, setSaving] = useState(false);
-  
+  // Fallo del último envío desde el modal (rechazo o resultado incierto). Se
+  // muestra DENTRO del modal; lo escrito no se borra.
+  const [falloEnvio, setFalloEnvio] = useState<FalloEnvio | null>(null);
+  const [notaFallo, setNotaFallo] = useState('');
+
   // Form mensaje
   const [tipoDestinatario, setTipoDestinatario] = useState<'individual' | 'rol'>('individual');
   const [destinatarioId, setDestinatarioId] = useState<number>(0);
@@ -86,6 +100,13 @@ export const ComunicacionPage = () => {
   useEffect(() => {
     cargarDatos();
   }, []);
+
+  // Abrir, cerrar o cambiar de formulario empieza sin avisos del envío anterior.
+  useEffect(() => {
+    setFalloEnvio(null);
+    setNotaFallo('');
+    setError('');
+  }, [showModal, modalType]);
 
   // v2.19.3-C: con /comunicacion abierta, un mensaje entrante aparece solo.
   // Antes esta pantalla solo consultaba al montar, así que el mensaje era
@@ -153,6 +174,8 @@ export const ComunicacionPage = () => {
 
     setSaving(true);
     setError('');
+    setFalloEnvio(null);
+    setNotaFallo('');
 
     try {
       if (modoIndividual) {
@@ -181,7 +204,9 @@ export const ComunicacionPage = () => {
       cargarDatos();
       setTimeout(() => setSuccess(''), 3000);
     } catch (err: any) {
-      setError(err.response?.data?.error || 'Error al enviar');
+      // Rechazo (4xx) o resultado incierto. El modal y lo escrito se conservan.
+      setFalloEnvio(await clasificarFalloEnvio(err, { porDefecto: 'El servidor no aceptó el mensaje.' }));
+      setNotaFallo(modoIndividual ? '' : NOTA_MASIVO);
     } finally {
       setSaving(false);
     }
@@ -195,6 +220,7 @@ export const ComunicacionPage = () => {
 
     setSaving(true);
     setError('');
+    setFalloEnvio(null);
 
     try {
       await api.post('/mensajes', {
@@ -209,7 +235,7 @@ export const ComunicacionPage = () => {
       cargarDatos();
       setTimeout(() => setSuccess(''), 3000);
     } catch (err: any) {
-      setError(err.response?.data?.error || 'Error al enviar');
+      setFalloEnvio(await clasificarFalloEnvio(err, { porDefecto: 'El servidor no aceptó la respuesta.' }));
     } finally {
       setSaving(false);
     }
@@ -223,6 +249,7 @@ export const ComunicacionPage = () => {
 
     setSaving(true);
     setError('');
+    setFalloEnvio(null);
 
     try {
       if (modalType === 'editarComunicado' && selectedItem) {
@@ -238,10 +265,35 @@ export const ComunicacionPage = () => {
       cargarDatos();
       setTimeout(() => setSuccess(''), 3000);
     } catch (err: any) {
-      setError(err.response?.data?.error || 'Error al guardar');
+      setFalloEnvio(await clasificarFalloEnvio(err, { porDefecto: 'El servidor no aceptó el comunicado.' }));
     } finally {
       setSaving(false);
     }
+  };
+
+  // «Consultar lista»: SOLO lectura. No cierra ni borra nada. Una respuesta con
+  // formato inesperado LANZA (fallo de consulta, el aviso se mantiene); nunca se
+  // trata como lista vacía. La lista de la página se actualiza en `aplicar`, que
+  // AvisoEnvio solo ejecuta si la consulta sigue vigente.
+  const porFechaDesc = <T extends { fecha: string }>(a: T, b: T) => (b.fecha || '').localeCompare(a.fecha || '');
+
+  const consultarComunicados = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/comunicados', { signal });
+    const lista = exigirLista<Comunicado>(res.data, ['id', 'titulo', 'fecha']);
+    return {
+      aplicar: () => setComunicados(lista),
+      items: [...lista].sort(porFechaDesc).map(c => ({ id: c.id, texto: c.titulo, detalle: `${c.autor} · ${formatFecha(c.fecha)}` })),
+    };
+  };
+
+  const consultarEnviados = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/mensajes', { signal });
+    const lista = exigirLista<Mensaje>(res.data, ['id', 'asunto', 'fecha', 'tipo']);
+    return {
+      aplicar: () => setMensajes(lista),
+      items: lista.filter(m => m.tipo === 'enviado').sort(porFechaDesc)
+        .map(m => ({ id: m.id, texto: `${m.asunto} → ${m.destinatario || ''}`, detalle: formatFecha(m.fecha) })),
+    };
   };
 
   const eliminarComunicado = async (id: number) => {
@@ -392,8 +444,8 @@ export const ComunicacionPage = () => {
         </div>
       </div>
 
-      {/* Alertas */}
-      {error && (
+      {/* Alertas. Con el modal abierto, el error se muestra dentro del modal. */}
+      {error && !showModal && (
         <div className="p-3 bg-red-100 border border-red-300 text-red-700 rounded-lg flex justify-between">
           <span>{error}</span>
           <button onClick={() => setError('')} className="font-bold">×</button>
@@ -800,6 +852,21 @@ export const ComunicacionPage = () => {
                   </button>
                 </div>
               )}
+
+              {/* Avisos del formulario, junto al botón de envío */}
+              {error && (
+                <div role="alert" data-error-formulario
+                  className="p-3 bg-red-50 border border-red-300 text-red-700 rounded-lg text-sm">
+                  {error}
+                </div>
+              )}
+              <AvisoEnvio
+                fallo={falloEnvio}
+                nota={notaFallo || undefined}
+                consultar={modalType === 'comunicado' || modalType === 'editarComunicado' ? consultarComunicados : consultarEnviados}
+                descripcionLista={modalType === 'comunicado' || modalType === 'editarComunicado' ? 'Comunicados publicados' : 'Mensajes enviados'}
+                contexto={`${modalType}:${selectedItem?.id ?? ''}`}
+              />
             </div>
           </div>
         </div>

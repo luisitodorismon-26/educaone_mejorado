@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { StickyNote, Plus, X, Save, Pin, Edit3, Trash2, Search } from 'lucide-react';
+import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
+import { AvisoEnvio, ResultadoConsultaLista } from '../../components/AvisoEnvio';
+import { exigirLista } from '../../utils/consultaVigente';
 
 interface NotaPersonal {
   id: number; titulo: string; contenido: string; color: string;
@@ -34,8 +37,13 @@ export const NotasPage = () => {
     finally { setLoading(false); }
   };
 
+  // Fallo del último guardado (rechazo o resultado incierto), dentro del formulario.
+  const [falloEnvio, setFalloEnvio] = useState<FalloEnvio | null>(null);
+  useEffect(() => { setFalloEnvio(null); }, [showForm, editingId]);
+
   const guardar = async () => {
     if (!form.titulo.trim() && !form.contenido.trim()) return;
+    setFalloEnvio(null);
     try {
       if (editingId) {
         const res = await api.put(`/notas-personales/${editingId}`, form);
@@ -45,7 +53,24 @@ export const NotasPage = () => {
         setNotas([res.data, ...notas]);
       }
       setShowForm(false); setEditingId(null); setForm({ titulo: '', contenido: '', color: 'yellow' });
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      // Antes solo iba a la consola. El formulario y lo escrito se conservan.
+      setFalloEnvio(await clasificarFalloEnvio(e, { porDefecto: 'El servidor no aceptó la nota.' }));
+    }
+  };
+
+  // «Consultar lista»: SOLO lectura de las notas propias. No cierra ni borra.
+  // Un formato inesperado LANZA (el aviso se mantiene); la lista de la página
+  // solo se actualiza en `aplicar`, si la consulta sigue vigente.
+  const consultarNotas = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/notas-personales', { signal });
+    const lista = exigirLista<NotaPersonal>(res.data, ['id', 'titulo', 'fecha_actualizacion']);
+    return {
+      aplicar: () => setNotas(lista),
+      items: [...lista]
+        .sort((a, b) => (b.fecha_actualizacion || '').localeCompare(a.fecha_actualizacion || ''))
+        .map(n => ({ id: n.id, texto: n.titulo || 'Sin título', detalle: new Date(n.fecha_actualizacion).toLocaleString('es-DO') })),
+    };
   };
 
   const eliminar = async (id: number) => {
@@ -138,6 +163,9 @@ export const NotasPage = () => {
                 <Save size={16} /> {editingId ? 'Actualizar' : 'Guardar'}
               </button>
             </div>
+          </div>
+          <div className="mt-3">
+            <AvisoEnvio fallo={falloEnvio} consultar={consultarNotas} descripcionLista="Mis notas" contexto={String(editingId ?? 'nueva')} />
           </div>
         </div>
       )}
