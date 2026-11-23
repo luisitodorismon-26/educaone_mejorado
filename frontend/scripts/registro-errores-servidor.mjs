@@ -18,7 +18,7 @@ const CR = String.fromCharCode(13);
 const leer = (...p) => readFileSync(join(aqui, '..', 'src', ...p), 'utf8').split(CR).join('');
 
 const js = transformSync(leer('utils', 'errorServidor.ts'), { loader: 'ts', format: 'esm' }).code;
-const { mensajeDeError, textoSeguro } = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));
+const { mensajeDeError, textoSeguro, AVISO_RESUMIDO } = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));
 
 let ok = 0; const fallos = [];
 const prueba = async (nombre, fn) => {
@@ -97,12 +97,13 @@ await prueba('404 sin cuerpo: texto propio del 404', async () => {
 });
 
 console.log('\nDetalles internos que no se muestran');
-await prueba('500 con `detalle: str(e)` con SQL: se muestra `error`, nunca el detalle', async () => {
+const MSG_500 = 'El servidor tuvo un problema al procesar la solicitud (error 500). Inténtelo de nuevo; si se repite, avise a soporte técnico.';
+await prueba('500 con `detalle: str(e)` con SQL: mensaje controlado por el frontend, nada del cuerpo', async () => {
   const m = await mensajeDeError(conRespuesta(500, blobJSON({
     error: 'Error generando preview',
     detalle: '(sqlite3.OperationalError) no such column: x [SQL: SELECT * FROM asistencias WHERE ...]',
   })), LECTURA);
-  igual(m, 'Error generando preview (error 500). Si se repite, avise a soporte técnico.');
+  igual(m, MSG_500);
 });
 await prueba('mensaje con traza de Python: se descarta', async () => {
   const m = await mensajeDeError(conRespuesta(400, { error: 'Traceback (most recent call last):\n  File "app.py", line 3' }), LECTURA);
@@ -118,17 +119,103 @@ await prueba('409 de catálogo con `detalle` textual interno: se muestra `mensaj
 });
 await prueba('página HTML de error dentro del Blob (500): genérico, sin HTML', async () => {
   const m = await mensajeDeError(conRespuesta(500, new Blob(['<html><body>Internal Server Error</body></html>'])), LECTURA);
-  igual(m, 'El servidor tuvo un problema al procesar la solicitud (error 500). Si se repite, avise a soporte técnico.');
+  igual(m, MSG_500);
 });
 await prueba('Blob con JSON roto: mensaje por defecto', async () => {
   igual(await mensajeDeError(conRespuesta(422, new Blob(['{"mensaje": "sin cerrar'])), LECTURA), LECTURA.porDefecto);
 });
-await prueba('texto larguísimo: se descarta', async () => {
-  igual(await mensajeDeError(conRespuesta(400, { error: 'a'.repeat(700) }), LECTURA), LECTURA.porDefecto);
+await prueba('texto absurdo (más de 20 000 caracteres): se descarta', async () => {
+  igual(await mensajeDeError(conRespuesta(400, { error: 'palabra '.repeat(3000) }), LECTURA), LECTURA.porDefecto);
 });
 await prueba('textoSeguro rechaza no-textos y textos sin letras', async () => {
   igual(textoSeguro(null), null); igual(textoSeguro(42), null); igual(textoSeguro({}), null); igual(textoSeguro('  ...  '), null);
 });
+
+console.log('\nTextos largos: se resumen, no se pierden');
+const NOTAS_5 = 'No se puede emitir el Registro oficial de 3ro A: faltan calificaciones de 5 estudiantes. '
+  + 'Estudiante Ficticio Uno (n.º 3): Lengua Española P2 y P3, Matemática P3, Ciencias de la Naturaleza P3. '
+  + 'Estudiante Ficticio Dos (n.º 7): Ciencias Sociales P1 a P4 y Educación Artística P4. '
+  + 'Estudiante Ficticio Tres (n.º 12): Formación Integral Humana y Religiosa P2, Educación Física P2 y P3. '
+  + 'Estudiante Ficticio Cuatro (n.º 18): Lengua Española P4, Matemática P4, Ciencias Sociales P4, Ciencias de la Naturaleza P4. '
+  + 'Estudiante Ficticio Cinco (n.º 25): todas las asignaturas del período 4. '
+  + 'Complete esas calificaciones en la pantalla de Calificaciones y vuelva a diagnosticar el curso.';
+await prueba('notas faltantes de 5 estudiantes (> 600 caracteres): se conserva la causa con aviso de resumen', async () => {
+  if (NOTAS_5.length <= 600) throw new Error('el mensaje de prueba debe superar 600 caracteres: ' + NOTAS_5.length);
+  const m = await mensajeDeError(conRespuesta(400, blobJSON({ error: NOTAS_5 })), LECTURA);
+  contiene(m, 'faltan calificaciones de 5 estudiantes');
+  contiene(m, 'Estudiante Ficticio Uno (n.º 3): Lengua Española P2 y P3');
+  contiene(m, 'Estudiante Ficticio Cuatro');
+  if (!m.endsWith(AVISO_RESUMIDO)) throw new Error('falta el aviso visible de resumen: ' + JSON.stringify(m.slice(-80)));
+  if (m.length > 600 + AVISO_RESUMIDO.length) throw new Error('demasiado largo: ' + m.length);
+  if (!NOTAS_5.startsWith(m.slice(0, m.length - AVISO_RESUMIDO.length))) throw new Error('el resumen debe ser el comienzo exacto del texto');
+});
+await prueba('texto largo con un dato interno AL FINAL: se descarta entero (protección antes de resumir)', async () => {
+  const m = await mensajeDeError(conRespuesta(400, { error: NOTAS_5 + ' Conexión: postgres://usuario:CLAVE_FICTICIA@servidor/base' }), LECTURA);
+  igual(m, LECTURA.porDefecto);
+});
+await prueba('causa larga dentro de `detalle[]`: se resume a 300 con aviso', async () => {
+  const larga = 'Estudiante Ficticio Seis: ' + 'falta la calificación del período 4 en Lengua Española; '.repeat(10);
+  const m = await mensajeDeError(conRespuesta(400, { error: 'Datos incompletos', detalle: [larga] }), LECTURA);
+  contiene(m, '• Estudiante Ficticio Seis: falta'); contiene(m, AVISO_RESUMIDO);
+});
+
+console.log('\n5xx: siempre mensaje controlado (datos ficticios)');
+for (const [nombre, cuerpo] of [
+  ['ruta /srv/... en `mensaje`', { mensaje: 'No se pudo abrir /srv/educaone/plantillas/registro.pdf' }],
+  ['conexión postgres con clave en `error`', { error: 'Fallo al conectar a postgres://usuario:CLAVE_FICTICIA@servidor/base' }],
+  ['texto aparentemente inocuo en `detail`', { detail: 'No se pudo generar el documento' }],
+  ['texto plano', 'Internal Server Error'],
+]) {
+  await prueba(`500 con ${nombre}: no se reproduce`, async () => {
+    const m = await mensajeDeError(conRespuesta(500, typeof cuerpo === 'string' ? cuerpo : blobJSON(cuerpo)), LECTURA);
+    igual(m, MSG_500);
+  });
+}
+await prueba('5xx en guardado: resultado incierto, sin reproducir el cuerpo', async () => {
+  const m = await mensajeDeError(conRespuesta(500, { error: 'postgres://usuario:CLAVE_FICTICIA@servidor/base' }), GUARDADO);
+  contiene(m, 'No se pudo confirmar si el cambio quedó guardado'); noContiene(m, 'CLAVE_FICTICIA'); noContiene(m.toLowerCase(), 'no se guardó');
+});
+
+console.log('\n4xx: textos internos descartados (datos ficticios)');
+for (const [nombre, texto] of [
+  ['ruta absoluta /srv/...', 'No se encontró la plantilla en /srv/educaone/plantillas/registro.pdf'],
+  ['ruta /tmp/...', 'Archivo temporal /tmp/registro_123.pdf no disponible'],
+  ['conexión postgres con usuario y clave', 'No se pudo leer el curso desde postgres://usuario:CLAVE_FICTICIA@servidor/base'],
+  ['usuario:clave@host sin esquema', 'Origen usuario:CLAVE_FICTICIA@servidor.interno no responde'],
+  ['URL interna https', 'Consulte https://interno.ejemplo.test/admin para más datos'],
+  ['dirección IP', 'El servicio 10.0.0.12 rechazó la conexión'],
+  ['localhost', 'No responde localhost en el puerto configurado'],
+  ['variable de entorno', 'Revise DATABASE_URL en la configuración'],
+  ['asignación clave=valor', 'Configuración inválida: modo=depuracion'],
+  ['«contraseña:» con valor', 'contraseña: Ficticia123 no válida'],
+  ['ruta de Windows', 'No existe C:\\srv\\educaone\\registro.pdf'],
+  ['ruta UNC', 'Sin acceso a \\\\servidor\\compartida\\registros'],
+  ['traza de JavaScript', 'Fallo at generarRegistro (registro.js:10:5)'],
+  ['representación de objeto Python', "Valor <class 'dict'> object at 0x7f3a2b1c9d10 inesperado"],
+  ['excepción de base de datos', 'UniqueViolation: psycopg2 rechazó la fila'],
+  ['nombre de excepción', 'Fallo de ResourceException al generar'],
+  ['detalle de PostgreSQL', 'Clave duplicada. DETAIL: Key (id)=(5) already exists.'],
+  ['SQL DDL', 'DROP TABLE estudiantes falló'],
+]) {
+  await prueba(`4xx con ${nombre}: mensaje por defecto`, async () => {
+    igual(await mensajeDeError(conRespuesta(422, blobJSON({ mensaje: texto })), LECTURA), LECTURA.porDefecto);
+  });
+}
+
+console.log('\n4xx: explicaciones legítimas que deben seguir mostrándose');
+for (const texto of [
+  'Asistencia de Primaria: hay 1 asistencia(s) registradas fuera del año escolar (2025-09-01 a 2026-06-19). No se imprimen en otro mes ni se ocultan: corrija su fecha o el rango del año antes de emitir el Registro.',
+  MSG_422,
+  'Formación Humana, noviembre: se necesitan 11 columnas y la hoja permite 10.',
+  'La asistencia del 14/05/2024 está fuera del año escolar.',
+  'Revise P1/P2 de Matemática y/o Lengua Española.',
+  'Solo puedes imprimir el registro de tus cursos asignados',
+  'Este curso tiene más de una asignatura vinculada al bloque curricular LEN del Registro Escolar. Dirección debe dejar solo una asignatura vinculada a ese bloque.',
+]) {
+  await prueba(`se muestra: «${texto.slice(0, 50)}…»`, async () => {
+    igual(await mensajeDeError(conRespuesta(422, blobJSON({ mensaje: texto })), LECTURA), texto);
+  });
+}
 
 console.log('\nSin respuesta del servidor');
 await prueba('fallo de conexión en lectura: conexión, no rechazo', async () => {
