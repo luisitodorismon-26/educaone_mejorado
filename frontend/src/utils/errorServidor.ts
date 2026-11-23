@@ -201,3 +201,31 @@ export async function mensajeDeErrorDescarga(err: unknown, opciones: OpcionesMen
   if (e && e.isAxiosError === true) return mensajeDeError(err, opciones);
   return typeof e?.message === 'string' && e.message.trim() ? e.message : opciones.porDefecto;
 }
+
+/** Texto ante un envío cuyo resultado no se pudo confirmar. */
+export const MSG_ENVIO_INCIERTO =
+  'No pudimos confirmar el envío. Puede haberse guardado. Consulte la lista antes de volver a enviarlo.';
+
+export interface FalloEnvio {
+  /** `rechazo`: el servidor respondió 4xx y NO guardó. `incierto`: no se sabe. */
+  tipo: 'rechazo' | 'incierto';
+  mensaje: string;
+}
+
+/**
+ * Clasifica el fallo de un ENVÍO que crea o modifica algo (POST/PUT).
+ *
+ *   · 4xx → rechazo confirmado: el servidor contestó que no; se muestra su texto
+ *     (con las protecciones de mensajeDeError).
+ *   · Sin respuesta, tiempo agotado, 5xx (incluidos 502/503/504 de la pasarela) o
+ *     cualquier otro error → incierto: el servidor pudo haberlo guardado.
+ *
+ * Solo informa. No reintenta ni evita duplicados: eso exige protección en el backend.
+ */
+export async function clasificarFalloEnvio(err: unknown, opciones: { porDefecto: string }): Promise<FalloEnvio> {
+  const estado = (err as { response?: { status?: unknown } } | null | undefined)?.response?.status;
+  if (typeof estado === 'number' && estado >= 400 && estado < 500) {
+    return { tipo: 'rechazo', mensaje: await mensajeDeError(err, { porDefecto: opciones.porDefecto }) };
+  }
+  return { tipo: 'incierto', mensaje: MSG_ENVIO_INCIERTO };
+}

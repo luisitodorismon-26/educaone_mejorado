@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { StickyNote, Plus, X, Save, Pin, Edit3, Trash2, Search } from 'lucide-react';
+import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
+import { AvisoEnvio, ItemListaEnvio } from '../../components/AvisoEnvio';
 
 interface NotaPersonal {
   id: number; titulo: string; contenido: string; color: string;
@@ -34,8 +36,13 @@ export const NotasPage = () => {
     finally { setLoading(false); }
   };
 
+  // Fallo del último guardado (rechazo o resultado incierto), dentro del formulario.
+  const [falloEnvio, setFalloEnvio] = useState<FalloEnvio | null>(null);
+  useEffect(() => { setFalloEnvio(null); }, [showForm, editingId]);
+
   const guardar = async () => {
     if (!form.titulo.trim() && !form.contenido.trim()) return;
+    setFalloEnvio(null);
     try {
       if (editingId) {
         const res = await api.put(`/notas-personales/${editingId}`, form);
@@ -45,7 +52,20 @@ export const NotasPage = () => {
         setNotas([res.data, ...notas]);
       }
       setShowForm(false); setEditingId(null); setForm({ titulo: '', contenido: '', color: 'yellow' });
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      // Antes solo iba a la consola. El formulario y lo escrito se conservan.
+      setFalloEnvio(await clasificarFalloEnvio(e, { porDefecto: 'El servidor no aceptó la nota.' }));
+    }
+  };
+
+  // «Consultar lista»: SOLO lectura de las notas propias. No cierra ni borra.
+  const consultarNotas = async (): Promise<ItemListaEnvio[]> => {
+    const res = await api.get('/notas-personales');
+    const lista: NotaPersonal[] = Array.isArray(res.data) ? res.data : [];
+    setNotas(lista);
+    return [...lista]
+      .sort((a, b) => (b.fecha_actualizacion || '').localeCompare(a.fecha_actualizacion || ''))
+      .map(n => ({ id: n.id, texto: n.titulo || 'Sin título', detalle: new Date(n.fecha_actualizacion).toLocaleString('es-DO') }));
   };
 
   const eliminar = async (id: number) => {
@@ -138,6 +158,9 @@ export const NotasPage = () => {
                 <Save size={16} /> {editingId ? 'Actualizar' : 'Guardar'}
               </button>
             </div>
+          </div>
+          <div className="mt-3">
+            <AvisoEnvio fallo={falloEnvio} consultar={consultarNotas} descripcionLista="Mis notas" />
           </div>
         </div>
       )}

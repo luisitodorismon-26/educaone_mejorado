@@ -1,6 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
+import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
+import { AvisoEnvio, ItemListaEnvio } from '../../components/AvisoEnvio';
 import { Brain, AlertCircle, Eye, Clock, CheckCircle, MessageSquare } from 'lucide-react';
 import { Modal, Button, Select, Textarea, Alert, Spinner } from '../../components/ui';
 import { labelCurso } from '../../utils/labelCurso';
@@ -69,11 +71,26 @@ export const PsicologiaPage = () => {
     }
   };
 
+  // Doble envío: la ref corta en el mismo instante (un estado de React no se
+  // actualiza hasta el siguiente render, así que dos clics seguidos pasarían);
+  // `enviando` deshabilita además el botón. No evita duplicados por sí sola:
+  // eso exige protección en el backend.
+  const enviandoRef = useRef(false);
+  const [enviando, setEnviando] = useState(false);
+  const [falloEnvio, setFalloEnvio] = useState<FalloEnvio | null>(null);
+
+  // Abrir o cerrar el formulario empieza sin avisos del envío anterior.
+  useEffect(() => { setFalloEnvio(null); }, [showModal]);
+
   const handleSolicitar = async () => {
+    if (enviandoRef.current) return;
     if (!form.estudiante_id || !form.motivo) {
-      setMessage({ type: 'error', text: 'Complete todos los campos' });
+      setFalloEnvio({ tipo: 'rechazo', mensaje: 'Complete todos los campos' });
       return;
     }
+    enviandoRef.current = true;
+    setEnviando(true);
+    setFalloEnvio(null);
     try {
       await api.post('/psicologia/solicitar', form);
       loadData();
@@ -81,8 +98,27 @@ export const PsicologiaPage = () => {
       setForm({ estudiante_id: 0, tipo: 'emocional', urgencia: 'normal', motivo: '', curso_filter: '' });
       setMessage({ type: 'success', text: 'Solicitud enviada correctamente' });
     } catch (err: any) {
-      setMessage({ type: 'error', text: err.response?.data?.error || 'Error al enviar solicitud' });
+      // Rechazo (4xx) o resultado incierto. El modal y lo escrito se conservan.
+      setFalloEnvio(await clasificarFalloEnvio(err, { porDefecto: 'El servidor no aceptó la solicitud.' }));
+    } finally {
+      enviandoRef.current = false;
+      setEnviando(false);
     }
+  };
+
+  // «Consultar lista»: SOLO lectura de los casos visibles para esta persona.
+  // No cierra el formulario ni borra el texto; si falla, el aviso se mantiene.
+  const consultarCasos = async (): Promise<ItemListaEnvio[]> => {
+    const res = await api.get('/psicologia/casos');
+    const lista: Caso[] = Array.isArray(res.data) ? res.data : [];
+    setCasos(lista);
+    return [...lista]
+      .sort((a, b) => (b.fecha_solicitud || '').localeCompare(a.fecha_solicitud || ''))
+      .map(c => ({
+        id: c.id,
+        texto: `${c.estudiante} — ${c.tipo}`,
+        detalle: `${c.fecha_solicitud ? new Date(c.fecha_solicitud).toLocaleString('es-DO') : 'sin fecha'} · solicitó ${c.solicitante}`,
+      }));
   };
 
   const handleTomar = async (id: number) => {
@@ -289,7 +325,9 @@ export const PsicologiaPage = () => {
         footer={
           <>
             <Button variant="secondary" onClick={() => setShowModal(false)}>Cancelar</Button>
-            <Button onClick={handleSolicitar} className="bg-purple-600 hover:bg-purple-700">Solicitar</Button>
+            <Button onClick={handleSolicitar} disabled={enviando} loading={enviando} className="bg-purple-600 hover:bg-purple-700">
+              {enviando ? 'Enviando…' : 'Solicitar'}
+            </Button>
           </>
         }
       >
@@ -339,6 +377,7 @@ export const PsicologiaPage = () => {
             placeholder="Describa el motivo por el cual solicita atención psicológica para este estudiante..."
             rows={4}
           />
+          <AvisoEnvio fallo={falloEnvio} consultar={consultarCasos} descripcionLista="Solicitudes de atención" />
         </div>
       </Modal>
 
