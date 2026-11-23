@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
+import { mensajeDeErrorDescarga } from '../../utils/errorServidor';
 import { Award, Download, Search, Medal, Trophy } from 'lucide-react';
 import { Select, Button, Alert } from '../../components/ui';
 
@@ -80,7 +81,7 @@ export const CuadroHonorPage: React.FC = () => {
       document.body.appendChild(link); link.click(); link.remove();
       window.URL.revokeObjectURL(dlUrl);
     } catch (e: any) {
-      setError(e?.message || 'Error al descargar el PDF');
+      setError(await mensajeDeErrorDescarga(e, { porDefecto: 'Error al descargar el PDF' }));
     } finally {
       setDescargando(false);
     }
@@ -113,7 +114,7 @@ export const CuadroHonorPage: React.FC = () => {
         Reconocimientos del año{data ? ` ${data.ano_escolar}` : ''}: promedio general de las Calificaciones Finales (solo asignaturas con las 4 competencias completas).
       </p>
 
-      {error && <Alert variant="error" onClose={() => setError('')}>{error}</Alert>}
+      {error && <Alert variant="error" onClose={() => setError('')}><span className="whitespace-pre-line" data-error-descarga>{error}</span></Alert>}
 
       {data && (
         data.modo === 'proyeccion' ? (

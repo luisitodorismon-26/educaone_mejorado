@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
+import { mensajeDeError } from '../../utils/errorServidor';
 import {
   Building2, Plus, Edit3, RefreshCw, Users, GraduationCap,
   BookOpen, Search, X, Check, AlertTriangle, BarChart3, Power,
@@ -143,7 +144,7 @@ const ColegiosTab=()=>{
     }catch(e:any){setError(e.response?.data?.error||'Error');}
   };
   const impersonar=async(id:number)=>{try{const r=await api.post(`/superadmin/impersonar/${id}`);localStorage.setItem('superadmin_token',localStorage.getItem('token')||'');localStorage.setItem('superadmin_user',localStorage.getItem('user')||'');localStorage.setItem('token',r.data.token);localStorage.setItem('user',JSON.stringify(r.data.user));window.location.href='/dashboard';}catch(e:any){setError(e.response?.data?.error||'Error');}};
-  const exportCSV=async()=>{try{const r=await api.get('/superadmin/export/colegios',{responseType:'blob'});const url=URL.createObjectURL(new Blob([r.data]));const a=document.createElement('a');a.href=url;a.download='colegios_educaone.csv';a.click();}catch(e:any){setError('Error exportando');}};
+  const exportCSV=async()=>{try{const r=await api.get('/superadmin/export/colegios',{responseType:'blob'});const url=URL.createObjectURL(new Blob([r.data]));const a=document.createElement('a');a.href=url;a.download='colegios_educaone.csv';a.click();}catch(e:any){setError(await mensajeDeError(e,{porDefecto:'Error exportando'}));}};
   const filtered=colegios.filter(c=>{const m=c.nombre.toLowerCase().includes(search.toLowerCase())||c.codigo.toLowerCase().includes(search.toLowerCase());return m&&(sub==='activos'?c.activo:!c.activo);});
 
   return(

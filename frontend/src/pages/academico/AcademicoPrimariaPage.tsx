@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import api from '../../services/api';
+import { mensajeDeErrorDescarga } from '../../utils/errorServidor';
 import { BookOpen, Backpack, Download } from 'lucide-react';
 import { Button, Spinner, Alert } from '../../components/ui';
 import { useAuth } from '../../context/AuthContext';
@@ -56,7 +57,7 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
       link.remove();
       window.URL.revokeObjectURL(url);
     } catch (e: any) {
-      setMensaje(e?.response?.data?.error || 'Error al descargar los Informes de Aprendizaje');
+      setMensaje(await mensajeDeErrorDescarga(e, { porDefecto: 'Error al descargar los Informes de Aprendizaje' }));
     } finally {
       setDescargando(false);
     }
@@ -134,7 +135,7 @@ export const AcademicoPrimariaPage: React.FC<Props> = ({ cursoId, asignaturaId, 
         </div>
       </div>
 
-      {mensaje && <Alert variant="error" onClose={() => setMensaje(null)}>{mensaje}</Alert>}
+      {mensaje && <Alert variant="error" onClose={() => setMensaje(null)}><span className="whitespace-pre-line" data-error-descarga>{mensaje}</span></Alert>}
 
       {/* Selector de modo de carga: Por Período (predeterminado) / Por Competencia */}
       <div className="flex gap-2 bg-gray-100 p-1 rounded-lg w-fit">

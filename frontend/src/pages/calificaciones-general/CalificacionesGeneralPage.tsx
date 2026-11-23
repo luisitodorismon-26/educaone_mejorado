@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
+import { mensajeDeErrorDescarga } from '../../utils/errorServidor';
 import { FileBarChart, Download, Search, ChevronDown, ChevronUp, LayoutGrid, List, Users, User } from 'lucide-react';
 import { Select, Button, Alert } from '../../components/ui';
 import { labelCurso } from '../../utils/labelCurso';
@@ -113,7 +114,7 @@ export const CalificacionesGeneralPage = () => {
   const descargarPDF = async () => {
     if (!cursoId) return;
     try { await descargarBlob(`/calificaciones/por-periodo/pdf?curso_id=${cursoId}&periodo=${periodo}`, `Notas_P${periodo}_${nombreCurso()}.pdf`); }
-    catch (e: any) { setError(e.message || 'Error al descargar PDF'); }
+    catch (e: any) { setError(await mensajeDeErrorDescarga(e, { porDefecto: 'Error al descargar PDF' })); }
   };
 
   const descargarReportePadresCurso = async () => {
@@ -124,7 +125,7 @@ export const CalificacionesGeneralPage = () => {
         `/calificaciones-secundaria/reporte-padres/curso/${cursoId}/pdf?periodo=${periodo}`,
         `Reporte_Periodo${periodo}_Curso_${nombreCurso()}.pdf`
       );
-    } catch (e: any) { setError(e.message || 'Error al generar reporte'); }
+    } catch (e: any) { setError(await mensajeDeErrorDescarga(e, { porDefecto: 'Error al generar reporte' })); }
     finally { setDescargandoPadres(false); }
   };
 
@@ -135,7 +136,7 @@ export const CalificacionesGeneralPage = () => {
         `/calificaciones-secundaria/reporte-padres/curso/${cursoId}/pdf?periodo=${periodo}&estudiante_id=${estId}`,
         `Reporte_Periodo${periodo}_${nombre.replace(/\s+/g, '_')}.pdf`
       );
-    } catch (e: any) { setError(e.message || 'Error al generar reporte individual'); }
+    } catch (e: any) { setError(await mensajeDeErrorDescarga(e, { porDefecto: 'Error al generar reporte individual' })); }
   };
 
   const getColorNota = (nota: number | null) => {
@@ -183,7 +184,7 @@ export const CalificacionesGeneralPage = () => {
         <p className="text-gray-500 mt-1">Nota del período por asignatura. Vista resumen o desglose por competencia.</p>
       </div>
 
-      {error && <Alert variant="error" onClose={() => setError('')}>{error}</Alert>}
+      {error && <Alert variant="error" onClose={() => setError('')}><span className="whitespace-pre-line" data-error-descarga>{error}</span></Alert>}
 
       <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 w-fit">
         <button onClick={() => { setVista('pc'); setData(null); setCompData(null); }}

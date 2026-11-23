@@ -190,3 +190,14 @@ export async function mensajeDeError(err: unknown, opciones: OpcionesMensaje): P
   const cuerpo = await leerCuerpo(e.response.data);
   return mensajeDesdeRespuesta(e.response.status ?? 0, cuerpo, opciones);
 }
+
+/**
+ * Para descargas que, además de los errores HTTP, lanzan su PROPIO `Error` cuando
+ * un 200 no trae el archivo esperado. Los errores de la petición (axios) pasan por
+ * mensajeDeError; ese Error propio conserva su texto, como antes.
+ */
+export async function mensajeDeErrorDescarga(err: unknown, opciones: OpcionesMensaje): Promise<string> {
+  const e = err as { isAxiosError?: unknown; message?: unknown } | null | undefined;
+  if (e && e.isAxiosError === true) return mensajeDeError(err, opciones);
+  return typeof e?.message === 'string' && e.message.trim() ? e.message : opciones.porDefecto;
+}
