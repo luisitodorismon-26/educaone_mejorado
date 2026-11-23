@@ -3,7 +3,8 @@ import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { useRefrescoEnVivo } from '../../hooks/useRefrescoEnVivo';
 import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
-import { AvisoEnvio, ItemListaEnvio } from '../../components/AvisoEnvio';
+import { AvisoEnvio, ResultadoConsultaLista } from '../../components/AvisoEnvio';
+import { exigirLista } from '../../utils/consultaVigente';
 
 // El masivo se guarda en una sola transacción y notifica a cada destinatario
 // después: si se guardó, ya está en todas las bandejas y algunos pueden haber
@@ -270,24 +271,29 @@ export const ComunicacionPage = () => {
     }
   };
 
-  // «Consultar lista»: SOLO lectura. Actualiza la lista de la página y devuelve
-  // los más recientes para mostrarlos dentro del modal. No cierra ni borra nada;
-  // si la petición falla, el error sube y el aviso se mantiene.
+  // «Consultar lista»: SOLO lectura. No cierra ni borra nada. Una respuesta con
+  // formato inesperado LANZA (fallo de consulta, el aviso se mantiene); nunca se
+  // trata como lista vacía. La lista de la página se actualiza en `aplicar`, que
+  // AvisoEnvio solo ejecuta si la consulta sigue vigente.
   const porFechaDesc = <T extends { fecha: string }>(a: T, b: T) => (b.fecha || '').localeCompare(a.fecha || '');
 
-  const consultarComunicados = async (): Promise<ItemListaEnvio[]> => {
-    const res = await api.get('/comunicados');
-    const lista: Comunicado[] = Array.isArray(res.data) ? res.data : [];
-    setComunicados(lista);
-    return [...lista].sort(porFechaDesc).map(c => ({ id: c.id, texto: c.titulo, detalle: `${c.autor} · ${formatFecha(c.fecha)}` }));
+  const consultarComunicados = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/comunicados', { signal });
+    const lista = exigirLista<Comunicado>(res.data, ['id', 'titulo', 'fecha']);
+    return {
+      aplicar: () => setComunicados(lista),
+      items: [...lista].sort(porFechaDesc).map(c => ({ id: c.id, texto: c.titulo, detalle: `${c.autor} · ${formatFecha(c.fecha)}` })),
+    };
   };
 
-  const consultarEnviados = async (): Promise<ItemListaEnvio[]> => {
-    const res = await api.get('/mensajes');
-    const lista: Mensaje[] = Array.isArray(res.data) ? res.data : [];
-    setMensajes(lista);
-    return lista.filter(m => m.tipo === 'enviado').sort(porFechaDesc)
-      .map(m => ({ id: m.id, texto: `${m.asunto} → ${m.destinatario || ''}`, detalle: formatFecha(m.fecha) }));
+  const consultarEnviados = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/mensajes', { signal });
+    const lista = exigirLista<Mensaje>(res.data, ['id', 'asunto', 'fecha', 'tipo']);
+    return {
+      aplicar: () => setMensajes(lista),
+      items: lista.filter(m => m.tipo === 'enviado').sort(porFechaDesc)
+        .map(m => ({ id: m.id, texto: `${m.asunto} → ${m.destinatario || ''}`, detalle: formatFecha(m.fecha) })),
+    };
   };
 
   const eliminarComunicado = async (id: number) => {
@@ -859,6 +865,7 @@ export const ComunicacionPage = () => {
                 nota={notaFallo || undefined}
                 consultar={modalType === 'comunicado' || modalType === 'editarComunicado' ? consultarComunicados : consultarEnviados}
                 descripcionLista={modalType === 'comunicado' || modalType === 'editarComunicado' ? 'Comunicados publicados' : 'Mensajes enviados'}
+                contexto={`${modalType}:${selectedItem?.id ?? ''}`}
               />
             </div>
           </div>

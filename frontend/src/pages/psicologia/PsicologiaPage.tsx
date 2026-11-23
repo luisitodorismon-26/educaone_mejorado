@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
-import { AvisoEnvio, ItemListaEnvio } from '../../components/AvisoEnvio';
+import { AvisoEnvio, ResultadoConsultaLista } from '../../components/AvisoEnvio';
+import { exigirLista } from '../../utils/consultaVigente';
 import { Brain, AlertCircle, Eye, Clock, CheckCircle, MessageSquare } from 'lucide-react';
 import { Modal, Button, Select, Textarea, Alert, Spinner } from '../../components/ui';
 import { labelCurso } from '../../utils/labelCurso';
@@ -107,18 +108,22 @@ export const PsicologiaPage = () => {
   };
 
   // «Consultar lista»: SOLO lectura de los casos visibles para esta persona.
-  // No cierra el formulario ni borra el texto; si falla, el aviso se mantiene.
-  const consultarCasos = async (): Promise<ItemListaEnvio[]> => {
-    const res = await api.get('/psicologia/casos');
-    const lista: Caso[] = Array.isArray(res.data) ? res.data : [];
-    setCasos(lista);
-    return [...lista]
-      .sort((a, b) => (b.fecha_solicitud || '').localeCompare(a.fecha_solicitud || ''))
-      .map(c => ({
-        id: c.id,
-        texto: `${c.estudiante} — ${c.tipo}`,
-        detalle: `${c.fecha_solicitud ? new Date(c.fecha_solicitud).toLocaleString('es-DO') : 'sin fecha'} · solicitó ${c.solicitante}`,
-      }));
+  // No cierra el formulario ni borra el texto. Un formato inesperado LANZA (el
+  // aviso se mantiene); la lista de la página solo se actualiza en `aplicar`,
+  // que AvisoEnvio ejecuta si la consulta sigue vigente.
+  const consultarCasos = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/psicologia/casos', { signal });
+    const lista = exigirLista<Caso>(res.data, ['id', 'estudiante', 'tipo', 'fecha_solicitud', 'solicitante']);
+    return {
+      aplicar: () => setCasos(lista),
+      items: [...lista]
+        .sort((a, b) => (b.fecha_solicitud || '').localeCompare(a.fecha_solicitud || ''))
+        .map(c => ({
+          id: c.id,
+          texto: `${c.estudiante} — ${c.tipo}`,
+          detalle: `${c.fecha_solicitud ? new Date(c.fecha_solicitud).toLocaleString('es-DO') : 'sin fecha'} · solicitó ${c.solicitante}`,
+        })),
+    };
   };
 
   const handleTomar = async (id: number) => {

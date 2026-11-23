@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { StickyNote, Plus, X, Save, Pin, Edit3, Trash2, Search } from 'lucide-react';
 import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
-import { AvisoEnvio, ItemListaEnvio } from '../../components/AvisoEnvio';
+import { AvisoEnvio, ResultadoConsultaLista } from '../../components/AvisoEnvio';
+import { exigirLista } from '../../utils/consultaVigente';
 
 interface NotaPersonal {
   id: number; titulo: string; contenido: string; color: string;
@@ -59,13 +60,17 @@ export const NotasPage = () => {
   };
 
   // «Consultar lista»: SOLO lectura de las notas propias. No cierra ni borra.
-  const consultarNotas = async (): Promise<ItemListaEnvio[]> => {
-    const res = await api.get('/notas-personales');
-    const lista: NotaPersonal[] = Array.isArray(res.data) ? res.data : [];
-    setNotas(lista);
-    return [...lista]
-      .sort((a, b) => (b.fecha_actualizacion || '').localeCompare(a.fecha_actualizacion || ''))
-      .map(n => ({ id: n.id, texto: n.titulo || 'Sin título', detalle: new Date(n.fecha_actualizacion).toLocaleString('es-DO') }));
+  // Un formato inesperado LANZA (el aviso se mantiene); la lista de la página
+  // solo se actualiza en `aplicar`, si la consulta sigue vigente.
+  const consultarNotas = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/notas-personales', { signal });
+    const lista = exigirLista<NotaPersonal>(res.data, ['id', 'titulo', 'fecha_actualizacion']);
+    return {
+      aplicar: () => setNotas(lista),
+      items: [...lista]
+        .sort((a, b) => (b.fecha_actualizacion || '').localeCompare(a.fecha_actualizacion || ''))
+        .map(n => ({ id: n.id, texto: n.titulo || 'Sin título', detalle: new Date(n.fecha_actualizacion).toLocaleString('es-DO') })),
+    };
   };
 
   const eliminar = async (id: number) => {
@@ -160,7 +165,7 @@ export const NotasPage = () => {
             </div>
           </div>
           <div className="mt-3">
-            <AvisoEnvio fallo={falloEnvio} consultar={consultarNotas} descripcionLista="Mis notas" />
+            <AvisoEnvio fallo={falloEnvio} consultar={consultarNotas} descripcionLista="Mis notas" contexto={String(editingId ?? 'nueva')} />
           </div>
         </div>
       )}

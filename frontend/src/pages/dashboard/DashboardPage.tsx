@@ -14,7 +14,8 @@ import {
 import { colorPorNombreCurso } from '../../utils/colorPorCurso';
 import { labelCurso } from '../../utils/labelCurso';
 import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
-import { AvisoEnvio, ItemListaEnvio } from '../../components/AvisoEnvio';
+import { AvisoEnvio, ResultadoConsultaLista } from '../../components/AvisoEnvio';
+import { exigirLista } from '../../utils/consultaVigente';
 
 interface Stats {
   estudiantes: number; profesores: number; cursos: number;
@@ -966,13 +967,17 @@ const BlocDeNotas = ({ notas, setNotas }: { notas: NotaPersonal[]; setNotas: (n:
     }
   };
   // «Consultar lista»: SOLO lectura de las notas propias. No cierra ni borra.
-  const consultarNotas = async (): Promise<ItemListaEnvio[]> => {
-    const res = await api.get('/notas-personales');
-    const lista: NotaPersonal[] = Array.isArray(res.data) ? res.data : [];
-    setNotas(lista);
-    return [...lista]
-      .sort((a, b) => (b.fecha_actualizacion || '').localeCompare(a.fecha_actualizacion || ''))
-      .map(n => ({ id: n.id, texto: n.titulo || 'Sin título', detalle: new Date(n.fecha_actualizacion).toLocaleString('es-DO') }));
+  // Un formato inesperado LANZA (el aviso se mantiene); la lista de la página
+  // solo se actualiza en `aplicar`, si la consulta sigue vigente.
+  const consultarNotas = async (signal: AbortSignal): Promise<ResultadoConsultaLista> => {
+    const res = await api.get('/notas-personales', { signal });
+    const lista = exigirLista<NotaPersonal>(res.data, ['id', 'titulo', 'fecha_actualizacion']);
+    return {
+      aplicar: () => setNotas(lista),
+      items: [...lista]
+        .sort((a, b) => (b.fecha_actualizacion || '').localeCompare(a.fecha_actualizacion || ''))
+        .map(n => ({ id: n.id, texto: n.titulo || 'Sin título', detalle: new Date(n.fecha_actualizacion).toLocaleString('es-DO') })),
+    };
   };
   const eliminar = async (id: number) => { try { await api.delete(`/notas-personales/${id}`); setNotas(notas.filter(n => n.id !== id)); } catch (e) {} };
   const fijar = async (nota: NotaPersonal) => {
@@ -998,7 +1003,7 @@ const BlocDeNotas = ({ notas, setNotas }: { notas: NotaPersonal[]; setNotas: (n:
             <button onClick={guardar} className="flex items-center gap-1 px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700"><Save size={16} /> {editingId ? 'Actualizar' : 'Guardar'}</button>
           </div>
           <div className="mt-3">
-            <AvisoEnvio fallo={falloEnvio} consultar={consultarNotas} descripcionLista="Mis notas" />
+            <AvisoEnvio fallo={falloEnvio} consultar={consultarNotas} descripcionLista="Mis notas" contexto={String(editingId ?? 'nueva')} />
           </div>
         </div>
       )}

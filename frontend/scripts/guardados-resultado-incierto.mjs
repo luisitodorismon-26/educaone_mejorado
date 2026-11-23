@@ -77,6 +77,9 @@ const PERMITIDOS = new Set([
   'frontend/src/pages/notas/NotasPage.tsx',
   'frontend/src/pages/dashboard/DashboardPage.tsx',
   'frontend/scripts/guardados-resultado-incierto.mjs',
+  // corrección de auditoría: vigencia de «Consultar lista» y formato de la respuesta
+  'frontend/src/utils/consultaVigente.ts',
+  'frontend/scripts/aviso-envio-consultas.mjs',
 ]);
 // Cambios de la rama: confirmados + sin confirmar + nuevos sin seguimiento dentro de frontend/src.
 const cambiados = [...new Set([
