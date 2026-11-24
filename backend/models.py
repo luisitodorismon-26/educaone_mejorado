@@ -1897,6 +1897,24 @@ class Comunicado(Base):
     para_psicologia = Column(Boolean, default=True)
     activo = Column(Boolean, default=True)
 
+    # === COM-DUP-1 · IDEMPOTENCIA DE LA CREACIÓN ===
+    # Mismo patrón que REP-DUP-1 (reportes de conducta). El formulario genera una
+    # clave por intento de publicación y la conserva al reintentarlo (p. ej. si
+    # se perdió la respuesta). El índice único parcial
+    # uq_comunicado_autor_client_request (colegio + autor + clave) admite UN solo
+    # comunicado por clave, aunque lleguen dos peticiones a la vez. La huella
+    # (SHA-256 del contenido) distingue un reintento de una clave reutilizada con
+    # otro contenido. NULL en todos los comunicados anteriores y en clientes que
+    # no la envían (quedan fuera del índice).
+    client_request_id = Column(String(64), nullable=True)
+    client_request_hash = Column(String(64), nullable=True)
+
+    __table_args__ = (
+        Index('uq_comunicado_autor_client_request', 'colegio_id', 'autor_id', 'client_request_id',
+              unique=True, postgresql_where=text('client_request_id IS NOT NULL'),
+              sqlite_where=text('client_request_id IS NOT NULL')),
+    )
+
     autor = relationship('Usuario', backref='comunicados')
 
 class ComunicadoLeido(Base):

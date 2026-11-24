@@ -68,6 +68,14 @@ for (const [nombre, err] of [
   await prueba(`${nombre}: incierto`, async () => igual(await clasificarFalloEnvio(err, OP), { tipo: 'incierto', mensaje: INCIERTO }));
 }
 
+// Las comprobaciones de ALCANCE miden el diff de ESTA entrega (#78) contra la
+// base de la que partió (main 0844c2e). Una vez integrada, otras ramas
+// cambian legítimamente estos u otros archivos, así que solo se aplican
+// mientras HEAD parte de esa base. Las de comportamiento se aplican siempre.
+const BASE_ENTREGA = '0844c2e6c58e511cd4bf23004945a147df8a3395';
+const EN_RAMA_DE_LA_ENTREGA = git('merge-base HEAD origin/main').trim() === BASE_ENTREGA;
+const omitida = (nombre) => console.log(`  \x1b[90mOMITIDA\x1b[0m ${nombre} (alcance de #78, ya integrada en main)`);
+
 console.log('\nAlcance frente a main');
 const PERMITIDOS = new Set([
   'frontend/src/utils/errorServidor.ts',
@@ -87,10 +95,12 @@ const cambiados = [...new Set([
   ...git('diff --name-only').split('\n'),
   ...git('ls-files --others --exclude-standard -- src scripts').split('\n').map((f) => f && 'frontend/' + f),
 ].filter(Boolean))].sort();
-await prueba('solo cambian los archivos previstos', () => {
-  const fuera = cambiados.filter((f) => !PERMITIDOS.has(f));
-  if (fuera.length) throw new Error('cambios fuera del alcance: ' + fuera.join(', '));
-});
+if (EN_RAMA_DE_LA_ENTREGA) {
+  await prueba('solo cambian los archivos previstos', () => {
+    const fuera = cambiados.filter((f) => !PERMITIDOS.has(f));
+    if (fuera.length) throw new Error('cambios fuera del alcance: ' + fuera.join(', '));
+  });
+} else omitida('solo cambian los archivos previstos');
 for (const [nombre, patron] of [
   ['notas académicas', /^frontend\/src\/pages\/academico\//],
   ['asistencia', /^frontend\/src\/pages\/asistencia\//],
@@ -99,16 +109,23 @@ for (const [nombre, patron] of [
   ['backend', /^backend\//],
   ['rutas y permisos (Router.tsx)', /^frontend\/src\/Router\.tsx$/],
 ]) {
-  await prueba(`sin cambios en ${nombre}`, () => igual(cambiados.filter((f) => patron.test(f)), []));
+  if (EN_RAMA_DE_LA_ENTREGA) await prueba(`sin cambios en ${nombre}`, () => igual(cambiados.filter((f) => patron.test(f)), []));
+  else omitida(`sin cambios en ${nombre}`);
 }
 
 console.log('\nSin envíos ni reintentos automáticos');
 const lineasNuevas = (rel) => git(`diff origin/main -- src/${rel}`).split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).join('\n');
 for (const rel of ['pages/comunicacion/ComunicacionPage.tsx', 'pages/psicologia/PsicologiaPage.tsx', 'pages/notas/NotasPage.tsx', 'pages/dashboard/DashboardPage.tsx', 'utils/errorServidor.ts']) {
-  await prueba(`${rel}: las líneas nuevas no envían (sin api.post/put/delete ni setTimeout de reenvío)`, () => {
-    const n = lineasNuevas(rel);
-    if (/api\.(post|put|patch|delete)\(/.test(n)) throw new Error('línea nueva con escritura');
-    if (/setTimeout\([^)]*(guardar|enviar|solicitar|publicar|handle)/i.test(n)) throw new Error('posible reintento temporizado');
+  if (EN_RAMA_DE_LA_ENTREGA) {
+    await prueba(`${rel}: las líneas nuevas no envían (sin api.post/put/delete ni setTimeout de reenvío)`, () => {
+      const n = lineasNuevas(rel);
+      if (/api\.(post|put|patch|delete)\(/.test(n)) throw new Error('línea nueva con escritura');
+      if (/setTimeout\([^)]*(guardar|enviar|solicitar|publicar|handle)/i.test(n)) throw new Error('posible reintento temporizado');
+    });
+  } else omitida(`${rel}: las líneas nuevas no envían`);
+  // Comportamiento (siempre): ningún envío programado con setTimeout (reenvío automático).
+  await prueba(`${rel}: sin reenvíos automáticos (ningún POST/PUT/DELETE dentro de setTimeout)`, () => {
+    if (/setTimeout\([^;]*api\.(post|put|patch|delete)\(/s.test(rama(rel))) throw new Error('posible reenvío temporizado');
   });
 }
 await prueba('AvisoEnvio no importa la API: «Consultar lista» solo llama a la lectura que recibe', () => {
@@ -133,8 +150,13 @@ await prueba('Psicología: corte inmediato en el manejador (ref) antes de valida
 await prueba('Psicología: botón deshabilitado mientras se envía', () => contiene(PSI, 'disabled={enviando} loading={enviando}'));
 const COM = rama('pages/comunicacion/ComunicacionPage.tsx');
 await prueba('Comunicación: con el modal abierto el error no se pinta detrás del velo', () => contiene(COM, '{error && !showModal && ('));
-await prueba('Comunicación: los 3 manejadores (mensaje individual y masivo, respuesta, comunicado) clasifican el fallo',
-  () => igual((COM.match(/clasificarFalloEnvio\(err,/g) || []).length, 3));
+await prueba('Comunicación: cada envío (mensaje individual y masivo, respuesta, comunicado) clasifica el fallo', () => {
+  // Desde COM-DUP-1, crear (publicarComunicado) y editar (guardarComunicado) son manejadores separados.
+  const cuerpo = (ini) => { const i = COM.indexOf(ini); return i < 0 ? '' : COM.slice(i, COM.indexOf('\n  };', i)); };
+  const manejadores = ['const enviarMensaje = async', 'const responderMensaje = async', 'const guardarComunicado = async']
+    .concat(COM.includes('const publicarComunicado = async') ? ['const publicarComunicado = async'] : []);
+  for (const m of manejadores) contiene(cuerpo(m), 'clasificarFalloEnvio(err,');
+});
 await prueba('Comunicación: el masivo añade la nota de destinatarios', () => contiene(COM, "setNotaFallo(modoIndividual ? '' : NOTA_MASIVO);"));
 for (const rel of ['pages/notas/NotasPage.tsx', 'pages/dashboard/DashboardPage.tsx']) {
   await prueba(`${rel}: el error ya no se queda solo en la consola`, () => {

@@ -1,10 +1,19 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { useRefrescoEnVivo } from '../../hooks/useRefrescoEnVivo';
-import { clasificarFalloEnvio, FalloEnvio } from '../../utils/errorServidor';
+import { clasificarFalloEnvio, FalloEnvio, MSG_ENVIO_INCIERTO } from '../../utils/errorServidor';
 import { AvisoEnvio, ResultadoConsultaLista } from '../../components/AvisoEnvio';
 import { exigirLista } from '../../utils/consultaVigente';
+import {
+  ContenidoComunicado, EnvioPendiente, ReferenciaAnotada, ResultadoEnvio,
+  anotarReferencia, decidirEnvio, huellaContenido, nuevaClaveEnvio, trasRespuesta,
+} from '../../utils/envioComunicado';
+
+// COM-DUP-1 · textos del envío pendiente al CREAR un comunicado.
+const NOTA_REINTENTO_COMUNICADO =
+  'Si vuelve a pulsar Publicar sin cambiar el texto, el sistema reconocerá este envío y no lo duplicará. ' +
+  'Si recarga la página, esa referencia se pierde: compruebe la lista antes de volver a publicar.';
 
 // El masivo se guarda en una sola transacción y notifica a cada destinatario
 // después: si se guardó, ya está en todas las bandejas y algunos pueden haber
@@ -69,6 +78,17 @@ export const ComunicacionPage = () => {
   const [falloEnvio, setFalloEnvio] = useState<FalloEnvio | null>(null);
   const [notaFallo, setNotaFallo] = useState('');
 
+  // COM-DUP-1 · envío de un comunicado NUEVO cuyo resultado no está confirmado.
+  // Vive en la página (sobrevive a cerrar y reabrir el modal, D1) y se pierde al
+  // recargar. La ref refleja el valor al instante (el estado llega en el render).
+  const [envioPendiente, setEnvioPendienteEstado] = useState<EnvioPendiente | null>(null);
+  const envioPendienteRef = useRef<EnvioPendiente | null>(null);
+  const setEnvioPendiente = (p: EnvioPendiente | null) => { envioPendienteRef.current = p; setEnvioPendienteEstado(p); };
+  const [anotadas, setAnotadas] = useState<ReferenciaAnotada[]>([]);
+  const [pidiendoDecision, setPidiendoDecision] = useState(false);
+  const [reintentoRechazado, setReintentoRechazado] = useState(false);
+  const enviandoComunicadoRef = useRef(false);
+
   // Form mensaje
   const [tipoDestinatario, setTipoDestinatario] = useState<'individual' | 'rol'>('individual');
   const [destinatarioId, setDestinatarioId] = useState<number>(0);
@@ -106,7 +126,27 @@ export const ComunicacionPage = () => {
     setFalloEnvio(null);
     setNotaFallo('');
     setError('');
+    setPidiendoDecision(false);
+    setReintentoRechazado(false);
   }, [showModal, modalType]);
+
+  // Aviso del envío pendiente (memorizado: AvisoEnvio reinicia su consulta si
+  // cambia el objeto `fallo`, y no debe hacerlo en cada render).
+  const avisoPendiente = useMemo<FalloEnvio | null>(() => {
+    const p = envioPendiente;
+    if (!p) return null;
+    const ref = `«${p.contenido.titulo}» (enviado a las ${p.hora})`;
+    if (p.estado === 'conflicto') {
+      return { tipo: 'incierto', mensaje: `Este envío no se publicó. La referencia del envío ${ref} ya corresponde a un comunicado con OTRO contenido, posiblemente un envío anterior que sí se publicó.` };
+    }
+    if (pidiendoDecision) {
+      return { tipo: 'incierto', mensaje: `Hay un envío anterior sin confirmar: ${ref}. Podría estar publicado. Ha cambiado el contenido: si publica ahora, se creará un comunicado nuevo y, si el anterior se publicó, habrá dos.` };
+    }
+    if (reintentoRechazado) {
+      return { tipo: 'incierto', mensaje: `El reintento fue rechazado, pero el resultado del envío anterior ${ref} sigue pendiente de comprobar: puede haberse publicado. Consulte la lista antes de volver a intentarlo.` };
+    }
+    return { tipo: 'incierto', mensaje: `${MSG_ENVIO_INCIERTO} Envío pendiente: ${ref}.` };
+  }, [envioPendiente, pidiendoDecision, reintentoRechazado]);
 
   // v2.19.3-C: con /comunicacion abierta, un mensaje entrante aparece solo.
   // Antes esta pantalla solo consultaba al montar, así que el mensaje era
@@ -246,20 +286,19 @@ export const ComunicacionPage = () => {
       setError('Título y contenido son requeridos');
       return;
     }
+    // Crear tiene su propio flujo con clave de envío (COM-DUP-1). Editar, el de siempre.
+    if (!(modalType === 'editarComunicado' && selectedItem)) {
+      await publicarComunicado(false);
+      return;
+    }
 
     setSaving(true);
     setError('');
     setFalloEnvio(null);
 
     try {
-      if (modalType === 'editarComunicado' && selectedItem) {
-        await api.put(`/comunicados/${selectedItem.id}`, { titulo, contenido, imagen, tipo: alcance });
-        setSuccess('Comunicado actualizado');
-      } else {
-        await api.post('/comunicados', { titulo, contenido, imagen, tipo: alcance });
-        setSuccess('Comunicado publicado');
-      }
-      
+      await api.put(`/comunicados/${selectedItem.id}`, { titulo, contenido, imagen, tipo: alcance });
+      setSuccess('Comunicado actualizado');
       setShowModal(false);
       resetForm();
       cargarDatos();
@@ -269,6 +308,107 @@ export const ComunicacionPage = () => {
     } finally {
       setSaving(false);
     }
+  };
+
+  // ── COM-DUP-1 · publicar un comunicado NUEVO con clave de envío ──────────────
+  // `comoNuevo`: la persona eligió expresamente publicar algo nuevo aunque haya un
+  // envío anterior sin confirmar; esa referencia se ANOTA (no se borra en silencio).
+  const publicarComunicado = async (comoNuevo: boolean) => {
+    if (enviandoComunicadoRef.current) return;          // doble clic: corte inmediato
+    if (!titulo.trim() || !contenido.trim()) {
+      setError('Título y contenido son requeridos');
+      return;
+    }
+    const actual: ContenidoComunicado = { titulo, contenido, alcance, imagen };
+    let antes = envioPendienteRef.current;
+    if (comoNuevo && antes) {
+      setAnotadas((a) => anotarReferencia(a, antes!));
+      setEnvioPendiente(null);
+      antes = null;
+    }
+    const decision = decidirEnvio(antes, actual, nuevaClaveEnvio);
+    if (decision.accion === 'decidir') {               // sin decisión explícita no se envía nada
+      setPidiendoDecision(true);
+      return;
+    }
+    const enviado = {
+      clave: decision.clave, huella: huellaContenido(actual), contenido: actual,
+      hora: new Date().toLocaleTimeString('es-DO', { hour: '2-digit', minute: '2-digit' }),
+    };
+    enviandoComunicadoRef.current = true;
+    setSaving(true);
+    setError('');
+    setFalloEnvio(null);
+    setPidiendoDecision(false);
+    setReintentoRechazado(false);
+    try {
+      const res = await api.post('/comunicados', {
+        titulo, contenido, imagen, tipo: alcance, client_request_id: decision.clave,
+      });
+      setEnvioPendiente(trasRespuesta(antes, enviado, 'confirmado').pendiente);
+      setSuccess(res.status === 200 && res.data?.reintento
+        ? 'El comunicado ya estaba publicado; no se publicó de nuevo.'
+        : 'Comunicado publicado');
+      setShowModal(false);
+      resetForm();
+      cargarDatos();
+      setTimeout(() => setSuccess(''), 4000);
+    } catch (err: any) {
+      const estado = err?.response?.status;
+      const datos = err?.response?.data;
+      let resultado: ResultadoEnvio;
+      let fallo: FalloEnvio | null = null;
+      if (estado === 409 && datos && typeof datos === 'object' && datos.motivo === 'clave_con_otro_contenido') {
+        resultado = 'conflicto';
+      } else {
+        fallo = await clasificarFalloEnvio(err, { porDefecto: 'El servidor no aceptó el comunicado.' });
+        resultado = fallo.tipo === 'rechazo' ? 'rechazo' : 'incierto';
+      }
+      const t = trasRespuesta(antes, enviado, resultado);
+      setEnvioPendiente(t.pendiente);
+      setReintentoRechazado(t.reintentoRechazado);
+      if (resultado === 'rechazo' && fallo) {
+        // Un reintento rechazado no dice nada del envío anterior: sigue pendiente.
+        setFalloEnvio({
+          tipo: 'rechazo',
+          mensaje: t.reintentoRechazado ? `El reintento fue rechazado: ${fallo.mensaje}` : fallo.mensaje,
+        });
+      }
+    } finally {
+      enviandoComunicadoRef.current = false;
+      setSaving(false);
+    }
+  };
+
+  const volverAlContenidoAnterior = () => {
+    const p = envioPendienteRef.current;
+    if (!p) return;
+    setTitulo(p.contenido.titulo);
+    setContenido(p.contenido.contenido);
+    setAlcance(p.contenido.alcance as Alcance);
+    setImagen(p.contenido.imagen);
+    setPidiendoDecision(false);
+    setFalloEnvio(null);
+  };
+
+  const publicarComoNuevo = () => {
+    const p = envioPendienteRef.current;
+    const aviso = p
+      ? `El envío anterior («${p.contenido.titulo}», ${p.hora}) podría estar publicado. ` +
+        'Si lo está, habrá dos comunicados. ¿Publicar este como un comunicado nuevo?'
+      : '¿Publicar este como un comunicado nuevo?';
+    if (!confirm(aviso)) return;
+    publicarComunicado(true);
+  };
+
+  const descartarReferencia = () => {
+    const p = envioPendienteRef.current;
+    if (!p) return;
+    if (!confirm(`¿Ya comprobó en la lista si «${p.contenido.titulo}» (${p.hora}) se publicó? ` +
+      'Se olvidará esta referencia y un nuevo envío no podrá reconocerse como su reintento.')) return;
+    setEnvioPendiente(null);
+    setPidiendoDecision(false);
+    setFalloEnvio(null);
   };
 
   // «Consultar lista»: SOLO lectura. No cierra ni borra nada. Una respuesta con
@@ -800,6 +940,7 @@ export const ComunicacionPage = () => {
                     onChange={e => setTitulo(e.target.value)}
                     placeholder="Título del comunicado"
                     className="w-full px-3 py-2 border rounded-lg"
+                    disabled={saving}
                   />
                   <div>
                     <label className="block text-sm font-medium mb-1">Dirigido a</label>
@@ -807,6 +948,7 @@ export const ComunicacionPage = () => {
                       value={alcance}
                       onChange={e => setAlcance(e.target.value as Alcance)}
                       className="w-full px-3 py-2 border rounded-lg"
+                      disabled={saving}
                     >
                       {alcancesPermitidos.map(a => (
                         <option key={a} value={a}>{ETIQUETA_ALCANCE[a]}</option>
@@ -819,6 +961,7 @@ export const ComunicacionPage = () => {
                     placeholder="Contenido del comunicado..."
                     className="w-full px-3 py-2 border rounded-lg"
                     rows={5}
+                    disabled={saving}
                   />
                   
                   {/* Subir imagen */}
@@ -829,12 +972,14 @@ export const ComunicacionPage = () => {
                       accept="image/*"
                       onChange={handleImageUpload}
                       className="w-full px-3 py-2 border rounded-lg"
+                      disabled={saving}
                     />
                     {imagen && (
                       <div className="mt-2 relative">
                         <img src={imagen} alt="Preview" className="max-h-32 rounded-lg" />
                         <button
                           onClick={() => setImagen('')}
+                          disabled={saving}
                           className="absolute top-1 right-1 bg-red-500 text-white rounded-full w-6 h-6"
                         >
                           ×
@@ -842,6 +987,53 @@ export const ComunicacionPage = () => {
                       </div>
                     )}
                   </div>
+
+                  {/* COM-DUP-1 · envío sin confirmar (solo al CREAR): nunca se publica algo
+                      nuevo en silencio mientras el anterior podría estar publicado. */}
+                  {modalType === 'comunicado' && envioPendiente && avisoPendiente && (
+                    <div className="space-y-2" data-envio-pendiente={envioPendiente.estado}
+                      data-pidiendo-decision={pidiendoDecision ? 'si' : 'no'}>
+                      <AvisoEnvio
+                        fallo={avisoPendiente}
+                        nota={envioPendiente.estado === 'incierto' && !pidiendoDecision && !reintentoRechazado
+                          ? NOTA_REINTENTO_COMUNICADO : undefined}
+                        consultar={consultarComunicados}
+                        descripcionLista="Comunicados publicados"
+                        contexto={`pendiente:${envioPendiente.clave}:${envioPendiente.estado}`}
+                      />
+                      <div className="flex flex-wrap gap-2 text-sm">
+                        <button type="button" data-accion="volver" onClick={volverAlContenidoAnterior} disabled={saving}
+                          className="px-3 py-1.5 bg-white border rounded-lg hover:bg-gray-50 disabled:opacity-50">
+                          Volver al contenido anterior
+                        </button>
+                        <button type="button" data-accion="nuevo" onClick={publicarComoNuevo} disabled={saving}
+                          className="px-3 py-1.5 bg-white border border-purple-300 text-purple-800 rounded-lg hover:bg-purple-50 disabled:opacity-50">
+                          Publicar como comunicado nuevo
+                        </button>
+                        <button type="button" data-accion="descartar" onClick={descartarReferencia} disabled={saving}
+                          className="px-3 py-1.5 bg-white border rounded-lg hover:bg-gray-50 disabled:opacity-50">
+                          Ya lo revisé: descartar la referencia
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {modalType === 'comunicado' && anotadas.length > 0 && (
+                    <div className="p-3 bg-amber-50 border border-amber-300 text-amber-900 rounded-lg text-sm space-y-1"
+                      data-referencias-anotadas>
+                      <p>Envíos anteriores sin confirmar en esta página (pueden estar publicados; consulte la lista):</p>
+                      <ul className="list-disc pl-5">
+                        {anotadas.map(a => (
+                          <li key={a.clave}>
+                            «{a.titulo}» ({a.hora}{a.estado === 'conflicto' ? ', en conflicto' : ''}){' '}
+                            <button type="button" className="underline" onClick={() => {
+                              if (confirm(`¿Ya comprobó en la lista si «${a.titulo}» (${a.hora}) se publicó?`))
+                                setAnotadas(x => x.filter(y => y.clave !== a.clave));
+                            }}>Ya lo revisé</button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
 
                   <button
                     onClick={guardarComunicado}
