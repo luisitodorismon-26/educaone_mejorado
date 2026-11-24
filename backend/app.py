@@ -488,6 +488,23 @@ async def lifespan(app):
                             logger.warning(f"No se pudo agregar reportes_conducta.{col_name}: {e}")
                             raise
 
+        # === 6a-ter. COM-DUP-1: idempotencia de la creación de comunicados ===
+        # Aditivo: dos columnas NULL, sin DEFAULT ni backfill. Los comunicados
+        # existentes quedan intactos (NULL = sin clave, fuera del índice). La
+        # verificación post-migración exige que existan, así que no es opcional.
+        if 'comunicados' in inspector.get_table_names():
+            com_cols = {c['name'] for c in inspect(engine).get_columns('comunicados')}
+            for col_name in ('client_request_id', 'client_request_hash'):
+                if col_name not in com_cols:
+                    with engine.connect() as conn:
+                        try:
+                            conn.execute(text(f'ALTER TABLE comunicados ADD COLUMN {col_name} VARCHAR(64)'))
+                            conn.commit()
+                            logger.info(f"✅ Migración: columna {col_name} agregada a comunicados")
+                        except Exception as e:
+                            logger.warning(f"No se pudo agregar comunicados.{col_name}: {e}")
+                            raise
+
         # === 6a-bis. Asignatura del reporte de conducta ===
         # Aditivo: dos columnas NULL, sin DEFAULT ni backfill. Los reportes
         # existentes quedan sin asignatura (no se deduce de las asignaciones).
@@ -1113,6 +1130,17 @@ async def lifespan(app):
                 "ON reportes_conducta (colegio_id, reportado_por, client_request_id) "
                 "WHERE client_request_id IS NOT NULL"
             ),
+            (
+                'uq_comunicado_autor_client_request',
+                # COM-DUP-1: un solo comunicado por intento de publicación
+                # (colegio + autor + clave). Barrera de la concurrencia: de dos
+                # peticiones simultáneas con la misma clave solo una inserta.
+                # Los comunicados existentes tienen la clave NULL y quedan fuera
+                # del predicado: el índice no puede fallar por ellos.
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_comunicado_autor_client_request "
+                "ON comunicados (colegio_id, autor_id, client_request_id) "
+                "WHERE client_request_id IS NOT NULL"
+            ),
         ]
         # Si alguno falla por datos duplicados, NO ocultamos el error: es más
         # seguro abortar el nuevo deploy y sanear los datos que seguir operando
@@ -1182,6 +1210,7 @@ async def lifespan(app):
             'push_subscriptions': {'uq_push_subscription_endpoint'},
             'eval_interna_estudiante': {'uq_eval_interna_identidad'},
             'reportes_conducta': {'uq_reporte_autor_client_request'},
+            'comunicados': {'uq_comunicado_autor_client_request'},
         }
         for tabla_nombre, requeridos in indices_requeridos.items():
             existentes = {idx.get('name') for idx in inspector_final.get_indexes(tabla_nombre)}
@@ -16251,9 +16280,71 @@ async def get_comunicados(request: Request, db: Session = Depends(get_db), curre
         'leido_por_mi': c.id in leidos_ids
     } for c in comunicados]
 
+# ── COM-DUP-1 · creación de comunicados: idempotente y atómica ──────────────
+# Mismo patrón que REP-DUP-1 (reportes). Además, el comunicado, TODAS sus
+# notificaciones y la auditoría CREAR_COMUNICADO se guardan en UNA sola
+# transacción: o queda todo, o no queda nada. Por eso un reintento que encuentra
+# el comunicado no necesita notificar ni auditar de nuevo.
+
+def _huella_comunicado(titulo, contenido, alcance, para_profesores, para_coordinadores,
+                       para_psicologia, imagen):
+    """SHA-256 del contenido tal como se guarda: distingue un reintento del mismo
+    envío de una clave reutilizada con otro contenido. La imagen entra por su
+    propio SHA-256 (puede ser un data URL grande)."""
+    import hashlib
+    import json as _j
+    img = hashlib.sha256((imagen or '').encode('utf-8')).hexdigest()
+    base = _j.dumps([titulo, contenido, alcance, bool(para_profesores), bool(para_coordinadores),
+                     bool(para_psicologia), img], ensure_ascii=False)
+    return hashlib.sha256(base.encode('utf-8')).hexdigest()
+
+
+def _nuevo_comunicado(current_user, campos, clave, huella):
+    """Construye el comunicado. Se llama DESPUÉS de la consulta previa por clave
+    y ANTES del insert (punto de encuentro de las pruebas de carrera)."""
+    return Comunicado(autor_id=current_user.id, colegio_id=current_user.colegio_id,
+                      client_request_id=clave, client_request_hash=huella, **campos)
+
+
+def _destinatarios_comunicado(db, colegio_id, comunicado, alcance):
+    """Los MISMOS destinatarios de siempre: roles marcados × quienes pueden ver
+    el alcance (COM1). Sin repetidos, en orden estable."""
+    roles_dest = []
+    if comunicado.para_profesores: roles_dest.append('profesor')
+    if comunicado.para_coordinadores: roles_dest.append('coordinador')
+    if comunicado.para_psicologia: roles_dest.append('psicologia')
+    nivel = None if alcance == 'general' else alcance
+    salida = []
+    for role in roles_dest:
+        for uid in usuarios_autorizados_para_nivel(db, colegio_id, role, nivel):
+            if uid not in salida:
+                salida.append(uid)
+    return salida
+
+
+def _notificaciones_comunicado_estrictas(db, comunicado, destinatarios, evento_key):
+    """Crea las notificaciones del comunicado SIN capturar errores (a diferencia de
+    notify(), que nunca propaga). Mismo título, mensaje, tipo y enlace de siempre;
+    añade evento_key (índice único usuario + evento: segunda barrera)."""
+    for uid in destinatarios:
+        db.add(Notificacion(usuario_id=uid, colegio_id=comunicado.colegio_id,
+                            titulo=f'📢 {comunicado.titulo}', mensaje=comunicado.contenido[:100],
+                            tipo='comunicado', link='/comunicacion', evento_key=evento_key))
+
+
+def _respuesta_comunicado_existente(existente, huella):
+    """Reintento de un envío ya guardado: solo id y confirmación, sin notificar
+    ni auditar de nuevo. La misma clave con OTRO contenido: 409, nada se crea."""
+    if existente.client_request_hash != huella:
+        return JSONResponse({'error': 'Esta referencia de envío ya se usó con otro contenido.',
+                             'motivo': 'clave_con_otro_contenido'}, status_code=409)
+    return JSONResponse({'message': 'Comunicado ya publicado', 'id': existente.id, 'reintento': True},
+                        status_code=200)
+
+
 @app.post("/api/comunicados")
 async def crear_comunicado(request: Request, db: Session = Depends(get_db), current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'psicologia'))):
-    """Crear un nuevo comunicado"""
+    """Crear un nuevo comunicado (idempotente con `client_request_id`; atómico siempre)."""
     data = await request.json()
     # COM1 · alcance pedido (Dirección y Coordinación publican los tres).
     alcance, _err = _alcance_pedido(data)
@@ -16263,36 +16354,62 @@ async def crear_comunicado(request: Request, db: Session = Depends(get_db), curr
     if current_user.role == 'psicologia' and alcance not in _alcances_psicologia(current_user):
         return JSONResponse({'error': 'No puede publicar comunicados para ese alcance.'}, status_code=403)
 
-    comunicado = Comunicado(
-        autor_id=current_user.id,
-        colegio_id=current_user.colegio_id,
+    campos = dict(
         titulo=data['titulo'],
         contenido=data['contenido'],
         imagen=data.get('imagen'),
         tipo=alcance,
         para_profesores=data.get('para_profesores', True),
         para_coordinadores=data.get('para_coordinadores', True),
-        para_psicologia=data.get('para_psicologia', True)
+        para_psicologia=data.get('para_psicologia', True),
     )
-    db.add(comunicado)
-    db.commit()
-    
-    # Notificar a todos los destinatarios
-    roles_dest = []
-    if comunicado.para_profesores: roles_dest.append('profesor')
-    if comunicado.para_coordinadores: roles_dest.append('coordinador')
-    if comunicado.para_psicologia: roles_dest.append('psicologia')
-    # COM1 · mismos roles de siempre, pero solo quien puede VER este alcance:
-    # un comunicado de Primaria no notifica a quien está fijo en Secundaria.
-    nivel = None if alcance == 'general' else alcance
-    for role in roles_dest:
-        for uid in usuarios_autorizados_para_nivel(db, current_user.colegio_id, role, nivel):
-            crear_notificacion(db, uid, f'📢 {comunicado.titulo}', comunicado.contenido[:100],
-                               'comunicado', '/comunicacion', current_user.colegio_id)
-    db.commit()
-    
-    log_auditoria(db, 'CREAR_COMUNICADO', 'comunicados', comunicado.id, user=current_user, request=request)
-    
+
+    # COM-DUP-1 · sin clave: comportamiento de siempre (cada envío es un
+    # comunicado). Con clave: uno solo por colegio + autor + clave.
+    clave = data.get('client_request_id')
+    huella = None
+    if clave is not None:
+        clave = str(clave).strip()
+        if not current_user.colegio_id or not _RE_CLAVE_ENVIO.fullmatch(clave):
+            return JSONResponse({'error': 'client_request_id inválido'}, status_code=400)
+        huella = _huella_comunicado(campos['titulo'], campos['contenido'], alcance, campos['para_profesores'],
+                                    campos['para_coordinadores'], campos['para_psicologia'], campos['imagen'])
+        existente = db.query(Comunicado).filter_by(
+            colegio_id=current_user.colegio_id, autor_id=current_user.id, client_request_id=clave).first()
+        if existente is not None:
+            return _respuesta_comunicado_existente(existente, huella)
+
+    # Una sola transacción: comunicado + notificaciones + auditoría (D4).
+    try:
+        comunicado = _nuevo_comunicado(current_user, campos, clave, huella)
+        db.add(comunicado)
+        db.flush()                                     # id definitivo
+        evento_key = f'comunicado:{comunicado.id}:creado'
+        destinatarios = _destinatarios_comunicado(db, current_user.colegio_id, comunicado, alcance)
+        _notificaciones_comunicado_estrictas(db, comunicado, destinatarios, evento_key)
+        db.flush()
+        creadas = db.query(Notificacion).filter(Notificacion.evento_key == evento_key).count()
+        if creadas != len(destinatarios):
+            raise RuntimeError(f'notificaciones incompletas: {creadas} de {len(destinatarios)}')
+        log_auditoria(db, 'CREAR_COMUNICADO', 'comunicados', comunicado.id, user=current_user, request=request)
+        db.commit()
+    except IntegrityError:
+        # Otra petición con la misma clave guardó primero: el índice único dejó
+        # pasar solo una. Se revierte TODO lo de esta (comunicado y avisos) y se
+        # devuelve el ganador, sin notificar ni auditar.
+        db.rollback()
+        if clave is None:
+            raise
+        existente = db.query(Comunicado).filter_by(
+            colegio_id=current_user.colegio_id, autor_id=current_user.id, client_request_id=clave).first()
+        if existente is None:
+            raise
+        return _respuesta_comunicado_existente(existente, huella)
+    except Exception:
+        # Cualquier otro fallo (SQL o no): nada queda a medias.
+        db.rollback()
+        raise
+
     return JSONResponse({'message': 'Comunicado creado', 'id': comunicado.id}, status_code=201)
 
 @app.delete("/api/comunicados/{id}")
