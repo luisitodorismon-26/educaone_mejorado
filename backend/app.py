@@ -1628,7 +1628,8 @@ async def add_security_headers(request: Request, call_next):
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['X-Frame-Options'] = 'DENY'
         response.headers['X-XSS-Protection'] = '1; mode=block'
-        response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+        response.headers['Referrer-Policy'] = ('no-referrer' if _audit_path.startswith('/doc/')
+                                               else 'strict-origin-when-cross-origin')
         # Permissions-Policy: bloquear acceso a APIs sensibles del browser
         # que el sistema no necesita.
         response.headers['Permissions-Policy'] = (
@@ -12158,72 +12159,33 @@ async def get_competencias_periodo_curso(curso_id: int, periodo: int,
     }
 
 
-@app.get("/api/calificaciones-secundaria/reporte-padres/curso/{curso_id}/pdf")
-async def reporte_padres_curso_pdf(curso_id: int, request: Request,
-                                    db: Session = Depends(get_db),
-                                    current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
-    """v2.13.40 — Reporte del PERÍODO para padres (curso o individual).
-    
-    Al final de cada período el colegio entrega la nota de ese período.
-    Por asignatura se reporta EL ÚLTIMO P del período: el valor del período N
-    en la competencia más alta que lo tenga cargado (práctica del colegio).
-    Sin promedio general. Parámetros: periodo=1-4 (default: período activo),
-    estudiante_id opcional.
-    
-    NOTA: al padre NO se le indica si la nota es PC o último P. El PDF solo
-    dice "Reporte de Calificaciones / Competencia N". El modo es interno.
-    
-    Query params:
-      - competencia: 1-4 (default 1). Cuál competencia reportar.
-      - modo: 'pc' | 'ultimo_p' (default 'pc').
-      - estudiante_id: opcional → si se pasa genera solo ese estudiante.
-    """
+def ano_del_reporte_periodo(db, current_user):
+    """Año del Reporte del Período: el activo; si el año está cerrado (tras
+    promover, v2.13.19) no hay activo y se usa el más reciente."""
+    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
+    if not ano:
+        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
+    return ano
+
+
+def generar_reporte_periodo_pdf(db, current_user, curso, ano, periodo_rep, estudiantes, config,
+                                filas_por_estudiante=None):
+    """Reporte del Período para padres: el MISMO dibujo que siempre descarga
+    `/api/calificaciones-secundaria/reporte-padres/curso/{id}/pdf`.
+
+    FAM-DOC-1 · se extrajo del endpoint (sin cambiar el dibujo) para que la
+    copia fija que se comparte con la familia use exactamente este formato.
+    Si se pasa `filas_por_estudiante` (dict), se llena con lo que se dibujó
+    para cada estudiante: [{asignatura, nota, nivel, estado}].
+    Devuelve los bytes del PDF."""
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas as pdf_canvas
     from reportlab.lib.units import cm
     from reportlab.lib import colors as rl_colors
     from reportlab.lib.utils import ImageReader
     import base64 as _b64
-    
-    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    curso_id = curso.id
 
-    # v2.19.3-A: un profesor solo genera el reporte de padres de sus cursos
-    # asignados (el endpoint acepta además ?estudiante_id, siempre acotado a
-    # este curso más abajo).
-    _guard = guard_profesor_curso(db, current_user, curso.id, que='el reporte de ese curso')
-    if _guard:
-        return _guard
-
-    ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter_by(activo=True).first()
-    if not ano:
-        # v2.13.19: si el año está cerrado (tras promover) no hay año activo.
-        # Usar el más reciente para no romper el reporte.
-        ano = tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).order_by(AnoEscolar.id.desc()).first()
-    if not ano:
-        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
-    
-    try:
-        periodo_rep = int(request.query_params.get('periodo', 0))
-    except (ValueError, TypeError):
-        periodo_rep = 0
-    if not (1 <= periodo_rep <= 4):
-        periodo_rep = ano.periodo_activo or 1
-    
-    estudiante_id = request.query_params.get('estudiante_id')
-    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
-    
-    # Estudiantes a incluir
-    # TRAS-1 · los mismos estudiantes que la pantalla de Notas por Período
-    # para ese período (incluye a quien se trasladó o se retiró durante él).
-    from services.stats_service import estudiantes_del_periodo
-    _curso_rep = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
-    estudiantes = sorted(estudiantes_del_periodo(db, _curso_rep, periodo_rep)[0],
-                         key=lambda e: ((e.apellido or ''), (e.nombre or '')))
-    if estudiante_id:
-        estudiantes = [e for e in estudiantes if e.id == int(estudiante_id)]
-    if not estudiantes:
-        return JSONResponse({'error': 'No hay estudiantes para el reporte'}, status_code=404)
-    
     est_ids = [e.id for e in estudiantes]
     asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(curso_id=curso_id, activo=True).all()
     asig_ids = sorted(set(a.asignatura_id for a in asignaciones))
@@ -12314,6 +12276,13 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
         for asig_id in asig_ids:
             comps = idx.get((est.id, asig_id), {})
             nota = _nota_periodo_asignatura(comps)
+            if filas_por_estudiante is not None:
+                filas_por_estudiante.setdefault(est.id, []).append({
+                    'asignatura': asig_nombres.get(asig_id, '')[:45],
+                    'nota': formatear_nota(nota) if nota is not None else None,
+                    'nivel': (None if nota is None else ('A' if nota >= 90 else 'B' if nota >= 80 else 'C' if nota >= 70 else 'F')),
+                    'estado': (None if nota is None else ('Aprobado' if nota >= 70 else 'En riesgo')),
+                })
             
             def _lit(n):
                 if n is None: return '-'
@@ -12356,11 +12325,69 @@ async def reporte_padres_curso_pdf(curso_id: int, request: Request,
         c.showPage()
     
     c.save()
-    buffer.seek(0)
+    return buffer.getvalue()
+
+
+@app.get("/api/calificaciones-secundaria/reporte-padres/curso/{curso_id}/pdf")
+async def reporte_padres_curso_pdf(curso_id: int, request: Request,
+                                    db: Session = Depends(get_db),
+                                    current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
+    """v2.13.40 — Reporte del PERÍODO para padres (curso o individual).
+    
+    Al final de cada período el colegio entrega la nota de ese período.
+    Por asignatura se reporta EL ÚLTIMO P del período: el valor del período N
+    en la competencia más alta que lo tenga cargado (práctica del colegio).
+    Sin promedio general. Parámetros: periodo=1-4 (default: período activo),
+    estudiante_id opcional.
+    
+    NOTA: al padre NO se le indica si la nota es PC o último P. El PDF solo
+    dice "Reporte de Calificaciones / Competencia N". El modo es interno.
+    
+    Query params:
+      - competencia: 1-4 (default 1). Cuál competencia reportar.
+      - modo: 'pc' | 'ultimo_p' (default 'pc').
+      - estudiante_id: opcional → si se pasa genera solo ese estudiante.
+    """
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+
+    # v2.19.3-A: un profesor solo genera el reporte de padres de sus cursos
+    # asignados (el endpoint acepta además ?estudiante_id, siempre acotado a
+    # este curso más abajo).
+    _guard = guard_profesor_curso(db, current_user, curso.id, que='el reporte de ese curso')
+    if _guard:
+        return _guard
+
+    ano = ano_del_reporte_periodo(db, current_user)
+    if not ano:
+        return JSONResponse({'error': 'No hay año escolar configurado'}, status_code=404)
+    
+    try:
+        periodo_rep = int(request.query_params.get('periodo', 0))
+    except (ValueError, TypeError):
+        periodo_rep = 0
+    if not (1 <= periodo_rep <= 4):
+        periodo_rep = ano.periodo_activo or 1
+    
+    estudiante_id = request.query_params.get('estudiante_id')
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+    
+    # Estudiantes a incluir
+    # TRAS-1 · los mismos estudiantes que la pantalla de Notas por Período
+    # para ese período (incluye a quien se trasladó o se retiró durante él).
+    from services.stats_service import estudiantes_del_periodo
+    _curso_rep = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    estudiantes = sorted(estudiantes_del_periodo(db, _curso_rep, periodo_rep)[0],
+                         key=lambda e: ((e.apellido or ''), (e.nombre or '')))
+    if estudiante_id:
+        estudiantes = [e for e in estudiantes if e.id == int(estudiante_id)]
+    if not estudiantes:
+        return JSONResponse({'error': 'No hay estudiantes para el reporte'}, status_code=404)
+    
+    pdf_bytes = generar_reporte_periodo_pdf(db, current_user, curso, ano, periodo_rep, estudiantes, config)
     
     tipo = 'individual' if estudiante_id else 'curso'
     filename = f"Reporte_Periodo{periodo_rep}_{tipo}_{(curso.nombre or 'curso').replace(' ', '_')}.pdf"
-    return Response(content=buffer.getvalue(), media_type='application/pdf',
+    return Response(content=pdf_bytes, media_type='application/pdf',
                     headers={'Content-Disposition': f'attachment; filename="{filename}"'})
 
 
@@ -30198,6 +30225,525 @@ async def export_colegios_csv(request: Request, db: Session = Depends(get_db), c
         media_type='text/csv',
         headers={'Content-Disposition': 'attachment; filename=colegios_educaone.csv'}
     )
+
+# ══ FAM-DOC-1 · DOCUMENTOS PARA LAS FAMILIAS (enlace privado) ═══════════════
+#
+# El colegio prepara el Reporte del Período de un estudiante como COPIA FIJA
+# (PDF con el formato de siempre + los mismos datos para la página) y lo
+# comparte con un enlace secreto. Abrir el enlace no recalcula nada.
+#
+#   · Un solo documento ACTIVO por estudiante + reporte (índice único
+#     parcial): doble clic, reintentos o dos pestañas devuelven el mismo.
+#   · Versión nueva SOLO a pedido («Preparar nueva versión»); la anterior
+#     queda `reemplazado` y su enlace sigue mostrando lo compartido, con aviso.
+#   · Anular: el enlace deja de abrir el documento. Sin vencimiento automático.
+#   · Abrir WhatsApp se anota como `whatsapp_abierto`: NO es «enviado».
+#   · Las visitas al enlace se cuentan, pero no prueban lectura (vistas
+#     previas, reenvíos).
+#
+# Permisos: dirección y coordinación (la pantalla de Notas por Período), con
+# aislamiento por colegio y el candado de división (validar_nivel_escritura).
+import json
+import threading as _famdoc_threading
+import documentos_familia as FAMDOC
+from models import DocumentoFamilia, DocumentoFamiliaArchivo, DocumentoFamiliaEvento
+
+_FAMDOC_SEM = _famdoc_threading.BoundedSemaphore(
+    max(1, int(os.environ.get('DOC_FAMILIA_GENERACIONES_SIMULTANEAS', '2'))))
+_FAMDOC_ESPERA_SEG = float(os.environ.get('DOC_FAMILIA_ESPERA_SEG', '25'))
+_FAMDOC_MAX_POR_PETICION = 60
+_FAMDOC_ROLES = ('direccion', 'coordinador')
+
+
+def _famdoc_url(request, nonce):
+    """URL absoluta del enlace (se reconstruye desde la semilla).
+    ENLACE_FAMILIA_BASE_URL (recomendado en producción) o el host por el que
+    llegó la petición."""
+    base = (os.environ.get('ENLACE_FAMILIA_BASE_URL') or '').strip().rstrip('/')
+    if not base:
+        proto = (request.headers.get('x-forwarded-proto') or request.url.scheme or 'https').split(',')[0].strip()
+        host = (request.headers.get('x-forwarded-host') or request.headers.get('host') or request.url.netloc).split(',')[0].strip()
+        base = f'{proto}://{host}'
+    return base + FAMDOC.ruta_publica(FAMDOC.token_de(nonce))
+
+
+def _famdoc_error(msg, status, motivo=None):
+    cuerpo = {'error': msg}
+    if motivo:
+        cuerpo['motivo'] = motivo
+    return JSONResponse(cuerpo, status_code=status)
+
+
+def _famdoc_curso(db, current_user, curso_id, periodo):
+    """(curso, ano, estudiantes del período, centro) o JSONResponse de error."""
+    if not getattr(current_user, 'colegio_id', None):
+        return _famdoc_error('Esta acción se hace desde la cuenta de un colegio.', 403)
+    curso = get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    guard = validar_nivel_escritura(db, current_user, curso_id=curso.id)
+    if guard:
+        return guard
+    try:
+        periodo = int(periodo)
+    except (TypeError, ValueError):
+        periodo = 0
+    if not 1 <= periodo <= 4:
+        return _famdoc_error('Período inválido.', 400)
+    grado = db.get(Grado, curso.grado_id) if curso.grado_id else None
+    if grado is not None and _canon_nivel(grado.nivel) == 'primaria':
+        return _famdoc_error('El Reporte del Período para las familias todavía no incluye las calificaciones '
+                             'de Primaria, así que no se puede compartir en este curso.', 409, 'nivel_no_soportado')
+    ano = ano_del_reporte_periodo(db, current_user)
+    if not ano:
+        return _famdoc_error('No hay año escolar configurado.', 404)
+    from services.stats_service import estudiantes_del_periodo
+    estudiantes = estudiantes_del_periodo(db, curso, periodo)[0]
+    config = tenant_filter(db.query(ConfiguracionColegio), ConfiguracionColegio, current_user).first()
+    centro = (getattr(config, 'nombre', None) or 'Centro Educativo') if config else 'Centro Educativo'
+    return {'curso': curso, 'ano': ano, 'periodo': periodo, 'estudiantes': estudiantes,
+            'config': config, 'centro': centro}
+
+
+def _famdoc_filas_actuales(db, current_user, curso, ano, periodo, estudiantes):
+    """{estudiante_id: filas} con los datos ACTUALES, sin dibujar el PDF. Debe
+    coincidir con lo que dibuja `generar_reporte_periodo_pdf` (lo comprueba
+    la suite): sirve para saber si un documento preparado quedó desactualizado."""
+    from nota_periodo import nota_del_periodo, formatear_nota
+    est_ids = [e.id for e in estudiantes]
+    asignaciones = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+        curso_id=curso.id, activo=True).all()
+    asig_ids = sorted(set(a.asignatura_id for a in asignaciones))
+    asignaturas = tenant_filter(db.query(Asignatura), Asignatura, current_user).filter(
+        Asignatura.id.in_(asig_ids)).all() if asig_ids else []
+    asig_nombres = {a.id: a.nombre for a in asignaturas}
+    califs = tenant_filter(db.query(CalificacionSecundaria), CalificacionSecundaria, current_user).filter(
+        CalificacionSecundaria.estudiante_id.in_(est_ids),
+        CalificacionSecundaria.asignatura_id.in_(asig_ids),
+        CalificacionSecundaria.ano_escolar_id == ano.id,
+    ).all() if est_ids and asig_ids else []
+    idx = {}
+    for c in califs:
+        idx.setdefault((c.estudiante_id, c.asignatura_id), {})[c.competencia_numero] = c
+    salida = {}
+    for est in estudiantes:
+        filas = []
+        for asig_id in asig_ids:
+            nota = nota_del_periodo(idx.get((est.id, asig_id), {}), periodo)
+            filas.append({
+                'asignatura': asig_nombres.get(asig_id, '')[:45],
+                'nota': formatear_nota(nota) if nota is not None else None,
+                'nivel': (None if nota is None else ('A' if nota >= 90 else 'B' if nota >= 80 else 'C' if nota >= 70 else 'F')),
+                'estado': (None if nota is None else ('Aprobado' if nota >= 70 else 'En riesgo')),
+            })
+        salida[est.id] = filas
+    return salida
+
+
+def _famdoc_vista(ctx, est, filas):
+    return {
+        'colegio': ctx['centro'],
+        'estudiante': est.nombre_completo,
+        'curso': ctx['curso'].nombre_completo,
+        'matricula': est.matricula or None,
+        'ano': ctx['ano'].nombre,
+        'periodo': ctx['periodo'],
+        'filas': filas,
+    }
+
+
+def _famdoc_resumen(db, request, doc, eventos=None, usuarios=None):
+    wa = [e for e in (eventos or []) if e.tipo == 'whatsapp_abierto']
+    ult = max(wa, key=lambda e: e.fecha or datetime.min) if wa else None
+    prep = (usuarios or {}).get(doc.preparado_por)
+    return {
+        'id': doc.id,
+        'estudiante_id': doc.estudiante_id,
+        'version': doc.version,
+        'estado': doc.estado,
+        'fecha_preparado': doc.fecha_preparado.isoformat() if doc.fecha_preparado else None,
+        'preparado_por': prep,
+        'url': _famdoc_url(request, doc.token_nonce) if doc.estado != 'anulado' else None,
+        'tamano_bytes': doc.tamano_bytes,
+        'visitas': doc.visitas or 0,
+        'descargas': doc.descargas or 0,
+        'vistas_previas': doc.vistas_previas or 0,
+        'primera_visita': doc.primera_visita.isoformat() if doc.primera_visita else None,
+        'ultima_visita': doc.ultima_visita.isoformat() if doc.ultima_visita else None,
+        'whatsapp_abierto': len(wa),
+        'ultimo_whatsapp': ({'fecha': ult.fecha.isoformat() if ult.fecha else None, 'contacto_rol': ult.contacto_rol,
+                             'telefono_final': ult.telefono_final} if ult else None),
+    }
+
+
+def _famdoc_clave(doc_o_dict):
+    g = (lambda k: doc_o_dict[k]) if isinstance(doc_o_dict, dict) else (lambda k: getattr(doc_o_dict, k))
+    return (g('colegio_id'), g('estudiante_id'), g('ano_escolar_id'), g('tipo'), g('periodo'))
+
+
+def _famdoc_activo(db, colegio_id, estudiante_id, ano_id, periodo):
+    return db.query(DocumentoFamilia).filter_by(
+        colegio_id=colegio_id, estudiante_id=estudiante_id, ano_escolar_id=ano_id,
+        tipo=FAMDOC.TIPO_REPORTE_PERIODO, periodo=periodo, estado='activo').first()
+
+
+def _famdoc_generar(db, current_user, ctx, est):
+    """(pdf_bytes, vista). Requiere tener tomado _FAMDOC_SEM."""
+    filas = {}
+    pdf = generar_reporte_periodo_pdf(db, current_user, ctx['curso'], ctx['ano'], ctx['periodo'], [est],
+                                      ctx['config'], filas_por_estudiante=filas)
+    return pdf, _famdoc_vista(ctx, est, filas.get(est.id, []))
+
+
+def _famdoc_insertar(db, current_user, request, ctx, est, pdf, vista, *, version, reemplaza=None, accion='preparado'):
+    import hashlib as _hl
+    nonce = FAMDOC.nueva_semilla()
+    token = FAMDOC.token_de(nonce)
+    vista = dict(vista, preparado=now_rd().strftime('%d/%m/%Y'))
+    doc = DocumentoFamilia(
+        colegio_id=current_user.colegio_id, estudiante_id=est.id, curso_id=ctx['curso'].id,
+        ano_escolar_id=ctx['ano'].id, tipo=FAMDOC.TIPO_REPORTE_PERIODO, periodo=ctx['periodo'],
+        version=version, estado='activo', token_nonce=nonce, token_hash=FAMDOC.hash_token(token),
+        contenido_sha256=_hl.sha256(pdf).hexdigest(), datos_sha256=FAMDOC.huella_datos(vista),
+        vista_json=json.dumps(vista, ensure_ascii=False), tamano_bytes=len(pdf),
+        nombre_archivo=FAMDOC.nombre_archivo(vista), preparado_por=current_user.id, fecha_preparado=now_rd(),
+        reemplaza_a_id=(reemplaza.id if reemplaza is not None else None))
+    db.add(doc)
+    db.flush()
+    db.add(DocumentoFamiliaArchivo(documento_id=doc.id, colegio_id=doc.colegio_id, pdf=pdf))
+    db.add(DocumentoFamiliaEvento(colegio_id=doc.colegio_id, documento_id=doc.id, tipo=accion,
+                                  usuario_id=current_user.id))
+    log_auditoria(db, 'PREPARAR_DOCUMENTO_FAMILIA' if accion == 'preparado' else 'NUEVA_VERSION_DOCUMENTO_FAMILIA',
+                  'documentos_familia', doc.id,
+                  datos_anteriores=({'documento_id': reemplaza.id, 'version': reemplaza.version} if reemplaza else None),
+                  datos_nuevos={'estudiante_id': est.id, 'curso_id': doc.curso_id, 'periodo': doc.periodo,
+                                'version': version, 'tamano_bytes': len(pdf)},
+                  user=current_user, request=request)
+    return doc
+
+
+def _famdoc_siguiente_version(db, colegio_id, est_id, ano_id, periodo):
+    v = db.query(func.max(DocumentoFamilia.version)).filter_by(
+        colegio_id=colegio_id, estudiante_id=est_id, ano_escolar_id=ano_id,
+        tipo=FAMDOC.TIPO_REPORTE_PERIODO, periodo=periodo).scalar()
+    return (v or 0) + 1
+
+
+def _famdoc_estudiante_payload(ctx, est, doc, filas_actuales, request, db, eventos, usuarios):
+    contactos = FAMDOC.contactos_de(est)
+    filas = filas_actuales.get(est.id, [])
+    desactualizado = None
+    if doc is not None:
+        vista_hoy = _famdoc_vista(ctx, est, filas)
+        desactualizado = FAMDOC.huella_datos(vista_hoy) != doc.datos_sha256
+    return {
+        'estudiante_id': est.id,
+        'nombre': est.nombre_completo,
+        'contactos': contactos,
+        'contacto_sugerido': FAMDOC.contacto_sugerido(contactos),
+        'notas_pendientes': sum(1 for f in filas if f['nota'] is None),
+        'documento': _famdoc_resumen(db, request, doc, eventos.get(doc.id, []), usuarios) if doc else None,
+        'desactualizado': desactualizado,
+    }
+
+
+def _famdoc_eventos_y_usuarios(db, docs):
+    ids = [d.id for d in docs]
+    eventos = {}
+    if ids:
+        for e in db.query(DocumentoFamiliaEvento).filter(DocumentoFamiliaEvento.documento_id.in_(ids)).all():
+            eventos.setdefault(e.documento_id, []).append(e)
+    uids = {d.preparado_por for d in docs if d.preparado_por}
+    usuarios = {}
+    if uids:
+        for u in db.query(Usuario).filter(Usuario.id.in_(uids)).all():
+            usuarios[u.id] = f'{u.nombre or ""} {u.apellido or ""}'.strip()
+    return eventos, usuarios
+
+
+@app.get("/api/documentos-familia/curso/{curso_id}")
+async def famdoc_listar_curso(curso_id: int, request: Request, db: Session = Depends(get_db),
+                              current_user: Usuario = Depends(RolesRequired(*_FAMDOC_ROLES))):
+    """Estado de cada estudiante del curso para el período: contactos (padre,
+    madre, tutor), contacto sugerido (el primero con teléfono utilizable),
+    documento activo (si existe) y si quedó desactualizado."""
+    ctx = _famdoc_curso(db, current_user, curso_id, request.query_params.get('periodo'))
+    if isinstance(ctx, Response):
+        return ctx
+    est_ids = [e.id for e in ctx['estudiantes']]
+    docs = db.query(DocumentoFamilia).filter(
+        DocumentoFamilia.colegio_id == current_user.colegio_id,
+        DocumentoFamilia.estudiante_id.in_(est_ids or [0]),
+        DocumentoFamilia.ano_escolar_id == ctx['ano'].id,
+        DocumentoFamilia.tipo == FAMDOC.TIPO_REPORTE_PERIODO,
+        DocumentoFamilia.periodo == ctx['periodo'],
+        DocumentoFamilia.estado == 'activo').all()
+    por_est = {d.estudiante_id: d for d in docs}
+    eventos, usuarios = _famdoc_eventos_y_usuarios(db, docs)
+    filas = _famdoc_filas_actuales(db, current_user, ctx['curso'], ctx['ano'], ctx['periodo'], ctx['estudiantes'])
+    return {
+        'colegio': ctx['centro'],
+        'curso': ctx['curso'].nombre_completo,
+        'ano': ctx['ano'].nombre,
+        'periodo': ctx['periodo'],
+        'estudiantes': [_famdoc_estudiante_payload(ctx, e, por_est.get(e.id), filas, request, db, eventos, usuarios)
+                        for e in ctx['estudiantes']],
+    }
+
+
+@app.post("/api/documentos-familia/preparar")
+def famdoc_preparar(request: Request, payload: dict, db: Session = Depends(get_db),
+                    current_user: Usuario = Depends(RolesRequired(*_FAMDOC_ROLES))):
+    """Prepara (o devuelve, si ya existe) el documento ACTIVO de cada
+    estudiante pedido. Idempotente: repetir la petición no crea copias.
+    Generación limitada por proceso (DOC_FAMILIA_GENERACIONES_SIMULTANEAS)."""
+    ids = payload.get('estudiante_ids') or []
+    if not isinstance(ids, list) or not ids:
+        return _famdoc_error('Elige al menos un estudiante.', 400)
+    try:
+        ids = list(dict.fromkeys(int(i) for i in ids))
+    except (TypeError, ValueError):
+        return _famdoc_error('Lista de estudiantes inválida.', 400)
+    if len(ids) > _FAMDOC_MAX_POR_PETICION:
+        return _famdoc_error(f'Como máximo {_FAMDOC_MAX_POR_PETICION} estudiantes por vez.', 400)
+    ctx = _famdoc_curso(db, current_user, payload.get('curso_id'), payload.get('periodo'))
+    if isinstance(ctx, Response):
+        return ctx
+    del_curso = {e.id: e for e in ctx['estudiantes']}
+    ajenos = [i for i in ids if i not in del_curso]
+    if ajenos:
+        # Sin revelar si existen en otro curso o colegio.
+        return _famdoc_error('Algún estudiante no pertenece a este curso en ese período.', 404, 'estudiante_fuera_del_curso')
+
+    resultado = {}
+    pendientes = []
+    for i in ids:
+        d = _famdoc_activo(db, current_user.colegio_id, i, ctx['ano'].id, ctx['periodo'])
+        if d is not None:
+            resultado[i] = (d, False)
+        else:
+            pendientes.append(i)
+
+    if pendientes:
+        if not _FAMDOC_SEM.acquire(timeout=_FAMDOC_ESPERA_SEG):
+            return _famdoc_error('El servidor está preparando otros reportes. Intenta de nuevo en unos segundos.',
+                                 503, 'ocupado')
+        try:
+            for i in pendientes:
+                est = del_curso[i]
+                # Otra petición pudo prepararlo mientras esperábamos.
+                d = _famdoc_activo(db, current_user.colegio_id, i, ctx['ano'].id, ctx['periodo'])
+                if d is not None:
+                    resultado[i] = (d, False)
+                    continue
+                pdf, vista = _famdoc_generar(db, current_user, ctx, est)
+                try:
+                    v = _famdoc_siguiente_version(db, current_user.colegio_id, i, ctx['ano'].id, ctx['periodo'])
+                    doc = _famdoc_insertar(db, current_user, request, ctx, est, pdf, vista, version=v)
+                    db.commit()
+                    resultado[i] = (doc, True)
+                except IntegrityError:
+                    db.rollback()
+                    d = _famdoc_activo(db, current_user.colegio_id, i, ctx['ano'].id, ctx['periodo'])
+                    if d is None:
+                        raise
+                    resultado[i] = (d, False)
+        finally:
+            _FAMDOC_SEM.release()
+
+    docs = [resultado[i][0] for i in ids]
+    eventos, usuarios = _famdoc_eventos_y_usuarios(db, docs)
+    filas = _famdoc_filas_actuales(db, current_user, ctx['curso'], ctx['ano'], ctx['periodo'],
+                                   [del_curso[i] for i in ids])
+    salida = []
+    for i in ids:
+        doc, creado = resultado[i]
+        p = _famdoc_estudiante_payload(ctx, del_curso[i], doc, filas, request, db, eventos, usuarios)
+        p['creado'] = creado
+        salida.append(p)
+    return {'colegio': ctx['centro'], 'curso': ctx['curso'].nombre_completo, 'ano': ctx['ano'].nombre,
+            'periodo': ctx['periodo'], 'estudiantes': salida,
+            'creados': sum(1 for i in ids if resultado[i][1])}
+
+
+def _famdoc_doc_o_404(db, current_user, doc_id):
+    doc = tenant_filter(db.query(DocumentoFamilia), DocumentoFamilia, current_user).filter(
+        DocumentoFamilia.id == doc_id).first()
+    if doc is None:
+        return None, _famdoc_error('Documento no encontrado.', 404)
+    guard = validar_nivel_escritura(db, current_user, curso_id=doc.curso_id)
+    if guard:
+        return None, guard
+    return doc, None
+
+
+@app.post("/api/documentos-familia/{doc_id}/version")
+def famdoc_nueva_version(doc_id: int, request: Request, db: Session = Depends(get_db),
+                         current_user: Usuario = Depends(RolesRequired(*_FAMDOC_ROLES))):
+    """Prepara EXPLÍCITAMENTE una versión nueva con las notas actuales. La
+    anterior queda `reemplazado`. Idempotente: si `doc_id` ya fue reemplazado
+    (doble clic, reintento) devuelve la versión que lo reemplazó."""
+    doc, err = _famdoc_doc_o_404(db, current_user, doc_id)
+    if err:
+        return err
+    if doc.estado != 'activo':
+        sucesor = db.query(DocumentoFamilia).filter_by(colegio_id=doc.colegio_id, reemplaza_a_id=doc.id).first()
+        if sucesor is not None:
+            return {'documento_id': sucesor.id, 'version': sucesor.version, 'creado': False}
+        return _famdoc_error('Este documento fue anulado. Prepáralo de nuevo desde la lista.', 409, 'anulado')
+    ctx = _famdoc_curso(db, current_user, doc.curso_id, doc.periodo)
+    if isinstance(ctx, Response):
+        return ctx
+    if ctx['ano'].id != doc.ano_escolar_id:
+        return _famdoc_error('El documento es de otro año escolar.', 409, 'otro_ano')
+    est = next((e for e in ctx['estudiantes'] if e.id == doc.estudiante_id), None)
+    if est is None:
+        return _famdoc_error('El estudiante ya no figura en este curso para ese período.', 409, 'estudiante_fuera_del_curso')
+    if not _FAMDOC_SEM.acquire(timeout=_FAMDOC_ESPERA_SEG):
+        return _famdoc_error('El servidor está preparando otros reportes. Intenta de nuevo en unos segundos.',
+                             503, 'ocupado')
+    try:
+        pdf, vista = _famdoc_generar(db, current_user, ctx, est)
+        try:
+            # Reemplazo condicionado: solo si sigue activo (dos clics → uno gana).
+            n = db.query(DocumentoFamilia).filter_by(id=doc.id, estado='activo').update(
+                {'estado': 'reemplazado'}, synchronize_session=False)
+            if n != 1:
+                raise IntegrityError('reemplazo concurrente', None, Exception('ya reemplazado'))
+            nuevo = _famdoc_insertar(db, current_user, request, ctx, est, pdf, vista, version=doc.version + 1,
+                                     reemplaza=doc, accion='nueva_version')
+            db.commit()
+            return {'documento_id': nuevo.id, 'version': nuevo.version, 'creado': True}
+        except IntegrityError:
+            db.rollback()
+            sucesor = db.query(DocumentoFamilia).filter_by(colegio_id=doc.colegio_id, reemplaza_a_id=doc.id).first()
+            if sucesor is None:
+                return _famdoc_error('No se pudo preparar la versión nueva. Actualiza la lista e inténtalo de nuevo.',
+                                     409, 'conflicto')
+            return {'documento_id': sucesor.id, 'version': sucesor.version, 'creado': False}
+    finally:
+        _FAMDOC_SEM.release()
+
+
+@app.post("/api/documentos-familia/{doc_id}/anular")
+async def famdoc_anular(doc_id: int, request: Request, db: Session = Depends(get_db),
+                        current_user: Usuario = Depends(RolesRequired(*_FAMDOC_ROLES))):
+    """Anula el enlace: deja de abrir el documento. Idempotente."""
+    doc, err = _famdoc_doc_o_404(db, current_user, doc_id)
+    if err:
+        return err
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    motivo = (str((data or {}).get('motivo') or '').strip()[:300]) or None
+    if doc.estado == 'anulado':
+        return {'documento_id': doc.id, 'estado': 'anulado', 'ya_estaba': True}
+    anterior = doc.estado
+    doc.estado = 'anulado'
+    doc.anulado_por = current_user.id
+    doc.fecha_anulado = now_rd()
+    doc.motivo_anulacion = motivo
+    db.add(DocumentoFamiliaEvento(colegio_id=doc.colegio_id, documento_id=doc.id, tipo='anulado',
+                                  usuario_id=current_user.id, detalle=motivo))
+    log_auditoria(db, 'ANULAR_DOCUMENTO_FAMILIA', 'documentos_familia', doc.id,
+                  datos_anteriores={'estado': anterior}, datos_nuevos={'estado': 'anulado', 'motivo': motivo},
+                  user=current_user, request=request)
+    db.commit()
+    return {'documento_id': doc.id, 'estado': 'anulado', 'ya_estaba': False}
+
+
+@app.post("/api/documentos-familia/{doc_id}/whatsapp")
+async def famdoc_whatsapp_abierto(doc_id: int, request: Request, db: Session = Depends(get_db),
+                                  current_user: Usuario = Depends(RolesRequired(*_FAMDOC_ROLES))):
+    """Anota que se abrió el chat de WhatsApp con un contacto. NO significa
+    que el mensaje se haya enviado."""
+    doc, err = _famdoc_doc_o_404(db, current_user, doc_id)
+    if err:
+        return err
+    if doc.estado != 'activo':
+        return _famdoc_error('Este documento ya no está activo.', 409, doc.estado)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    rol = str((data or {}).get('contacto_rol') or '')
+    est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(Estudiante.id == doc.estudiante_id).first()
+    contacto = next((c for c in FAMDOC.contactos_de(est) if c['rol'] == rol and c['valido']), None) if est else None
+    if contacto is None:
+        return _famdoc_error('Ese contacto no tiene un teléfono utilizable.', 400, 'contacto_invalido')
+    db.add(DocumentoFamiliaEvento(colegio_id=doc.colegio_id, documento_id=doc.id, tipo='whatsapp_abierto',
+                                  usuario_id=current_user.id, contacto_rol=rol,
+                                  telefono_final=contacto['telefono_whatsapp'][-4:]))
+    db.commit()
+    total = db.query(func.count(DocumentoFamiliaEvento.id)).filter_by(documento_id=doc.id, tipo='whatsapp_abierto').scalar()
+    return {'documento_id': doc.id, 'whatsapp_abierto': total}
+
+
+# ── Página pública (sin sesión): solo con el enlace secreto ──
+
+def _famdoc_publico(db, token):
+    if not FAMDOC.token_con_formato_valido(token):
+        return None
+    doc = db.query(DocumentoFamilia).filter(DocumentoFamilia.token_hash == FAMDOC.hash_token(token)).first()
+    if doc is None:
+        return None
+    # Defensa extra: el enlace debe derivarse de SU semilla con el secreto actual.
+    import hmac as _hmac
+    if not _hmac.compare_digest(FAMDOC.token_de(doc.token_nonce), token):
+        return None
+    return doc
+
+
+def _famdoc_contar(db, doc, campo, request):
+    """Cuenta la visita con un UPDATE atómico. Las vistas previas (WhatsApp,
+    etc.) se cuentan aparte. Un fallo al contar nunca impide ver el documento."""
+    try:
+        ahora = now_rd()
+        if FAMDOC.es_vista_previa(request.headers.get('user-agent')):
+            valores = {'vistas_previas': DocumentoFamilia.vistas_previas + 1}
+        else:
+            valores = {campo: getattr(DocumentoFamilia, campo) + 1, 'ultima_visita': ahora,
+                       'primera_visita': func.coalesce(DocumentoFamilia.primera_visita, ahora)}
+        db.query(DocumentoFamilia).filter(DocumentoFamilia.id == doc.id).update(valores, synchronize_session=False)
+        db.commit()
+    except Exception as e:  # pragma: no cover
+        db.rollback()
+        logger.warning(f'FAM-DOC-1: no se pudo contar la visita: {e}')
+
+
+def _famdoc_html(contenido, status=200):
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(contenido, status_code=status, headers=dict(FAMDOC.CABECERAS_PRIVADAS))
+
+
+@app.get("/doc/{token}")
+def famdoc_pagina_publica(token: str, request: Request, db: Session = Depends(get_db)):
+    doc = _famdoc_publico(db, token)
+    if doc is None:
+        return _famdoc_html(FAMDOC.pagina_no_disponible('no_encontrado'), 404)
+    if doc.estado == 'anulado':
+        return _famdoc_html(FAMDOC.pagina_no_disponible('anulado'), 410)
+    vista = json.loads(doc.vista_json)
+    _famdoc_contar(db, doc, 'visitas', request)
+    return _famdoc_html(FAMDOC.pagina_documento(vista, token, doc.estado, vista.get('preparado') or ''))
+
+
+@app.get("/doc/{token}/pdf")
+def famdoc_pdf_publico(token: str, request: Request, db: Session = Depends(get_db)):
+    doc = _famdoc_publico(db, token)
+    if doc is None:
+        return _famdoc_html(FAMDOC.pagina_no_disponible('no_encontrado'), 404)
+    if doc.estado == 'anulado':
+        return _famdoc_html(FAMDOC.pagina_no_disponible('anulado'), 410)
+    archivo = db.get(DocumentoFamiliaArchivo, doc.id)
+    if archivo is None:
+        return _famdoc_html(FAMDOC.pagina_no_disponible('no_encontrado'), 404)
+    descargar = request.query_params.get('descargar') == '1'
+    _famdoc_contar(db, doc, 'descargas' if descargar else 'visitas', request)
+    disp = 'attachment' if descargar else 'inline'
+    cab = dict(FAMDOC.CABECERAS_PRIVADAS)
+    cab['Content-Disposition'] = f'{disp}; filename="{doc.nombre_archivo or "Reporte.pdf"}"'
+    return Response(content=bytes(archivo.pdf), media_type='application/pdf', headers=cab)
+
 
 # ===========================================
 # SERVIR FRONTEND (DEBE SER LO ÚLTIMO)

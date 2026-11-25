@@ -15,7 +15,12 @@ export default defineConfig({
       '/api': {
         target: `http://localhost:${BACKEND_PORT}`,
         changeOrigin: true,
-      }
+      },
+      // FAM-DOC-1 · página pública del documento para la familia (la sirve el
+      // backend). Expresión con barra final: no toca rutas como /docentes.
+      '^/doc/': {
+        target: `http://localhost:${BACKEND_PORT}`,
+      },
     }
   }
 })
