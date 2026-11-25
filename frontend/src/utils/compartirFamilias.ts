@@ -29,6 +29,8 @@ export interface DocumentoResumen {
   fecha_preparado: string | null;
   preparado_por: string | null;
   url: string | null;
+  /** false: activo, pero su clave de enlaces se retiró (hay que preparar versión nueva). */
+  enlace_disponible?: boolean;
   tamano_bytes: number;
   visitas: number;
   descargas: number;

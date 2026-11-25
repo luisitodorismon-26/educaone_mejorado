@@ -118,8 +118,48 @@ prueba('Correo queda «Próximamente» y deshabilitado; no se usa el correo del 
   noContiene(panel, '.email'); noContiene(pagina, '.email');
 });
 prueba('el panel avisa: solo pulsar Enviar, sin copiar el enlace', () => contiene(panel, 'No necesitas copiar ni pegar el enlace'));
-prueba('doble clic: preparar/versión/anular protegidos con useRef', () => { contiene(panel, 'enCurso.current'); contiene(panel, 'if (enCurso.current) return;'); });
+prueba('doble clic: preparar/versión/anular protegidos con useRef', () => {
+  contiene(panel, 'if (enCurso.current) return;'); contiene(panel, 'const g = generacion.current;');
+  si((panel.match(/if \(![a-z?.]+ \|\| enCurso\.current\) return;|if \(!familia \|\| enCurso\.current\) return;/g) || []).length >= 2, 'versión/anular sin corte');
+});
 prueba('Primaria: compartir deshabilitado con explicación (no hay datos que compartir)', () => { contiene(pagina, 'disabled={esPrimaria'); contiene(pagina, 'todavía no incluye las calificaciones de Primaria'); });
+
+console.log('\n6. Correcciones de la revisión');
+prueba('cambiar curso o período limpia la tabla y cierra el panel hasta «Ver notas»', () => {
+  contiene(pagina, "onChange={e => { setCursoId(Number(e.target.value)); limpiarConsulta(); }}");
+  contiene(pagina, "onChange={e => { setPeriodo(Number(e.target.value)); limpiarConsulta(); }}");
+  const i = pagina.indexOf('const limpiarConsulta = () => {'); const cuerpo = pagina.slice(i, pagina.indexOf('};', i));
+  ['setData(null)', 'setCompData(null)', 'setSeleccion(new Set())', 'setPanel(null)', 'setConsulta(null)', 'consultaVigente.current += 1']
+    .forEach(x => contiene(cuerpo, x));
+});
+prueba('una carga de notas que llega después de cambiar un filtro se descarta', () => {
+  const i = pagina.indexOf('const cargar = async () => {'); const cuerpo = pagina.slice(i, pagina.indexOf('const descargarBlob', i));
+  contiene(cuerpo, 'const id = ++consultaVigente.current;');
+  si((cuerpo.match(/if \(id !== consultaVigente\.current\) return;/g) || []).length === 2, 'faltan guardas en las dos vistas');
+});
+prueba('el panel comparte el curso y período de la consulta, no los selectores', () => {
+  contiene(pagina, 'cursoId={consulta.cursoId} periodo={consulta.periodo}');
+});
+prueba('cerrar el panel: no pide más lotes, cancela la petición y descarta respuestas tardías', () => {
+  contiene(panel, 'if (generacion.current === g) generacion.current += 1;');
+  contiene(panel, 'cancelar.current?.abort();');
+  contiene(panel, "if (!vigente(g)) return;                         // panel cerrado: no pedir más lotes");
+  contiene(panel, "if (!vigente(g)) return;                         // respuesta tardía: se descarta");
+  contiene(panel, '{ signal: ctrl.signal }');
+  contiene(panel, '.then(res => vigente(g) && setFamilias(prev');
+  noContiene(panel, 'vivo.current');
+});
+prueba('lista de versiones con fecha y «Anular enlace» (también años anteriores); anular no borra el PDF', () => {
+  contiene(panel, '/documentos-familia/estudiante/${estId}/versiones');
+  contiene(panel, 'Versiones y enlaces anteriores');
+  contiene(panel, "{v.estado !== 'anulado' && (");
+  contiene(panel, 'Preparado el {fecha(v.fecha_preparado)}');
+  contiene(panel, 'Anular no borra el PDF');
+  noContiene(panel, 'api.delete');
+});
+prueba('enlace con clave retirada: se avisa y se ofrece versión nueva', () => {
+  contiene(panel, 'enlace_disponible === false'); contiene(panel, 'ya se retiró');
+});
 
 console.log(`\n${ok}/${ok + fallos.length}`);
 process.exit(fallos.length ? 1 : 0);

@@ -17,6 +17,13 @@ interface Props {
 // Lotes cortos: cada petición dura pocos segundos y se ve el avance.
 const LOTE = 10;
 
+interface VersionDoc {
+  id: number; ano: string | null; periodo: number; version: number;
+  estado: 'activo' | 'reemplazado' | 'anulado'; fecha_preparado: string | null; fecha_anulado: string | null; visitas: number;
+}
+const ESTADO_VERSION: Record<VersionDoc['estado'], string> = { activo: 'Enlace activo', reemplazado: 'Reemplazado (el enlace sigue abriendo)', anulado: 'Anulado' };
+const fecha = (iso: string | null) => iso ? new Date(iso).toLocaleDateString('es-DO') : '—';
+
 const IconoWhatsApp = ({ size = 20 }: { size?: number }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
     <path d="M12.04 2C6.58 2 2.13 6.45 2.13 11.91c0 1.75.46 3.45 1.32 4.95L2.05 22l5.25-1.38a9.9 9.9 0 0 0 4.74 1.21h.01c5.46 0 9.91-4.45 9.91-9.91C21.96 6.45 17.5 2 12.04 2Zm0 18.15h-.01a8.2 8.2 0 0 1-4.19-1.15l-.3-.18-3.12.82.83-3.04-.2-.31a8.2 8.2 0 0 1-1.26-4.38c0-4.54 3.7-8.23 8.25-8.23 2.2 0 4.27.86 5.83 2.42a8.18 8.18 0 0 1 2.41 5.82c0 4.54-3.7 8.23-8.24 8.23Zm4.52-6.16c-.25-.12-1.47-.72-1.69-.81-.23-.08-.39-.12-.56.13-.16.25-.64.81-.79.97-.14.17-.29.19-.54.06-.25-.12-1.05-.39-1.99-1.23-.74-.66-1.23-1.47-1.38-1.72-.14-.25-.02-.38.11-.51.11-.11.25-.29.37-.43.13-.15.17-.25.25-.42.08-.17.04-.31-.02-.43-.06-.13-.56-1.35-.77-1.85-.2-.48-.41-.42-.56-.43h-.48c-.17 0-.43.06-.66.31-.23.25-.87.85-.87 2.07 0 1.22.89 2.4 1.01 2.56.12.17 1.75 2.67 4.24 3.74.59.26 1.05.41 1.41.52.59.19 1.13.16 1.56.1.48-.07 1.47-.6 1.67-1.18.21-.58.21-1.07.14-1.18-.06-.1-.22-.16-.47-.29Z" />
@@ -36,21 +43,35 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
   const [accion, setAccion] = useState<string | null>(null);
   const enCurso = useRef(false);
   const listaRef = useRef<HTMLUListElement>(null);
+  // Al cerrar el panel: no se piden más lotes, se cancela la petición en curso
+  // y cualquier respuesta tardía se descarta. Lo que el servidor ya preparó se
+  // conserva allí y vuelve al abrir de nuevo (preparar es idempotente).
+  // Cada apertura tiene su GENERACIÓN; cerrar la invalida. Toda operación
+  // asíncrona captura la generación al empezar y, si cambió, no toca el estado.
+  const generacion = useRef(0);
+  const vigente = (g: number) => g === generacion.current;
+  const cancelar = useRef<AbortController | null>(null);
+  const [versiones, setVersiones] = useState<{ estudianteId: number; lista: VersionDoc[] | null; error?: string } | null>(null);
 
   const reemplazar = (nuevas: FamiliaEstado[]) =>
     setFamilias(prev => prev.map(f => nuevas.find(n => n.estudiante_id === f.estudiante_id) || f));
 
   const preparar = async (ids: number[], inicial: boolean) => {
     if (enCurso.current) return;
+    const g = generacion.current;
     enCurso.current = true;
     setError(''); setOcupado(false);
     if (inicial) { setPreparando(true); setProgreso({ hechos: 0, total: ids.length }); }
     try {
       const todas: FamiliaEstado[] = [];
       for (let i = 0; i < ids.length; i += LOTE) {
+        if (!vigente(g)) return;                         // panel cerrado: no pedir más lotes
         const lote = ids.slice(i, i + LOTE);
+        const ctrl = new AbortController();
+        cancelar.current = ctrl;
         const res = await api.post('/documentos-familia/preparar',
-          { curso_id: cursoId, periodo, estudiante_ids: lote });
+          { curso_id: cursoId, periodo, estudiante_ids: lote }, { signal: ctrl.signal });
+        if (!vigente(g)) return;                         // respuesta tardía: se descarta
         setMeta({ colegio: res.data.colegio, ano: res.data.ano });
         todas.push(...(res.data.estudiantes || []));
         if (inicial) setProgreso({ hechos: Math.min(i + LOTE, ids.length), total: ids.length });
@@ -63,15 +84,30 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
         reemplazar(todas);
       }
     } catch (e: any) {
+      if (!vigente(g) || e?.code === 'ERR_CANCELED') return;
       if (e?.response?.status === 503) setOcupado(true);
       setError(await mensajeDeError(e, { porDefecto: 'No se pudieron preparar los reportes.' }));
     } finally {
-      enCurso.current = false;
-      setPreparando(false);
+      if (vigente(g)) {                                  // tras cerrar, el cierre ya lo dejó todo libre
+        enCurso.current = false;
+        cancelar.current = null;
+        setPreparando(false);
+      }
     }
   };
 
-  useEffect(() => { preparar(estudianteIds, true); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  useEffect(() => {
+    const g = ++generacion.current;
+    enCurso.current = false;
+    preparar(estudianteIds, true);
+    return () => {
+      if (generacion.current === g) generacion.current += 1;
+      cancelar.current?.abort();
+      cancelar.current = null;
+      enCurso.current = false;
+    };
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, []);
 
   // La familia actual siempre visible dentro de la lista (que tiene altura limitada).
   useEffect(() => {
@@ -90,9 +126,10 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
   const anotarWhatsApp = () => {
     if (!familia?.documento || !contacto) return;
     const docId = familia.documento.id;
+    const g = generacion.current;
     // Abrir WhatsApp NO es enviar: solo se anota que se abrió el chat.
     api.post(`/documentos-familia/${docId}/whatsapp`, { contacto_rol: contacto.rol })
-      .then(res => setFamilias(prev => prev.map(f => f.documento?.id === docId
+      .then(res => vigente(g) && setFamilias(prev => prev.map(f => f.documento?.id === docId
         ? { ...f, documento: { ...f.documento!, whatsapp_abierto: res.data.whatsapp_abierto,
             ultimo_whatsapp: { fecha: new Date().toISOString(), contacto_rol: contacto.rol, telefono_final: contacto.telefono_final } } }
         : f)))
@@ -101,29 +138,53 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
 
   const nuevaVersion = async () => {
     if (!familia?.documento || enCurso.current) return;
+    const g = generacion.current;
     setAccion('version');
     try {
       enCurso.current = true;
       await api.post(`/documentos-familia/${familia.documento.id}/version`);
+      if (!vigente(g)) return;
       enCurso.current = false;
       await preparar([familia.estudiante_id], false);
+      if (vigente(g) && versiones?.estudianteId === familia.estudiante_id) cargarVersiones(familia.estudiante_id);
     } catch (e: any) {
+      if (!vigente(g)) return;
       if (e?.response?.status === 503) setOcupado(true);
       setError(await mensajeDeError(e, { porDefecto: 'No se pudo preparar la versión nueva.', operacion: 'guardado' }));
-    } finally { enCurso.current = false; setAccion(null); }
+    } finally { if (vigente(g)) { enCurso.current = false; setAccion(null); } }
   };
 
-  const anular = async () => {
-    if (!familia?.documento || enCurso.current) return;
-    if (!window.confirm(`¿Anular el enlace del reporte de ${familia.nombre}?\n\nQuien lo tenga dejará de poder abrirlo. Después puedes preparar uno nuevo.`)) return;
+  /** Anula el enlace de una versión (la actual o una anterior, de cualquier año). No borra el PDF. */
+  const anular = async (docId: number, descripcion: string) => {
+    if (!familia || enCurso.current) return;
+    if (!window.confirm(`¿Anular el enlace ${descripcion} de ${familia.nombre}?\n\nQuien lo tenga dejará de poder abrirlo. El PDF no se borra. Después puedes preparar uno nuevo.`)) return;
+    const estId = familia.estudiante_id;
+    const g = generacion.current;
     setAccion('anular');
     try {
       enCurso.current = true;
-      await api.post(`/documentos-familia/${familia.documento.id}/anular`, { motivo: 'Anulado desde Notas por período' });
-      setFamilias(prev => prev.map(f => f.estudiante_id === familia.estudiante_id ? { ...f, documento: null, desactualizado: null } : f));
+      await api.post(`/documentos-familia/${docId}/anular`, { motivo: 'Anulado desde Notas por período' });
+      if (!vigente(g)) return;
+      setFamilias(prev => prev.map(f => f.estudiante_id === estId && f.documento?.id === docId ? { ...f, documento: null, desactualizado: null } : f));
+      if (versiones?.estudianteId === estId) cargarVersiones(estId);
     } catch (e: any) {
+      if (!vigente(g)) return;
       setError(await mensajeDeError(e, { porDefecto: 'No se pudo anular el enlace.', operacion: 'guardado' }));
-    } finally { enCurso.current = false; setAccion(null); }
+    } finally { if (vigente(g)) { enCurso.current = false; setAccion(null); } }
+  };
+
+  const cargarVersiones = async (estId: number) => {
+    const g = generacion.current;
+    setVersiones({ estudianteId: estId, lista: null });
+    try {
+      const res = await api.get(`/documentos-familia/estudiante/${estId}/versiones`);
+      if (!vigente(g)) return;
+      setVersiones(v => v && v.estudianteId === estId ? { estudianteId: estId, lista: res.data.versiones || [] } : v);
+    } catch (e: any) {
+      if (!vigente(g)) return;
+      const msg = await mensajeDeError(e, { porDefecto: 'No se pudieron cargar las versiones.' });
+      setVersiones(v => v && v.estudianteId === estId ? { estudianteId: estId, lista: [], error: msg } : v);
+    }
   };
 
   const irSiguiente = () => {
@@ -237,6 +298,15 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
                       </button>
                     </div>
                   )}
+                  {familia.documento && familia.documento.enlace_disponible === false && (
+                    <div className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" data-enlace-no-disponible>
+                      <p>El enlace de este reporte se firmó con una clave de enlaces que ya se retiró: no se puede volver a compartir. Prepara una versión nueva.</p>
+                      <button onClick={nuevaVersion} disabled={accion !== null}
+                        className="mt-2 inline-flex items-center gap-1 font-semibold text-amber-900 underline disabled:opacity-50">
+                        <RefreshCw size={14} className={accion === 'version' ? 'animate-spin' : ''} /> Preparar nueva versión
+                      </button>
+                    </div>
+                  )}
                   {!familia.documento && familia.contactos.some(c => c.valido) && (
                     <button onClick={() => preparar([familia.estudiante_id], false)}
                       className="w-full rounded-lg border border-blue-600 text-blue-700 font-semibold py-2.5">Preparar reporte de {primerNombre(familia.nombre)}</button>
@@ -274,10 +344,48 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
                       <p>{textoVisitas(familia.documento)}</p>
                       <div className="flex flex-wrap gap-x-4 gap-y-1">
                         {url && <a href={url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-blue-700 hover:underline"><ExternalLink size={12} /> Ver lo que recibe la familia</a>}
-                        <button onClick={anular} disabled={accion !== null} className="inline-flex items-center gap-1 text-red-700 hover:underline disabled:opacity-50"><Ban size={12} /> Anular enlace</button>
+                        <button onClick={() => anular(familia.documento!.id, 'actual')} disabled={accion !== null} className="inline-flex items-center gap-1 text-red-700 hover:underline disabled:opacity-50"><Ban size={12} /> Anular enlace</button>
                       </div>
                     </div>
                   )}
+
+                  {/* Versiones de este estudiante (todos los años y períodos), para anular enlaces anteriores. */}
+                  <div className="border-t pt-3" data-versiones>
+                    {versiones?.estudianteId !== familia.estudiante_id ? (
+                      <button onClick={() => cargarVersiones(familia.estudiante_id)} className="text-sm font-semibold text-blue-700 hover:underline">
+                        Versiones y enlaces anteriores
+                      </button>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <p className="text-sm font-semibold text-gray-900">Versiones de {familia.nombre}</p>
+                          <button onClick={() => setVersiones(null)} className="text-xs text-gray-500 hover:underline">Ocultar</button>
+                        </div>
+                        {versiones.lista === null && <p className="text-xs text-gray-500 flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> Cargando…</p>}
+                        {versiones.error && <p className="text-xs text-red-700 whitespace-pre-line">{versiones.error}</p>}
+                        {versiones.lista && versiones.lista.length === 0 && !versiones.error && <p className="text-xs text-gray-500">Todavía no hay versiones preparadas.</p>}
+                        {versiones.lista && versiones.lista.length > 0 && (
+                          <ul className="divide-y rounded-lg border border-gray-200 text-sm">
+                            {versiones.lista.map(v => (
+                              <li key={v.id} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-2">
+                                <div className="min-w-0">
+                                  <p className="text-gray-900">{v.ano || '—'} · Período {v.periodo} · versión {v.version}</p>
+                                  <p className="text-xs text-gray-500">Preparado el {fecha(v.fecha_preparado)} · {ESTADO_VERSION[v.estado]}{v.estado === 'anulado' ? ` el ${fecha(v.fecha_anulado)}` : ''}</p>
+                                </div>
+                                {v.estado !== 'anulado' && (
+                                  <button onClick={() => anular(v.id, `del período ${v.periodo} (${v.ano || '—'}, versión ${v.version})`)} disabled={accion !== null}
+                                    className="inline-flex items-center gap-1 text-xs font-semibold text-red-700 hover:underline disabled:opacity-50 shrink-0">
+                                    <Ban size={12} /> Anular enlace
+                                  </button>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        <p className="text-xs text-gray-500">Anular no borra el PDF: solo deja de abrirse el enlace.</p>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </>

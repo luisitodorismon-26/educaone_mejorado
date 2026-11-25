@@ -178,6 +178,14 @@ def _validar_config_produccion():
             "(ej: 'https://educaone1.onrender.com,https://miColegio.educaone.com')."
         )
     
+    # FAM-DOC-1 · enlaces de las familias: clave PROPIA (≥ 32, distinta de las
+    # de inicio de sesión) y dirección pública fija https. Sin ellas, en
+    # producción no se arranca; en desarrollo local se avisa y se usan valores
+    # de desarrollo (nunca SECRET_KEY ni el host de la petición).
+    import documentos_familia as _FAMDOC_CFG
+    _FAMDOC_CFG.MODO_DESARROLLO = bool(DEBUG and not _RUNNING_ON_RENDER)
+    errores.extend(_FAMDOC_CFG.errores_configuracion())
+
     if errores:
         if DEBUG and not _RUNNING_ON_RENDER:
             log.warning("⚠️  Configuración insegura detectada (DEBUG=True, no se bloquea):")
@@ -30255,16 +30263,15 @@ _FAMDOC_MAX_POR_PETICION = 60
 _FAMDOC_ROLES = ('direccion', 'coordinador')
 
 
-def _famdoc_url(request, nonce):
-    """URL absoluta del enlace (se reconstruye desde la semilla).
-    ENLACE_FAMILIA_BASE_URL (recomendado en producción) o el host por el que
-    llegó la petición."""
-    base = (os.environ.get('ENLACE_FAMILIA_BASE_URL') or '').strip().rstrip('/')
-    if not base:
-        proto = (request.headers.get('x-forwarded-proto') or request.url.scheme or 'https').split(',')[0].strip()
-        host = (request.headers.get('x-forwarded-host') or request.headers.get('host') or request.url.netloc).split(',')[0].strip()
-        base = f'{proto}://{host}'
-    return base + FAMDOC.ruta_publica(FAMDOC.token_de(nonce))
+def _famdoc_url(doc):
+    """URL absoluta del enlace YA compartido, reconstruido desde la semilla con
+    la clave que lo firmó (actual o anterior). Siempre con la dirección fija
+    ENLACE_FAMILIA_BASE_URL: nunca con el host que llega en la petición.
+    None si el documento está anulado o su clave ya se retiró."""
+    if doc.estado == 'anulado':
+        return None
+    token = FAMDOC.enlace_de_documento(doc.token_nonce, doc.token_hash)
+    return FAMDOC.base_url() + FAMDOC.ruta_publica(token) if token else None
 
 
 def _famdoc_error(msg, status, motivo=None):
@@ -30361,7 +30368,9 @@ def _famdoc_resumen(db, request, doc, eventos=None, usuarios=None):
         'estado': doc.estado,
         'fecha_preparado': doc.fecha_preparado.isoformat() if doc.fecha_preparado else None,
         'preparado_por': prep,
-        'url': _famdoc_url(request, doc.token_nonce) if doc.estado != 'anulado' else None,
+        'url': _famdoc_url(doc),
+        # False: el documento sigue activo pero su clave se retiró → preparar versión nueva.
+        'enlace_disponible': doc.estado == 'anulado' or bool(FAMDOC.enlace_de_documento(doc.token_nonce, doc.token_hash)),
         'tamano_bytes': doc.tamano_bytes,
         'visitas': doc.visitas or 0,
         'descargas': doc.descargas or 0,
@@ -30678,6 +30687,34 @@ async def famdoc_whatsapp_abierto(doc_id: int, request: Request, db: Session = D
     return {'documento_id': doc.id, 'whatsapp_abierto': total}
 
 
+@app.get("/api/documentos-familia/estudiante/{estudiante_id}/versiones")
+async def famdoc_versiones_estudiante(estudiante_id: int, request: Request, db: Session = Depends(get_db),
+                                      current_user: Usuario = Depends(RolesRequired(*_FAMDOC_ROLES))):
+    """Todas las versiones preparadas para un estudiante, de cualquier año y
+    período (las anteriores también), para poder anular sus enlaces. No
+    incluye el enlace ni los PDF: anular no borra nada."""
+    if not getattr(current_user, 'colegio_id', None):
+        return _famdoc_error('Esta acción se hace desde la cuenta de un colegio.', 403)
+    est = tenant_filter(db.query(Estudiante), Estudiante, current_user).filter(Estudiante.id == estudiante_id).first()
+    if est is None:
+        return _famdoc_error('Estudiante no encontrado.', 404)
+    docs = tenant_filter(db.query(DocumentoFamilia), DocumentoFamilia, current_user).filter(
+        DocumentoFamilia.estudiante_id == est.id).order_by(
+        DocumentoFamilia.ano_escolar_id.desc(), DocumentoFamilia.periodo.desc(), DocumentoFamilia.version.desc()).all()
+    # Candado de división: por el curso de cada documento (un estudiante pudo cambiar de curso).
+    visibles = [d for d in docs if validar_nivel_escritura(db, current_user, curso_id=d.curso_id) is None]
+    if docs and not visibles:
+        return _famdoc_error('No tenés acceso a los documentos de este estudiante.', 403)
+    anos = {a.id: a.nombre for a in tenant_filter(db.query(AnoEscolar), AnoEscolar, current_user).filter(
+        AnoEscolar.id.in_({d.ano_escolar_id for d in visibles} or {0})).all()}
+    return {'estudiante_id': est.id, 'nombre': est.nombre_completo, 'versiones': [{
+        'id': d.id, 'ano': anos.get(d.ano_escolar_id), 'periodo': d.periodo, 'version': d.version, 'estado': d.estado,
+        'fecha_preparado': d.fecha_preparado.isoformat() if d.fecha_preparado else None,
+        'fecha_anulado': d.fecha_anulado.isoformat() if d.fecha_anulado else None,
+        'visitas': (d.visitas or 0) + (d.descargas or 0),
+    } for d in visibles]}
+
+
 # ── Página pública (sin sesión): solo con el enlace secreto ──
 
 def _famdoc_publico(db, token):
@@ -30686,9 +30723,9 @@ def _famdoc_publico(db, token):
     doc = db.query(DocumentoFamilia).filter(DocumentoFamilia.token_hash == FAMDOC.hash_token(token)).first()
     if doc is None:
         return None
-    # Defensa extra: el enlace debe derivarse de SU semilla con el secreto actual.
-    import hmac as _hmac
-    if not _hmac.compare_digest(FAMDOC.token_de(doc.token_nonce), token):
+    # Defensa extra: el enlace debe derivarse de SU semilla con alguna clave
+    # conocida (la actual o una anterior todavía no retirada).
+    if not FAMDOC.token_valido(doc.token_nonce, token):
         return None
     return doc
 

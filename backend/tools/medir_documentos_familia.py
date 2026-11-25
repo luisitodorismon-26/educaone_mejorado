@@ -31,6 +31,7 @@ sys.path.insert(0, BK)
 sys.path.insert(0, os.path.join(BK, "tools"))
 os.environ.setdefault('ENLACE_FAMILIA_SECRET', 'secreto-de-medicion-no-produccion')
 os.environ.setdefault('DISABLE_GLOBAL_RATE_LIMIT', 'true')
+os.environ.setdefault('ENLACE_FAMILIA_BASE_URL', 'https://educaone.ejemplo.invalid')
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 40
 
 from test_utils import aislar_base_de_datos  # noqa: E402

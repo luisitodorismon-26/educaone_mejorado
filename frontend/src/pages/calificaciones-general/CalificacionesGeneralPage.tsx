@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { mensajeDeErrorDescarga } from '../../utils/errorServidor';
@@ -90,23 +90,35 @@ export const CalificacionesGeneralPage = () => {
     catch { setError('Error al cargar cursos'); }
   };
 
+  // FAM-DOC-1 · lo que se ve, se descarga y se comparte es SIEMPRE el curso y
+  // período de la última «Ver notas». Cambiar un filtro limpia la tabla y
+  // cierra el panel; una respuesta que llegue después de cambiarlo se descarta.
+  const consultaVigente = useRef(0);
+  const limpiarConsulta = () => {
+    consultaVigente.current += 1;
+    setData(null); setCompData(null); setSeleccion(new Set()); setPanel(null); setConsulta(null); setLoading(false);
+  };
+
   const cargar = async () => {
     if (!cursoId) return;
-    setLoading(true); setError(''); setData(null); setCompData(null); setSeleccion(new Set()); setPanel(null);
+    const id = ++consultaVigente.current;
+    setLoading(true); setError(''); setData(null); setCompData(null); setSeleccion(new Set()); setPanel(null); setConsulta(null);
     try {
       if (vista === 'pc') {
         const res = await api.get(`/calificaciones/por-periodo?curso_id=${cursoId}&periodo=${periodo}`);
+        if (id !== consultaVigente.current) return;
         setData(res.data);
         setConsulta({ cursoId, periodo });
       } else {
         const res = await api.get(`/calificaciones-secundaria/curso/${cursoId}/periodo/${periodo}/competencias`);
+        if (id !== consultaVigente.current) return;
         setCompData(res.data);
         if (res.data.asignaturas_nombres?.length && !asignaturaSel) {
           setAsignaturaSel(res.data.asignaturas_nombres[0]);
         }
       }
-    } catch (err: any) { setError(err.response?.data?.error || 'Error al cargar notas'); }
-    finally { setLoading(false); }
+    } catch (err: any) { if (id === consultaVigente.current) setError(err.response?.data?.error || 'Error al cargar notas'); }
+    finally { if (id === consultaVigente.current) setLoading(false); }
   };
 
   const descargarBlob = async (url: string, filename: string) => {
@@ -236,11 +248,11 @@ export const CalificacionesGeneralPage = () => {
       {error && <Alert variant="error" onClose={() => setError('')}><span className="whitespace-pre-line" data-error-descarga>{error}</span></Alert>}
 
       <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 w-full sm:w-fit overflow-x-auto">
-        <button onClick={() => { setVista('pc'); setData(null); setCompData(null); setPanel(null); }}
+        <button onClick={() => { setVista('pc'); limpiarConsulta(); }}
           className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${vista === 'pc' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
           <List size={16} /> Nota del período
         </button>
-        <button onClick={() => { setVista('competencias'); setData(null); setCompData(null); setPanel(null); }}
+        <button onClick={() => { setVista('competencias'); limpiarConsulta(); }}
           className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${vista === 'competencias' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
           <LayoutGrid size={16} /> Por competencia
         </button>
@@ -248,12 +260,12 @@ export const CalificacionesGeneralPage = () => {
 
       <div className="bg-white rounded-xl border shadow-sm p-4">
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_auto] gap-3 items-end">
-          <Select label="Curso" value={cursoId.toString()} onChange={e => setCursoId(Number(e.target.value))} options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))} placeholder="Seleccionar curso" />
+          <Select label="Curso" value={cursoId.toString()} onChange={e => { setCursoId(Number(e.target.value)); limpiarConsulta(); }} options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))} placeholder="Seleccionar curso" />
           <div className="w-full">
             <label className="block text-sm font-medium text-gray-700 mb-1">Año</label>
             <div className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-800" title="Las notas y los reportes son del año escolar activo">{anoNombre || 'Año escolar activo'}</div>
           </div>
-          <Select label="Período" value={periodo.toString()} onChange={e => setPeriodo(Number(e.target.value))} options={periodoOpts} />
+          <Select label="Período" value={periodo.toString()} onChange={e => { setPeriodo(Number(e.target.value)); limpiarConsulta(); }} options={periodoOpts} />
           <Button onClick={cargar} disabled={!cursoId} loading={loading} icon={<Search size={18} />} className="w-full xl:w-auto whitespace-nowrap">Ver notas</Button>
         </div>
       </div>

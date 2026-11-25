@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(BK, "tools"))
 
 os.environ.setdefault('ENLACE_FAMILIA_SECRET', 'secreto-de-prueba-famdoc-no-produccion')
 os.environ.setdefault('DISABLE_GLOBAL_RATE_LIMIT', 'true')
+os.environ.setdefault('ENLACE_FAMILIA_BASE_URL', 'https://educaone.ejemplo.invalid')
 
 from test_utils import aislar_base_de_datos  # noqa: E402
 
@@ -527,8 +528,9 @@ with engine.connect() as cn:
     autos = [a for (a,) in cn.execute(text("SELECT accion FROM %s WHERE tabla='_auto' AND accion LIKE 'POST /api/documentos-familia/%%'" % tabla_aud)).fetchall()]
 check('auditoría automática registrada para preparar, versión, anular y WhatsApp',
       all(any(a.endswith(s) for a in autos) for s in ('/preparar', '/version', '/anular', '/whatsapp')), sorted(set(autos))[:8])
-largo_max = max(len('POST ' + r.path.replace('{doc_id}', '9' * 9)) for r in APP.app.routes
-                if getattr(r, 'path', '').startswith('/api/documentos-familia'))
+# Solo las escrituras pasan por la auditoría automática (las GET no se registran).
+largo_max = max(len('POST ' + re.sub(r'\{[^}]+\}', '9' * 9, r.path)) for r in APP.app.routes
+                if getattr(r, 'path', '').startswith('/api/documentos-familia') and 'POST' in (getattr(r, 'methods', None) or ()))
 check('rutas cortas: «POST ruta» con un id de 9 cifras cabe en 50 caracteres', largo_max <= 50, largo_max)
 
 # ═════════ 10. Persistencia tras reiniciar ═════════

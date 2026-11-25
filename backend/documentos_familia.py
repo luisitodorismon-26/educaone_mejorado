@@ -3,11 +3,16 @@ FAM-DOC-1 · Documentos para las familias: enlace privado, contactos y página.
 
 Piezas sin dependencias de la app (se prueban solas):
 
-  - Enlace secreto: `token_de(nonce)` = HMAC-SHA256(secreto, semilla), 256 bits
-    en base64url (43 caracteres). La base guarda la semilla y el SHA-256 del
-    enlace, nunca el enlace. Con la semilla y el secreto el colegio puede
-    volver a compartir el MISMO enlace; con una copia de la base sin el
-    secreto no se reconstruye ninguno.
+  - Enlace secreto: HMAC-SHA256(clave de enlaces, semilla), 256 bits en
+    base64url (43 caracteres). La base guarda la semilla y el SHA-256 del
+    enlace, nunca el enlace. Con la semilla y la clave el colegio puede volver
+    a compartir el MISMO enlace; con una copia de la base sin la clave no se
+    reconstruye ninguno.
+  - Clave PROPIA (`ENLACE_FAMILIA_SECRET`, ≥ 32 caracteres, distinta de las
+    claves de inicio de sesión) y rotación: `ENLACE_FAMILIA_SECRETOS_ANTERIORES`
+    conserva válidos los enlaces ya enviados; los nuevos usan la actual.
+  - Dirección fija: `ENLACE_FAMILIA_BASE_URL` (https en producción). Nunca se
+    usa el dominio que llega en las cabeceras de la petición.
   - Contactos: padre, madre y tutor del estudiante, con su teléfono en formato
     de WhatsApp (wa.me) solo si es utilizable. Un contacto con nombre pero
     sin teléfono válido NO se sugiere.
@@ -33,23 +38,118 @@ ORDINAL_PERIODO = {1: 'primer', 2: 'segundo', 3: 'tercer', 4: 'cuarto'}
 ORDINAL_PERIODO_TITULO = {1: 'Primer', 2: 'Segundo', 3: 'Tercer', 4: 'Cuarto'}
 
 
+# ─────────────────────────── Configuración ───────────────────────────
+
+MIN_LARGO_CLAVE = 32
+# Solo en desarrollo local (DEBUG fuera de Render): la app lo fija al arrancar.
+# En producción la app no arranca sin la configuración válida.
+MODO_DESARROLLO = False
+_CLAVE_DESARROLLO = 'solo-desarrollo-local-enlaces-familia-no-usar-en-produccion'
+_BASE_DESARROLLO = 'http://localhost:5173'
+
+
+def _claves_anteriores():
+    crudo = os.environ.get('ENLACE_FAMILIA_SECRETOS_ANTERIORES') or ''
+    return [c for c in re.split(r'[\s,]+', crudo) if c]
+
+
+def errores_configuracion():
+    """Problemas de configuración de los enlaces (lista vacía = correcta).
+    La app los trata como el resto de su validación de arranque: en producción
+    impiden arrancar."""
+    errores = []
+    clave = os.environ.get('ENLACE_FAMILIA_SECRET') or ''
+    de_sesion = {v for v in (os.environ.get('SECRET_KEY'), os.environ.get('JWT_SECRET_KEY')) if v}
+    if not clave:
+        errores.append('ENLACE_FAMILIA_SECRET no está configurada: los enlaces de las familias necesitan una clave '
+                       'propia (generá una con `python -c "import secrets; print(secrets.token_urlsafe(48))"`).')
+    elif len(clave) < MIN_LARGO_CLAVE:
+        errores.append(f'ENLACE_FAMILIA_SECRET es demasiado corta (mínimo {MIN_LARGO_CLAVE} caracteres).')
+    elif clave in de_sesion:
+        errores.append('ENLACE_FAMILIA_SECRET debe ser independiente: no puede repetir SECRET_KEY ni JWT_SECRET_KEY.')
+    for i, ant in enumerate(_claves_anteriores(), 1):
+        if len(ant) < MIN_LARGO_CLAVE:
+            errores.append(f'ENLACE_FAMILIA_SECRETOS_ANTERIORES: la clave n.º {i} es demasiado corta.')
+        elif ant == clave:
+            errores.append(f'ENLACE_FAMILIA_SECRETOS_ANTERIORES: la clave n.º {i} repite la actual.')
+        elif ant in de_sesion:
+            errores.append(f'ENLACE_FAMILIA_SECRETOS_ANTERIORES: la clave n.º {i} repite una clave de inicio de sesión.')
+    base = (os.environ.get('ENLACE_FAMILIA_BASE_URL') or '').strip()
+    if not base:
+        errores.append('ENLACE_FAMILIA_BASE_URL no está configurada: los enlaces necesitan la dirección pública fija '
+                       '(ej: https://educaone1.onrender.com).')
+    else:
+        motivo = _motivo_base_invalida(base, permitir_http_local=False)
+        if motivo:
+            errores.append('ENLACE_FAMILIA_BASE_URL ' + motivo)
+    return errores
+
+
+def _motivo_base_invalida(base, permitir_http_local):
+    from urllib.parse import urlsplit
+    u = urlsplit(base)
+    local = (u.hostname or '') in ('localhost', '127.0.0.1')
+    if u.scheme != 'https' and not (permitir_http_local and u.scheme == 'http' and local):
+        return 'debe empezar por https://.'
+    if not u.hostname or u.username or u.password or u.query or u.fragment or (u.path not in ('', '/')):
+        return 'debe ser solo el origen (https://dominio), sin ruta, usuario ni parámetros.'
+    return None
+
+
+def claves_enlaces():
+    """[actual, anteriores…] en bytes. La actual firma los enlaces nuevos; las
+    anteriores solo validan y reconstruyen los ya enviados."""
+    actual = os.environ.get('ENLACE_FAMILIA_SECRET') or ''
+    if not actual:
+        if not MODO_DESARROLLO:
+            raise RuntimeError('ENLACE_FAMILIA_SECRET no está configurada.')
+        actual = _CLAVE_DESARROLLO
+    return [c.encode('utf-8') for c in [actual] + [a for a in _claves_anteriores() if a != actual]]
+
+
+def base_url():
+    """Dirección pública fija de los enlaces (sin barra final)."""
+    base = (os.environ.get('ENLACE_FAMILIA_BASE_URL') or '').strip().rstrip('/')
+    if not base:
+        if not MODO_DESARROLLO:
+            raise RuntimeError('ENLACE_FAMILIA_BASE_URL no está configurada.')
+        return _BASE_DESARROLLO
+    motivo = _motivo_base_invalida(base, permitir_http_local=MODO_DESARROLLO)
+    if motivo:
+        raise RuntimeError('ENLACE_FAMILIA_BASE_URL ' + motivo)
+    return base
+
+
 # ─────────────────────────── Enlace secreto ───────────────────────────
-
-def secreto_enlaces():
-    """Secreto de los enlaces. `ENLACE_FAMILIA_SECRET` si está definido (se
-    recomienda: así rotar SECRET_KEY no invalida los enlaces ya enviados);
-    si no, SECRET_KEY."""
-    s = os.environ.get('ENLACE_FAMILIA_SECRET') or os.environ.get('SECRET_KEY') or 'dev-secret-key-change-in-production'
-    return s.encode('utf-8')
-
 
 def nueva_semilla():
     return secrets.token_urlsafe(32)
 
 
-def token_de(nonce):
-    mac = hmac.new(secreto_enlaces(), _DOMINIO_HMAC + nonce.encode('utf-8'), hashlib.sha256).digest()
+def token_de(nonce, clave=None):
+    """Enlace de una semilla. Sin `clave`, con la clave ACTUAL (documentos nuevos)."""
+    clave = clave if clave is not None else claves_enlaces()[0]
+    mac = hmac.new(clave, _DOMINIO_HMAC + nonce.encode('utf-8'), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(mac).decode('ascii').rstrip('=')
+
+
+def enlace_de_documento(nonce, token_hash):
+    """El enlace EXACTO que ya se compartió (para volver a compartirlo): el que,
+    con alguna clave conocida (actual o anterior), da el hash guardado. None si
+    su clave ya se retiró."""
+    for clave in claves_enlaces():
+        t = token_de(nonce, clave)
+        if hmac.compare_digest(hash_token(t), token_hash):
+            return t
+    return None
+
+
+def token_valido(nonce, token):
+    """El enlace recibido se deriva de la semilla con alguna clave conocida."""
+    ok = False
+    for clave in claves_enlaces():
+        ok |= hmac.compare_digest(token_de(nonce, clave), token)
+    return ok
 
 
 def hash_token(token):
