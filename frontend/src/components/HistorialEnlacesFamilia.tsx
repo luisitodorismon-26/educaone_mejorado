@@ -54,8 +54,10 @@ export const HistorialEnlacesFamilia = ({ estudianteId, nombre, textoAbrir = 'Ve
       if (g === generacion.current) setLista(res.data.versiones || []);
     } catch (e: any) {
       if (g !== generacion.current) return;
+      const msg = await mensajeDeError(e, { porDefecto: 'No se pudieron cargar los enlaces de este estudiante.' });
+      if (g !== generacion.current) return;   // se cerró o se recargó mientras se preparaba el mensaje
       setLista([]);
-      setError(await mensajeDeError(e, { porDefecto: 'No se pudieron cargar los enlaces de este estudiante.' }));
+      setError(msg);
     }
   };
 
@@ -75,7 +77,9 @@ export const HistorialEnlacesFamilia = ({ estudianteId, nombre, textoAbrir = 'Ve
       onAnulado?.(v.id);
       if (g === generacion.current) await cargar();
     } catch (e: any) {
-      if (g === generacion.current) setError(await mensajeDeError(e, { porDefecto: 'No se pudo anular el enlace.', operacion: 'guardado' }));
+      if (g !== generacion.current) return;
+      const msg = await mensajeDeError(e, { porDefecto: 'No se pudo anular el enlace.', operacion: 'guardado' });
+      if (g === generacion.current) setError(msg);   // vigencia también después de esperar el mensaje
     } finally { enCurso.current = false; setAnulando(null); }
   };
 

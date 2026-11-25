@@ -111,6 +111,10 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
     li?.scrollIntoView({ block: 'nearest' });
   }, [actual, familias.length]);
 
+  // Generación de ESTA apertura del panel, capturada al dibujar: un callback que
+  // llegue después de cerrarlo (p. ej. onAnulado tras una respuesta demorada) la
+  // compara con la actual y no toca el estado.
+  const generacionDeEstaApertura = generacion.current;
   const familia = familias[actual];
   const contacto = familia ? contactoElegido(familia, eleccion[familia.estudiante_id]) : null;
   const url = familia?.documento?.estado === 'activo' ? familia.documento.url : null;
@@ -335,7 +339,7 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
                   <div className="border-t pt-3" data-versiones>
                     <HistorialEnlacesFamilia key={familia.estudiante_id} estudianteId={familia.estudiante_id} nombre={familia.nombre}
                       recarga={recargaHistorial}
-                      onAnulado={docId => vigente(generacion.current) && setFamilias(prev => prev.map(f =>
+                      onAnulado={docId => vigente(generacionDeEstaApertura) && setFamilias(prev => prev.map(f =>
                         f.documento?.id === docId ? { ...f, documento: null, desactualizado: null } : f))} />
                   </div>
                 </div>
