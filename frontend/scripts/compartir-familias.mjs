@@ -149,13 +149,32 @@ prueba('cerrar el panel: no pide más lotes, cancela la petición y descarta res
   contiene(panel, '.then(res => vigente(g) && setFamilias(prev');
   noContiene(panel, 'vivo.current');
 });
+const historial = leer('components/HistorialEnlacesFamilia.tsx');
+const ficha = leer('pages/estudiantes/EstudiantesPage.tsx');
 prueba('lista de versiones con fecha y «Anular enlace» (también años anteriores); anular no borra el PDF', () => {
-  contiene(panel, '/documentos-familia/estudiante/${estId}/versiones');
-  contiene(panel, 'Versiones y enlaces anteriores');
-  contiene(panel, "{v.estado !== 'anulado' && (");
-  contiene(panel, 'Preparado el {fecha(v.fecha_preparado)}');
-  contiene(panel, 'Anular no borra el PDF');
-  noContiene(panel, 'api.delete');
+  contiene(historial, '/documentos-familia/estudiante/${estudianteId}/versiones');
+  contiene(historial, "textoAbrir = 'Versiones y enlaces anteriores'");
+  contiene(historial, "{v.estado !== 'anulado' && (");
+  contiene(historial, 'Preparado el {fecha(v.fecha_preparado)}');
+  contiene(historial, 'Anular no borra el PDF');
+  contiene(historial, '/documentos-familia/${v.id}/anular');
+  noContiene(historial, 'api.delete');
+});
+prueba('el panel reutiliza el historial compartido (sin copia propia)', () => {
+  contiene(panel, "import { HistorialEnlacesFamilia } from '../../components/HistorialEnlacesFamilia';");
+  contiene(panel, '<HistorialEnlacesFamilia key={familia.estudiante_id}');
+  noContiene(panel, '/versiones`');
+});
+prueba('ficha del estudiante: historial para dirección y coordinación (los mismos permisos del endpoint)', () => {
+  contiene(ficha, "import { HistorialEnlacesFamilia } from '../../components/HistorialEnlacesFamilia';");
+  contiene(ficha, "const canVerEnlacesFamilia = user?.role === 'direccion' || user?.role === 'coordinador';");
+  contiene(ficha, '{canVerEnlacesFamilia && (');
+  contiene(ficha, '<HistorialEnlacesFamilia key={showDetalle.id} estudianteId={showDetalle.id}');
+});
+prueba('historial: respuestas tardías descartadas y doble clic cortado', () => {
+  contiene(historial, 'if (g === generacion.current) setLista(');
+  contiene(historial, 'return () => { generacion.current += 1; };');
+  contiene(historial, 'if (enCurso.current) return;');
 });
 prueba('enlace con clave retirada: se avisa y se ofrece versión nueva', () => {
   contiene(panel, 'enlace_disponible === false'); contiene(panel, 'ya se retiró');

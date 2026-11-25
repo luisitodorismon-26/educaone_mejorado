@@ -1,1 +1,7 @@
-{ "rewrites": [ { "source": "/(.*)", "destination": "/index.html" } ] }
+{
+  "rewrites": [
+    { "source": "/doc/:token/pdf", "destination": "https://educaone-api.onrender.com/doc/:token/pdf" },
+    { "source": "/doc/:token", "destination": "https://educaone-api.onrender.com/doc/:token" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

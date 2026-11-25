@@ -12,6 +12,7 @@ import { labelCurso } from '../../utils/labelCurso';
 import { MovimientoEstudianteModal, HistorialCursos, TipoMovimiento } from './MovimientoEstudianteModal';
 import { RetiroAnulacionesPanel } from './RetiroAnulacionesPanel';
 import { PermisoCorreccionModal } from './PermisoCorreccionModal';
+import { HistorialEnlacesFamilia } from '../../components/HistorialEnlacesFamilia';
 import { useNavigate } from 'react-router-dom';
 
 interface Estudiante {
@@ -124,6 +125,8 @@ export const EstudiantesPage = () => {
   const [confirmaId, setConfirmaId] = useState('');
   const [eliminando, setEliminando] = useState(false);
   const canEliminarPorError = user?.role === 'direccion';
+  // FAM-DOC-1 · historial de enlaces compartidos con la familia: los mismos roles que lo preparan.
+  const canVerEnlacesFamilia = user?.role === 'direccion' || user?.role === 'coordinador';
   // ENT-A · boletines y notas de retirados sin reactivarlos.
   const navigate = useNavigate();
   const [permisoPara, setPermisoPara] = useState<Estudiante | null>(null);
@@ -711,7 +714,12 @@ export const EstudiantesPage = () => {
                 <tbody className="divide-y">
                   {estudiantesRetirados.map(est => (
                     <tr key={est.id} className="hover:bg-gray-50">
-                      <td className="px-4 py-3 font-medium">{est.nombre_completo}</td>
+                      {/* FAM-DOC-1 · abre la misma ficha que un activo (con su historial de enlaces) */}
+                      <td className="px-4 py-3 font-medium">
+                        <button onClick={() => setShowDetalle(est)} className="text-left hover:underline" title="Ver la ficha del estudiante" data-ver-ficha-retirado>
+                          {est.nombre_completo}
+                        </button>
+                      </td>
                       <td className="px-4 py-3 text-gray-600">{est.curso || 'Sin curso'}</td>
                       <td className="px-4 py-3">
                         <span className="px-2 py-1 text-xs font-medium bg-red-100 text-red-700 rounded">
@@ -1079,6 +1087,13 @@ export const EstudiantesPage = () => {
             {/* RET-R · anuladas por retiro, reversión y corrección de fecha (solo Dirección) */}
             {canEliminarPorError && (
               <RetiroAnulacionesPanel estudianteId={showDetalle.id} retirado={!showDetalle.activo} />
+            )}
+            {/* FAM-DOC-1 · enlaces de reportes compartidos con la familia (también retirados o sin curso actual) */}
+            {canVerEnlacesFamilia && (
+              <div className="rounded-lg border border-gray-200 p-3" data-ficha-enlaces-familia>
+                <HistorialEnlacesFamilia key={showDetalle.id} estudianteId={showDetalle.id} nombre={showDetalle.nombre_completo}
+                  textoAbrir="Ver enlaces de reportes compartidos con la familia" />
+              </div>
             )}
 
             {/* Banner prominente de retiro: visible al inicio del modal */}

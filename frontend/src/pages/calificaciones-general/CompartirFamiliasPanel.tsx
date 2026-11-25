@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { X, Users, Mail, MessageCircle, User, ArrowRight, Info, AlertTriangle, RefreshCw, Ban, Loader2, ExternalLink } from 'lucide-react';
 import api from '../../services/api';
+import { HistorialEnlacesFamilia } from '../../components/HistorialEnlacesFamilia';
 import { mensajeDeError } from '../../utils/errorServidor';
 import {
   FamiliaEstado, RolContacto, contactoElegido, etiquetaContacto, mensajeFamilia, enlaceWhatsApp,
@@ -17,12 +18,6 @@ interface Props {
 // Lotes cortos: cada petición dura pocos segundos y se ve el avance.
 const LOTE = 10;
 
-interface VersionDoc {
-  id: number; ano: string | null; periodo: number; version: number;
-  estado: 'activo' | 'reemplazado' | 'anulado'; fecha_preparado: string | null; fecha_anulado: string | null; visitas: number;
-}
-const ESTADO_VERSION: Record<VersionDoc['estado'], string> = { activo: 'Enlace activo', reemplazado: 'Reemplazado (el enlace sigue abriendo)', anulado: 'Anulado' };
-const fecha = (iso: string | null) => iso ? new Date(iso).toLocaleDateString('es-DO') : '—';
 
 const IconoWhatsApp = ({ size = 20 }: { size?: number }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -51,7 +46,8 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
   const generacion = useRef(0);
   const vigente = (g: number) => g === generacion.current;
   const cancelar = useRef<AbortController | null>(null);
-  const [versiones, setVersiones] = useState<{ estudianteId: number; lista: VersionDoc[] | null; error?: string } | null>(null);
+  // Cambiar este número recarga el historial abierto (tras versión nueva o anular).
+  const [recargaHistorial, setRecargaHistorial] = useState(0);
 
   const reemplazar = (nuevas: FamiliaEstado[]) =>
     setFamilias(prev => prev.map(f => nuevas.find(n => n.estudiante_id === f.estudiante_id) || f));
@@ -146,7 +142,7 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
       if (!vigente(g)) return;
       enCurso.current = false;
       await preparar([familia.estudiante_id], false);
-      if (vigente(g) && versiones?.estudianteId === familia.estudiante_id) cargarVersiones(familia.estudiante_id);
+      if (vigente(g)) setRecargaHistorial(n => n + 1);
     } catch (e: any) {
       if (!vigente(g)) return;
       if (e?.response?.status === 503) setOcupado(true);
@@ -166,25 +162,11 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
       await api.post(`/documentos-familia/${docId}/anular`, { motivo: 'Anulado desde Notas por período' });
       if (!vigente(g)) return;
       setFamilias(prev => prev.map(f => f.estudiante_id === estId && f.documento?.id === docId ? { ...f, documento: null, desactualizado: null } : f));
-      if (versiones?.estudianteId === estId) cargarVersiones(estId);
+      setRecargaHistorial(n => n + 1);
     } catch (e: any) {
       if (!vigente(g)) return;
       setError(await mensajeDeError(e, { porDefecto: 'No se pudo anular el enlace.', operacion: 'guardado' }));
     } finally { if (vigente(g)) { enCurso.current = false; setAccion(null); } }
-  };
-
-  const cargarVersiones = async (estId: number) => {
-    const g = generacion.current;
-    setVersiones({ estudianteId: estId, lista: null });
-    try {
-      const res = await api.get(`/documentos-familia/estudiante/${estId}/versiones`);
-      if (!vigente(g)) return;
-      setVersiones(v => v && v.estudianteId === estId ? { estudianteId: estId, lista: res.data.versiones || [] } : v);
-    } catch (e: any) {
-      if (!vigente(g)) return;
-      const msg = await mensajeDeError(e, { porDefecto: 'No se pudieron cargar las versiones.' });
-      setVersiones(v => v && v.estudianteId === estId ? { estudianteId: estId, lista: [], error: msg } : v);
-    }
   };
 
   const irSiguiente = () => {
@@ -349,42 +331,12 @@ export const CompartirFamiliasPanel = ({ cursoId, periodo, estudianteIds, onCerr
                     </div>
                   )}
 
-                  {/* Versiones de este estudiante (todos los años y períodos), para anular enlaces anteriores. */}
+                  {/* Historial de enlaces de este estudiante (todos los años y períodos), para anular los anteriores. */}
                   <div className="border-t pt-3" data-versiones>
-                    {versiones?.estudianteId !== familia.estudiante_id ? (
-                      <button onClick={() => cargarVersiones(familia.estudiante_id)} className="text-sm font-semibold text-blue-700 hover:underline">
-                        Versiones y enlaces anteriores
-                      </button>
-                    ) : (
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between">
-                          <p className="text-sm font-semibold text-gray-900">Versiones de {familia.nombre}</p>
-                          <button onClick={() => setVersiones(null)} className="text-xs text-gray-500 hover:underline">Ocultar</button>
-                        </div>
-                        {versiones.lista === null && <p className="text-xs text-gray-500 flex items-center gap-1"><Loader2 size={12} className="animate-spin" /> Cargando…</p>}
-                        {versiones.error && <p className="text-xs text-red-700 whitespace-pre-line">{versiones.error}</p>}
-                        {versiones.lista && versiones.lista.length === 0 && !versiones.error && <p className="text-xs text-gray-500">Todavía no hay versiones preparadas.</p>}
-                        {versiones.lista && versiones.lista.length > 0 && (
-                          <ul className="divide-y rounded-lg border border-gray-200 text-sm">
-                            {versiones.lista.map(v => (
-                              <li key={v.id} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-2">
-                                <div className="min-w-0">
-                                  <p className="text-gray-900">{v.ano || '—'} · Período {v.periodo} · versión {v.version}</p>
-                                  <p className="text-xs text-gray-500">Preparado el {fecha(v.fecha_preparado)} · {ESTADO_VERSION[v.estado]}{v.estado === 'anulado' ? ` el ${fecha(v.fecha_anulado)}` : ''}</p>
-                                </div>
-                                {v.estado !== 'anulado' && (
-                                  <button onClick={() => anular(v.id, `del período ${v.periodo} (${v.ano || '—'}, versión ${v.version})`)} disabled={accion !== null}
-                                    className="inline-flex items-center gap-1 text-xs font-semibold text-red-700 hover:underline disabled:opacity-50 shrink-0">
-                                    <Ban size={12} /> Anular enlace
-                                  </button>
-                                )}
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                        <p className="text-xs text-gray-500">Anular no borra el PDF: solo deja de abrirse el enlace.</p>
-                      </div>
-                    )}
+                    <HistorialEnlacesFamilia key={familia.estudiante_id} estudianteId={familia.estudiante_id} nombre={familia.nombre}
+                      recarga={recargaHistorial}
+                      onAnulado={docId => vigente(generacion.current) && setFamilias(prev => prev.map(f =>
+                        f.documento?.id === docId ? { ...f, documento: null, desactualizado: null } : f))} />
                   </div>
                 </div>
               )}

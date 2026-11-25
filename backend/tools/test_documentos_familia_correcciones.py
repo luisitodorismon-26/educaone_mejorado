@@ -349,6 +349,35 @@ check('al volver a abrir solo se prepara lo que faltaba (13 de 23)', total_cread
 check('lo preparado antes conserva su enlace', all(listar()[i]['documento']['url'] == u for i, u in urls_1.items()))
 check('sin duplicados', contar('documentos_familia') == n_docs + 13)
 
+# ═════════ F. Historial desde la ficha: retirados o sin curso actual ═════════
+print('\nF. Historial de un estudiante retirado y sin curso actual')
+SECRE = usuario(COL, 'sint_secre', 'secretaria')
+db.commit()
+RET = ESTS[2]
+url_ret = listar()[RET.id]['documento']['url']
+with engine.begin() as cn:  # se retira y queda sin curso (como tras un retiro)
+    cn.execute(text('UPDATE estudiantes SET activo = :f, curso_id = NULL WHERE id = :e'), {'f': False, 'e': RET.id})
+check('retirado: ya no aparece en la lista del curso', RET.id not in listar())
+rl = client.get('/api/documentos-familia/estudiante/%d/versiones' % RET.id, headers=H(DIR))
+VR = rl.json().get('versiones', [])
+check('su historial sigue accesible por estudiante (200, con su versión activa)',
+      rl.status_code == 200 and len(VR) == 1 and VR[0]['estado'] == 'activo', (rl.status_code, VR))
+check('secretaría (ve la ficha) no ve este historial (403)',
+      client.get('/api/documentos-familia/estudiante/%d/versiones' % RET.id, headers=H(SECRE)).status_code == 403)
+check('profesor: 403 · otro colegio: 404 · Primaria: 403', (
+    client.get('/api/documentos-familia/estudiante/%d/versiones' % RET.id, headers=H(PROF)).status_code,
+    client.get('/api/documentos-familia/estudiante/%d/versiones' % RET.id, headers=H(DIR2)).status_code,
+    client.get('/api/documentos-familia/estudiante/%d/versiones' % RET.id, headers=H(COORD_P)).status_code) == (403, 404, 403))
+check('su enlace sigue abriendo hasta que se anule', anon.get(ruta(url_ret)).status_code == 200)
+pdfs_antes = contar('documentos_familia_archivos')
+ra = client.post('/api/documentos-familia/%d/anular' % VR[0]['id'], headers=H(DIR), json={'motivo': 'retirado'})
+check('anular desde el historial del retirado → 410 y el PDF se conserva',
+      ra.status_code == 200 and anon.get(ruta(url_ret)).status_code == 410 and contar('documentos_familia_archivos') == pdfs_antes)
+SIN = add(M.Estudiante(colegio_id=COL.id, nombre='SinDocs', apellido='Sintetico', curso_id=None, activo=True, no_lista=99))
+db.commit()
+r = client.get('/api/documentos-familia/estudiante/%d/versiones' % SIN.id, headers=H(DIR))
+check('estudiante sin curso ni documentos → lista vacía (200)', r.status_code == 200 and r.json()['versiones'] == [], r.text)
+
 ok = sum(1 for _, b in RES if b)
 print('\n%d/%d' % (ok, len(RES)))
 sys.exit(0 if ok == len(RES) else 1)
