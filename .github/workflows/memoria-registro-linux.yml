@@ -1,0 +1,76 @@
+# PRUEBA (no forma parte del producto): memoria del Registro de Secundaria en Linux.
+# Compara main (3a5a96b) con el PR #81 (a2bfb45) con 2 workers en un contenedor
+# limitado a 512 MiB sin swap adicional y PostgreSQL SINTÉTICO aparte.
+# No usa secretos ni credenciales de producción; no despliega nada.
+name: MEM-REG · memoria del Registro en Linux (prueba)
+
+on:
+  push:
+    branches: [claude/ci-memoria-registro-linux]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mem-reg-linux
+  cancel-in-progress: false
+
+jobs:
+  banco:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    env:
+      REF_MAIN: 3a5a96b983f6083e21228bd13dbd0cef11ab792a
+      REF_RAMA: a2bfb451ae2b44913f6a0a38cfc479693b583a67
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Versiones a comparar (worktrees fijos por SHA)
+        run: |
+          git fetch --no-tags origin main claude/registro-memoria-concurrencia
+          git worktree add --detach /tmp/v/main "$REF_MAIN"
+          git worktree add --detach /tmp/v/rama "$REF_RAMA"
+          git -C /tmp/v/main log -1 --format='main: %H %s'
+          git -C /tmp/v/rama log -1 --format='rama: %H %s'
+          cmp /tmp/v/main/backend/requirements.txt /tmp/v/rama/backend/requirements.txt && echo "requirements.txt idéntico"
+
+      - name: Entorno del runner
+        run: |
+          uname -r; nproc; free -m
+          stat -fc 'cgroup: %T' /sys/fs/cgroup
+          docker version --format 'docker {{.Server.Version}}'
+
+      - name: Imagen de prueba (dependencias fijadas de producción)
+        run: docker build -t eo-memreg -f ci/memoria_registro/Dockerfile /tmp/v/main/backend
+
+      - name: PostgreSQL sintético (contenedor aparte, sin límite)
+        run: |
+          docker network create eo
+          docker run -d --name pg --network eo -e POSTGRES_USER=eo_test -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17
+          for i in $(seq 1 60); do docker exec pg pg_isready -U eo_test && break; sleep 1; done
+
+      - name: Banco (main y PR #81, dos rondas alternas)
+        run: bash ci/memoria_registro/ejecutar.sh
+
+      - name: Resumen
+        if: always()
+        run: |
+          python3 ci/memoria_registro/comparar.py /tmp/res > /tmp/res/RESUMEN.md || true
+          cat /tmp/res/RESUMEN.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Resultados (artefacto)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mem-reg-linux
+          path: /tmp/res
+          retention-days: 30
+
+      - name: Detener contenedores
+        if: always()
+        run: |
+          docker rm -f srv pg 2>/dev/null || true
+          docker network rm eo 2>/dev/null || true
