@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import api from '../../services/api';
 import { mensajeDeErrorDescarga } from '../../utils/errorServidor';
-import { FileBarChart, Download, Search, ChevronDown, ChevronUp, LayoutGrid, List, Users, User } from 'lucide-react';
+import { FileText, Search, ChevronDown, ChevronUp, LayoutGrid, List, Users, CheckCircle2, AlertCircle, Info } from 'lucide-react';
 import { Select, Button, Alert } from '../../components/ui';
 import { labelCurso } from '../../utils/labelCurso';
+import { CompartirFamiliasPanel } from './CompartirFamiliasPanel';
 
 interface Curso { id: number; nombre_completo: string; grado?: string; nombre?: string; tanda?: string; }
 
@@ -68,30 +69,56 @@ export const CalificacionesGeneralPage = () => {
   const [ordenDesc, setOrdenDesc] = useState(false);
 
   const [descargandoPadres, setDescargandoPadres] = useState(false);
+  const [descargandoTabla, setDescargandoTabla] = useState(false);
+  const [descargandoEst, setDescargandoEst] = useState<number | null>(null);
+  const [anoNombre, setAnoNombre] = useState<string>('');
+  // FAM-DOC-1 · selección para compartir (individual o por curso).
+  const [seleccion, setSeleccion] = useState<Set<number>>(new Set());
+  const [panel, setPanel] = useState<{ ids: number[] } | null>(null);
+  // Curso y período de la tabla que se ve (no los de los selectores, que pueden cambiar antes de «Ver notas»).
+  const [consulta, setConsulta] = useState<{ cursoId: number; periodo: number } | null>(null);
 
-  useEffect(() => { cargarCursos(); }, []);
+  useEffect(() => { cargarCursos(); cargarAno(); }, []);
+
+  const cargarAno = async () => {
+    try { const res = await api.get('/ano-escolar'); setAnoNombre(res.data?.nombre || ''); }
+    catch { setAnoNombre(''); }
+  };
 
   const cargarCursos = async () => {
     try { const res = await api.get('/cursos'); setCursos(res.data || []); }
     catch { setError('Error al cargar cursos'); }
   };
 
+  // FAM-DOC-1 · lo que se ve, se descarga y se comparte es SIEMPRE el curso y
+  // período de la última «Ver notas». Cambiar un filtro limpia la tabla y
+  // cierra el panel; una respuesta que llegue después de cambiarlo se descarta.
+  const consultaVigente = useRef(0);
+  const limpiarConsulta = () => {
+    consultaVigente.current += 1;
+    setData(null); setCompData(null); setSeleccion(new Set()); setPanel(null); setConsulta(null); setLoading(false);
+  };
+
   const cargar = async () => {
     if (!cursoId) return;
-    setLoading(true); setError(''); setData(null); setCompData(null);
+    const id = ++consultaVigente.current;
+    setLoading(true); setError(''); setData(null); setCompData(null); setSeleccion(new Set()); setPanel(null); setConsulta(null);
     try {
       if (vista === 'pc') {
         const res = await api.get(`/calificaciones/por-periodo?curso_id=${cursoId}&periodo=${periodo}`);
+        if (id !== consultaVigente.current) return;
         setData(res.data);
+        setConsulta({ cursoId, periodo });
       } else {
         const res = await api.get(`/calificaciones-secundaria/curso/${cursoId}/periodo/${periodo}/competencias`);
+        if (id !== consultaVigente.current) return;
         setCompData(res.data);
         if (res.data.asignaturas_nombres?.length && !asignaturaSel) {
           setAsignaturaSel(res.data.asignaturas_nombres[0]);
         }
       }
-    } catch (err: any) { setError(err.response?.data?.error || 'Error al cargar notas'); }
-    finally { setLoading(false); }
+    } catch (err: any) { if (id === consultaVigente.current) setError(err.response?.data?.error || 'Error al cargar notas'); }
+    finally { if (id === consultaVigente.current) setLoading(false); }
   };
 
   const descargarBlob = async (url: string, filename: string) => {
@@ -113,8 +140,10 @@ export const CalificacionesGeneralPage = () => {
 
   const descargarPDF = async () => {
     if (!cursoId) return;
+    setDescargandoTabla(true); setError('');
     try { await descargarBlob(`/calificaciones/por-periodo/pdf?curso_id=${cursoId}&periodo=${periodo}`, `Notas_P${periodo}_${nombreCurso()}.pdf`); }
     catch (e: any) { setError(await mensajeDeErrorDescarga(e, { porDefecto: 'Error al descargar PDF' })); }
+    finally { setDescargandoTabla(false); }
   };
 
   const descargarReportePadresCurso = async () => {
@@ -131,12 +160,14 @@ export const CalificacionesGeneralPage = () => {
 
   const descargarReportePadresIndividual = async (estId: number, nombre: string) => {
     if (!cursoId) return;
+    setDescargandoEst(estId); setError('');
     try {
       await descargarBlob(
         `/calificaciones-secundaria/reporte-padres/curso/${cursoId}/pdf?periodo=${periodo}&estudiante_id=${estId}`,
         `Reporte_Periodo${periodo}_${nombre.replace(/\s+/g, '_')}.pdf`
       );
     } catch (e: any) { setError(await mensajeDeErrorDescarga(e, { porDefecto: 'Error al generar reporte individual' })); }
+    finally { setDescargandoEst(null); }
   };
 
   const getColorNota = (nota: number | null) => {
@@ -177,60 +208,97 @@ export const CalificacionesGeneralPage = () => {
 
   const periodoOpts = [{ value: 1, label: 'Periodo 1' }, { value: 2, label: 'Periodo 2' }, { value: 3, label: 'Periodo 3' }, { value: 4, label: 'Periodo 4' }];
 
+  // Indicadores informativos (no bloquean nada): materias sin nota en el período.
+  const pendientesDe = (est: NotaPeriodo) => data ? data.asignaturas_nombres.filter(a => est.asignaturas[a] === null || est.asignaturas[a] === undefined).length : 0;
+  const totalEst = data?.estudiantes.length || 0;
+  const conPendientes = data ? data.estudiantes.filter(e => pendientesDe(e) > 0).length : 0;
+  const esPrimaria = data?.nivel === 'primaria';
+  const motivoSinCompartir = esPrimaria ? 'El Reporte del Período todavía no incluye las calificaciones de Primaria' : '';
+
+  const todosMarcados = totalEst > 0 && seleccion.size === totalEst;
+  const alternarTodos = () => setSeleccion(todosMarcados ? new Set() : new Set(data!.estudiantes.map(e => e.estudiante_id)));
+  const alternar = (id: number) => setSeleccion(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  // Orden de la lista del curso (n.º de lista) para recorrer las familias.
+  const idsEnOrden = (ids: Set<number> | null) => data ? [...data.estudiantes]
+    .sort((a, b) => (a.no_lista ?? 9999) - (b.no_lista ?? 9999))
+    .map(e => e.estudiante_id).filter(id => !ids || ids.has(id)) : [];
+  const abrirCompartir = (soloId?: number) => {
+    if (esPrimaria || !data || !consulta) return;
+    const ids = soloId ? [soloId] : idsEnOrden(seleccion.size ? seleccion : null);
+    if (ids.length) setPanel({ ids });
+  };
+
+  const BtnAccion = ({ children, ...p }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button {...p} className={`inline-flex items-center justify-center gap-2 rounded-lg border-2 border-gray-300 bg-white px-4 py-2.5 font-semibold text-gray-800 shadow-sm hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed ${p.className || ''}`}>{children}</button>
+  );
+  const IconoWA = ({ size = 18 }: { size?: number }) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12.04 2C6.58 2 2.13 6.45 2.13 11.91c0 1.75.46 3.45 1.32 4.95L2.05 22l5.25-1.38a9.9 9.9 0 0 0 4.74 1.21c5.46 0 9.91-4.45 9.91-9.91C21.96 6.45 17.5 2 12.04 2Zm0 18.15a8.2 8.2 0 0 1-4.19-1.15l-.3-.18-3.12.82.83-3.04-.2-.31a8.2 8.2 0 0 1-1.26-4.38c0-4.54 3.7-8.23 8.25-8.23 4.54 0 8.24 3.69 8.24 8.24 0 4.54-3.7 8.23-8.24 8.23Zm4.52-6.16c-.25-.12-1.47-.72-1.69-.81-.23-.08-.39-.12-.56.13-.16.25-.64.81-.79.97-.14.17-.29.19-.54.06-.25-.12-1.05-.39-1.99-1.23-.74-.66-1.23-1.47-1.38-1.72-.14-.25-.02-.38.11-.51.11-.11.25-.29.37-.43.13-.15.17-.25.25-.42.08-.17.04-.31-.02-.43-.06-.13-.56-1.35-.77-1.85-.2-.48-.41-.42-.56-.43h-.48c-.17 0-.43.06-.66.31-.23.25-.87.85-.87 2.07 0 1.22.89 2.4 1.01 2.56.12.17 1.75 2.67 4.24 3.74 2.07.9 2.49.72 2.94.68.48-.07 1.47-.6 1.67-1.18.21-.58.21-1.07.14-1.18-.06-.1-.22-.16-.47-.29Z" /></svg>
+  );
+  const ChipEstado = ({ pendientes }: { pendientes: number }) => pendientes === 0
+    ? <span className="inline-flex items-center gap-1 rounded-full bg-green-100 text-green-800 px-2.5 py-1 text-xs font-semibold whitespace-nowrap"><CheckCircle2 size={14} /> Completo</span>
+    : <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 text-amber-800 px-2.5 py-1 text-xs font-semibold whitespace-nowrap" title={`${pendientes} ${pendientes === 1 ? 'materia' : 'materias'} sin nota (informativo)`}><AlertCircle size={14} /> Nota pendiente</span>;
+
   return (
-    <div className="space-y-6">
+    <div className={`space-y-5 ${panel ? 'xl:pr-[440px]' : ''}`}>
       <div>
-        <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2"><FileBarChart className="text-blue-600" /> Notas por Periodo</h1>
-        <p className="text-gray-500 mt-1">Nota del período por asignatura. Vista resumen o desglose por competencia.</p>
+        <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">Notas por período</h1>
+        <p className="text-gray-600 mt-1">Consulta las calificaciones y prepara los reportes para las familias.</p>
       </div>
 
       {error && <Alert variant="error" onClose={() => setError('')}><span className="whitespace-pre-line" data-error-descarga>{error}</span></Alert>}
 
-      <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 w-fit">
-        <button onClick={() => { setVista('pc'); setData(null); setCompData(null); }}
-          className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${vista === 'pc' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
-          <List size={16} /> Vista Nota del Período (resumen)
+      <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 w-full sm:w-fit overflow-x-auto">
+        <button onClick={() => { setVista('pc'); limpiarConsulta(); }}
+          className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${vista === 'pc' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
+          <List size={16} /> Nota del período
         </button>
-        <button onClick={() => { setVista('competencias'); setData(null); setCompData(null); }}
-          className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${vista === 'competencias' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
-          <LayoutGrid size={16} /> Vista por Competencia
+        <button onClick={() => { setVista('competencias'); limpiarConsulta(); }}
+          className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${vista === 'competencias' ? 'bg-white text-blue-700 shadow-sm' : 'text-gray-600 hover:text-gray-800'}`}>
+          <LayoutGrid size={16} /> Por competencia
         </button>
       </div>
 
       <div className="bg-white rounded-xl border shadow-sm p-4">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-          <Select label="Curso" value={cursoId.toString()} onChange={e => setCursoId(Number(e.target.value))} options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))} placeholder="Seleccionar curso" />
-          <Select label="Periodo" value={periodo.toString()} onChange={e => setPeriodo(Number(e.target.value))} options={periodoOpts} />
-          <div className="flex items-end"><Button onClick={cargar} disabled={!cursoId} loading={loading} icon={<Search size={18} />} className="w-full">Ver Notas</Button></div>
-        </div>
-
-        {vista === 'pc' && data && (
-          <div className="mt-3 pt-3 border-t border-gray-100">
-            <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
-              <div>
-                <p className="text-[11px] font-medium text-gray-600 mb-1.5">Descargar tabla completa</p>
-                <Button onClick={descargarPDF} variant="secondary" icon={<Download size={16} />} className="text-xs">Tabla general (PDF)</Button>
-                <p className="text-[9px] text-gray-400 mt-0.5">Todas las asignaturas del periodo</p>
-              </div>
-              <div className="border-l border-gray-200 pl-6">
-                <p className="text-[11px] font-medium text-gray-600 mb-1.5">Reporte del Período para padres</p>
-                <Button onClick={descargarReportePadresCurso} variant="primary" loading={descargandoPadres} icon={<Users size={16} />} className="text-xs">Reporte del Período {periodo} (curso)</Button>
-                <p className="text-[9px] text-gray-400 mt-0.5">
-                  {data.nivel === 'primaria'
-                    ? 'La tabla general y este reporte leen calificaciones de Secundaria: todavía no incluyen las de Primaria'
-                    : 'Un reporte por estudiante con la nota del período (último P registrado) por asignatura'}
-                </p>
-              </div>
-            </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_auto] gap-3 items-end">
+          <Select label="Curso" value={cursoId.toString()} onChange={e => { setCursoId(Number(e.target.value)); limpiarConsulta(); }} options={cursos.map(c => ({ value: c.id, label: labelCurso(c), group: c.tanda || 'Sin tanda' }))} placeholder="Seleccionar curso" />
+          <div className="w-full">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Año</label>
+            <div className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-800" title="Las notas y los reportes son del año escolar activo">{anoNombre || 'Año escolar activo'}</div>
           </div>
-        )}
+          <Select label="Período" value={periodo.toString()} onChange={e => { setPeriodo(Number(e.target.value)); limpiarConsulta(); }} options={periodoOpts} />
+          <Button onClick={cargar} disabled={!cursoId} loading={loading} icon={<Search size={18} />} className="w-full xl:w-auto whitespace-nowrap">Ver notas</Button>
+        </div>
       </div>
 
       {vista === 'pc' && data && (
-        <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-2.5 text-xs text-gray-600 flex items-center gap-2">
-          <span className="text-base">ℹ️</span>
-          Todo en esta pantalla corresponde al <strong>Periodo {periodo}</strong>: la tabla, las estadisticas y el reporte que descargas.
-        </div>
+        <>
+          <div className="flex flex-col sm:flex-row sm:flex-wrap gap-3">
+            <BtnAccion onClick={descargarPDF} disabled={descargandoTabla} title="Todas las asignaturas del período en una tabla">
+              <FileText size={18} /> {descargandoTabla ? 'Generando…' : 'Tabla general PDF'}
+            </BtnAccion>
+            <BtnAccion onClick={descargarReportePadresCurso} disabled={descargandoPadres} title="Un reporte por estudiante, todo el curso en un PDF">
+              <FileText size={18} /> {descargandoPadres ? 'Generando…' : 'Reportes del curso PDF'}
+            </BtnAccion>
+            <button onClick={() => abrirCompartir()} disabled={esPrimaria || totalEst === 0} title={motivoSinCompartir || 'Compartir el reporte de cada estudiante con su familia'}
+              data-compartir-familias
+              className="inline-flex items-center justify-center gap-2 rounded-lg bg-green-700 hover:bg-green-800 px-4 py-2.5 font-semibold text-white shadow-sm disabled:opacity-50 disabled:cursor-not-allowed sm:ml-auto">
+              <IconoWA /> Compartir con familias{seleccion.size ? ` (${seleccion.size})` : ''}
+            </button>
+          </div>
+          {esPrimaria && <p className="text-sm text-amber-800 -mt-2">{motivoSinCompartir}: la tabla general y el reporte del curso leen calificaciones de Secundaria.</p>}
+          {!esPrimaria && !seleccion.size && totalEst > 0 && <p className="text-xs text-gray-500 -mt-2">Sin selección, «Compartir con familias» recorre todo el curso, una familia por vez.</p>}
+
+          <div className="bg-white rounded-xl border shadow-sm grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x">
+            <div className="flex items-center gap-3 px-4 py-3"><Users className="text-blue-600" size={22} /><span><strong className="text-xl">{totalEst}</strong> estudiantes</span></div>
+            <div className="flex items-center gap-3 px-4 py-3"><CheckCircle2 className="text-green-600" size={22} /><span><strong className="text-xl">{totalEst - conPendientes}</strong> reportes completos</span></div>
+            <div className="flex items-center gap-3 px-4 py-3"><AlertCircle className="text-amber-500" size={22} /><span><strong className="text-xl">{conPendientes}</strong> con notas pendientes</span></div>
+          </div>
+
+          <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-2.5 text-xs text-gray-600 flex items-start gap-2">
+            <Info size={16} className="shrink-0" />
+            <span>Todo en esta pantalla corresponde al <strong>Periodo {periodo}</strong>: la tabla, las estadísticas y los reportes. «Nota pendiente» es informativo: el reporte se puede descargar o compartir igual y muestra «Sin nota» en esas materias.</span>
+          </div>
+        </>
       )}
 
       {vista === 'pc' && stats && (
@@ -245,50 +313,113 @@ export const CalificacionesGeneralPage = () => {
 
       {vista === 'pc' && data && (
         <div className="bg-white rounded-xl border shadow-sm overflow-hidden">
-          <div className="p-4 bg-gradient-to-r from-blue-600 to-blue-700 text-white">
-            <h2 className="text-lg font-bold">{data.curso} - Periodo {data.periodo}</h2>
-            <p className="text-blue-100 text-sm">{data.estudiantes.length} estudiantes - {data.asignaturas_nombres.length} {data.asignaturas_nombres.length === 1 ? 'asignatura' : 'asignaturas'} - cada celda = {REGLA_NOTA_PERIODO[data.nivel === 'primaria' ? 'primaria' : 'secundaria']} · Prom. = promedio de esas notas</p>
+          <div className="px-4 py-3 border-b bg-gray-50">
+            <h2 className="text-base font-bold text-gray-900">{data.curso} — Periodo {data.periodo}</h2>
+            <p className="text-gray-600 text-xs">{data.estudiantes.length} estudiantes · {data.asignaturas_nombres.length} {data.asignaturas_nombres.length === 1 ? 'asignatura' : 'asignaturas'} · cada celda = {REGLA_NOTA_PERIODO[data.nivel === 'primaria' ? 'primaria' : 'secundaria']} · Prom. = promedio de esas notas</p>
           </div>
-          <div className="overflow-x-auto">
+
+          {/* Escritorio y tableta: tabla */}
+          <div className="hidden md:block overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-gray-50 border-b">
-                  <th className="text-left p-2 font-medium text-gray-600 cursor-pointer hover:bg-gray-100 whitespace-nowrap" onClick={() => toggleOrden('no_lista')}><span className="flex items-center gap-1"># <SortIcon col="no_lista" /></span></th>
-                  <th className="text-left p-2 font-medium text-gray-600 cursor-pointer hover:bg-gray-100 whitespace-nowrap min-w-[160px]" onClick={() => toggleOrden('nombre')}><span className="flex items-center gap-1">Estudiante <SortIcon col="nombre" /></span></th>
+                  <th className="p-2 pl-4 w-10"><input type="checkbox" aria-label="Seleccionar todo el curso" checked={todosMarcados} onChange={alternarTodos} disabled={esPrimaria} className="w-4 h-4" /></th>
+                  <th className="text-left p-2 font-medium text-gray-600 cursor-pointer hover:bg-gray-100 whitespace-nowrap" onClick={() => toggleOrden('no_lista')}><span className="flex items-center gap-1">Nº <SortIcon col="no_lista" /></span></th>
+                  <th className="text-left p-2 font-medium text-gray-600 cursor-pointer hover:bg-gray-100 whitespace-nowrap min-w-[180px]" onClick={() => toggleOrden('nombre')}><span className="flex items-center gap-1">Estudiante <SortIcon col="nombre" /></span></th>
                   {data.asignaturas_nombres.map(asig => (
-                    <th key={asig} className="text-center p-2 font-medium text-gray-600 cursor-pointer hover:bg-gray-100 whitespace-nowrap" onClick={() => toggleOrden(asig)}>
+                    <th key={asig} title={asig} className="text-center p-2 font-medium text-gray-600 cursor-pointer hover:bg-gray-100 whitespace-nowrap" onClick={() => toggleOrden(asig)}>
                       <span className="flex items-center justify-center gap-1 text-xs">{asig.length > 12 ? asig.substring(0, 12) + '.' : asig}<SortIcon col={asig} /></span>
                     </th>
                   ))}
                   {data.asignaturas_nombres.length > 1 && (
                     <th className="text-center p-2 font-bold text-gray-700 cursor-pointer hover:bg-gray-100 whitespace-nowrap bg-blue-50" onClick={() => toggleOrden('promedio')}><span className="flex items-center justify-center gap-1">Prom.<SortIcon col="promedio" /></span></th>
                   )}
-                  <th className="text-center p-2 font-medium text-gray-600 whitespace-nowrap">Reporte</th>
+                  <th className="text-left p-2 font-medium text-gray-600 whitespace-nowrap">Estado</th>
+                  <th className="text-center p-2 pr-4 font-medium text-gray-600 whitespace-nowrap sticky right-0 bg-gray-50 shadow-[-6px_0_6px_-6px_rgba(0,0,0,0.25)]">Acciones</th>
                 </tr>
               </thead>
               <tbody className="divide-y">
                 {estudiantesOrdenados.map((est) => (
-                  <tr key={est.estudiante_id} className="hover:bg-gray-50">
+                  <tr key={est.estudiante_id} className={`hover:bg-gray-50 ${seleccion.has(est.estudiante_id) ? 'bg-blue-50/40' : ''}`}>
+                    <td className="p-2 pl-4"><input type="checkbox" aria-label={`Seleccionar a ${est.nombre}`} checked={seleccion.has(est.estudiante_id)} onChange={() => alternar(est.estudiante_id)} disabled={esPrimaria} className="w-4 h-4" /></td>
                     <td className="p-2 text-gray-500 text-center">{est.no_lista}</td>
-                    <td className="p-2 font-medium text-gray-800 max-w-[200px]"><span className="block truncate">{est.nombre}</span>{(est.avisos || []).length > 0 && (<span className="block text-[10px] font-normal text-indigo-700 whitespace-normal">{(est.avisos || []).join(' · ')}</span>)}</td>
+                    <td className="p-2 font-medium text-gray-800 min-w-[180px]"><span className="block">{est.nombre}</span>{(est.avisos || []).length > 0 && (<span className="block text-[10px] font-normal text-indigo-700 whitespace-normal">{(est.avisos || []).join(' · ')}</span>)}</td>
                     {data.asignaturas_nombres.map(asig => {
                       const nota = est.asignaturas[asig];
-                      return (<td key={asig} className={`p-2 text-center ${getBgNota(nota)}`}><span className={`text-sm ${getColorNota(nota)}`}>{fmtNota(nota)}</span></td>);
+                      return (<td key={asig} className={`p-2 text-center ${getBgNota(nota)}`}><span className={`text-sm ${getColorNota(nota)}`}>{nota === null || nota === undefined ? <span className="text-amber-500">—</span> : fmtNota(nota)}</span></td>);
                     })}
                     {data.asignaturas_nombres.length > 1 && (
                       <td className="p-2 text-center bg-blue-50"><span className={`text-sm font-bold ${getColorNota(est.promedio)}`}>{est.promedio !== null ? est.promedio.toFixed(1) : '-'}</span></td>
                     )}
-                    <td className="p-2 text-center">
-                      <button onClick={() => descargarReportePadresIndividual(est.estudiante_id, est.nombre)} title={`Reporte del Período ${periodo} de este estudiante`} className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 hover:underline">
-                        <User size={12} /> PDF
-                      </button>
+                    <td className="p-2"><ChipEstado pendientes={pendientesDe(est)} /></td>
+                    <td className={`p-2 pr-4 sticky right-0 shadow-[-6px_0_6px_-6px_rgba(0,0,0,0.25)] ${seleccion.has(est.estudiante_id) ? 'bg-blue-50' : 'bg-white'}`}>
+                      <div className="flex items-center justify-center gap-2">
+                        <button onClick={() => descargarReportePadresIndividual(est.estudiante_id, est.nombre)} disabled={descargandoEst === est.estudiante_id}
+                          title={`Reporte del Período ${periodo} de ${est.nombre} (PDF)`}
+                          className="inline-flex items-center gap-1 rounded-md border border-blue-600 text-blue-700 px-2 py-1 text-xs font-semibold hover:bg-blue-50 disabled:opacity-50">
+                          <FileText size={14} /> {descargandoEst === est.estudiante_id ? '…' : 'PDF'}
+                        </button>
+                        <button onClick={() => abrirCompartir(est.estudiante_id)} disabled={esPrimaria}
+                          title={motivoSinCompartir || `Compartir el reporte de ${est.nombre} por WhatsApp`} aria-label={`Compartir el reporte de ${est.nombre} por WhatsApp`}
+                          className="inline-flex items-center justify-center rounded-md border border-green-700 text-green-700 p-1.5 hover:bg-green-50 disabled:opacity-40">
+                          <IconoWA size={16} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+
+          {/* Teléfono: tarjetas, sin cortar nombres ni botones */}
+          <div className="md:hidden">
+            <label className="flex items-center gap-3 px-4 py-3 border-b bg-gray-50 text-sm font-medium text-gray-700">
+              <input type="checkbox" checked={todosMarcados} onChange={alternarTodos} disabled={esPrimaria} className="w-5 h-5" /> Seleccionar todo el curso
+            </label>
+            <ul className="divide-y">
+              {estudiantesOrdenados.map(est => (
+                <li key={est.estudiante_id} className={`px-4 py-3 ${seleccion.has(est.estudiante_id) ? 'bg-blue-50/40' : ''}`}>
+                  <div className="flex items-start gap-3">
+                    <input type="checkbox" aria-label={`Seleccionar a ${est.nombre}`} checked={seleccion.has(est.estudiante_id)} onChange={() => alternar(est.estudiante_id)} disabled={esPrimaria} className="w-5 h-5 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-gray-900 break-words"><span className="text-gray-500 font-normal mr-1">{est.no_lista}.</span>{est.nombre}</p>
+                      {(est.avisos || []).length > 0 && <p className="text-[11px] text-indigo-700">{(est.avisos || []).join(' · ')}</p>}
+                      <div className="mt-1"><ChipEstado pendientes={pendientesDe(est)} /></div>
+                      <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
+                        {data.asignaturas_nombres.map(asig => (
+                          <div key={asig} className="flex justify-between gap-2 min-w-0">
+                            <dt className="text-gray-600 break-words">{asig}</dt>
+                            <dd className={`shrink-0 ${getColorNota(est.asignaturas[asig])}`}>{est.asignaturas[asig] === null || est.asignaturas[asig] === undefined ? '—' : fmtNota(est.asignaturas[asig])}</dd>
+                          </div>
+                        ))}
+                        {data.asignaturas_nombres.length > 1 && (
+                          <div className="flex justify-between gap-2 font-bold"><dt>Prom.</dt><dd className={getColorNota(est.promedio)}>{est.promedio !== null ? est.promedio.toFixed(1) : '-'}</dd></div>
+                        )}
+                      </dl>
+                      <div className="mt-3 grid grid-cols-2 gap-2">
+                        <button onClick={() => descargarReportePadresIndividual(est.estudiante_id, est.nombre)} disabled={descargandoEst === est.estudiante_id}
+                          className="inline-flex items-center justify-center gap-1 rounded-lg border border-blue-600 text-blue-700 py-2 text-sm font-semibold disabled:opacity-50">
+                          <FileText size={16} /> {descargandoEst === est.estudiante_id ? 'Generando…' : 'PDF'}
+                        </button>
+                        <button onClick={() => abrirCompartir(est.estudiante_id)} disabled={esPrimaria}
+                          className="inline-flex items-center justify-center gap-1 rounded-lg border border-green-700 text-green-700 py-2 text-sm font-semibold disabled:opacity-40">
+                          <IconoWA size={16} /> WhatsApp
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <p className="flex items-center gap-2 px-4 py-3 border-t text-sm text-gray-600"><Info size={16} /> Las descargas actuales se mantienen.</p>
         </div>
+      )}
+
+      {panel && consulta && (
+        <CompartirFamiliasPanel key={panel.ids.join(',')} cursoId={consulta.cursoId} periodo={consulta.periodo}
+          estudianteIds={panel.ids} onCerrar={() => setPanel(null)} />
       )}
 
       {vista === 'competencias' && compData && (

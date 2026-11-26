@@ -90,11 +90,27 @@ const sinCambiosPrevistos = (s) => s.split('\n')
   .filter((l) => !/^\s*\{(error|mensaje) && <Alert variant="error" onClose=/.test(l))
   .join('\n');
 
+// Las comprobaciones de IDENTIDAD con main (mismas URLs, archivo idéntico) miden
+// el alcance de ESTA entrega (#77, base 0504032). Una rama posterior que cambia
+// a propósito una de estas pantallas (p. ej. FAM-DOC-1 en Notas por período)
+// las omite SOLO para los archivos que ella misma cambia; las demás pruebas
+// (nombres de archivo, forma de descargar, extractor de errores) se aplican siempre.
+const git = (cmd) => execSync(`git ${cmd}`, { cwd: join(aqui, '..'), encoding: 'utf8' }).split(CR).join('');
+const BASE_ENTREGA_77 = '050403277bef16e1a980a6aad08b9ba7939f9586';
+const BASE_RAMA = git('merge-base HEAD origin/main').trim();
+const CAMBIADOS_EN_RAMA = BASE_RAMA === BASE_ENTREGA_77 ? new Set() : new Set(
+  git(`diff --name-only ${BASE_RAMA}`).split('\n').concat(git('ls-files --others --exclude-standard').split('\n'))
+    .map((f) => f.trim().replace(/^frontend\//, '')).filter(Boolean));
+const omitida = (nombre) => console.log(`  \x1b[90mOMITIDA\x1b[0m ${nombre} (alcance de #77; esta rama cambia el archivo a propósito)`);
+
 for (const [k, rel] of Object.entries(ARCH)) {
   const R = rama(rel), M = main(rel);
+  const cambiadoAqui = CAMBIADOS_EN_RAMA.has(`src/${rel}`);
+  if (cambiadoAqui) omitida(`${k}: mismas URLs`); else
   await prueba(`${k}: mismas URLs`, () => igual(urls(R), urls(M)));
   await prueba(`${k}: mismos nombres de archivo`, () => igual(archivos(R), archivos(M)));
   await prueba(`${k}: misma forma de descargar`, () => igual(descarga(R), descarga(M)));
+  if (cambiadoAqui) { omitida(`${k}: fuera de los catch previstos, el archivo es idéntico a main`); continue; }
   await prueba(`${k}: fuera de los catch previstos, el archivo es idéntico a main`, () => {
     const a = sinCambiosPrevistos(R), b = sinCambiosPrevistos(M);
     if (a !== b) {

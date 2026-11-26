@@ -5,7 +5,7 @@ Modelos de Base de Datos (SQLAlchemy puro para FastAPI)
 import os as _os
 from sqlalchemy import (
     Column, Integer, String, Text, Float, Boolean, Date, DateTime,
-    ForeignKey, Table, UniqueConstraint, Index, text
+    ForeignKey, Table, UniqueConstraint, Index, text, LargeBinary
 )
 from sqlalchemy.orm import relationship, backref
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -1931,6 +1931,89 @@ class ComunicadoLeido(Base):
     
     comunicado = relationship('Comunicado', backref='lecturas')
     usuario = relationship('Usuario', backref='comunicados_leidos')
+
+class DocumentoFamilia(Base):
+    """FAM-DOC-1 · Documento preparado para una familia (copia fija).
+
+    Un documento = UN estudiante + UN reporte (hoy: el Reporte del Período
+    de un año escolar). Al prepararlo se genera el PDF con el formato de
+    siempre y se guarda tal cual (`DocumentoFamiliaArchivo`): abrir el enlace
+    no vuelve a calcular las notas. Si después cambian las calificaciones, el
+    colegio prepara EXPLÍCITAMENTE una versión nueva; la anterior queda
+    `reemplazado` (su enlace sigue mostrando lo que se compartió, con aviso).
+
+    El enlace secreto no se guarda: se guarda una semilla (`token_nonce`) y
+    el enlace es HMAC(secreto del servidor, semilla). Con eso el colegio puede
+    volver a compartirlo, y quien obtenga una copia de la base sin el secreto
+    no puede reconstruir enlaces. La búsqueda pública usa `token_hash`
+    (SHA-256 del enlace)."""
+    __tablename__ = 'documentos_familia'
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    estudiante_id = Column(Integer, ForeignKey('estudiantes.id'), nullable=False)
+    curso_id = Column(Integer, ForeignKey('cursos.id'), nullable=False)
+    ano_escolar_id = Column(Integer, ForeignKey('ano_escolar.id'), nullable=False)
+    tipo = Column(String(30), nullable=False)          # 'reporte_periodo'
+    periodo = Column(Integer, nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    estado = Column(String(15), nullable=False, default='activo')  # activo | reemplazado | anulado
+    token_nonce = Column(String(64), nullable=False)
+    token_hash = Column(String(64), nullable=False)
+    contenido_sha256 = Column(String(64), nullable=False)   # huella del PDF guardado
+    datos_sha256 = Column(String(64), nullable=False)       # huella de los datos con que se generó
+    vista_json = Column(Text, nullable=False)               # mismos datos del PDF, para la página
+    tamano_bytes = Column(Integer, nullable=False, default=0)
+    nombre_archivo = Column(String(150))
+    preparado_por = Column(Integer, ForeignKey('usuarios.id'))
+    fecha_preparado = Column(DateTime, default=_now_dr)
+    reemplaza_a_id = Column(Integer, ForeignKey('documentos_familia.id'), nullable=True)
+    anulado_por = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    fecha_anulado = Column(DateTime, nullable=True)
+    motivo_anulacion = Column(String(300), nullable=True)
+    # Visitas al enlace (no prueban lectura: pueden ser vistas previas o reenvíos).
+    visitas = Column(Integer, nullable=False, default=0)
+    descargas = Column(Integer, nullable=False, default=0)
+    vistas_previas = Column(Integer, nullable=False, default=0)
+    primera_visita = Column(DateTime, nullable=True)
+    ultima_visita = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        # Un solo documento ACTIVO por estudiante + reporte: dos clics o dos
+        # pestañas no pueden dejar dos enlaces vivos del mismo reporte.
+        Index('uq_doc_familia_activo', 'colegio_id', 'estudiante_id', 'ano_escolar_id', 'tipo', 'periodo',
+              unique=True, postgresql_where=text("estado = 'activo'"),
+              sqlite_where=text("estado = 'activo'")),
+        # Cada versión existe una vez: dos «nueva versión» simultáneas no crean dos.
+        UniqueConstraint('colegio_id', 'estudiante_id', 'ano_escolar_id', 'tipo', 'periodo', 'version',
+                         name='uq_doc_familia_version'),
+        UniqueConstraint('token_hash', name='uq_doc_familia_token'),
+        Index('ix_doc_familia_curso', 'colegio_id', 'curso_id', 'ano_escolar_id', 'periodo'),
+    )
+
+
+class DocumentoFamiliaArchivo(Base):
+    """FAM-DOC-1 · Bytes del PDF fijo. Tabla aparte para que listar
+    documentos nunca cargue los PDF."""
+    __tablename__ = 'documentos_familia_archivos'
+    documento_id = Column(Integer, ForeignKey('documentos_familia.id'), primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    pdf = Column(LargeBinary, nullable=False)
+
+
+class DocumentoFamiliaEvento(Base):
+    """FAM-DOC-1 · Lo que hizo el personal con el documento. `whatsapp_abierto`
+    significa solo eso: se abrió el chat; NO que el mensaje se enviara."""
+    __tablename__ = 'documentos_familia_eventos'
+    id = Column(Integer, primary_key=True)
+    colegio_id = Column(Integer, ForeignKey('colegios.id'), nullable=False, index=True)
+    documento_id = Column(Integer, ForeignKey('documentos_familia.id'), nullable=False, index=True)
+    tipo = Column(String(30), nullable=False)   # preparado | nueva_version | anulado | whatsapp_abierto | enlace_consultado
+    usuario_id = Column(Integer, ForeignKey('usuarios.id'), nullable=True)
+    contacto_rol = Column(String(10), nullable=True)      # padre | madre | tutor
+    telefono_final = Column(String(4), nullable=True)     # solo los 4 últimos dígitos
+    detalle = Column(String(300), nullable=True)
+    fecha = Column(DateTime, default=_now_dr)
+
 
 class HistorialReportePadres(Base):
     __tablename__ = 'historial_reportes_padres'
