@@ -86,27 +86,30 @@ def crear_xobject_borrador(writer: PdfWriter, width: float, height: float):
     Registra el sello BORRADOR en `writer` como Form XObject y devuelve su
     referencia. Se llama UNA vez por documento y geometría.
     """
-    overlay = PdfReader(io.BytesIO(_overlay_bytes(width, height))).pages[0]
+    # MEM-REG · el lector y el buffer del sello se cierran al terminar: el
+    # XObject COPIA el contenido y clona los recursos al writer.
+    with io.BytesIO(_overlay_bytes(width, height)) as buf, PdfReader(buf) as lector:
+        overlay = lector.pages[0]
 
-    xobj = DecodedStreamObject()
-    xobj.set_data(overlay.get_contents().get_data())
-    xobj[NameObject("/Type")] = NameObject("/XObject")
-    xobj[NameObject("/Subtype")] = NameObject("/Form")
-    xobj[NameObject("/FormType")] = NumberObject(1)
-    xobj[NameObject("/BBox")] = ArrayObject(
-        [FloatObject(0), FloatObject(0), FloatObject(width), FloatObject(height)]
-    )
+        xobj = DecodedStreamObject()
+        xobj.set_data(overlay.get_contents().get_data())
+        xobj[NameObject("/Type")] = NameObject("/XObject")
+        xobj[NameObject("/Subtype")] = NameObject("/Form")
+        xobj[NameObject("/FormType")] = NumberObject(1)
+        xobj[NameObject("/BBox")] = ArrayObject(
+            [FloatObject(0), FloatObject(0), FloatObject(width), FloatObject(height)]
+        )
 
-    recursos = overlay.get("/Resources")
-    if recursos is not None:
-        # `clone` copia las fuentes y el ExtGState DENTRO del writer. Copiar la
-        # referencia tal cual dejaría los recursos apuntando a un reader que el
-        # writer no conoce: el visor no encontraría Helvetica-Bold y dibujaría
-        # el sello con una fuente por defecto (sin negrita y sin el guion largo
-        # de "VISTA PREVIA — NO OFICIAL").
-        xobj[NameObject("/Resources")] = recursos.get_object().clone(writer)
+        recursos = overlay.get("/Resources")
+        if recursos is not None:
+            # `clone` copia las fuentes y el ExtGState DENTRO del writer. Copiar la
+            # referencia tal cual dejaría los recursos apuntando a un reader que el
+            # writer no conoce: el visor no encontraría Helvetica-Bold y dibujaría
+            # el sello con una fuente por defecto (sin negrita y sin el guion largo
+            # de "VISTA PREVIA — NO OFICIAL").
+            xobj[NameObject("/Resources")] = recursos.get_object().clone(writer)
 
-    return writer._add_object(xobj)
+        return writer._add_object(xobj)
 
 
 def estampar_borrador(writer: PdfWriter, page, xobject_ref) -> None:
@@ -260,19 +263,18 @@ def aplicar_marca_borrador(pdf_bytes: bytes) -> bytes:
     Returns:
         bytes del PDF con marca de agua
     """
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    writer = PdfWriter()
+    # MEM-REG · lector, escritor y buffers se cierran al terminar (también si falla).
+    with io.BytesIO(pdf_bytes) as entrada, PdfReader(entrada) as reader, PdfWriter() as writer:
+        refs = {}
+        for page in reader.pages:
+            nueva = writer.add_page(page)
+            w = float(nueva.mediabox.width)
+            h = float(nueva.mediabox.height)
+            clave = (round(w, 2), round(h, 2))
+            if clave not in refs:
+                refs[clave] = crear_xobject_borrador(writer, w, h)
+            estampar_borrador(writer, nueva, refs[clave])
 
-    refs = {}
-    for page in reader.pages:
-        nueva = writer.add_page(page)
-        w = float(nueva.mediabox.width)
-        h = float(nueva.mediabox.height)
-        clave = (round(w, 2), round(h, 2))
-        if clave not in refs:
-            refs[clave] = crear_xobject_borrador(writer, w, h)
-        estampar_borrador(writer, nueva, refs[clave])
-
-    output = io.BytesIO()
-    writer.write(output)
-    return output.getvalue()
+        with io.BytesIO() as output:
+            writer.write(output)
+            return output.getvalue()

@@ -48,6 +48,7 @@ from reglas_academicas import redondear_calificacion_final
 # R4-A3: el puente a los motores canonicos A1/A2. No decide nada por su
 # cuenta; traduce filas ORM a lo que A1 y A2 esperan.
 import resultado_academico_consumidores as RAC
+from limite_generacion import generacion_pesada, GeneracionOcupada
 import asistencia_canonica as ASIS
 from models import (
     Colegio, ConfiguracionColegio, AnoEscolar, Grado, Tanda, Recreo,
@@ -25636,6 +25637,27 @@ async def generar_registro_primaria_v2(curso_id: int, request: Request,
 async def preview_pdf_secundaria(curso_id: int, request: Request,
                                   db: Session = Depends(get_db),
                                   current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor'))):
+    """Borrador del Registro de Secundaria. Permisos de siempre; la generación
+    (validar, cargar datos, PDF) espera un turno de `generacion_pesada`
+    (MEM-REG) y el cuerpo está en `_preview_pdf_secundaria_cuerpo`."""
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    # v2.17: el PROFESOR solo descarga el borrador de SUS cursos asignados
+    # (cierra el hueco: antes en secundaria podía pedir cualquier curso).
+    # MEM-REG: se comprueba ANTES de esperar turno (misma respuesta de siempre).
+    if current_user.role == 'profesor':
+        _tiene_reg = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
+        if not _tiene_reg:
+            return JSONResponse({'error': 'Solo puedes ver el borrador de tus cursos asignados'}, status_code=403)
+    try:
+        async with generacion_pesada():
+            return await _preview_pdf_secundaria_cuerpo(curso_id, request, db, current_user)
+    except GeneracionOcupada:
+        return _respuesta_generacion_ocupada()
+
+
+async def _preview_pdf_secundaria_cuerpo(curso_id: int, request: Request, db: Session, current_user: Usuario):
     """
     Vista previa del PDF de secundaria con marca de agua BORRADOR.
     Genera SIEMPRE, ignorando errores y warnings — para que el director
@@ -25666,13 +25688,7 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
     if not grado:
         return JSONResponse({'error': 'El curso no tiene grado asignado'}, status_code=400)
 
-    # v2.17: el PROFESOR solo descarga el borrador de SUS cursos asignados
-    # (cierra el hueco: antes en secundaria podía pedir cualquier curso).
-    if current_user.role == 'profesor':
-        _tiene_reg = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
-        if not _tiene_reg:
-            return JSONResponse({'error': 'Solo puedes ver el borrador de tus cursos asignados'}, status_code=403)
+    # (MEM-REG: el permiso del profesor se comprueba en el endpoint, antes del turno.)
 
     # v2.19.5: esta guarda estaba copiada tal cual del borrador de primaria y
     # exigía nivel 'primaria' DENTRO del endpoint de secundaria, así que
@@ -25822,9 +25838,29 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
 
 
 @app.get("/api/registros/secundaria/{curso_id}")
-async def generar_registro_secundaria_v2(curso_id: int, request: Request, 
+async def generar_registro_secundaria_v2(curso_id: int, request: Request,
                                           db: Session = Depends(get_db),
                                           current_user: Usuario = Depends(RolesRequired('direccion', 'coordinador', 'profesor', 'secretaria'))):
+    """Registro OFICIAL de Secundaria. Permisos de siempre; la generación
+    (validar, cargar datos, PDF) espera un turno de `generacion_pesada`
+    (MEM-REG) y el cuerpo está en `_generar_registro_secundaria_cuerpo`."""
+    # ENTREGA-1 · Mismo cierre de tenant que en el resto del módulo.
+    get_tenant_or_404(db, Curso, curso_id, current_user, name='curso')
+    # v2.17: el PROFESOR puede imprimir el registro OFICIAL, pero SOLO de sus
+    # cursos asignados. MEM-REG: se comprueba ANTES de esperar turno.
+    if current_user.role == 'profesor':
+        _tiene_of = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
+            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
+        if not _tiene_of:
+            return JSONResponse({'error': 'Solo puedes imprimir el registro de tus cursos asignados'}, status_code=403)
+    try:
+        async with generacion_pesada():
+            return _generar_registro_secundaria_cuerpo(curso_id, request, db, current_user)
+    except GeneracionOcupada:
+        return _respuesta_generacion_ocupada()
+
+
+def _generar_registro_secundaria_cuerpo(curso_id: int, request: Request, db: Session, current_user: Usuario):
     """
     Genera el PDF del Registro Escolar MINERD para un curso de SECUNDARIA.
     
@@ -25839,14 +25875,7 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
     from registro_validator import validar_registro_secundaria
     from registro_escolar import generar_registro_desde_sistema, get_asignaturas_por_grado
 
-    # v2.17: el PROFESOR puede imprimir el registro OFICIAL, pero SOLO de sus
-    # cursos asignados.
-    if current_user.role == 'profesor':
-        _tiene_of = tenant_filter(db.query(AsignacionProfesor), AsignacionProfesor, current_user).filter_by(
-            profesor_id=current_user.id, curso_id=curso_id, activo=True).first()
-        if not _tiene_of:
-            return JSONResponse({'error': 'Solo puedes imprimir el registro de tus cursos asignados'}, status_code=403)
-    
+    # (MEM-REG: el permiso del profesor se comprueba en el endpoint, antes del turno.)
     force = request.query_params.get('force', 'false').lower() == 'true'
 
     # SALIDAS-MIXTAS: más componentes optativos que espacios es un problema de
@@ -25995,6 +26024,14 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             'detalle': str(e),
             'validacion': validacion.to_dict(),
         }, status_code=500)
+
+
+def _respuesta_generacion_ocupada():
+    """MEM-REG · No hubo turno de generación pesada a tiempo: 503 con Retry-After.
+    La interfaz lo muestra como «El servidor no está disponible en este momento
+    (error 503). Inténtelo de nuevo en unos minutos.»"""
+    return JSONResponse({'error': 'Se están generando otros registros en este momento. Intente de nuevo en unos segundos.',
+                         'motivo': 'generacion_ocupada'}, status_code=503, headers={'Retry-After': '15'})
 
 
 # R2.1D — correspondencia BLOQUE OFICIAL -> SLOT del Registro.

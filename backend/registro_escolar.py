@@ -14,6 +14,7 @@ Estructura:
 Autor: EducaOne
 """
 
+import gc
 import io
 from contextvars import ContextVar
 import os
@@ -2211,6 +2212,12 @@ def generar_registro_escolar(grado: int, datos_centro: Dict, datos_portada: Dict
     finally:
         if token is not None:
             _PLANTILLA_ACTIVA.reset(token)
+        # MEM-REG · los lectores/escritores de pypdf forman ciclos de referencias
+        # (página ↔ lector ↔ objetos resueltos) que el conteo de referencias no
+        # libera: sin esto quedan vivos hasta que el recolector decide pasar, y
+        # se suman a la generación siguiente. Una pasada aquí (decenas de ms
+        # frente a segundos de generación) los devuelve al acabar CADA registro.
+        gc.collect()
 
 
 def _generar_registro_escolar(
@@ -2805,6 +2812,10 @@ def _generar_registro_escolar(
     # ========================================
     # MERGE: Template + Overlays
     # ========================================
+    # MEM-REG · liberación explícita: el lector de la plantilla, cada lector de
+    # overlay, cada buffer y el escritor se cierran en cuanto dejan de hacer
+    # falta (también si algo falla). Los overlays se consumen de uno en uno
+    # (`pop`): ya no conviven los ~170 buffers con el PDF terminado.
     writer = PdfWriter()
 
     # v2.19.6: el sello BORRADOR se estampa acá, en la MISMA pasada. Antes se
@@ -2820,37 +2831,45 @@ def _generar_registro_escolar(
     # página: TEMPLATE -> DATOS -> BORRADOR.
     refs_borrador = {}
 
-    for pg_idx in range(total_pages):
-        template_page = template_reader.pages[pg_idx]
+    try:
+        for pg_idx in range(total_pages):
+            template_page = template_reader.pages[pg_idx]
 
-        pagina = writer.add_page(template_page)
+            pagina = writer.add_page(template_page)
 
-        # DATOS: overlay ReportLab de esta página como Form XObject encadenado
-        # al /Contents. `pg_idx in overlays` solo es cierto para páginas con
-        # contenido real (portada, centro, estudiantes, asistencia con datos,
-        # calificaciones, promoción): las demás no reciben ningún XObject.
-        if pg_idx in overlays:
-            overlay_reader = PdfReader(overlays[pg_idx])
-            if len(overlay_reader.pages) > 0:
-                nombre = nombre_xobject_libre(pagina, "/EODataOverlay")
-                ref = crear_xobject_desde_overlay(writer, overlay_reader.pages[0])
-                estampar_xobject(writer, pagina, ref, nombre)
+            # DATOS: overlay ReportLab de esta página como Form XObject encadenado
+            # al /Contents. `pg_idx in overlays` solo es cierto para páginas con
+            # contenido real (portada, centro, estudiantes, asistencia con datos,
+            # calificaciones, promoción): las demás no reciben ningún XObject.
+            buf_overlay = overlays.pop(pg_idx, None)
+            if buf_overlay is not None:
+                # El XObject COPIA el contenido y clona los recursos al writer, así
+                # que el lector del overlay y su buffer se pueden soltar ya.
+                with buf_overlay, PdfReader(buf_overlay) as overlay_reader:
+                    if len(overlay_reader.pages) > 0:
+                        nombre = nombre_xobject_libre(pagina, "/EODataOverlay")
+                        ref = crear_xobject_desde_overlay(writer, overlay_reader.pages[0])
+                        estampar_xobject(writer, pagina, ref, nombre)
 
-        if marca_borrador:
-            # Después de los DATOS, para que el sello quede ENCIMA de todo.
-            ancho = float(pagina.mediabox.width)
-            alto = float(pagina.mediabox.height)
-            clave = (round(ancho, 2), round(alto, 2))
-            if clave not in refs_borrador:
-                refs_borrador[clave] = crear_xobject_borrador(writer, ancho, alto)
-            estampar_borrador(writer, pagina, refs_borrador[clave])
-    
-    # Escribir resultado
-    output = io.BytesIO()
-    writer.write(output)
-    output.seek(0)
-    
-    return output.getvalue()
+            if marca_borrador:
+                # Después de los DATOS, para que el sello quede ENCIMA de todo.
+                ancho = float(pagina.mediabox.width)
+                alto = float(pagina.mediabox.height)
+                clave = (round(ancho, 2), round(alto, 2))
+                if clave not in refs_borrador:
+                    refs_borrador[clave] = crear_xobject_borrador(writer, ancho, alto)
+                estampar_borrador(writer, pagina, refs_borrador[clave])
+
+        # Escribir resultado
+        with io.BytesIO() as output:
+            writer.write(output)
+            return output.getvalue()
+    finally:
+        writer.close()
+        template_reader.close()
+        for buf_restante in overlays.values():   # solo si algo falló a mitad
+            buf_restante.close()
+        overlays.clear()
 
 
 # ============================================================================
