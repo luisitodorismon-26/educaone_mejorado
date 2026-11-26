@@ -3,7 +3,8 @@
 MEM-REG · Huella del Registro de Secundaria para comparar dos versiones del código.
 
 Siembra una base SINTÉTICA temporal (REG-43: 1ro A con 40 estudiantes, 1ro B con
-43 -plantilla ampliada-, 1ro C con 44 -excede-), genera el Registro oficial y el
+43 -plantilla ampliada-, 1ro C con 44 -excede-, y 4to D, 5to E y 6to F con 40:
+238-240 páginas), genera el Registro oficial y el
 borrador con varios roles y escribe en JSON, por caso: estado HTTP, tipo, nº de
 páginas, huella normalizada de cada página (contenido y recursos, sin fechas ni
 ids internos) y el cuerpo de los rechazos. Ejecutándolo con `main` y con la rama
@@ -45,7 +46,7 @@ M.Base.metadata.create_all(bind=engine)
 with TestClient(APP.app):
     pass
 db = SessionLocal()
-sem = S.sembrar(db, M, [(1, 'A', 40), (1, 'B', 43), (1, 'C', 44)])
+sem = S.sembrar(db, M, [(1, 'A', 40), (1, 'B', 43), (1, 'C', 44), (4, 'D', 40), (5, 'E', 40), (6, 'F', 40)])
 col = sem['colegio']
 
 
