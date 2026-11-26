@@ -15,11 +15,17 @@ with engine.connect() as cn:
     tablas = cn.execute(text("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")).scalar()
 if tablas:
     raise SystemExit('La base de prueba no está vacía; no se siembra.')
-from fastapi.testclient import TestClient
+import asyncio
 import app as APP, models as M
 import registro_43_semilla as S
-with TestClient(APP.app):
-    pass
+
+
+async def _arranque():
+    # El arranque real de la app (crea tablas y aplica migraciones), sin el
+    # cliente de pruebas de Starlette, que necesita paquetes que producción no instala.
+    async with APP.lifespan(APP.app):
+        pass
+asyncio.run(_arranque())
 db = SessionLocal()
 sem = S.sembrar(db, M, [(1, 'A', 40), (1, 'B', 43), (1, 'C', 44), (4, 'D', 40), (5, 'E', 40), (6, 'F', 40)])
 db.commit()
