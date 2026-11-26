@@ -237,6 +237,77 @@ r = client.get(BORRADOR, headers=H(sem['director']))
 vivos = [o for o in gc.get_objects() if isinstance(o, (pypdf.PdfReader, pypdf.PdfWriter))]
 check('ídem tras el borrador (sello incluido)', r.status_code == 200 and not vivos, (r.status_code, len(vivos)))
 
+# ═════════ 6. Errores ANTES de la fusión final ═════════
+print('\n6. Errores antes de la fusión final del PDF')
+import io as _io  # noqa: E402
+
+buffers = []
+
+
+class BufferContado(_io.BytesIO):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        buffers.append(self)
+
+
+class _IOContado:
+    BytesIO = BufferContado
+
+    def __getattr__(self, nombre):
+        return getattr(_io, nombre)
+
+
+def fallo_controlado(nombre, parchear, restaurar, esperado):
+    abiertos.clear(); cerrados.clear(); buffers.clear()
+    RE.PdfReader = LectorContado
+    _io_orig = RE.io
+    RE.io = _IOContado()
+    parchear()
+    try:
+        r = TestClient(APP.app, raise_server_exceptions=False).get(OFICIAL, headers=H(sem['director']))
+    finally:
+        restaurar()
+        RE.io = _io_orig
+        RE.PdfReader = _Lector
+    vivos = [o for o in gc.get_objects() if isinstance(o, (pypdf.PdfReader, pypdf.PdfWriter))]
+    check('%s → %s (igual que antes)' % (nombre, esperado), r.status_code == esperado, (r.status_code, r.text[:160]))
+    if abiertos:
+        check('%s: la plantilla y los lectores abiertos se cerraron' % nombre, set(abiertos) <= set(cerrados),
+              (len(abiertos), len(set(abiertos) - set(cerrados))))
+    check('%s: ningún buffer quedó abierto (%d creados)' % (nombre, len(buffers)),
+          all(b.closed for b in buffers), sum(1 for b in buffers if not b.closed))
+    check('%s: ningún PdfReader/PdfWriter vivo' % nombre, not vivos, len(vivos))
+    check('%s: el turno quedó libre' % nombre, asyncio.run(_intento()) == 'entró')
+
+
+# a) Rechazo deliberado al DIBUJAR una página (el dato no cabe): antes de la fusión.
+_dibujo = RE.draw_promocion_izq
+
+
+def _no_cabe(*a, **k):
+    raise RE.RegistroExcedePlantilla({'motivo': 'PRUEBA_NO_CABE', 'mensaje': 'rechazo sintético al dibujar'})
+fallo_controlado('rechazo al dibujar una página', lambda: setattr(RE, 'draw_promocion_izq', _no_cabe),
+                 lambda: setattr(RE, 'draw_promocion_izq', _dibujo), 422)
+
+# b) Excepción inesperada al dibujar (va por el mismo camino que siempre: página vacía + log).
+# c) Excepción en la FUSIÓN, ya con plantilla y overlays abiertos.
+_xobj = RE.crear_xobject_desde_overlay
+
+
+def _rompe_fusion(*a, **k):
+    raise RuntimeError('fallo sintético en la fusión')
+fallo_controlado('excepción en la fusión', lambda: setattr(RE, 'crear_xobject_desde_overlay', _rompe_fusion),
+                 lambda: setattr(RE, 'crear_xobject_desde_overlay', _xobj), 500)
+
+# d) Excepción al CARGAR los datos (antes de abrir ningún PDF).
+_carga = APP._cargar_datos_asignaturas_secundaria
+
+
+def _rompe_carga(*a, **k):
+    raise RuntimeError('fallo sintético al cargar datos')
+fallo_controlado('excepción al cargar datos', lambda: setattr(APP, '_cargar_datos_asignaturas_secundaria', _rompe_carga),
+                 lambda: setattr(APP, '_cargar_datos_asignaturas_secundaria', _carga), 500)
+
 ok = sum(1 for _, b in RES if b)
 print('\n%d/%d' % (ok, len(RES)))
 sys.exit(0 if ok == len(RES) else 1)

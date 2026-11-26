@@ -49,6 +49,7 @@ from reglas_academicas import redondear_calificacion_final
 # cuenta; traduce filas ORM a lo que A1 y A2 esperan.
 import resultado_academico_consumidores as RAC
 from limite_generacion import generacion_pesada, GeneracionOcupada
+import gc as _gc_registro
 import asistencia_canonica as ASIS
 from models import (
     Colegio, ConfiguracionColegio, AnoEscolar, Grado, Tanda, Recreo,
@@ -25655,6 +25656,11 @@ async def preview_pdf_secundaria(curso_id: int, request: Request,
             return await _preview_pdf_secundaria_cuerpo(curso_id, request, db, current_user)
     except GeneracionOcupada:
         return _respuesta_generacion_ocupada()
+    finally:
+        # MEM-REG · si la generación falló, el traceback de la excepción
+        # retenía lector, escritor y buffers hasta el siguiente paso del
+        # recolector; aquí la excepción ya se trató y se liberan.
+        _gc_registro.collect()
 
 
 async def _preview_pdf_secundaria_cuerpo(curso_id: int, request: Request, db: Session, current_user: Usuario):
@@ -25858,6 +25864,11 @@ async def generar_registro_secundaria_v2(curso_id: int, request: Request,
             return _generar_registro_secundaria_cuerpo(curso_id, request, db, current_user)
     except GeneracionOcupada:
         return _respuesta_generacion_ocupada()
+    finally:
+        # MEM-REG · si la generación falló, el traceback de la excepción
+        # retenía lector, escritor y buffers hasta el siguiente paso del
+        # recolector; aquí la excepción ya se trató y se liberan.
+        _gc_registro.collect()
 
 
 def _generar_registro_secundaria_cuerpo(curso_id: int, request: Request, db: Session, current_user: Usuario):

@@ -1077,7 +1077,8 @@ def _create_overlay_page(draw_func, *args, **kwargs) -> io.BytesIO:
         draw_func(c, *args, **kwargs)
     except RegistroExcedePlantilla:
         # REG-2: un rechazo deliberado (el dato no cabe) NO se convierte en
-        # una página en blanco silenciosa.
+        # una página en blanco silenciosa. MEM-REG: su buffer se cierra ya.
+        buf.close()
         raise
     except Exception:
         # Si la función de dibujo falla, se genera la página vacía como
@@ -2207,8 +2208,8 @@ def generar_registro_escolar(grado: int, datos_centro: Dict, datos_portada: Dict
     ampliada = seleccionar_plantilla(grado, len(estudiantes or []))
     token = _PLANTILLA_ACTIVA.set(_activar_plantilla(ampliada)) if ampliada else None
     try:
-        return _generar_registro_escolar(grado, datos_centro, datos_portada, estudiantes,
-                                         *args, **kwargs)
+        return _generar_con_recursos(grado, datos_centro, datos_portada, estudiantes,
+                                     *args, **kwargs)
     finally:
         if token is not None:
             _PLANTILLA_ACTIVA.reset(token)
@@ -2218,6 +2219,42 @@ def generar_registro_escolar(grado: int, datos_centro: Dict, datos_portada: Dict
         # se suman a la generación siguiente. Una pasada aquí (decenas de ms
         # frente a segundos de generación) los devuelve al acabar CADA registro.
         gc.collect()
+
+
+class _RecursosRegistro:
+    """MEM-REG · Lectores y buffers de UNA generación del Registro.
+
+    Se abren a lo largo de la generación (la plantilla al principio, un buffer
+    por página con datos después) y se cierran TODOS al terminar, también si
+    algo falla antes de llegar a la fusión final (p. ej. un rechazo
+    RegistroExcedePlantilla al dibujar una página)."""
+
+    def __init__(self):
+        self.lectores = []
+        self.overlays = {}
+
+    def lector(self, fuente):
+        lector = PdfReader(fuente)
+        self.lectores.append(lector)
+        return lector
+
+    def cerrar(self):
+        for lector in self.lectores:
+            lector.close()
+        self.lectores.clear()
+        for buf in self.overlays.values():   # solo quedan si algo falló a mitad
+            buf.close()
+        self.overlays.clear()
+
+
+def _generar_con_recursos(*args, **kwargs) -> bytes:
+    """MEM-REG · Llama a `_generar_registro_escolar` y cierra sus lectores y
+    buffers pase lo que pase (también si falla antes de la fusión final)."""
+    recursos = _RecursosRegistro()
+    try:
+        return _generar_registro_escolar(*args, recursos=recursos, **kwargs)
+    finally:
+        recursos.cerrar()
 
 
 def _generar_registro_escolar(
@@ -2238,6 +2275,7 @@ def _generar_registro_escolar(
     estadisticas_data: Optional[Dict] = None,
     template_dir: Optional[str] = None,
     marca_borrador: bool = False,
+    recursos: Optional['_RecursosRegistro'] = None,
 ) -> bytes:
     """
     Genera el registro escolar completo para un grado.
@@ -2285,11 +2323,12 @@ def _generar_registro_escolar(
     if not os.path.exists(tpl_path):
         raise FileNotFoundError(f"Template no encontrado: {tpl_path}")
     
-    template_reader = PdfReader(tpl_path)
+    recursos = recursos if recursos is not None else _RecursosRegistro()
+    template_reader = recursos.lector(tpl_path)   # MEM-REG: se cierra al terminar, con o sin error
     total_pages = len(template_reader.pages)
     
     # Crear diccionario de overlays: {page_index_0based: overlay_buffer}
-    overlays = {}
+    overlays = recursos.overlays   # MEM-REG: buffers registrados, cerrados al terminar
     
     # --- PORTADA (Pg 1) ---
     if datos_portada:
@@ -2866,10 +2905,6 @@ def _generar_registro_escolar(
             return output.getvalue()
     finally:
         writer.close()
-        template_reader.close()
-        for buf_restante in overlays.values():   # solo si algo falló a mitad
-            buf_restante.close()
-        overlays.clear()
 
 
 # ============================================================================
