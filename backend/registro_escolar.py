@@ -14,6 +14,7 @@ Estructura:
 Autor: EducaOne
 """
 
+import gc
 import io
 from contextvars import ContextVar
 import os
@@ -1076,7 +1077,8 @@ def _create_overlay_page(draw_func, *args, **kwargs) -> io.BytesIO:
         draw_func(c, *args, **kwargs)
     except RegistroExcedePlantilla:
         # REG-2: un rechazo deliberado (el dato no cabe) NO se convierte en
-        # una página en blanco silenciosa.
+        # una página en blanco silenciosa. MEM-REG: su buffer se cierra ya.
+        buf.close()
         raise
     except Exception:
         # Si la función de dibujo falla, se genera la página vacía como
@@ -2206,11 +2208,53 @@ def generar_registro_escolar(grado: int, datos_centro: Dict, datos_portada: Dict
     ampliada = seleccionar_plantilla(grado, len(estudiantes or []))
     token = _PLANTILLA_ACTIVA.set(_activar_plantilla(ampliada)) if ampliada else None
     try:
-        return _generar_registro_escolar(grado, datos_centro, datos_portada, estudiantes,
-                                         *args, **kwargs)
+        return _generar_con_recursos(grado, datos_centro, datos_portada, estudiantes,
+                                     *args, **kwargs)
     finally:
         if token is not None:
             _PLANTILLA_ACTIVA.reset(token)
+        # MEM-REG · los lectores/escritores de pypdf forman ciclos de referencias
+        # (página ↔ lector ↔ objetos resueltos) que el conteo de referencias no
+        # libera: sin esto quedan vivos hasta que el recolector decide pasar, y
+        # se suman a la generación siguiente. Una pasada aquí (decenas de ms
+        # frente a segundos de generación) los devuelve al acabar CADA registro.
+        gc.collect()
+
+
+class _RecursosRegistro:
+    """MEM-REG · Lectores y buffers de UNA generación del Registro.
+
+    Se abren a lo largo de la generación (la plantilla al principio, un buffer
+    por página con datos después) y se cierran TODOS al terminar, también si
+    algo falla antes de llegar a la fusión final (p. ej. un rechazo
+    RegistroExcedePlantilla al dibujar una página)."""
+
+    def __init__(self):
+        self.lectores = []
+        self.overlays = {}
+
+    def lector(self, fuente):
+        lector = PdfReader(fuente)
+        self.lectores.append(lector)
+        return lector
+
+    def cerrar(self):
+        for lector in self.lectores:
+            lector.close()
+        self.lectores.clear()
+        for buf in self.overlays.values():   # solo quedan si algo falló a mitad
+            buf.close()
+        self.overlays.clear()
+
+
+def _generar_con_recursos(*args, **kwargs) -> bytes:
+    """MEM-REG · Llama a `_generar_registro_escolar` y cierra sus lectores y
+    buffers pase lo que pase (también si falla antes de la fusión final)."""
+    recursos = _RecursosRegistro()
+    try:
+        return _generar_registro_escolar(*args, recursos=recursos, **kwargs)
+    finally:
+        recursos.cerrar()
 
 
 def _generar_registro_escolar(
@@ -2231,6 +2275,7 @@ def _generar_registro_escolar(
     estadisticas_data: Optional[Dict] = None,
     template_dir: Optional[str] = None,
     marca_borrador: bool = False,
+    recursos: Optional['_RecursosRegistro'] = None,
 ) -> bytes:
     """
     Genera el registro escolar completo para un grado.
@@ -2278,11 +2323,12 @@ def _generar_registro_escolar(
     if not os.path.exists(tpl_path):
         raise FileNotFoundError(f"Template no encontrado: {tpl_path}")
     
-    template_reader = PdfReader(tpl_path)
+    recursos = recursos if recursos is not None else _RecursosRegistro()
+    template_reader = recursos.lector(tpl_path)   # MEM-REG: se cierra al terminar, con o sin error
     total_pages = len(template_reader.pages)
     
     # Crear diccionario de overlays: {page_index_0based: overlay_buffer}
-    overlays = {}
+    overlays = recursos.overlays   # MEM-REG: buffers registrados, cerrados al terminar
     
     # --- PORTADA (Pg 1) ---
     if datos_portada:
@@ -2805,6 +2851,10 @@ def _generar_registro_escolar(
     # ========================================
     # MERGE: Template + Overlays
     # ========================================
+    # MEM-REG · liberación explícita: el lector de la plantilla, cada lector de
+    # overlay, cada buffer y el escritor se cierran en cuanto dejan de hacer
+    # falta (también si algo falla). Los overlays se consumen de uno en uno
+    # (`pop`): ya no conviven los ~170 buffers con el PDF terminado.
     writer = PdfWriter()
 
     # v2.19.6: el sello BORRADOR se estampa acá, en la MISMA pasada. Antes se
@@ -2820,37 +2870,41 @@ def _generar_registro_escolar(
     # página: TEMPLATE -> DATOS -> BORRADOR.
     refs_borrador = {}
 
-    for pg_idx in range(total_pages):
-        template_page = template_reader.pages[pg_idx]
+    try:
+        for pg_idx in range(total_pages):
+            template_page = template_reader.pages[pg_idx]
 
-        pagina = writer.add_page(template_page)
+            pagina = writer.add_page(template_page)
 
-        # DATOS: overlay ReportLab de esta página como Form XObject encadenado
-        # al /Contents. `pg_idx in overlays` solo es cierto para páginas con
-        # contenido real (portada, centro, estudiantes, asistencia con datos,
-        # calificaciones, promoción): las demás no reciben ningún XObject.
-        if pg_idx in overlays:
-            overlay_reader = PdfReader(overlays[pg_idx])
-            if len(overlay_reader.pages) > 0:
-                nombre = nombre_xobject_libre(pagina, "/EODataOverlay")
-                ref = crear_xobject_desde_overlay(writer, overlay_reader.pages[0])
-                estampar_xobject(writer, pagina, ref, nombre)
+            # DATOS: overlay ReportLab de esta página como Form XObject encadenado
+            # al /Contents. `pg_idx in overlays` solo es cierto para páginas con
+            # contenido real (portada, centro, estudiantes, asistencia con datos,
+            # calificaciones, promoción): las demás no reciben ningún XObject.
+            buf_overlay = overlays.pop(pg_idx, None)
+            if buf_overlay is not None:
+                # El XObject COPIA el contenido y clona los recursos al writer, así
+                # que el lector del overlay y su buffer se pueden soltar ya.
+                with buf_overlay, PdfReader(buf_overlay) as overlay_reader:
+                    if len(overlay_reader.pages) > 0:
+                        nombre = nombre_xobject_libre(pagina, "/EODataOverlay")
+                        ref = crear_xobject_desde_overlay(writer, overlay_reader.pages[0])
+                        estampar_xobject(writer, pagina, ref, nombre)
 
-        if marca_borrador:
-            # Después de los DATOS, para que el sello quede ENCIMA de todo.
-            ancho = float(pagina.mediabox.width)
-            alto = float(pagina.mediabox.height)
-            clave = (round(ancho, 2), round(alto, 2))
-            if clave not in refs_borrador:
-                refs_borrador[clave] = crear_xobject_borrador(writer, ancho, alto)
-            estampar_borrador(writer, pagina, refs_borrador[clave])
-    
-    # Escribir resultado
-    output = io.BytesIO()
-    writer.write(output)
-    output.seek(0)
-    
-    return output.getvalue()
+            if marca_borrador:
+                # Después de los DATOS, para que el sello quede ENCIMA de todo.
+                ancho = float(pagina.mediabox.width)
+                alto = float(pagina.mediabox.height)
+                clave = (round(ancho, 2), round(alto, 2))
+                if clave not in refs_borrador:
+                    refs_borrador[clave] = crear_xobject_borrador(writer, ancho, alto)
+                estampar_borrador(writer, pagina, refs_borrador[clave])
+
+        # Escribir resultado
+        with io.BytesIO() as output:
+            writer.write(output)
+            return output.getvalue()
+    finally:
+        writer.close()
 
 
 # ============================================================================
